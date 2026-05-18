@@ -1,0 +1,196 @@
+# AI E2E harness — CI integration
+#
+# Runs `ai-e2e-tests/harness.py` in two modes:
+#
+#   1. dry-run — fires on every PR + push to main. Exercises harness shape +
+#      browser-skill primitives directly via subprocess (no Claude agent, no
+#      ANTHROPIC_API_KEY needed, no cost). ~30s wall time. Catches plumbing
+#      regressions in launch-chrome / daemon-url / memory schemas / solidify
+#      scaffold. This is the only mode that runs by default.
+#
+#   2. live — fires only on manual `workflow_dispatch` and only when a
+#      `claude_oauth_token` secret is present (you supply it via repo
+#      Settings → Secrets). Spawns a real Claude agent through the SDK
+#      and runs all 6 stories (US1, US2, US3, US3R, US4, US5). ~5min,
+#      ~$0.50 estimated per run. Gated behind an explicit input toggle
+#      so you never trigger it by accident.
+#
+# Why these specific stories vs. just dry-run?
+#   - dry-run catches plumbing regressions deterministically.
+#   - live mode catches *agent UX regressions* that no unit test can see:
+#     a future framework change might make the agent take 10x more probe
+#     calls or fail to recover from a `js()` quirk. The transcript diff
+#     against the on-disk baseline is the assertion.
+#
+# Branch-protection rules: only the dry-run job is required for merge.
+# The live job is informational.
+
+name: AI E2E
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "browser-skill/**"
+      - "browser-daemon/**"
+      - "ai-e2e-tests/**"
+      - ".github/workflows/ai-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "browser-skill/**"
+      - "browser-daemon/**"
+      - "ai-e2e-tests/**"
+      - ".github/workflows/ai-e2e.yml"
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: "Also run live Claude agent tests (requires CLAUDE_CODE_OAUTH_TOKEN secret; ~$0.50/run)"
+        type: boolean
+        default: false
+
+# Cancel any in-flight runs for the same PR / branch when a new push arrives.
+concurrency:
+  group: ai-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  # Dry-run — the only thing that runs on PR. Driver-quality smoke check.
+  # =========================================================================
+  dry-run:
+    name: dry-run (no API cost)
+    # macOS gets us a real Chrome installation pre-installed at the standard
+    # `/Applications/Google Chrome.app/...` path. Linux runners need extra
+    # setup (apt install chromium-browser + path-discovery is broken there
+    # — see Bug #4 / homebrew-wrapper finding). Pin macOS-14 to keep that
+    # contract stable.
+    runs-on: macos-14
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install browser-daemon
+        run: |
+          cd browser-daemon
+          python -m venv .venv
+          .venv/bin/pip install -q -e .
+
+      - name: Install browser-skill
+        run: |
+          cd browser-skill
+          python -m venv .venv
+          .venv/bin/pip install -q -e .
+
+      - name: Install harness deps
+        run: |
+          cd ai-e2e-tests
+          python -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt
+
+      - name: Sanity — Chrome is on disk
+        run: |
+          test -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+      - name: Dry-run harness
+        # Strict mode: no `--allow-port-9222-listener`. CI runners don't have
+        # the user's daily Chrome on :9222, so the safety check should pass.
+        # If it fails, that means SOMETHING is listening on :9222 in CI — bail
+        # before any cascade.
+        run: |
+          cd ai-e2e-tests
+          .venv/bin/python harness.py --dry-run --label ci-dry
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-failure-artifacts
+          path: |
+            ai-e2e-tests/AI-E2E-REPORT.ci-dry.auto.md
+            ai-e2e-tests/transcripts/
+
+  # =========================================================================
+  # Live — manually triggered only. Costs money.
+  # =========================================================================
+  live:
+    name: live (Claude Agent SDK)
+    # Skip entirely unless this is a workflow_dispatch with run_live=true.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_live == 'true'
+    runs-on: macos-14
+    timeout-minutes: 15
+    needs: dry-run  # only run live if dry-run passed
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify auth secret is present
+        # Fail fast with a useful message if the token wasn't configured.
+        run: |
+          if [ -z "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" ]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN secret is not set on this repo."
+            echo "::error::Configure it at Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install browser-daemon
+        run: |
+          cd browser-daemon
+          python -m venv .venv
+          .venv/bin/pip install -q -e .
+
+      - name: Install browser-skill
+        run: |
+          cd browser-skill
+          python -m venv .venv
+          .venv/bin/pip install -q -e .
+
+      - name: Install harness deps
+        run: |
+          cd ai-e2e-tests
+          python -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt
+
+      - name: Live harness run (all 6 stories)
+        env:
+          # Claude Agent SDK auths from this env var when neither
+          # ANTHROPIC_API_KEY nor the local OAuth credentials file is present.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          cd ai-e2e-tests
+          .venv/bin/python harness.py --label ci-live
+
+      - name: Upload transcripts + report
+        if: always()  # always upload, pass or fail — they're the diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-run-artifacts
+          path: |
+            ai-e2e-tests/AI-E2E-REPORT.ci-live.auto.md
+            ai-e2e-tests/transcripts/
+
+      - name: Summary
+        if: always()
+        run: |
+          cd ai-e2e-tests
+          if [ -f AI-E2E-REPORT.ci-live.auto.md ]; then
+            echo "## AI E2E live run summary" >> $GITHUB_STEP_SUMMARY
+            # Extract just the summary table from the auto-report.
+            sed -n '/^## Summary/,/^## /p' AI-E2E-REPORT.ci-live.auto.md \
+              | head -n -1 >> $GITHUB_STEP_SUMMARY
+          fi

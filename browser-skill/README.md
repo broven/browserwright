@@ -1,0 +1,388 @@
+# browser-skill — Layer 2 of the browser stack
+
+`browser-skill` is the AI-agent-facing layer of the browser automation stack:
+
+- **REPL** in three shapes (inline heredoc, long-lived unix-socket daemon,
+  one-off task invocation).
+- **Primitives** that talk CDP directly (no Playwright, no Selenium): screenshot,
+  click, JS evaluation, navigation, raw CDP escape hatch.
+- **Site-skills** — per-host directories with `SKILL.md` + `memory.md` + a `tasks/*.py`
+  bundle. Five sites ship bundled: google, github, hacker news, wikipedia,
+  producthunt.
+- **Three-tier memory** — global preferences, per-site notes, in-process REPL state.
+  Append-only by default; preference writes require explicit user confirm.
+- **Solidification** — `propose_solidify()` looks at REPL history, scores readiness,
+  and produces a ready-to-commit `tasks/<name>.py` scaffold.
+
+See `design.md` for the full specification.
+
+## Install
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+The console script `browser-skill` is registered automatically. The daemon
+(`browser-daemon`) lives in `../browser-daemon/` and is a separate package.
+
+## Usage
+
+```bash
+# inline heredoc (zero ceremony) — INTERACTIVE USE ONLY on autoconnect.
+# Skill aborts the heredoc with exit 2 when the daemon would pick the
+# autoconnect backend, because each call would fire a Chrome Allow popup
+# and Chrome 144+ accumulates those popups until it freezes. Use one of
+# the alternatives below instead, or set BS_FORCE_AUTOCONNECT_INLINE=1
+# if you really know what you're doing.
+browser-skill <<'PY'
+print(page_info())
+PY
+
+# Long-lived REPL daemon — the canonical autoconnect-friendly path.
+# One popup at `repl start`, then zero for the rest of the session.
+browser-skill repl start
+browser-skill exec "print(page_info())"
+browser-skill repl stop
+
+# Isolated background Chrome (zero popups, zero banner) — preferred for
+# scripted / iterative work and the install wizard's default pick:
+browser-daemon launch-chrome --port 9333 --profile /tmp/bs-isolated &
+BD_PORT=9333 BD_BACKEND=rdp browser-skill <<'PY'
+print(page_info())
+PY
+
+# task invocation:
+browser-skill task wikipedia.org/lookup --title="Wikipedia"
+
+# install wizard (defaults to isolated profile; autoconnect is gated):
+browser-skill install
+
+# daemon health:
+browser-skill doctor
+
+# discoverability:
+browser-skill list-tasks
+browser-skill list-tasks --query="search the web"
+
+# memory inspection:
+browser-skill memory show --global=true
+browser-skill memory show --site=github.com
+```
+
+### Memory: dotted-key preferences
+
+`remember_preference(key, value)` interprets `key` as a YAML frontmatter
+*path*, not a literal flat key. Dots open new mapping levels:
+
+| Call | Frontmatter shape |
+|---|---|
+| `remember_preference("dark_mode", True)` | `dark_mode: True` |
+| `remember_preference("daemon.preferred_backend", "extension")` | `daemon:`<br>&nbsp;&nbsp;`preferred_backend: extension` |
+| `remember_preference("ui.theme.accent", "#ff0")` | `ui:`<br>&nbsp;&nbsp;`theme:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`accent: '#ff0'` |
+
+That's why the install wizard's `daemon.preferred_backend` write produces
+a nested `daemon:` block in `global.md` instead of a flat
+`daemon.preferred_backend:` line. Verify with
+`browser-skill memory show --global=true` — the output is the full
+frontmatter tree.
+
+## Tests
+
+```bash
+.venv/bin/pip install pytest pytest-timeout
+.venv/bin/pytest tests/
+```
+
+30+ unit + integration tests; all green on macOS / Python 3.11. The default
+suite uses subprocess mocks and an env-overridden CDP URL, so it never touches
+real Chrome.
+
+### Testing policy — do **not** hammer the user's daily Chrome
+
+Chrome 144+ requires a fresh "Allow remote debugging?" popup for **every**
+new CDP WebSocket on the default profile, with no memory between popups.
+Iterative or scripted test runs that open dozens of WebSockets will spam the
+user with that dialog. Two safe paths:
+
+1. **Recommended for CI / iterative testing — `launch-chrome` isolated profile.**
+   Spin a hidden background Chrome on a dedicated user-data-dir; nothing in
+   the user's daily Chrome is touched and the popup never appears.
+
+   ```bash
+   browser-daemon launch-chrome \
+       --port 9333 \
+       --profile bs-test-profile \
+       --persistent &
+   # then point Skill at that endpoint:
+   export BS_CDP_WS="$(curl -s http://127.0.0.1:9333/json/version \
+       | python3 -c 'import sys,json;print(json.load(sys.stdin)["webSocketDebuggerUrl"])')"
+   pytest tests/
+   ```
+
+   Note: on macOS Chrome 148, if the user's daily Chrome is already running,
+   `launch-chrome` may not see `DevToolsActivePort` written even though the
+   new Chrome IS up on the requested port. Workaround: `open -na
+   "Google Chrome" --args --user-data-dir=/tmp/<unique> --remote-debugging-port=9333`
+   and grab the ws URL from `http://127.0.0.1:9333/json/version`.
+
+2. **One-shot live "does it actually work" verify against the user's real
+   Chrome** is fine — but the user is asked to click Allow once and then
+   `browser-skill repl start` so the next N calls reuse the ws.
+
+The inline heredoc **refuses to run** with exit code 2 when the daemon would
+pick the autoconnect backend (or any backend whose `ux_cost` mentions
+`popup`) and no Mode B socket or Skill REPL daemon is available to absorb
+the cost. The error message points the agent at `browser-skill repl start`
+or `browser-daemon launch-chrome --profile …`. Escape hatch:
+`BS_FORCE_AUTOCONNECT_INLINE=1` (one-off CI smoke tests, etc.).
+
+## v0.4 — Browser-extension relay (zero popups, zero banner)
+
+`browser-daemon` v0.4 ships a Chrome-extension backend that relays CDP
+through the extension's `chrome.debugger` permission. It bypasses both the
+"Allow remote debugging?" popup and the persistent CDP banner because the
+extension itself holds the debugger handle. The Skill side is wired through
+`browser-skill install` option 4; the daemon side requires Mode B
+(`browser-daemon serve --backend extension`).
+
+End-to-end setup (run once, then forget it):
+
+```bash
+# 1. Install the unpacked extension. browser-skill install prints the
+#    absolute path; alternatively ask the daemon directly:
+browser-daemon extension-path --json
+# → {"path": "/.../browser-daemon/chrome-extension"}
+# Then in Chrome: chrome://extensions → Developer mode → Load unpacked
+# → pick that directory.
+
+# 2. Start the daemon as a Mode B relay.
+browser-daemon serve --backend extension --name default
+
+# 3. Click the extension icon → "Attach this tab".
+
+# 4. Skill picks the running socket automatically:
+browser-skill <<'PY'
+print(page_info())
+PY
+
+# 5. Persist the preference so future installs / agents keep using extension:
+browser-skill install   # → choose 4
+```
+
+`browser-daemon doctor --json` lists the extension backend with
+`available=true` once the relay is alive. The Skill install wizard's option 4
+auto-flips from "coming v0.4 — not yet available" to live based on that
+doctor signal — no Skill release required to surface a freshly-shipped
+daemon backend.
+
+## v0.5 — Cloud / remote-browser backend
+
+`browser-daemon` v0.5 ships a `cloud` backend that fronts third-party
+remote-Chrome services (Browser Use, Browserless, Hyperbrowser, or any
+CDP-compatible cloud endpoint with the `generic` provider). The daemon's
+built-in `AuthProvider` abstraction handles Bearer / Basic / mTLS
+credential injection so Skill never has to see the secret itself.
+
+### Backend chooser — pick one
+
+| Backend | Picked via | Chrome process | Popup | Banner | Credentials live in |
+|---|---|---|---|---|---|
+| `autoconnect` | wizard option **3** | user's daily Chrome | 1 per ws (Chrome 144+ **accumulates**) | yes | n/a |
+| `rdp` (isolated profile) | wizard option **1** (default) — `browser-daemon launch-chrome` | dedicated background user-data-dir | ❌ | ❌ | n/a |
+| `rdp` (fingerprint browser) | wizard option **2** — user runs AdsPower / MultiLogin / etc. | user's fingerprint browser | ❌ | ❌ | n/a |
+| `extension` | wizard option **4** — load unpacked extension | user's Chrome via `chrome.debugger` | ❌ | ❌ | n/a |
+| `cloud` (v0.5) | wizard option **5** | none (remote) | ❌ | ❌ | env var name / file path / URL-embedded — **never the secret itself** |
+
+The inline-heredoc popup-cost gate (`BS_FORCE_AUTOCONNECT_INLINE`)
+applies only to `autoconnect`. `cloud`'s `ux_cost` is `"auth-required"`
+and does not trip the gate — the daemon will surface auth failures via
+ordinary CDP error paths, no popup involved.
+
+### Setup walkthrough
+
+```bash
+# 1. Install browser-daemon v0.5+ and verify the cloud backend is registered.
+browser-daemon doctor --json
+# → look for {"name": "cloud", "available": true, "ux_cost": "auth-required",
+#             "extras": {"provider": ..., "auth_kind": ..., ...}}
+
+# 2. Run the wizard — pick option 5.
+browser-skill install
+#   ...
+#   Choose 1 / 2 / 3 / 4 / 5 [1]: 5
+#   Provider (browser-use / browserless / hyperbrowser / generic) [browser-use]:
+#   Auth kind (bearer / basic / mtls; oauth2 coming v0.6) [bearer]:
+#   ...
+#   wrote daemon.preferred_backend = 'cloud' to ~/.browser-skill/global.md
+#   wrote [backends.cloud] + [backends.cloud.auth.*] sections to ~/.config/browser-daemon/config.toml
+
+# 3. Start the daemon in cloud-relay mode.
+browser-daemon serve --backend cloud --provider browser-use --name default
+
+# 4. Verify the connection.
+browser-daemon doctor --json
+# → "cloud" backend now shows "available": true with a "ws_url"
+
+# 5. Skill picks up the running socket — same workflow as every other backend.
+browser-skill <<'PY'
+print(page_info())
+PY
+```
+
+### Three auth-kind flows
+
+The wizard collects *references* to credentials, never the credentials
+themselves. The daemon's `AuthProvider` reads the live values from env,
+disk, or the URL at `serve` startup.
+
+#### Bearer (Browser Use, Hyperbrowser, generic)
+
+```bash
+browser-skill install   # → 5 → browser-use → bearer
+# wizard prompt: env var name → e.g. BROWSER_USE_API_KEY
+# wizard prompt: endpoint → wss://api.browser-use.example/ws  (optional)
+
+# Then export the token before serving:
+export BROWSER_USE_API_KEY=<your-token>
+browser-daemon serve --backend cloud --provider browser-use
+```
+
+#### Basic (Browserless, generic with HTTP basic auth)
+
+```bash
+browser-skill install   # → 5 → browserless → basic
+# wizard prompts: username_env name → e.g. BROWSERLESS_USER
+#                 password_env name → e.g. BROWSERLESS_PASS
+#                 endpoint (BARE URL, no creds) →
+#                   wss://chrome.browserless.io/ws
+
+# Then export both env vars before serving. The daemon's BasicAuth
+# reads them at startup and emits `Authorization: Basic <b64>` headers
+# upstream — credentials never enter the URL or Skill memory.
+export BROWSERLESS_USER=<your-username>
+export BROWSERLESS_PASS=<your-password>
+browser-daemon serve --backend cloud --provider browserless
+```
+
+> The wizard refuses `wss://user:pass@host/...` style URLs even though
+> the daemon supports `embed_in_url=true` mode — the URL form would put
+> the secret in Skill memory, which violates the "Skill never holds
+> credentials" contract. If you genuinely need URL-embedded basic auth,
+> hand-edit `~/.config/browser-daemon/config.toml` to add
+> `embed_in_url = true` after the wizard runs.
+
+#### mTLS (enterprise / generic with client certs)
+
+```bash
+browser-skill install   # → 5 → generic → mtls
+# wizard prompts: cert path → /opt/certs/client.crt
+#                 key  path → /opt/certs/client.key
+#                 endpoint  → wss://api.example/cdp   (optional)
+
+browser-daemon serve --backend cloud --provider generic
+# daemon loads both PEMs at startup; secrets never enter Skill memory.
+```
+
+### `oauth2` is coming in v0.6
+
+The wizard recognises `oauth2` by name and refuses with a version-specific
+hint (`"oauth2 auth is coming in v0.6 — not yet supported by daemon. Pick
+bearer / basic / mtls."`). This is deliberate — typing it on purpose
+should teach the user when to expect it, not pretend it's an unknown
+auth_kind.
+
+### What gets persisted (and what doesn't)
+
+```yaml
+# ~/.browser-skill/global.md (frontmatter)
+daemon:
+  preferred_backend:    cloud
+  cloud_provider_hint:  browser-use
+  cloud_auth_kind:      bearer
+  cloud_endpoint:       wss://...           # if collected
+  # bearer: env-var *name* (never the token itself):
+  cloud_token_env:      BROWSER_USE_API_KEY
+  # basic (instead of bearer): two env-var names:
+  # cloud_username_env: BROWSERLESS_USER
+  # cloud_password_env: BROWSERLESS_PASS
+  # mtls (instead of bearer): cert + key paths:
+  # cloud_cert_file:    /opt/certs/client.crt
+  # cloud_key_file:     /opt/certs/client.key
+```
+
+```toml
+# ~/.config/browser-daemon/config.toml
+[backends.cloud]
+endpoint      = "wss://..."
+auth_kind     = "bearer"
+provider_hint = "browser-use"           # display name, daemon doesn't act on it
+
+[backends.cloud.auth.bearer]            # <- one of:
+token_env     = "BROWSER_USE_API_KEY"   #    .bearer / .basic / .mtls
+                                        # daemon dispatches AuthProvider
+                                        # implementations off this subtable
+```
+
+**Never** persisted: bearer tokens, mTLS private-key contents, basic-auth
+URL passwords (the URL itself is stored, but it *is* the credential by
+design — RFC 3986 URI). If the daemon-side `AuthProvider` ever needs to
+escalate to a real secret store (OS keychain, Vault, etc.), that's
+daemon work — Skill keeps holding only references.
+
+> **Daemon-side reference**: see [browser-daemon README, v0.5 cloud
+> backend section](../browser-daemon/README.md#v05-cloud-backend) for the
+> daemon's own protocol + auth contract.
+
+## v0.5.1 — Review remediation release
+
+After the v0.5.0 ship landed (cloud backend + Schema-correct wizard
+emit), independent reviewer-1 produced REVIEW.md with 12 skill-side
+findings. v0.5.1 closes all 12 (and 2 incidental bugs that surfaced
+during the audit) with **229 tests** passing.
+
+**Surface completeness (F-4)** — 13 documented-but-missing primitives
+shipped: `type_text`, `press_key`, `fill_input`, `scroll`,
+`dispatch_key`, `upload_file`, `wait_for_element`,
+`wait_for_network_idle`, `drain_events`, `ensure_real_tab`,
+`iframe_target`, `http_get`, plus three Layer-3 re-exports
+(`list_site_skills`, `load_site_skill`, `run_task`). `EXPORTS` grew
+from 23 → 36. Two primitives remain deferred to v0.6 with explicit
+footnotes in `design.md` §A.2: `handle_dialog`, `try_recover_from_drift`.
+
+**Production hardening (F-4b)** — the popup-defense assertions that
+previously only lived in the ai-e2e harness are now in the CLI
+entry points (`repl start`, `task`, inline heredoc). `assert_safe_environment()`
+refuses to start when Chrome's autoconnect default port `:9222` is
+listening (almost always the user's daily Chrome); `assert_daemon_url_safe()`
+cross-checks `browser-daemon url` to catch the `BD_PORT=<typo>` class
+of misconfigurations. Opt-out: `BS_PRODUCTION_HARDENING=0`. Targeted
+bypass: `BS_ALLOW_PORT_9222_LISTENER=1`.
+
+**Inline gate strengthened (F-4d)** — `BS_CDP_WS` no longer
+short-circuits the popup-cost gate when it points at `:9222`. The
+gate now refuses with a clear actionable error unless
+`BS_FORCE_AUTOCONNECT_INLINE=1` is set explicitly.
+
+**Mode-B identity check (F-5d)** — `auto_client()` now invokes
+`assert_backend_matches()` on the resolved Mode-B daemon when the
+caller pinned a backend (`backend=` arg / `BD_BACKEND` env). Catches
+the "BD_NAME=foo daemon was last started against autoconnect,
+operator now wants rdp" silent-reuse failure mode. Raises
+`DaemonBackendMismatch` with a daemon-restart command in the message.
+
+**Coverage & contract hygiene (F-7 / F-9 / F-12 / F-13 / F-16 / F-17)** —
+scaffold template now emits `OUTPUT_SCHEMA` (commented placeholder or
+inferred from `return {...}` / `return [...]`); 14 more `host_stem`
+multi-label TLD cases; args-schema rejects non-string keys; Mode-A
+`disconnect_upstream()` no-op stub for API parity; TOML emit rejects
+unsafe control characters; `browser-skill solidify` aliases `save`;
+`warm_upstream` flagged for removal in v0.6.
+
+**Two incidental bug fixes** surfaced during expanded coverage and
+were shipped alongside: `host_stem("github.com.")` now strips the FQDN
+trailing dot, and `_validate_args_schema` now rejects non-string keys
+with a clear `ValueError`.
+
+Full per-finding table + cross-team status: see `../HANDOFF-v0.5.md`
+"Review remediation summary" section.

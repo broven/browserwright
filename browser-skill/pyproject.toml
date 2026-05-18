@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-skill"
+version = "0.5.1"
+description = "Layer 2 of the browser stack: REPL + site-skills + memory for AI agents."
+requires-python = ">=3.11"
+dependencies = [
+    "cdp-use==1.4.5",
+    "websockets==15.0.1",
+    "pillow==12.2.0",
+]
+
+[project.optional-dependencies]
+ux = ["rich>=13"]
+test = ["pytest>=8"]
+
+[project.scripts]
+browser-skill = "browser_skill.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+browser_skill = ["site_skills_starter/**/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
