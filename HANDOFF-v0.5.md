@@ -1,7 +1,8 @@
-# browser stack — v0.5 handoff
+# browser stack — v0.5 delivery log
 
-For the next agent picking up the cloud-backend work. Read top-to-bottom
-once; the repo navigation table is at the bottom.
+Version-by-version record of what landed, what's tested, and what
+trade-offs were made. Reads top-to-bottom; the repo navigation table is
+at the bottom.
 
 ## Versions shipped
 
@@ -26,10 +27,9 @@ spec-defined user stories on the v0.4 stack and **all four passed**:
 
 That run also surfaced the 7 bugs listed below; all fixed in
 `browser-skill 0.3.1` (Skill 1-4) and `browser-daemon 0.4.0` (Daemon 1-3).
-The framework is now harness-validated as an AI-agent platform — see
-`ai-e2e-tests/AI-E2E-REPORT.md` (canonical, hand-curated) and
-`ai-e2e-tests/AI-E2E-REPORT.auto.md` (auto-generated from the harness
-run) for the full transcript and bug provenance.
+The framework is harness-validated as an AI-agent platform — see
+`ai-e2e-tests/AI-E2E-REPORT.md` (canonical, hand-curated) for the full
+transcript and bug provenance.
 
 ## What each version landed
 
@@ -81,7 +81,7 @@ run) for the full transcript and bug provenance.
 
 ### v0.3.1 — AI E2E bug fix patch
 
-All four skill bugs from the agent-sdk-tester live run, mock-tested only:
+All four skill bugs from the live AI-E2E run, mock-tested only:
 
 | Bug | Surface | Fix |
 |---|---|---|
@@ -104,7 +104,7 @@ Per `browser-daemon/design-v2.md` §7 v0.5 + §8.1.1:
 - Observability/metrics/structured logging hooks (also v0.5 scope).
 - Doctor report quality polish.
 
-**Skill side (~150 LOC + 6-10 tests; per team-lead brief):**
+**Skill side (~150 LOC + 6-10 tests):**
 
 **First wave — already in `browser-skill 0.3.1`** (doctor-driven, mock-tested):
 
@@ -134,7 +134,7 @@ Per `browser-daemon/design-v2.md` §7 v0.5 + §8.1.1:
   — no `tomli_w` dependency. Failures are non-fatal (memory still
   persists; re-run can retry).
 - Auto-flips from "(coming v0.5 — not yet available)" to live label as
-  soon as daemon-impl-2's cloud backend lists itself in `doctor --json`
+  soon as the daemon's cloud backend lists itself in `doctor --json`
   with `available=true`. Pre-defined doctor contract documented inline
   in `_cloud_backend_entry()` docstring.
 - Test file `tests/test_install_cloud_v05.py` (17 tests, ~365 LOC):
@@ -145,9 +145,8 @@ Per `browser-daemon/design-v2.md` §7 v0.5 + §8.1.1:
   isolation ×2** (minimal block + section preservation),
   detection-contract regression guard ×1.
 
-**Second wave — closed**. After daemon-impl-2 shipped the real cloud
-backend in `browser-daemon 0.5.0`, three things landed in
-`browser-skill 0.3.1`:
+**Second wave — closed**. After the real cloud backend shipped in
+`browser-daemon 0.5.0`, three things landed in `browser-skill 0.3.1`:
 
 1. **Live verification (3 tests)** — `tests/test_install_cloud_v05.py`
    subprocess-invokes the real `browser-daemon doctor --json` binary
@@ -203,9 +202,8 @@ single-source-of-truth section-name constants
   ```
   Update README's `Memory: dotted-key preferences` table with one cloud
   example row.
-- Write the corresponding daemon `config.toml` block (whatever shape
-  daemon-impl-2 lands — coordinate when their stats CLI / config writer
-  surfaces).
+- Write the corresponding daemon `config.toml` block alongside the
+  daemon's own stats CLI / config writer surface.
 - Tests: cloud doctor=available + bearer flow / basic flow / mtls flow
   (3 wizard end-to-end), cloud doctor=unavailable → option 5 disabled
   (1 negative). Plus 2-3 unit tests on the new helper / memory schema
@@ -224,11 +222,11 @@ single-source-of-truth section-name constants
 
 > ### ⚠️ Detection contract for any new wizard option
 >
-> The v0.4 EMERGENCY-STOP incident (Allow popups on the user's daily
-> Chrome) was root-caused to a misconfigured `BD_PORT=9444` collapsing
-> to default `9222` and hitting the user's Chrome directly — **not** to
-> the wizard's doctor probe, which is contract-bound to zero ws side
-> effects (spec H3).
+> The v0.4 popup-storm incident (Allow popups accumulating on the
+> user's daily Chrome) was root-caused to a misconfigured `BD_PORT=9444`
+> collapsing to default `9222` and hitting the user's Chrome directly —
+> **not** to the wizard's doctor probe, which is contract-bound to zero
+> ws side effects (spec H3).
 >
 > However, that incident proves the failure mode is one Skill mistake
 > away. **Every new wizard option `_<backend>_backend_available()`
@@ -238,7 +236,7 @@ single-source-of-truth section-name constants
 > If a future detection needs richer signal than doctor provides,
 > extend the daemon's doctor schema first.
 
-## E2E bug status (post-AI-agent-sdk-tester run)
+## E2E bug status (post live AI-E2E run)
 
 | # | Side | Severity | Status |
 |---|---|---|---|
@@ -251,14 +249,13 @@ single-source-of-truth section-name constants
 | 7 | Daemon | P2 | ✅ launch-chrome `--remote-allow-origins=*` |
 
 All 7 fixed. The E2E harness can be re-run as a regression gate before
-shipping v0.5 (entry point: `ai-e2e-tests/harness.py` — see daemon-impl-2's
-recent SendMessage for details).
+shipping v0.5 (entry point: `ai-e2e-tests/harness.py`).
 
 ## Review remediation summary (v0.5.1)
 
-After agent-sdk-tester's 4/4 LIVE pass, an independent reviewer-1 pass
-produced REVIEW.md with **28 findings** across the three teammates. Status
-as of the v0.5.1 / daemon-0.5.3 / ai-e2e-0.2.x ship window:
+After the 4/4 LIVE pass, an independent review pass produced REVIEW.md
+with **28 findings** across the three components. Status as of the
+v0.5.1 / daemon-0.5.3 / ai-e2e-0.2.x ship window:
 
 | Side | Closed | Deferred | Total |
 |---|---|---|---|

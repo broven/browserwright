@@ -1,10 +1,16 @@
 # Campaign Review — browser-daemon + browser-skill
 
-**Reviewer**: reviewer-1 (independent fresh teammate, no prior involvement)
+**Reviewer**: independent review pass with no prior involvement in the code
 **Date**: 2026-05-18
 **Scope**: design + code + tests + AI-E2E harness + CI + docs
 **Versions audited**: browser-daemon 0.5.0 (228 tests), browser-skill 0.3.1 (146 tests)
 **Methodology**: 4 parallel deep-dive subagents (daemon-drift, skill-drift, bug-fix-verification, user-vision-E2E) + direct foreground audit of P1/P2 angles. Read-only mandate — no framework code modified.
+
+> **Status banner — this is the v0.5.0 / 0.3.1 audit, not the current state.**
+> 26 of the 28 findings below were closed in the v0.5.1 / daemon-0.5.3 ship
+> window. The 2 deferred items are tracked in `HANDOFF-v0.5.md` "Review
+> remediation summary". This file is preserved as the audit-time snapshot;
+> consult HANDOFF for what's true at HEAD.
 
 ## Executive Summary
 
@@ -75,7 +81,7 @@ doctor.py:22            SCHEMA_VERSION = 1           # unchanged
 ### F-4c: `BD_PORT` typo silently collapses to default Chrome — the v0.4 incident root cause is NOT actually mitigated
 
 **Where**: `browser-daemon/src/browser_daemon/config.py:190-209`; `grep -rn "BD_PORT\b" browser-daemon/src/` → **zero matches**.
-**Issue**: The v0.4 emergency-stop incident (Allow popups on the user's daily Chrome) was root-caused per HANDOFF:219-224 to `BD_PORT=9444` collapsing to default `9222`. The fix was to introduce a **new** env name `BD_RDP_PORT`. But there is **no warning, deprecation message, or alias** for the old (and intuitive) name `BD_PORT`. A user who today re-types `BD_PORT=9444 BD_BACKEND=rdp browser-skill ...` gets the **exact same silent collapse** as the original incident.
+**Issue**: The v0.4 popup-storm incident (Allow popups on the user's daily Chrome) was root-caused per HANDOFF:219-224 to `BD_PORT=9444` collapsing to default `9222`. The fix was to introduce a **new** env name `BD_RDP_PORT`. But there is **no warning, deprecation message, or alias** for the old (and intuitive) name `BD_PORT`. A user who today re-types `BD_PORT=9444 BD_BACKEND=rdp browser-skill ...` gets the **exact same silent collapse** as the original incident.
 **Impact**: Same emergency, one env-var typo away. Memory `chrome-popup-accumulation-bug.md` says "framework must defend, not just doc". This is undefended.
 **Recommended fix**: Add a startup-time warning in `config.py:load()`: if `BD_PORT` is present but `BD_RDP_PORT` is not, emit a clear "did you mean BD_RDP_PORT? `BD_PORT` is not read." stderr message. Or alias `BD_PORT` → `BD_RDP_PORT` outright.
 
@@ -157,7 +163,7 @@ Verifying the 8 known bug fixes:
 | Bug | Status | Gap |
 |---|---|---|
 | #1 host_stem eTLD+1 | ⚠️ partial | 30 TLDs in set (not 26 as brief claims). Parametrize tests cover only 2 (`co.uk`, `com.cn`); `gov.uk`, `ac.jp`, `com.br`, `com.au`, `co.in` not exercised. No IDN/uppercase/trailing-dot/IP tests. |
-| #2 args-schema | ⚠️ partial | `draft_args_schema` as None/string/tuple/set, schema with non-string keys, nested malformed entries — all untested. **Note**: team-lead brief's mental model (`{name, type}` list shape) doesn't match actual `{argname: {type:…}}` dict shape — clarify which is right. |
+| #2 args-schema | ⚠️ partial | `draft_args_schema` as None/string/tuple/set, schema with non-string keys, nested malformed entries — all untested. **Note**: the brief's mental model (`{name, type}` list shape) doesn't match actual `{argname: {type:…}}` dict shape — clarify which is right. |
 | #3 propose dict | ⚠️ partial | 3+ `ready=False` paths untested: `>30 success steps` penalty, captcha branch, `host=None`, empty-history-without-`like`. All construct the dict correctly, but the regression guards are bounded. |
 | #4 dotted-key docs | ✅ thorough | Edge: overwriting non-dict scalar with dotted key silently destroys old value — undocumented. |
 | #5 BD_RDP_PORT | ⚠️ partial | TOML-vs-env precedence not directly tested for the port (only for `default_backend`). |
