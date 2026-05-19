@@ -460,16 +460,9 @@ def close_tab(
     Extension backend only — raises ``CDPError`` on other backends.
     """
     sess = current_session()
-    daemon = sess.daemon
-    if not hasattr(daemon, "close_tab"):
-        raise CDPError(
-            method="BrowserDaemon.closeTab",
-            params={"sessionId": session_id, "targetId": target_id},
-            cdp_message="close_tab requires the Mode B daemon client (ModeBClient)",
-        )
-    # If neither was provided, default to the current attached tab. Resolve
-    # both the targetId and the sessionId so daemon-side lookup has the best
-    # chance regardless of which client carries the binding.
+    # Resolve target_id and session_id from local state when not passed,
+    # then forward to the daemon over the long-lived ws so the session
+    # binding lookup runs against this client's bindings.
     resolved_target_id = target_id
     resolved_session_id = session_id
     if resolved_target_id is None and resolved_session_id is None:
@@ -481,20 +474,32 @@ def close_tab(
                 cdp_message="close_tab: no current attached tab to close",
             )
         resolved_session_id = sess.cdp._sessions.get(resolved_target_id)
-    payload = daemon.close_tab(
-        resolved_session_id, target_id=resolved_target_id,
-    )
-    # Backfill below the rest of the function with the resolved id for state cleanup.
+    elif resolved_session_id is None and resolved_target_id is not None:
+        # Caller passed target_id; fill in session_id from local cache if we have it.
+        resolved_session_id = sess.cdp._sessions.get(resolved_target_id)
+    try:
+        payload = sess.cdp.send(
+            "BrowserDaemon.closeTab",
+            sessionId=resolved_session_id,
+            targetId=resolved_target_id,
+        )
+    except CDPError as e:
+        raise CDPError(
+            method="BrowserDaemon.closeTab",
+            params={"sessionId": resolved_session_id,
+                    "targetId": resolved_target_id},
+            cdp_message=(
+                f"close_tab failed: {e.cdp_message}. "
+                "Requires the extension backend with a running daemon."
+            ),
+        ) from e
+    # Backfill the local session_id var for the state-cleanup block below.
     session_id = resolved_session_id
     if not payload:
-        detail = getattr(daemon, "last_cli_error", None) or (
-            "daemon did not return a valid close-tab payload "
-            "(requires the extension backend, with a running daemon)"
-        )
         raise CDPError(
             method="BrowserDaemon.closeTab",
             params={"sessionId": session_id},
-            cdp_message=f"close_tab failed: {detail}",
+            cdp_message="daemon returned an empty close-tab payload",
         )
     # Clear local CDPSession state — locate any target whose stored sessionId
     # matches and drop it; clear the per-session event ring too.

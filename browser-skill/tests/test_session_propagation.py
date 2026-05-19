@@ -85,3 +85,29 @@ def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
         "groupId": 7,
     }
     assert sess.current_target_id == "ext-tab-42"
+
+
+def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):
+    """close_tab() must dispatch BrowserDaemon.closeTab over sess.cdp.send."""
+    from browser_skill.primitives.page import close_tab
+
+    sess = _stub_session_for_ws(monkeypatch, response={
+        "ok": True, "tabId": 99,
+    })
+    # Seed a target_id → sid mapping like a prior open_background would have.
+    sess.cdp._sessions["ext-tab-99"] = "ws-sid-99"
+    sess.current_target_id = "ext-tab-99"
+
+    result = close_tab(target_id="ext-tab-99")
+
+    # The session_id forwarded to the daemon comes from the local cache
+    # (since we have one). Both params are sent.
+    assert sess.cdp.calls == [
+        ("BrowserDaemon.closeTab",
+         {"session": None, "sessionId": "ws-sid-99",
+          "targetId": "ext-tab-99"}),
+    ], f"unexpected wire calls: {sess.cdp.calls!r}"
+    assert result == {"ok": True, "tabId": 99}
+    # Local state is cleaned up after a successful close.
+    assert "ext-tab-99" not in sess.cdp._sessions
+    assert sess.current_target_id is None
