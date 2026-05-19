@@ -209,6 +209,41 @@ async def test_session_scoped_command_with_unknown_session_id_errors():
         assert err["error"]["code"] == -32602
 
 
+# ---- attach_active_tab (v0.5.4) ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attach_active_tab_returns_fabricated_session_id():
+    """ExtensionUpstream.attach_active_tab() drives the relay's
+    attach_active_tab and synthesises a sessionId in the same shape as
+    Target.attachToTarget would. The session is registered in
+    upstream._sessions so subsequent session-scoped commands route through
+    the relay for the same tab."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        async def respond_attach_active():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "attachActive"
+            await ext.respond(cmd["id"], result={
+                "tabId": 99,
+                "url": "https://active.example/",
+                "title": "Active",
+            })
+
+        r = asyncio.create_task(respond_attach_active())
+        info = await upstream.attach_active_tab()
+        await r
+
+        assert info["tabId"] == 99
+        assert info["url"] == "https://active.example/"
+        assert info["title"] == "Active"
+        assert info["targetId"] == "ext-tab-99"
+        sid = info["sessionId"]
+        assert sid.startswith("ext-sid-99-")
+        # The session is registered so a follow-up Page.navigate routes via
+        # the relay to tabId=99 (matches the standard attach behaviour).
+        assert upstream._sessions.get(sid) == 99
+
+
 # ---- event push-back through on_frame ------------------------------------
 
 
@@ -250,3 +285,79 @@ async def test_extension_event_translated_to_cdp_frame_with_session_id():
         assert evt["method"] == "Page.loadEventFired"
         assert evt["sessionId"] == sid
         assert evt["params"]["timestamp"] == 12.34
+
+
+# ---- Phase B: open_background_tab + close_tab ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_background_tab_returns_fabricated_session():
+    """upstream.open_background_tab fans out to relay.create_background_tab
+    and surfaces the synthetic sessionId + tabId + groupId."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "createTab"
+            assert cmd["url"] == "https://example.com/"
+            assert cmd["groupName"] == "Agent"
+            await ext.respond(cmd["id"], result={
+                "tabId": 12,
+                "url": "https://example.com/",
+                "title": "Example",
+                "groupId": 4,
+            })
+
+        r = asyncio.create_task(respond())
+        result = await upstream.open_background_tab(
+            "https://example.com/", group_name="Agent")
+        await r
+
+        assert result["targetId"] == "ext-tab-12"
+        assert result["tabId"] == 12
+        assert result["url"] == "https://example.com/"
+        assert result["title"] == "Example"
+        assert result["groupId"] == 4
+        sid = result["sessionId"]
+        assert sid.startswith("ext-sid-12-")
+        # Session is registered for future relay routing.
+        assert upstream._sessions[sid] == 12
+
+
+@pytest.mark.asyncio
+async def test_close_tab_removes_session():
+    """upstream.close_tab pops the upstream sessionId mapping after the relay
+    has confirmed the chrome.tabs.remove call."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        # First open a background tab so we have a sessionId to close.
+        async def respond_create():
+            cmd = await ext.next_command()
+            await ext.respond(cmd["id"], result={
+                "tabId": 21, "url": "https://x/", "title": "x", "groupId": 1,
+            })
+
+        c = asyncio.create_task(respond_create())
+        opened = await upstream.open_background_tab("https://x/", group_name="Agent")
+        await c
+        sid = opened["sessionId"]
+        assert sid in upstream._sessions
+
+        async def respond_close():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "closeTab"
+            assert cmd["tabId"] == 21
+            await ext.respond(cmd["id"], result={"ok": True, "tabId": 21})
+
+        cl = asyncio.create_task(respond_close())
+        result = await upstream.close_tab(sid)
+        await cl
+
+        assert result == {"ok": True, "tabId": 21}
+        assert sid not in upstream._sessions
+
+
+@pytest.mark.asyncio
+async def test_close_tab_unknown_session_raises_value_error():
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        with pytest.raises(ValueError):
+            await upstream.close_tab("not-a-real-session-id")

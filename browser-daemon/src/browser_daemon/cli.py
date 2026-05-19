@@ -97,12 +97,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_port(p_serve)
     _add_name(p_serve)
     # v0.5.3 Task #24: extension relay port override. Useful when default
-    # 19988 is occupied (e.g., playwriter coexisting on the dev machine).
-    # Precedence: this flag > BD_EXTENSION_PORT > toml > 19988 default.
+    # 19989 is occupied (e.g., a stale daemon process). playwriter sits on
+    # 19988, so the default no longer collides with it.
+    # Precedence: this flag > BD_EXTENSION_PORT > toml > 19989 default.
     p_serve.add_argument(
         "--extension-port", type=int, default=None, metavar="N",
         help=("Bind the extension relay ws server on this port instead of "
-              "the default 19988. Only relevant when --backend extension. "
+              "the default 19989. Only relevant when --backend extension. "
               "Equivalent to BD_EXTENSION_PORT env or "
               "[backends.extension].port in config.toml."))
 
@@ -147,6 +148,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_port(p_at)
     p_at.add_argument("--json", action="store_true")
 
+    # attach-active (v0.5.4 — extension backend only)
+    p_aa = sub.add_parser(
+        "attach-active",
+        help="(extension backend) attach the focused-window active tab without a popup click")
+    _add_name(p_aa)
+    p_aa.add_argument("--json", action="store_true")
+
     # launch-chrome
     p_lc = sub.add_parser("launch-chrome", help="launch a detached isolated-profile Chrome and print its ws URL")
     p_lc.add_argument("--profile", default="isolated")
@@ -184,6 +192,32 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_name(p_stats)
     p_stats.add_argument("--json", action="store_true",
                          help="emit as JSON (default: tab-separated)")
+
+    # open-background (Phase B — extension backend only)
+    p_ob = sub.add_parser(
+        "open-background",
+        help=("open a Chrome tab in the background (group=Agent by default), "
+              "attach chrome.debugger, print {sessionId,targetId,tabId,url,title,groupId}"),
+    )
+    _add_name(p_ob)
+    p_ob.add_argument("--url", required=True, help="URL to open in the background tab")
+    p_ob.add_argument("--group", default="Agent",
+                      help="Chrome tab-group title to place the new tab in (default: Agent)")
+    # Output is always JSON (spec §5.1 single-line discipline); no --json flag.
+
+    # close-tab (Phase B — extension backend only)
+    p_ct = sub.add_parser(
+        "close-tab",
+        help="close a tab by sessionId (persistent ws) or targetId (CLI)",
+    )
+    _add_name(p_ct)
+    p_ct.add_argument("--session-id", default=None,
+                      help="local sessionId from a persistent ws (Skill REPL)")
+    p_ct.add_argument("--target-id", default=None,
+                      help="globally-addressable targetId (e.g. ext-tab-42); "
+                           "use this from one-shot CLI calls since transient "
+                           "ws can't share per-client session state")
+    # Output is always JSON (spec §5.1 single-line discipline); no --json flag.
 
     return p
 
@@ -463,6 +497,72 @@ async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
     return 0
 
 
+def _cmd_attach_active(args, cfg: Config) -> int:
+    """Ask the running daemon (extension backend) to attach the
+    currently-focused-window active tab. Prints the result as JSON or as
+    `targetId<TAB>url<TAB>title`. Exits 1 if the daemon errored.
+    """
+    return _run(_attach_active_via_ws(cfg, args))
+
+
+async def _attach_active_via_ws(cfg: Config, args) -> int:
+    import websockets
+    from . import _ipc
+
+    if _ipc.IS_WINDOWS:
+        port, token = _ipc.read_port_file(cfg.name)
+        if port is None:
+            print("no daemon running", file=sys.stderr)
+            return 2
+        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-attach-active"
+        try:
+            async with websockets.connect(url, compression=None) as ws:
+                return await _attach_active_roundtrip(ws, args)
+        except Exception as e:
+            print(f"attach-active failed: {e}", file=sys.stderr)
+            return 1
+    path = _ipc.sock_path(cfg.name)
+    if not path.exists():
+        print("no daemon running", file=sys.stderr)
+        return 2
+    try:
+        async with websockets.unix_connect(
+                str(path), uri="ws://localhost/?client=cli-attach-active",
+                compression=None) as ws:
+            return await _attach_active_roundtrip(ws, args)
+    except Exception as e:
+        print(f"attach-active failed: {e}", file=sys.stderr)
+        return 1
+
+
+async def _attach_active_roundtrip(ws, args) -> int:
+    await ws.send(json.dumps({
+        "id": 1, "method": "BrowserDaemon.attachActiveTab",
+    }))
+    # Drain until we see id=1 — lifecycle events (upstreamConnecting,
+    # upstreamReady) can arrive ahead of the response.
+    for _ in range(20):
+        raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+        msg = json.loads(raw)
+        if msg.get("id") != 1:
+            continue
+        if "error" in msg:
+            err = msg["error"] or {}
+            print(f"attach-active error: {err.get('message', str(err))}",
+                  file=sys.stderr)
+            return 1
+        result = msg.get("result") or {}
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"{result.get('targetId')}\t{result.get('url', '')}\t"
+                  f"{result.get('title', '')}")
+        return 0
+    print("daemon did not respond to BrowserDaemon.attachActiveTab",
+          file=sys.stderr)
+    return 1
+
+
 def _cmd_logs(args, cfg: Config) -> int:
     """Print log file path, or tail -f it."""
     from . import _ipc
@@ -552,6 +652,110 @@ def _cmd_version(args, cfg: Config) -> int:
     return 0
 
 
+async def _rpc_via_ws(cfg: Config, method: str, params: dict,
+                      *, client_label: str, timeout: float = 10.0) -> dict:
+    """Open a transient ws to the running daemon, send one BrowserDaemon.*
+    RPC, read the response, close. Mirrors `_disconnect_via_ws` but returns
+    the parsed result (or raises with the daemon's error message).
+
+    Used by `open-background` and `close-tab` subcommands.
+    """
+    import websockets
+    from . import _ipc
+
+    async def _drain_until_response(ws) -> dict:
+        # Lifecycle events (upstreamConnecting/Ready) can arrive ahead of the
+        # actual id=1 response, especially when lazy-open is triggered by the
+        # RPC. Drain frames until we see ours. Mirrors `_attach_active_roundtrip`.
+        for _ in range(20):
+            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            msg = json.loads(raw)
+            if msg.get("id") == 1:
+                return msg
+        raise DaemonError(f"{method} no id=1 response after 20 frames")
+
+    if _ipc.IS_WINDOWS:
+        port, token = _ipc.read_port_file(cfg.name)
+        if port is None:
+            raise Unavailable("no daemon running")
+        url = f"ws://127.0.0.1:{port}/?token={token}&client={client_label}"
+        async with websockets.connect(url, compression=None) as ws:
+            await ws.send(json.dumps({
+                "id": 1, "method": method, "params": params,
+            }))
+            msg = await _drain_until_response(ws)
+    else:
+        path = _ipc.sock_path(cfg.name)
+        if not path.exists():
+            raise Unavailable("no daemon running")
+        async with websockets.unix_connect(
+            str(path),
+            uri=f"ws://localhost/?client={client_label}",
+            compression=None,
+        ) as ws:
+            await ws.send(json.dumps({
+                "id": 1, "method": method, "params": params,
+            }))
+            msg = await _drain_until_response(ws)
+    if "error" in msg:
+        err = msg["error"] or {}
+        raise DaemonError(
+            f"{method} failed: {err.get('message', err)} (code={err.get('code')})"
+        )
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        raise DaemonError(f"{method} returned non-dict result: {result!r}")
+    return result
+
+
+def _cmd_open_background(args, cfg: Config) -> int:
+    try:
+        result = _run(_rpc_via_ws(
+            cfg,
+            "BrowserDaemon.openBackgroundTab",
+            {"url": args.url, "groupName": args.group},
+            client_label="cli-open-background",
+            timeout=15.0,
+        ))
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    # Always emit JSON — single-line spec §5.1 discipline; the response is
+    # structured so a tab-separated form would lose fields.
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _cmd_close_tab(args, cfg: Config) -> int:
+    if not args.session_id and not args.target_id:
+        print("error: provide --session-id or --target-id", file=sys.stderr)
+        return 2
+    params: dict = {}
+    if args.session_id:
+        params["sessionId"] = args.session_id
+    if args.target_id:
+        params["targetId"] = args.target_id
+    try:
+        result = _run(_rpc_via_ws(
+            cfg,
+            "BrowserDaemon.closeTab",
+            params,
+            client_label="cli-close-tab",
+            timeout=10.0,
+        ))
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 _DISPATCH = {
     "url": _cmd_url,
     "doctor": _cmd_doctor,
@@ -567,6 +771,10 @@ _DISPATCH = {
     "logs": _cmd_logs,
     # v0.5
     "stats": _cmd_stats,
+    # v0.5.4 — extension backend
+    "attach-active": _cmd_attach_active,
+    "open-background": _cmd_open_background,
+    "close-tab": _cmd_close_tab,
 }
 
 

@@ -217,6 +217,77 @@ async def test_unknown_browserdaemon_method_returns_method_not_found():
     assert err["code"] == -32601
 
 
+# ---- v0.5.4 attach-active (extension backend) ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_attach_active_without_callback_returns_method_not_found():
+    """Without an extension backend wired, BrowserDaemon.attachActiveTab
+    must surface -32601 instead of silently doing nothing."""
+    state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 33, "method": "BrowserDaemon.attachActiveTab",
+    }))
+    err = cap.per_client[client.client_id][-1]["error"]
+    assert err["code"] == -32601
+    assert "extension backend" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_attach_active_with_callback_binds_session_and_attacher():
+    """When the extension callback is wired, calling attachActiveTab must
+    bind a local session + claim_attacher so subsequent CDP commands route
+    correctly under the returned sessionId."""
+    state, router, cap, (client,) = _setup()
+
+    async def fake_attach_active():
+        return {
+            "sessionId": "UPSTREAM-XSID-1",
+            "targetId": "ext-tab-77",
+            "tabId": 77,
+            "url": "https://x.example/",
+            "title": "X",
+        }
+
+    router._attach_active_tab = fake_attach_active
+    await router.route_from_client(client, json.dumps({
+        "id": 10, "method": "BrowserDaemon.attachActiveTab",
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 10
+    local_sid = resp["result"]["sessionId"]
+    assert local_sid != "UPSTREAM-XSID-1"  # daemon-allocated local id
+    assert resp["result"]["targetId"] == "ext-tab-77"
+    assert resp["result"]["tabId"] == 77
+
+    # Attacher + session bindings updated to mirror Target.attachToTarget.
+    own = state.attachers["ext-tab-77"]
+    assert own.primary_client_id == client.client_id
+    assert own.upstream_session_id == "UPSTREAM-XSID-1"
+    binding = client.sessions[local_sid]
+    assert binding.upstream_session_id == "UPSTREAM-XSID-1"
+    assert binding.target_id == "ext-tab-77"
+    assert binding.readonly is False
+
+
+@pytest.mark.asyncio
+async def test_attach_active_callback_failure_returns_error():
+    """If the callback raises, the client sees a CDP -32000 error rather
+    than a hung request."""
+    state, router, cap, (client,) = _setup()
+
+    async def boom():
+        raise RuntimeError("relay says no")
+
+    router._attach_active_tab = boom
+    await router.route_from_client(client, json.dumps({
+        "id": 11, "method": "BrowserDaemon.attachActiveTab",
+    }))
+    err = cap.per_client[client.client_id][-1]["error"]
+    assert err["code"] == -32000
+    assert "relay says no" in err["message"]
+
+
 # ---- v0.3 multi-client: single-attacher rule -----------------------------
 
 
@@ -535,6 +606,273 @@ async def test_pre_open_buffer_per_client_isolation():
     # Both replayed; method preserved.
     methods = {m["method"] for m in cap.upstream}
     assert methods == {"Browser.getVersion"}
+
+
+# ---- Phase B: BrowserDaemon.openBackgroundTab / closeTab ------------------
+
+
+@pytest.mark.asyncio
+async def test_open_background_without_callback_returns_method_not_found():
+    """When backend != extension, the callback stays None and the handler
+    must surface -32601 'requires extension backend' (NOT -32602 from
+    missing-params)."""
+    state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "params": {"url": "https://x/"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 1
+    assert resp["error"]["code"] == -32601
+    assert "extension backend" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_open_background_with_callback_binds_session_and_attacher():
+    """Happy path: callback wired, params valid → session binding + attacher
+    ownership registered with the daemon-allocated LOCAL sessionId."""
+    state, router, cap, (client,) = _setup()
+
+    async def _fake_open(url: str, group_name: str | None) -> dict:
+        assert url == "https://example.com/"
+        assert group_name == "Agent"
+        return {
+            "sessionId": "UPSTREAM-SID-42",
+            "targetId": "ext-tab-42",
+            "tabId": 42,
+            "url": "https://example.com/",
+            "title": "Example",
+            "groupId": 7,
+        }
+
+    router._open_background_tab = _fake_open
+    await router.route_from_client(client, json.dumps({
+        "id": 5, "method": "BrowserDaemon.openBackgroundTab",
+        "params": {"url": "https://example.com/", "groupName": "Agent"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 5
+    result = resp["result"]
+    assert result["targetId"] == "ext-tab-42"
+    assert result["tabId"] == 42
+    assert result["groupId"] == 7
+    local_sid = result["sessionId"]
+    assert local_sid != "UPSTREAM-SID-42"
+    # Session binding registered on the client + attacher table claimed.
+    binding = client.sessions[local_sid]
+    assert binding.upstream_session_id == "UPSTREAM-SID-42"
+    assert binding.target_id == "ext-tab-42"
+    assert binding.readonly is False
+    own = state.attachers["ext-tab-42"]
+    assert own.primary_client_id == client.client_id
+    assert own.primary_local_session == local_sid
+
+
+@pytest.mark.asyncio
+async def test_open_background_missing_url_returns_invalid_params():
+    """params.url is required; absence → -32602."""
+    state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 9, "method": "BrowserDaemon.openBackgroundTab",
+    }))
+    err = cap.per_client[client.client_id][-1]["error"]
+    assert err["code"] == -32602
+    assert "url" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_close_tab_without_callback_returns_method_not_found():
+    state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserDaemon.closeTab",
+        "params": {"sessionId": "anything"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["error"]["code"] == -32601
+    assert "extension backend" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_close_tab_with_callback_cleans_session_state():
+    """Happy path: open a tab, then close it; session binding + attacher
+    table cleared after the close completes."""
+    state, router, cap, (client,) = _setup()
+    upstream_sid = "UPSTREAM-SID-99"
+
+    async def _fake_open(url: str, group_name: str | None) -> dict:
+        return {
+            "sessionId": upstream_sid,
+            "targetId": "ext-tab-99",
+            "tabId": 99,
+            "url": "https://x/",
+            "title": "x",
+            "groupId": -1,
+        }
+
+    captured_close: list[str] = []
+
+    async def _fake_close(sid: str) -> dict:
+        captured_close.append(sid)
+        return {"ok": True, "tabId": 99}
+
+    router._open_background_tab = _fake_open
+    router._close_tab = _fake_close
+
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "params": {"url": "https://x/"},
+    }))
+    local_sid = cap.per_client[client.client_id][-1]["result"]["sessionId"]
+    assert local_sid in client.sessions
+    assert "ext-tab-99" in state.attachers
+
+    await router.route_from_client(client, json.dumps({
+        "id": 2, "method": "BrowserDaemon.closeTab",
+        "params": {"sessionId": local_sid},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 2
+    assert resp["result"] == {"ok": True, "tabId": 99}
+    # Upstream got the UPSTREAM sid, not the local one.
+    assert captured_close == [upstream_sid]
+    # Session + attacher bindings are gone.
+    assert local_sid not in client.sessions
+    assert "ext-tab-99" not in state.attachers
+
+
+@pytest.mark.asyncio
+async def test_close_tab_unknown_local_session_returns_invalid_params():
+    state, router, cap, (client,) = _setup()
+    async def _fake_close(sid: str) -> dict:
+        return {"ok": True, "tabId": 0}
+    router._close_tab = _fake_close
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserDaemon.closeTab",
+        "params": {"sessionId": "no-such-local-sid"},
+    }))
+    err = cap.per_client[client.client_id][-1]["error"]
+    assert err["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_close_tab_by_target_id_works_across_client_boundary():
+    """CLI use-case: one ws opens the tab (binding lives on that client),
+    a SECOND (fresh) ws calls closeTab with targetId. Lookup must reach the
+    global state.attachers table, not just the local client's sessions."""
+    state, router, cap, (alice, bob) = _setup("alice", "bob")
+
+    async def _fake_open(url: str, group_name: str | None) -> dict:
+        return {
+            "sessionId": "UPSTREAM-SID-77",
+            "targetId": "ext-tab-77",
+            "tabId": 77,
+            "url": "https://x/", "title": "x", "groupId": -1,
+        }
+    captured_close: list[str] = []
+    async def _fake_close(sid: str) -> dict:
+        captured_close.append(sid)
+        return {"ok": True, "tabId": 77}
+    router._open_background_tab = _fake_open
+    router._close_tab = _fake_close
+
+    # Alice opens; binding lands on alice.sessions only.
+    await router.route_from_client(alice, json.dumps({
+        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "params": {"url": "https://x/"},
+    }))
+    alice_local_sid = cap.per_client[alice.client_id][-1]["result"]["sessionId"]
+    assert alice_local_sid in alice.sessions
+    assert "ext-tab-77" in state.attachers
+
+    # Bob (different client, no shared session state) closes by targetId.
+    await router.route_from_client(bob, json.dumps({
+        "id": 2, "method": "BrowserDaemon.closeTab",
+        "params": {"targetId": "ext-tab-77"},
+    }))
+    resp = cap.per_client[bob.client_id][-1]
+    assert resp.get("id") == 2
+    assert "result" in resp, resp
+    assert captured_close == ["UPSTREAM-SID-77"]
+    # Global cleanup: alice's binding gone, attacher gone.
+    assert alice_local_sid not in alice.sessions
+    assert "ext-tab-77" not in state.attachers
+
+
+@pytest.mark.asyncio
+async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
+    """Opener (alice) opens the tab, then her transient ws disconnects —
+    `release_client` reaps her sessions + the global attacher binding. A
+    fresh ws (bob) then calls closeTab with targetId. The regular
+    `_close_tab(upstream_sid)` path is unreachable (no attacher), so the
+    handler must take the `_close_tab_by_target_id` fallback path that
+    `test_close_tab_by_target_id_works_across_client_boundary` never
+    exercises (alice stays attached in that test, so the attacher table
+    still has an entry)."""
+    state, router, cap, (alice, bob) = _setup("alice", "bob")
+
+    async def _fake_open(url: str, group_name: str | None) -> dict:
+        return {
+            "sessionId": "UPSTREAM-SID-88",
+            "targetId": "ext-tab-88",
+            "tabId": 88,
+            "url": "https://y/", "title": "y", "groupId": -1,
+        }
+    by_sid_calls: list[str] = []
+    by_tid_calls: list[str] = []
+
+    async def _fake_close(sid: str) -> dict:
+        by_sid_calls.append(sid)
+        return {"ok": True, "tabId": 88}
+
+    async def _fake_close_by_target(tid: str) -> dict:
+        by_tid_calls.append(tid)
+        return {"ok": True, "tabId": 88}
+
+    router._open_background_tab = _fake_open
+    router._close_tab = _fake_close
+    router._close_tab_by_target_id = _fake_close_by_target
+
+    # Alice opens the tab.
+    await router.route_from_client(alice, json.dumps({
+        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "params": {"url": "https://y/"},
+    }))
+    assert "ext-tab-88" in state.attachers
+
+    # Simulate alice's transient ws dropping. release_client unbinds her
+    # sessions and the global attacher binding via _unbind_session.
+    state.release_client(alice.client_id)
+    assert "ext-tab-88" not in state.attachers, \
+        "release_client should drop the attacher binding"
+
+    # Bob closes by targetId. No attacher → fallback path runs.
+    await router.route_from_client(bob, json.dumps({
+        "id": 2, "method": "BrowserDaemon.closeTab",
+        "params": {"targetId": "ext-tab-88"},
+    }))
+    resp = cap.per_client[bob.client_id][-1]
+    assert resp.get("id") == 2
+    assert "result" in resp, resp
+    assert resp["result"]["ok"] is True
+    assert resp["result"]["tabId"] == 88
+    # Critical: it took the fallback path, NOT the regular one.
+    assert by_tid_calls == ["ext-tab-88"]
+    assert by_sid_calls == []
+
+
+@pytest.mark.asyncio
+async def test_close_tab_without_session_or_target_id_returns_invalid_params():
+    state, router, cap, (client,) = _setup()
+    async def _fake_close(sid: str) -> dict:
+        return {"ok": True, "tabId": 0}
+    router._close_tab = _fake_close
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserDaemon.closeTab",
+        "params": {},
+    }))
+    err = cap.per_client[client.client_id][-1]["error"]
+    assert err["code"] == -32602
+    assert "sessionId or params.targetId" in err["message"]
 
 
 @pytest.mark.asyncio

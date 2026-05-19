@@ -786,7 +786,7 @@ doctor 行为（§5.2 已说）：`probe` 仅检查文件存在 + 可读，**不
 
 v0.1 doctor 输出 `available: false, detail: "not implemented (v0.4)"`。v0.4 实装时形状：
 
-- 默认 relay endpoint：`ws://127.0.0.1:19988`（沿用 playwriter 端口约定）。
+- 默认 relay endpoint：`ws://127.0.0.1:19989`（比 playwriter 的 19988 高一位，默认共存不冲突）。
 - 扩展握手：扩展连过来时发 `{"type":"hello","installId":"...","browser":"chrome","version":"..."}`。
 - 用户手动 attach 模型：扩展不自动 attach 所有 tab，用户点扩展图标 → 扩展通过 `chrome.debugger.attach` → 通知 daemon。
 - daemon 把 attach 过的 tab 当成 ghost target 在 `Target.getTargets` 里返回。
@@ -935,7 +935,7 @@ serve() {
 
 **借鉴**：
 
-- `playwriter/src/cdp-relay.ts:71-90` relay 启动端口 19988——extension backend v0.4 沿用，减少冲突意识。
+- `playwriter/src/cdp-relay.ts:71-90` relay 启动端口 19988——extension backend 选 19989 跟它并排避冲突，端口段保持邻近便于识别同类工具。
 - `playwriter/src/chrome-discovery.ts:55-89` `probePortStatus` 三态 (`live`/`blocked`/`dead`) + `appendSessionToWsUrl` Chrome 136+ default-profile 锁定 fallback。Mode B 实装直接套用。
 - `playwriter/src/relay-state.ts` + `docs/plan-centralize-relay-state.md` 集中状态 + 纯转换 + subscribe 副作用模式。**Mode B 实现推荐这个 pattern**——状态可单测，副作用集中，事件流的"先 setState 再 sendToPlaywright"顺序自然落地。
 - `cdp-relay.ts:39-64` restricted-target 过滤（chrome://、devtools://、edge:// 黑名单 + 扩展 URL 按 id 白名单）。`BrowserDaemon.getActiveTab` 复用同套过滤。

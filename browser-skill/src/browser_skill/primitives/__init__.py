@@ -38,7 +38,9 @@ from .interact import (  # noqa: F401
     wait_for_network_idle,
 )
 from .page import (  # noqa: F401
+    attach_active,
     attach_readonly,
+    close_tab,
     current_page,
     current_tab,
     ensure_real_tab,
@@ -46,6 +48,7 @@ from .page import (  # noqa: F401
     iframe_target,
     list_tabs,
     new_tab,
+    open_background,
     switch_tab,
     wait,
     wait_for_load,

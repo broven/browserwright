@@ -67,6 +67,11 @@ V2_BROWSER_DAEMON_METHODS = frozenset({
     "BrowserDaemon.disconnect",
     "BrowserDaemon.version",
     "BrowserDaemon.stats",
+    # v0.5.4 — extension backend only; -32601 on other backends.
+    "BrowserDaemon.attachActiveTab",
+    # Phase B: extension-backend-only verbs.
+    "BrowserDaemon.openBackgroundTab",
+    "BrowserDaemon.closeTab",
 })
 
 
@@ -208,15 +213,21 @@ async def test_browser_daemon_dispatch_uses_v2_lockable_methods_only(monkeypatch
     router.register_client(client.client_id, _send)
     router.bind_lifecycle(_ensure, _disc)
 
+    # v0.5.4: BrowserDaemon.attachActiveTab is backend-conditional — when no
+    # extension callback is wired (this test uses rdp), it deliberately
+    # returns -32601 with a "requires the extension backend" message. The
+    # smoke check below distinguishes that legitimate gating from the
+    # "unknown method" -32601 the test was originally written to catch.
     for i, method in enumerate(sorted(V2_BROWSER_DAEMON_METHODS), start=1):
         await router.route_from_client(client, json.dumps({
             "id": i, "method": method,
         }))
-        # Find the response for this id; must NOT be -32601.
         resps = [m for m in captured if m.get("id") == i]
         assert resps, f"no response for {method}"
         resp = resps[-1]
         if "error" in resp:
-            assert resp["error"]["code"] != -32601, (
-                f"{method} returned -32601 'unknown method' — drift between "
-                f"V2_BROWSER_DAEMON_METHODS and dispatch")
+            if resp["error"]["code"] == -32601:
+                msg = resp["error"].get("message", "")
+                assert "unknown" not in msg.lower(), (
+                    f"{method} returned -32601 'unknown method' — drift "
+                    f"between V2_BROWSER_DAEMON_METHODS and dispatch")

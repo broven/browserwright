@@ -258,6 +258,71 @@ class ExtensionUpstream:
         except Exception as e:
             await self._error(req_id, -32603, f"relay send failed: {e!r}")
 
+    async def attach_active_tab(self) -> dict:
+        """Daemon-driven attach: relay asks the extension for its focused-
+        window active tab, attaches it, and we fabricate a sessionId the
+        same shape `Target.attachToTarget` would. Returned dict is what the
+        Skill client should see: `{sessionId, targetId, tabId, url, title}`.
+        """
+        ghost = await self._relay.attach_active_tab(timeout=10.0)
+        sid = _new_upstream_session_id(ghost.tab_id)
+        self._sessions[sid] = ghost.tab_id
+        return {
+            "sessionId": sid,
+            "targetId": ghost.target_id,
+            "tabId": ghost.tab_id,
+            "url": ghost.url,
+            "title": ghost.title,
+        }
+
+    async def open_background_tab(
+        self,
+        url: str,
+        *,
+        group_name: str | None = "Agent",
+    ) -> dict:
+        """Open a background tab via the relay, fabricate a sessionId, and
+        return ``{sessionId, targetId, tabId, url, title, groupId}``."""
+        gt = await self._relay.create_background_tab(url, group_name=group_name)
+        sid = _new_upstream_session_id(gt.tab_id)
+        self._sessions[sid] = gt.tab_id
+        group_id = getattr(gt, "group_id", -1)
+        return {
+            "sessionId": sid,
+            "targetId": gt.target_id,
+            "tabId": gt.tab_id,
+            "url": gt.url,
+            "title": gt.title,
+            "groupId": int(group_id) if isinstance(group_id, int) else -1,
+        }
+
+    async def close_tab(self, session_id: str) -> dict:
+        """Close the tab bound to ``session_id`` (UPSTREAM sessionId). Raises
+        ValueError if unknown — proxy translates to a CDP error."""
+        tab_id = self._sessions.pop(session_id, None)
+        if tab_id is None:
+            tab_id = _tab_id_from_session_id(session_id)
+        if tab_id is None:
+            raise ValueError(f"unknown sessionId {session_id!r}")
+        await self._relay.close_tab(tab_id)
+        return {"ok": True, "tabId": tab_id}
+
+    async def close_tab_by_target_id(self, target_id: str) -> dict:
+        """Close-tab path used when the daemon proxy can't resolve a session
+        binding (e.g. the original opener's transient ws disconnected and the
+        per-client attacher was reaped). Derives tabId from ``ext-tab-N`` and
+        calls the relay directly — no session lookup required. Also evicts
+        any matching tab from ``_sessions`` to keep state tidy."""
+        tab_id = _tab_id_from_target_id(target_id)
+        if tab_id is None:
+            raise ValueError(f"unknown targetId {target_id!r}")
+        # Drop any sessions that still reference this tab so the upstream
+        # doesn't hold stale entries.
+        for sid in [s for s, t in self._sessions.items() if t == tab_id]:
+            self._sessions.pop(sid, None)
+        await self._relay.close_tab(tab_id)
+        return {"ok": True, "tabId": tab_id}
+
     async def send_command(self, method: str, params: dict | None = None,
                            session_id: str | None = None,
                            timeout: float = 10.0) -> dict:

@@ -2,7 +2,7 @@
 
 Architecture: this backend doesn't return an upstream ws URL — Chrome's
 CDP isn't the upstream here. Instead, the daemon (Mode B `serve`) starts a
-local relay ws server (`server/relay.py`) on `127.0.0.1:19988`, and the
+local relay ws server (`server/relay.py`) on `127.0.0.1:19989`, and the
 user's Chrome extension connects TO us. The daemon then proxies standard
 CDP between Skill clients and the extension's `chrome.debugger` API.
 
@@ -12,7 +12,7 @@ Implications:
   emulates the upstream side.
 - `resolve()` in Mode A still raises — Mode A `url` is meaningless when the
   daemon IS the relay; Skill must drive Mode B.
-- `probe()` does a real check: GET `http://127.0.0.1:19988/__status__` and
+- `probe()` does a real check: GET `http://127.0.0.1:19989/__status__` and
   inspect the response for a connected extension. If reachable + at least
   one extension has sent `hello`, `available=true`.
 """
@@ -47,7 +47,7 @@ class ExtensionBackend(Backend):
         self._host, self._port = cfg.backends.extension.resolved_host_port()
 
     async def probe(self) -> DoctorResult:
-        """HTTP GET 127.0.0.1:19988/__status__.
+        """HTTP GET 127.0.0.1:19989/__status__.
 
         Three outcomes:
           1. connection refused → no daemon-serve running with extension

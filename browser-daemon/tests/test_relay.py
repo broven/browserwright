@@ -152,13 +152,13 @@ async def test_relay_status_endpoint_reports_connected_extensions():
         await ext.close()
 
 
-# ---- §A.4 anti-CSRF: non-empty Origin → 403 --------------------------------
+# ---- §A.4 anti-CSRF: web-page Origin → 403, chrome-extension:// → allowed --
 
 
 @pytest.mark.asyncio
-async def test_relay_rejects_ws_upgrade_with_non_empty_origin():
+async def test_relay_rejects_ws_upgrade_with_web_origin():
     """Spec §A.4 OpenCLI borrow: drive-by ws upgrade from a malicious page
-    always carries a non-empty `Origin` header. The relay must 403."""
+    always carries a web-page `Origin` header. The relay must 403."""
     async with _relay_running() as relay:
         with pytest.raises(websockets.exceptions.InvalidStatus) as exc_info:
             await websockets.connect(
@@ -168,6 +168,26 @@ async def test_relay_rejects_ws_upgrade_with_non_empty_origin():
                 open_timeout=2.0,
             )
         assert exc_info.value.response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_relay_accepts_ws_upgrade_with_chrome_extension_origin():
+    """Chrome 144+ MV3 service workers emit `Origin: chrome-extension://<id>`
+    on ws upgrades. The relay must let those through; the original anti-CSRF
+    rule incorrectly assumed no Origin would be set."""
+    async with _relay_running() as relay:
+        conn = await websockets.connect(
+            f"ws://127.0.0.1:{relay.port}/",
+            additional_headers={
+                "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+            },
+            compression=None,
+            open_timeout=2.0,
+        )
+        try:
+            assert conn.state.name == "OPEN"
+        finally:
+            await conn.close()
 
 
 # ---- ghost target table ----------------------------------------------------
@@ -294,7 +314,236 @@ async def test_send_cdp_forwards_method_and_returns_result():
         await ext.close()
 
 
+# ---- Phase B: create_background_tab + close_tab ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_background_tab_returns_ghost_target():
+    """Phase B Feature 1: relay sends createTab, the mock extension responds
+    with tabId + group metadata, relay surfaces a GhostTarget that carries
+    the group_id."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "createTab"
+            assert cmd["url"] == "https://example.com/"
+            assert cmd["groupName"] == "Agent"
+            await ext.respond(cmd["id"], result={
+                "tabId": 77,
+                "url": "https://example.com/",
+                "title": "Example",
+                "groupId": 9,
+            })
+
+        r = asyncio.create_task(respond())
+        gt = await relay.create_background_tab(
+            "https://example.com/", group_name="Agent")
+        await r
+
+        assert gt.target_id == "ext-tab-77"
+        assert gt.tab_id == 77
+        assert gt.url == "https://example.com/"
+        assert gt.title == "Example"
+        assert getattr(gt, "group_id", None) == 9
+        # Ghost-target table picked it up.
+        assert any(g.target_id == "ext-tab-77"
+                   for g in relay.list_ghost_targets())
+        await ext.close()
+
+
+@pytest.mark.asyncio
+async def test_create_background_tab_without_group_name_omits_group_field():
+    """When group_name=None we skip the groupName param entirely; the result's
+    group_id falls back to -1 if the extension didn't populate it."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "createTab"
+            assert "groupName" not in cmd
+            await ext.respond(cmd["id"], result={
+                "tabId": 8, "url": "https://x/", "title": "x",
+            })
+
+        r = asyncio.create_task(respond())
+        gt = await relay.create_background_tab("https://x/", group_name=None)
+        await r
+
+        assert gt.tab_id == 8
+        assert getattr(gt, "group_id", None) == -1
+        await ext.close()
+
+
+@pytest.mark.asyncio
+async def test_close_tab_sends_close_message():
+    """Phase B Feature 2: relay sends a closeTab ws frame and pops the ghost
+    target from the table when the extension acks."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+        # Register a ghost via attached so close_tab has something to clean up.
+        await ext.announce_attached(tab_id=33)
+        await asyncio.sleep(0.05)
+        assert any(g.tab_id == 33 for g in relay.list_ghost_targets())
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "closeTab"
+            assert cmd["tabId"] == 33
+            await ext.respond(cmd["id"], result={"ok": True, "tabId": 33})
+
+        r = asyncio.create_task(respond())
+        await relay.close_tab(33)
+        await r
+
+        # Ghost-target table no longer carries tab 33 — relay cleaned it.
+        assert not any(g.tab_id == 33 for g in relay.list_ghost_targets())
+        await ext.close()
+
+
+@pytest.mark.asyncio
+async def test_close_tab_unknown_tab_returns_success():
+    """Extension responds 'No tab with id' (already-closed race). The
+    extension itself surfaces this as success; the relay then pops the
+    ghost target with no error logged for the caller."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+        await ext.announce_attached(tab_id=51)
+        await asyncio.sleep(0.05)
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "closeTab"
+            # Real extension would map this case to a success result; we
+            # mirror that here (see background.js doCloseTab).
+            await ext.respond(cmd["id"], result={"ok": True, "tabId": 51})
+
+        r = asyncio.create_task(respond())
+        await relay.close_tab(51)
+        await r
+        assert not any(g.tab_id == 51 for g in relay.list_ghost_targets())
+        await ext.close()
+
+
+@pytest.mark.asyncio
+async def test_close_tab_raises_when_no_extension_connected():
+    """Reviewer H1: previously close_tab silently returned success when no
+    extension was connected at all — callers got `{"ok": True}` for a close
+    that never went over the wire. The relay must surface this as a raised
+    exception so upstream layers can map it to -32603."""
+    relay = RelayServer(port=0)
+    await relay.start()
+    try:
+        with pytest.raises(Exception):  # RuntimeError today; accept any
+            await relay.close_tab(tab_id=42)
+    finally:
+        await relay.stop()
+
+
 # ---- event push-back from extension ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attach_active_tab_returns_ghost_target():
+    """v0.5.4: attach_active_tab() asks the extension for the focused-window
+    active tab and registers the resulting ghost target identically to a
+    popup-driven attach."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+
+        async def respond_attach_active():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "attachActive"
+            await ext.respond(cmd["id"], result={
+                "tabId": 314,
+                "url": "https://focused.example/",
+                "title": "Focused",
+            })
+
+        r = asyncio.create_task(respond_attach_active())
+        gt = await relay.attach_active_tab(timeout=3.0)
+        await r
+
+        assert gt.target_id == "ext-tab-314"
+        assert gt.tab_id == 314
+        assert gt.url == "https://focused.example/"
+        assert gt.title == "Focused"
+        # Ghost target is reachable via list_ghost_targets too.
+        ghosts = relay.list_ghost_targets()
+        assert any(g.target_id == "ext-tab-314" for g in ghosts)
+        await ext.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_active_tab_retries_on_already_attached():
+    """attach_active_tab inherits the same 3-retry behaviour as attach_tab —
+    Chrome occasionally reports the debugger as already attached during a
+    quick reattach race."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+
+        attempts = 0
+
+        async def responder():
+            nonlocal attempts
+            for _ in range(ATTACH_RETRY_LIMIT):
+                cmd = await ext.next_command()
+                attempts += 1
+                if attempts < ATTACH_RETRY_LIMIT:
+                    await ext.respond(cmd["id"], error={
+                        "code": -32000,
+                        "message": "Another debugger is already attached",
+                    })
+                else:
+                    await ext.respond(cmd["id"], result={
+                        "tabId": 8, "url": "https://retried/", "title": "ok",
+                    })
+
+        r = asyncio.create_task(responder())
+        gt = await asyncio.wait_for(relay.attach_active_tab(timeout=3.0),
+                                    timeout=4.0)
+        await r
+        assert attempts == ATTACH_RETRY_LIMIT
+        assert gt.tab_id == 8
+        await ext.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_active_tab_surfaces_no_active_tab_error():
+    """If the extension says there's no active tab (e.g., zero windows),
+    attach_active_tab surfaces a _CommandError so the caller can map to a
+    CDP -32000 reply."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+
+        async def responder():
+            cmd = await ext.next_command()
+            await ext.respond(cmd["id"], error={
+                "code": -32000, "message": "no active tab in focused window",
+            })
+
+        r = asyncio.create_task(responder())
+        with pytest.raises(_CommandError) as exc:
+            await relay.attach_active_tab(timeout=3.0)
+        await r
+        assert "no active tab" in exc.value.message.lower()
+        await ext.close()
 
 
 @pytest.mark.asyncio

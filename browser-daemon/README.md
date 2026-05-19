@@ -103,7 +103,7 @@ ws = subprocess.check_output(["browser-daemon", "url"], text=True).strip()
 | `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析） | 1（最高） |
 | `rdp` | 假设 Chrome 启动时带了 `--remote-debugging-port=9222`，HTTP 探测 `/json/version` | 2 |
 | `autoconnect` | 扫描 Chrome user-data-dir 找 `DevToolsActivePort` 文件，再拼 ws URL | 3 |
-| `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19988` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**v0.4 起真实装**。 | 默认不在链中，需 `--backend extension` 显式选 |
+| `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**v0.4 起真实装**。 | 默认不在链中，需 `--backend extension` 显式选 |
 | `cloud` | 远程托管浏览器（Browser Use / Browserless / Hyperbrowser），daemon Mode B 自连 upstream ws 时按 AuthProvider 注入 `Authorization: Bearer ...` / mTLS client cert（v0.1 `env` backend 只能 URL-embedded token，所以专门拆这条）。**v0.5 起真实装**。 | 默认不在链中，需 `--backend cloud` 显式选 |
 
 ## v0.4 extension backend
@@ -118,7 +118,7 @@ ws = subprocess.check_output(["browser-daemon", "url"], text=True).strip()
 
    daemon 会同时在两个端口上监听：
    - 本地 unix socket（Skill 通过此连）—— `/tmp/browser-daemon-myrepl.sock`
-   - relay ws server `ws://127.0.0.1:19988`（扩展通过此连）
+   - relay ws server `ws://127.0.0.1:19989`（扩展通过此连）
 
 2. 把 `browser-daemon/chrome-extension/` 整个目录作为 **unpacked extension** 装到 Chrome：
    - 打开 `chrome://extensions/`
@@ -146,7 +146,7 @@ ws = subprocess.check_output(["browser-daemon", "url"], text=True).strip()
 
 | `available` | `detail` | 含义 |
 |---|---|---|
-| `false` | "no extension relay listening on 127.0.0.1:19988…" | daemon 没起 serve，先 `browser-daemon serve --backend extension` |
+| `false` | "no extension relay listening on 127.0.0.1:19989…" | daemon 没起 serve，先 `browser-daemon serve --backend extension` |
 | `false` | "extension relay is running but no Chrome extension has connected yet" | daemon 起来了，但 Chrome 扩展还没装/还没启动 |
 | `true` | `"<N> extension(s) connected (install_ids=[…], attached tabs=N)"` | 健康 |
 
@@ -263,9 +263,9 @@ port = 9222
 profile_paths = ["~/Library/Application Support/Google/Chrome"]
 
 [backends.extension]
-# 覆盖 daemon 内 extension relay ws server 的绑定地址（默认 ws://127.0.0.1:19988）
-# 跟 playwriter 在同机器跑时把这个调到别的端口避冲突
-relay_url = "ws://127.0.0.1:19988"
+# 覆盖 daemon 内 extension relay ws server 的绑定地址（默认 ws://127.0.0.1:19989）
+# 默认 19989 是为了跟 playwriter (19988) 共存；如需进一步避冲突再调整
+relay_url = "ws://127.0.0.1:19989"
 
 [backends.cloud]
 # 云端浏览器配置详见上文 §v0.5 cloud backend
@@ -294,7 +294,7 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
 | `BD_FORCE_AUTOCONNECT_RECONNECT` | 绕过 `autoconnect` 60s rate-limit（仅当你完全理解 Chrome 144+ 弹窗累积 hazard 时）|
 | `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias（v0.5.3 起）。**v0.4 popup-storm 根因防御**：之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
-| `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19988。用于跟 playwriter 等占 19988 的工具共存 |
+| `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988，但需要进一步避冲突（多 daemon 实例等）时用这个 |
 | `BD_CLOUD_ENDPOINT` / `BD_CLOUD_AUTH_KIND` / `BD_CLOUD_PROVIDER_HINT` | cloud backend 配置 env shortcut（v0.5 起），等价 `[backends.cloud].*` toml key |
 | `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE` | EXPERT ESCAPE：绕过 launch-chrome 拒绝用户 default profile 的 guard。truthy 值 `1`/`true`/`yes`/`on`/`y`（case-insensitive）unlock。**仅当你完全理解会永久暴露日常 Chrome 给 CDP popup hazard 时** |
 | `BD_LOG_JSON` | `1` / `true` / `yes` → daemon log 输出 JSON 行（`{ts, level, logger, msg, extra?, exc_info?}`），方便日志聚合器消费。默认 plaintext |

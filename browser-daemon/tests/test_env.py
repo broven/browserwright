@@ -313,17 +313,18 @@ profile_paths = [{str(custom)!r}]
 
 
 # ---- v0.5.3 Task #24: extension port precedence (CLI > env > toml port
-# > toml relay_url > 19988 default). Unblocks F-4e (ai-e2e harness can't
-# bind 19988 when playwriter occupies it). -------------------------------
+# > toml relay_url > 19989 default). Unblocks F-4e (ai-e2e harness can't
+# bind 19988 when playwriter occupies it; default 19989 sidesteps this). ---
 
 
-def test_extension_port_default_is_19988():
+def test_extension_port_default_is_19989():
     """No config / no env / no CLI → fall back to DEFAULT_RELAY_PORT."""
     from browser_daemon.server.relay import DEFAULT_RELAY_PORT
     cfg = load(env={})
     host, port = cfg.backends.extension.resolved_host_port()
     assert host == "127.0.0.1"
     assert port == DEFAULT_RELAY_PORT
+    assert port == 19989
 
 
 def test_extension_port_toml_relay_url_only():

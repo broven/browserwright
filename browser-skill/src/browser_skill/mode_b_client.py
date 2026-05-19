@@ -272,6 +272,31 @@ class ModeBClient:
             "since_seconds": data.get("since_seconds"),
         }
 
+    def attach_active(self) -> Optional[dict]:
+        """v0.5.4: ask the daemon's extension backend to attach the
+        currently-focused-window active tab — bypasses the popup click.
+
+        Returns ``{sessionId, targetId, tabId, url, title}`` on success,
+        ``None`` if the daemon errored or isn't reachable. Only meaningful
+        when the running daemon was started with ``--backend extension``;
+        other backends will return -32601 ("requires the extension backend")
+        and that surfaces as ``None`` here.
+        """
+        try:
+            proc = subprocess.run(
+                ["browser-daemon", "attach-active",
+                 "--name", self.name, "--json"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None
+
     def disconnect_upstream(self, reason: str = "skill_idle") -> bool:
         """Ask the daemon to close its upstream ws (banner disappears) but
         keep our socket alive. Used by REPL idle policy."""
@@ -284,6 +309,70 @@ class ModeBClient:
             return proc.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
+
+    # ---- Phase B: open_background / close_tab CLI shims ---------------
+
+    def open_background(self, url: str, *, group: str = "Agent") -> Optional[dict]:
+        """Phase B Feature 1 — invoke ``browser-daemon open-background``.
+
+        Returns the parsed JSON result (``{sessionId,targetId,tabId,url,
+        title,groupId}``) or ``None`` if the CLI was unavailable. The
+        daemon-side handler requires backend=extension; on any other
+        backend the call surfaces an error (returncode != 0) and we
+        translate that to None so the caller can fall back / surface
+        a higher-level message.
+        """
+        try:
+            proc = subprocess.run(
+                ["browser-daemon", "open-background",
+                 "--name", self.name,
+                 "--url", url,
+                 "--group", group,
+                 "--json"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None
+
+    def close_tab(
+        self, session_id: str | None = None, *, target_id: str | None = None,
+    ) -> Optional[dict]:
+        """Phase B Feature 2 — invoke ``browser-daemon close-tab``.
+
+        Pass ``target_id`` (the ``ext-tab-N`` string returned by
+        ``open_background``) when calling from a fresh subprocess context —
+        the CLI's transient ws can't see other clients' session bindings.
+        ``session_id`` works only from a persistent ws (e.g. inside the
+        Skill REPL where the same client connection issued the open).
+
+        Returns ``{"ok":True,"tabId":N}`` on success or ``None`` when the
+        CLI is unreachable / the daemon errored.
+        """
+        if not session_id and not target_id:
+            return None
+        cmd = ["browser-daemon", "close-tab", "--name", self.name, "--json"]
+        if target_id:
+            cmd += ["--target-id", target_id]
+        if session_id:
+            cmd += ["--session-id", session_id]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None
 
     def doctor(self) -> dict:
         """For parity with ``ModeAClient.doctor``."""

@@ -24,11 +24,13 @@ from .errors import (
 )
 from .multitask import run_tasks_concurrent
 from .primitives import (
+    attach_active,
     attach_readonly,
     bootstrap_site,
     capture_screenshot,
     cdp,
     click_at_xy,
+    close_tab,
     current_page,
     current_tab,
     dispatch_key,
@@ -44,6 +46,7 @@ from .primitives import (
     load_site_skill,
     memory_read,
     new_tab,
+    open_background,
     page_info,
     press_key,
     propose_solidify,
@@ -66,7 +69,8 @@ EXPORTS = [
     # navigation / tabs
     "goto_url", "new_tab", "switch_tab", "list_tabs", "current_tab",
     "current_page", "ensure_real_tab", "iframe_target",
-    "attach_readonly",
+    "attach_readonly", "attach_active",
+    "open_background", "close_tab",
     # input
     "click_at_xy", "type_text", "press_key", "fill_input", "scroll",
     "dispatch_key", "upload_file",

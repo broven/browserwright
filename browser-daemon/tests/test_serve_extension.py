@@ -44,7 +44,7 @@ def short_runtime(monkeypatch):
 
 @pytest.fixture
 def patch_relay_port():
-    """Pick an ephemeral relay port so concurrent tests don't fight over 19988.
+    """Pick an ephemeral relay port so concurrent tests don't fight over 19989.
 
     v0.5.3 Task #24: the canonical way to override the port is now
     `cfg.backends.extension.port` (set by toml / env / CLI). Tests use the

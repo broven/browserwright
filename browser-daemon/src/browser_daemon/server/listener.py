@@ -552,6 +552,21 @@ class _UpstreamHolder:
             raise
         self.upstream = ext
         self.router.update_upstream_send(ext.send_text)
+        # IMPORTANT: wire all extension-only verb callbacks BEFORE
+        # state.set_connected — concurrent BrowserDaemon.* handlers in the
+        # proxy gate on state.upstream_phase == CONNECTED to skip the lazy-
+        # open call, so if we flip the phase first they'd see callback=None
+        # and respond -32601 incorrectly. Tear-down in trigger_close runs
+        # the opposite order (clear callbacks AFTER set_disconnected) for
+        # the symmetric reason.
+        # v0.5.4: wire the daemon-driven attach-active path. Only the
+        # extension backend has an out-of-band attach verb; other backends
+        # leave the callback as None so the proxy errors -32601.
+        self.router._attach_active_tab = ext.attach_active_tab
+        # Phase B: open_background + close_tab — same extension-only contract.
+        self.router._open_background_tab = ext.open_background_tab
+        self.router._close_tab = ext.close_tab
+        self.router._close_tab_by_target_id = ext.close_tab_by_target_id
         await self.state.set_connected(ext.ws_url or "ext://relay",
                                        was_popup=False)
 
@@ -603,6 +618,13 @@ class _UpstreamHolder:
         up = self.upstream
         self.upstream = None
         self.router.update_upstream_send(None)
+        # v0.5.4: drop the extension-backend attach-active callback so
+        # post-close BrowserDaemon.attachActiveTab returns -32601 instead
+        # of racing against a torn-down upstream.
+        self.router._attach_active_tab = None
+        self.router._open_background_tab = None
+        self.router._close_tab = None
+        self.router._close_tab_by_target_id = None
         if up is not None:
             try:
                 await up.close(code=1000, reason=reason)

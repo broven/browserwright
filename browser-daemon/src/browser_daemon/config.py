@@ -55,13 +55,13 @@ class AutoconnectConfig:
 class ExtensionConfig:
     """v0.5.3 REVIEW.md F-5 / Task #24: relay endpoint config.
 
-    Two ways to override the default `ws://127.0.0.1:19988`:
+    Two ways to override the default `ws://127.0.0.1:19989`:
       - `relay_url`: full URL — most expressive, can change host too
-      - `port`: int — common case ("19988 is occupied, use 19989")
+      - `port`: int — common case ("19989 is occupied, use 29989")
 
     Precedence (highest first):
       CLI `--extension-port N`  >  `BD_EXTENSION_PORT` env  >  toml `port`
-        >  toml `relay_url` (parsed for port)  >  `DEFAULT_RELAY_PORT` (19988)
+        >  toml `relay_url` (parsed for port)  >  `DEFAULT_RELAY_PORT` (19989)
 
     `host` follows the same source: explicit `port` knobs preserve the
     existing host (or 127.0.0.1 default), `relay_url` carries both.
@@ -323,8 +323,9 @@ def load(
     if "BD_CLOUD_PROVIDER_HINT" in e:
         cfg.backends.cloud.provider_hint = e["BD_CLOUD_PROVIDER_HINT"]
     # v0.5.3 Task #24: extension relay port via env. Symmetric to BD_RDP_PORT
-    # — useful when the default 19988 is occupied by playwriter or a stale
-    # daemon process and the user can't write a config.toml on the fly.
+    # — useful when the default 19989 is occupied by a stale daemon process
+    # and the user can't write a config.toml on the fly. (playwriter sits on
+    # 19988, so default conflict with it is no longer a concern.)
     if "BD_EXTENSION_PORT" in e:
         try:
             cfg.backends.extension.port = int(e["BD_EXTENSION_PORT"])

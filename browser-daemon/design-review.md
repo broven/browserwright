@@ -214,7 +214,7 @@ profile path 列表建议 *搬* browser-harness 的（`daemon.py:36-65`，覆盖
 
 v0.1 占位 OK，但**协议形状**现在就应该定下来，否则 v0.2 mode B 上线时回头改架构会痛。具体设计建议：
 
-- 默认 endpoint：`ws://127.0.0.1:19988/relay`（沿用 playwriter 的端口减少冲突意识，路径换掉避免误装成 playwriter）。
+- 默认 endpoint：`ws://127.0.0.1:19989/relay`（比 playwriter 的 19988 高一位，默认就跟它共存不冲突；路径也换掉避免误装成 playwriter）。
 - 扩展握手：扩展连过来时发 `{"type":"hello","installId":"...","browser":"chrome","email":"...","version":"..."}`。
 - "用户主动 attach 一个 tab" 模型：扩展不自动 attach 所有 tab，用户点扩展图标 → 扩展通过 chrome.debugger.attach 后向 daemon 发 `{"type":"tabAvailable","tabId":...,"url":...,"title":...}`。
 - daemon 把扩展 attach 过的 tab 当成 "ghost target"，在 `Target.getTargets` 里以 `type:"page"` 形式返回给 Layer 2 client。Layer 2 client 发 `Target.attachToTarget` 时，daemon 通过扩展的 chrome.debugger.sendCommand 实现。

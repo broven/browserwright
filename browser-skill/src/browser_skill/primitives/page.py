@@ -12,6 +12,63 @@ _INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://",
              "chrome-extension://", "about:")
 
 
+def attach_active() -> dict:
+    """v0.5.4: extension-backend-only. Attach the user's currently-focused-
+    window active tab in Chrome without requiring a popup click.
+
+    Returns ``{targetId, tabId, url, title}``. The Session's current target
+    is set so subsequent primitives (``js``, ``goto_url``, ``capture_screenshot``)
+    operate on this tab. Raises ``CDPError`` if the daemon backend isn't
+    extension or no extension is connected.
+
+    For non-extension backends (rdp/autoconnect/env) the existing
+    ``current_page()`` helper already resolves the active tab via
+    Target.getTargets — use that path instead.
+    """
+    from collections import deque as _deque
+    sess = current_session()
+    result = sess.daemon.attach_active() if hasattr(sess.daemon, "attach_active") else None
+    if not result:
+        raise CDPError(
+            method="BrowserDaemon.attachActiveTab",
+            params={},
+            cdp_message=("attach_active() requires the extension backend; "
+                         "start the daemon with `browser-daemon serve "
+                         "--backend extension` and load the chrome-extension/."),
+        )
+    target_id = result.get("targetId")
+    sid = result.get("sessionId")
+    if not isinstance(target_id, str) or not isinstance(sid, str):
+        raise CDPError(
+            method="BrowserDaemon.attachActiveTab",
+            params={},
+            cdp_message=f"malformed daemon response: {result!r}",
+        )
+    sess.current_target_id = target_id
+    # Register the daemon-minted session in CDPSession's tables so subsequent
+    # send(method, session=sid) calls work, mirroring CDPSession.attach()'s
+    # post-attach state. We skip the regular Page/Runtime/DOM/Network.enable
+    # bootstrap because attach_active routes through the extension backend
+    # which auto-enables those via the relay's session setup.
+    cdp_session = sess.cdp
+    from .. import cdp as _cdp_mod
+    cdp_session._sessions[target_id] = sid  # type: ignore[attr-defined]
+    cdp_session._events.setdefault(sid, _deque(maxlen=_cdp_mod._EVENT_RING_LIMIT))  # type: ignore[attr-defined]
+    # Best-effort domain enables (matching CDPSession.attach()). Errors are
+    # tolerated since some Chrome builds noop on certain domains.
+    for domain in ("Page", "Runtime", "DOM", "Network"):
+        try:
+            cdp_session.send(f"{domain}.enable", session=sid)
+        except CDPError:
+            pass
+    return {
+        "targetId": target_id,
+        "tabId": result.get("tabId"),
+        "url": result.get("url", ""),
+        "title": result.get("title", ""),
+    }
+
+
 def attach_readonly(target_id: str) -> str:
     """Open a read-only secondary session on ``target_id`` (daemon v0.3 H7).
 
@@ -217,6 +274,129 @@ def ensure_real_tab() -> dict | None:
         return cur
     switch_tab(tabs[0])
     return tabs[0]
+
+
+def open_background(url: str, *, group: str = "Agent") -> dict:
+    """Phase B Feature 1 — open a new Chrome tab in the background.
+
+    The tab is created with ``active: false`` so the user's currently-focused
+    tab keeps focus; the new tab is placed in a Chrome tab group titled
+    ``group`` (default "Agent") and ``chrome.debugger`` is attached. Returns
+    ``{"targetId","tabId","url","title","groupId"}``. After this call,
+    ``sess.current_target_id`` points at the new tab and subsequent primitives
+    (``js``, ``capture_screenshot``, etc.) operate on it.
+
+    Extension backend only. On other backends (rdp, autoconnect, cloud) the
+    daemon answers ``-32601`` which we translate to ``CDPError``.
+    """
+    sess = current_session()
+    daemon = sess.daemon
+    if not hasattr(daemon, "open_background"):
+        raise CDPError(
+            method="BrowserDaemon.openBackgroundTab",
+            params={"url": url, "groupName": group},
+            cdp_message="open_background requires the Mode B daemon client "
+                        "(ModeBClient)",
+        )
+    payload = daemon.open_background(url, group=group)
+    if not payload:
+        raise CDPError(
+            method="BrowserDaemon.openBackgroundTab",
+            params={"url": url, "groupName": group},
+            cdp_message="daemon did not return a valid open-background payload "
+                        "(requires the extension backend, with a running daemon)",
+        )
+    target_id = payload.get("targetId")
+    session_id = payload.get("sessionId")
+    if not target_id or not session_id:
+        raise CDPError(
+            method="BrowserDaemon.openBackgroundTab",
+            params={"url": url, "groupName": group},
+            cdp_message=f"daemon returned incomplete payload: {payload!r}",
+        )
+    # Pre-register the daemon-minted sessionId in the CDPSession's session
+    # map so subsequent primitives that ask for the active session reuse it
+    # without a duplicate Target.attachToTarget roundtrip. We also ensure
+    # the per-session event ring exists.
+    cdp = sess.cdp
+    cdp._sessions[target_id] = session_id
+    from collections import deque  # local import: avoid module-level cost
+    cdp._events.setdefault(session_id, deque(maxlen=1024))
+    sess.current_target_id = target_id
+    return {
+        "targetId": target_id,
+        "tabId": payload.get("tabId"),
+        "url": payload.get("url", url),
+        "title": payload.get("title", ""),
+        "groupId": payload.get("groupId", -1),
+    }
+
+
+def close_tab(
+    session_id: str | None = None, *, target_id: str | None = None,
+) -> dict:
+    """Phase B Feature 2 — close the tab via ``chrome.tabs.remove``.
+
+    Identify the tab one of two ways:
+      - ``target_id`` (e.g. ``ext-tab-N`` returned by ``open_background``) —
+        globally addressable, works across daemon-client boundaries.
+      - ``session_id`` — per-client; falls back to the currently-attached
+        tab when omitted. Only works in contexts that share the original
+        opener's persistent ws.
+
+    This is NOT a debugger detach. After the call returns the sessionId is
+    invalid; any cached CDPSession state for it is cleared.
+
+    Returns ``{"ok": True, "tabId": N}``.
+
+    Extension backend only — raises ``CDPError`` on other backends.
+    """
+    sess = current_session()
+    daemon = sess.daemon
+    if not hasattr(daemon, "close_tab"):
+        raise CDPError(
+            method="BrowserDaemon.closeTab",
+            params={"sessionId": session_id, "targetId": target_id},
+            cdp_message="close_tab requires the Mode B daemon client (ModeBClient)",
+        )
+    # If neither was provided, default to the current attached tab. Resolve
+    # both the targetId and the sessionId so daemon-side lookup has the best
+    # chance regardless of which client carries the binding.
+    resolved_target_id = target_id
+    resolved_session_id = session_id
+    if resolved_target_id is None and resolved_session_id is None:
+        resolved_target_id = sess.current_target_id
+        if not resolved_target_id:
+            raise CDPError(
+                method="BrowserDaemon.closeTab",
+                params={"sessionId": None, "targetId": None},
+                cdp_message="close_tab: no current attached tab to close",
+            )
+        resolved_session_id = sess.cdp._sessions.get(resolved_target_id)
+    payload = daemon.close_tab(
+        resolved_session_id, target_id=resolved_target_id,
+    )
+    # Backfill below the rest of the function with the resolved id for state cleanup.
+    session_id = resolved_session_id
+    if not payload:
+        raise CDPError(
+            method="BrowserDaemon.closeTab",
+            params={"sessionId": session_id},
+            cdp_message="daemon did not return a valid close-tab payload "
+                        "(requires the extension backend, with a running daemon)",
+        )
+    # Clear local CDPSession state — locate any target whose stored sessionId
+    # matches and drop it; clear the per-session event ring too.
+    cdp = sess.cdp
+    stale_targets = [tid for tid, sid in cdp._sessions.items()
+                     if sid == session_id]
+    for tid in stale_targets:
+        cdp._sessions.pop(tid, None)
+        if sess.current_target_id == tid:
+            sess.current_target_id = None
+    cdp._events.pop(session_id, None)
+    return {"ok": bool(payload.get("ok", True)),
+            "tabId": payload.get("tabId")}
 
 
 def iframe_target(url_substr: str) -> str | None:

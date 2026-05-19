@@ -23,11 +23,15 @@ Protocol on the wire (extension ↔ daemon, all JSON text frames):
 
 Design points:
 
-- **Anti-CSRF** (§A.4 OpenCLI borrow): a non-empty `Origin` header on the
-  ws upgrade is refused with HTTP 403. Drive-by browser pages can issue
-  cross-origin ws upgrades unless we filter — Origin is the only header
-  browsers can't lie about for ws.
-- **HTTP /__status__** doctor hook: `GET http://127.0.0.1:19988/__status__`
+- **Anti-CSRF** (§A.4 OpenCLI borrow): web-page Origins on the ws upgrade
+  are refused with HTTP 403. Drive-by browser pages can issue cross-origin
+  ws upgrades unless we filter — Origin is the only header browsers can't
+  lie about for ws. `chrome-extension://...` Origins are allowed (Chrome
+  MV3 SW does emit one on connect — earlier docs claimed otherwise; real-
+  world Chrome 144+ proves it does). Missing Origin is also allowed: that
+  shape only comes from non-browser tooling (curl, raw ws clients) that
+  can't be exploited through a drive-by page.
+- **HTTP /__status__** doctor hook: `GET http://127.0.0.1:19989/__status__`
   returns `{"running":true,"extensions":N,"installIds":[...]}` so the v0.1
   doctor probe can answer `available=true` without opening a ws.
 - **3-retry `chrome.debugger` conflict** (§A.4 OpenCLI borrow): when the
@@ -59,10 +63,12 @@ from websockets.asyncio.server import ServerConnection, serve
 logger = logging.getLogger(__name__)
 
 
-# Spec §8.4: default relay port is 19988 (sourced from playwriter, see
-# `playwriter/src/cdp-relay.ts:71-90`). Tests can override via `RelayServer(port=0)`
-# to bind an ephemeral port.
-DEFAULT_RELAY_PORT = 19988
+# Spec §8.4: default relay port is 19989. Originally we mirrored playwriter's
+# 19988 (`playwriter/src/cdp-relay.ts:71-90`) to ride its conflict-awareness
+# convention; in practice users run both daemons side-by-side, so we shifted
+# one port up to coexist. Tests can override via `RelayServer(port=0)` to
+# bind an ephemeral port.
+DEFAULT_RELAY_PORT = 19989
 
 # Spec §A.4: OpenCLI `extension/src/cdp.ts:96-150` retries 3 times when
 # chrome.debugger.attach fails with "Another debugger is already attached".
@@ -103,7 +109,7 @@ class _ExtensionConn:
 
 
 class RelayServer:
-    """ws://127.0.0.1:19988 — extension talks to us here.
+    """ws://127.0.0.1:19989 — extension talks to us here.
 
     Lifecycle: `start()` binds; `wait_ready(timeout)` blocks until at least
     one extension has sent `hello`; `stop()` closes everything cleanly.
@@ -205,6 +211,47 @@ class RelayServer:
         return await self._request(ext, {"type": "queryActiveTab"},
                                    timeout=timeout)
 
+    async def attach_active_tab(self, *,
+                                timeout: float = 10.0) -> GhostTarget:
+        """Daemon-driven equivalent of the popup's "Attach this tab" — asks
+        the extension to attach Chrome's currently-focused-window active tab
+        without needing the user to click the popup.
+
+        Retries on "already attached" the same way `attach_tab` does. Returns
+        the GhostTarget once the extension confirms. The extension also emits
+        `attached` as part of announceAttached, so the ghost ends up in
+        `ext.tabs` for the regular routing path.
+        """
+        ext = self._pick_active_extension()
+        if ext is None:
+            raise RuntimeError("no extension connected")
+        last_err: Exception | None = None
+        for i in range(ATTACH_RETRY_LIMIT):
+            try:
+                result = await self._request(
+                    ext, {"type": "attachActive"}, timeout=timeout)
+                info = result or {}
+                tab_id_raw = info.get("tabId")
+                if not isinstance(tab_id_raw, int):
+                    raise RuntimeError(
+                        f"attachActive response missing tabId: {info!r}")
+                gt = GhostTarget(
+                    target_id=f"ext-tab-{tab_id_raw}",
+                    tab_id=tab_id_raw,
+                    url=str(info.get("url", "")),
+                    title=str(info.get("title", "")),
+                    install_id=ext.install_id,
+                )
+                ext.tabs[tab_id_raw] = gt
+                return gt
+            except _CommandError as e:
+                last_err = e
+                if "already attached" not in (e.message or "").lower():
+                    raise
+                await asyncio.sleep(ATTACH_RETRY_BACKOFF[i])
+        raise last_err if last_err is not None else RuntimeError(
+            "attach active failed (no error captured)")
+
     async def attach_tab(self, tab_id: int, *,
                          timeout: float = 5.0) -> GhostTarget:
         """Tell the extension to `chrome.debugger.attach({tabId})`. Retries
@@ -250,6 +297,74 @@ class RelayServer:
                 ext, {"type": "detach", "tabId": tab_id}, timeout=timeout)
         except Exception as e:
             logger.warning("detach(tab=%d) failed: %r", tab_id, e)
+        ext.tabs.pop(tab_id, None)
+
+    async def create_background_tab(
+        self,
+        url: str,
+        *,
+        group_name: str | None = "Agent",
+        timeout: float = 10.0,
+    ) -> GhostTarget:
+        """Spec Phase B Feature 1: open a tab in the background (active=false)
+        in tab group ``group_name`` (default "Agent"), attach
+        ``chrome.debugger`` to it, and return a GhostTarget bound to the new
+        tab. The user's currently-active tab keeps focus.
+
+        ``group_name=None`` skips the grouping step; the resulting GhostTarget
+        carries the extension-reported ``group_id`` (which may be ``-1`` when
+        no group was requested or when grouping failed in a recoverable way).
+        """
+        ext = self._pick_active_extension()
+        if ext is None:
+            raise RuntimeError("no extension connected")
+        body: dict = {"type": "createTab", "url": url}
+        if group_name:
+            body["groupName"] = group_name
+        result = await self._request(ext, body, timeout=timeout) or {}
+        tab_id = int(result.get("tabId", -1))
+        if tab_id < 0:
+            raise RuntimeError(
+                f"extension createTab returned invalid tabId: {result!r}")
+        gt = GhostTarget(
+            target_id=f"ext-tab-{tab_id}",
+            tab_id=tab_id,
+            url=str(result.get("url", url)),
+            title=str(result.get("title", "")),
+            install_id=ext.install_id,
+        )
+        # Stash a group_id attribute on the dataclass instance for callers
+        # that want to expose it (we don't widen GhostTarget's dataclass
+        # shape — using object.__setattr__ keeps the schema-locked fields
+        # frozen for everyone else).
+        try:
+            gt.group_id = int(result.get("groupId", -1))  # type: ignore[attr-defined]
+        except (TypeError, ValueError):
+            gt.group_id = -1  # type: ignore[attr-defined]
+        ext.tabs[tab_id] = gt
+        return gt
+
+    async def close_tab(self, tab_id: int, *,
+                        timeout: float = 5.0) -> None:
+        """Spec Phase B Feature 2: close a tab via chrome.tabs.remove (not a
+        debugger detach). Clears the ghost-target entry whether or not the
+        extension confirmed.
+
+        Raises if no extension is connected at all — silently returning
+        success here would lie to callers about a close that never went
+        over the wire. `_extension_for_tab` already falls back to any ready
+        extension if no ext owns the tab (race between popup attach and
+        ghost registration), so a None return means "no extension exists"
+        rather than "no extension owns this specific tab id".
+        """
+        ext = self._extension_for_tab(tab_id)
+        if ext is None:
+            raise RuntimeError(f"no extension knows tab {tab_id}")
+        try:
+            await self._request(
+                ext, {"type": "closeTab", "tabId": tab_id}, timeout=timeout)
+        except Exception as e:
+            logger.warning("close_tab(tab=%d) failed: %r", tab_id, e)
         ext.tabs.pop(tab_id, None)
 
     async def send_cdp(self, tab_id: int, method: str, params: dict,
@@ -307,8 +422,17 @@ class RelayServer:
         """Intercept the HTTP handshake before upgrade.
 
         - `GET /__status__` answered as JSON (doctor probe hook).
-        - Non-empty `Origin` header → 403 (anti-CSRF, OpenCLI borrow).
-        - Anything else → allow ws upgrade.
+        - Web-page `Origin` header → 403 (anti-CSRF, OpenCLI borrow).
+        - `Origin: chrome-extension://<id>` → allowed. NOTE: this admits ANY
+          extension installed in the user's Chrome profile, not just ours.
+          We rely on (a) the daemon binding to 127.0.0.1 (local-only) and
+          (b) the user-trusted extension install model. A malicious
+          extension on the same profile already has `chrome.debugger`
+          primitives strictly more powerful than what the relay exposes,
+          so admitting unknown-id extension Origins here doesn't widen the
+          attack surface beyond what the user already implicitly trusts.
+        - Missing Origin → allowed (curl, raw ws clients — not exploitable
+          via drive-by page since the browser would always set Origin).
         """
         path = request.path or "/"
         if path.startswith("/__status__"):
@@ -323,14 +447,20 @@ class RelayServer:
             resp.headers["Content-Type"] = "application/json"
             return resp
 
-        # Anti-CSRF: refuse non-empty Origin. Chrome extensions (MV3 service
-        # workers) connect with NO Origin header, which is the discriminator
-        # we want — drive-by web pages always include Origin.
+        # Anti-CSRF: refuse web-page Origins. Allow Origin: chrome-extension://*
+        # — note this admits ANY extension installed in the user's profile, not
+        # just ours. We rely on the daemon binding to 127.0.0.1 + the user-
+        # trusted extension install model. A malicious extension on the same
+        # profile already has chrome.debugger primitives strictly more powerful
+        # than what the relay exposes. Chrome MV3 SW does emit Origin
+        # (chrome-extension://<id>) on ws upgrades from Chrome 144+ — earlier
+        # comments here claimed otherwise and 403'd legitimate extension
+        # connections. We allow that prefix and 403 anything else non-empty.
         origin = request.headers.get("Origin", "") or request.headers.get("origin", "")
-        if origin:
+        if origin and not origin.startswith("chrome-extension://"):
             resp = conn.respond(
                 http.HTTPStatus.FORBIDDEN,
-                "extension relay refuses requests with Origin header (anti-CSRF)\n",
+                "extension relay refuses non-extension Origin (anti-CSRF)\n",
             )
             return resp
         return None  # allow upgrade

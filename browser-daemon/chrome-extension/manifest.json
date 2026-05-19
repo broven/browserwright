@@ -2,12 +2,14 @@
   "manifest_version": 3,
   "name": "browser-daemon relay",
   "version": "0.4.0",
-  "description": "Local CDP relay for browser-daemon (Mode B, --backend extension). Connects to ws://127.0.0.1:19988 and proxies chrome.debugger commands.",
+  "description": "Local CDP relay for browser-daemon (Mode B, --backend extension). Connects to ws://127.0.0.1:19989 and proxies chrome.debugger commands.",
   "permissions": [
     "debugger",
     "tabs",
+    "tabGroups",
     "activeTab",
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "ws://127.0.0.1/*",

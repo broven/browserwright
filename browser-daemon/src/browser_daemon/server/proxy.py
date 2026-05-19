@@ -95,6 +95,17 @@ class Router:
         self._client_sends: dict[int, Callable[[str], Awaitable[None]]] = {}
         self._ensure_upstream: Callable[[], Awaitable[None]] | None = None
         self._trigger_disconnect: Callable[[str], Awaitable[None]] | None = None
+        # Extension-backend-only verbs. listener.py sets these only when
+        # backend=extension; other backends leave them None and the proxy
+        # handlers respond -32601. `_close_tab_by_target_id` is the fallback
+        # close-path used when the original opener disconnected and the
+        # per-client session binding was reaped.
+        self._attach_active_tab: Callable[[], Awaitable[dict]] | None = None
+        self._open_background_tab: (
+            Callable[[str, str | None], Awaitable[dict]] | None) = None
+        self._close_tab: Callable[[str], Awaitable[dict]] | None = None
+        self._close_tab_by_target_id: (
+            Callable[[str], Awaitable[dict]] | None) = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -700,6 +711,82 @@ class Router:
                 "schema_version": 1,
             }))
             return
+        if method == "BrowserDaemon.attachActiveTab":
+            # v0.5.4: extension-backend-only. Bypasses the standard
+            # Target.attachToTarget flow because the targetId isn't known
+            # until the extension picks the focused-window active tab. We
+            # still register the resulting session in the proxy's binding
+            # tables so subsequent CDP commands on the returned sessionId
+            # route the same way an explicit attach would.
+            if self._attach_active_tab is None:
+                # Trigger lazy-open once; the listener wires
+                # `_attach_active_tab` inside _open_extension_upstream so a
+                # cold daemon + extension already connected will become
+                # ready by the time ensure_upstream returns.
+                if (self._ensure_upstream is not None
+                        and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                    try:
+                        await self._ensure_upstream()
+                    except Exception as e:
+                        await self._send_to_client(client.client_id, _error_response(
+                            req_id, -32603,
+                            f"attach active failed (upstream open): {e!r}"))
+                        return
+            if self._attach_active_tab is None:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32601,
+                    "BrowserDaemon.attachActiveTab requires the extension backend"))
+                return
+            try:
+                info = await self._attach_active_tab()
+            except Exception as e:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32000, f"attach active failed: {e!r}"))
+                return
+            upstream_sid = info.get("sessionId")
+            target_id = info.get("targetId")
+            if not isinstance(upstream_sid, str) or not isinstance(target_id, str):
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"attach active returned malformed payload: {info!r}"))
+                return
+            # Mirror the binding shape that Target.attachToTarget would
+            # produce: allocate a local sessionId visible to the client,
+            # bind it to the upstream session, and claim the attacher slot.
+            existing = self.state.attachers.get(target_id)
+            if existing is None:
+                local_sid = _new_local_session_id(client.client_id)
+                self.state.bind_session(
+                    client.client_id, local_sid, upstream_sid,
+                    target_id, readonly=False,
+                )
+                self.state.claim_attacher(
+                    target_id, client.client_id, local_sid, upstream_sid)
+                # Stash target metadata so list_tabs / getActiveTab see it.
+                self.state.note_target_info({
+                    "targetId": target_id,
+                    "type": "page",
+                    "url": info.get("url", ""),
+                    "title": info.get("title", ""),
+                })
+            elif existing.primary_client_id == client.client_id:
+                # Same client re-attaching the active tab — reuse the
+                # existing local sessionId rather than minting a new one.
+                local_sid = existing.primary_local_session
+            else:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32602,
+                    f"target {target_id} already attached by another client"))
+                return
+            await self._send_to_client(client.client_id, _result_response(
+                req_id, {
+                    "sessionId": local_sid,
+                    "targetId": target_id,
+                    "tabId": info.get("tabId"),
+                    "url": info.get("url", ""),
+                    "title": info.get("title", ""),
+                }))
+            return
         if method == "BrowserDaemon.stats":
             # v0.5: expose in-process metrics counters. Schema is the
             # observability.Metrics dataclass keys + uptime_seconds.
@@ -707,8 +794,220 @@ class Router:
                 client.client_id,
                 _result_response(req_id, metrics().snapshot()))
             return
+        if method == "BrowserDaemon.openBackgroundTab":
+            await self._handle_open_background_tab(client, msg, req_id)
+            return
+        if method == "BrowserDaemon.closeTab":
+            await self._handle_close_tab(client, msg, req_id)
+            return
         await self._send_to_client(client.client_id, _error_response(
             req_id, -32601, f"unknown BrowserDaemon method: {method}"))
+
+    # ---- Phase B: BrowserDaemon.openBackgroundTab / closeTab ----------
+
+    async def _handle_open_background_tab(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """Spec Phase B Feature 1.
+
+        Requires backend=extension (the only backend with the callback wired
+        in). Calls the upstream's open_background_tab, then registers the
+        returned (target_id, upstream_session_id) as a regular client-side
+        binding so subsequent CDP commands work through the same session-id
+        translation path as Target.attachToTarget.
+        """
+        # Param validation runs FIRST: the schema-lock smoke test calls
+        # every BrowserDaemon.* method with no params and asserts the
+        # response code is NOT -32601 ("unknown method"). Returning -32602
+        # here for the missing required param keeps the lock satisfied
+        # without us wiring a real extension upstream in unit tests.
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        url = params.get("url")
+        if not isinstance(url, str) or not url:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserDaemon.openBackgroundTab requires params.url"))
+            return
+        group_name = params.get("groupName")
+        if group_name is not None and not isinstance(group_name, str):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserDaemon.openBackgroundTab params.groupName must be a string"))
+            return
+        if self._open_background_tab is None:
+            # Lazy-open: a cold daemon + already-connected extension becomes
+            # ready after ensure_upstream runs (listener wires the callbacks
+            # inside _open_extension_upstream). Mirrors attachActiveTab.
+            if (self._ensure_upstream is not None
+                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"openBackgroundTab failed (upstream open): {e!r}"))
+                    return
+        if self._open_background_tab is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32601,
+                "BrowserDaemon.openBackgroundTab requires the extension backend"))
+            return
+        try:
+            result = await self._open_background_tab(url, group_name=group_name)
+        except Exception as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"openBackgroundTab failed: {e!r}"))
+            return
+        upstream_sid = result.get("sessionId")
+        target_id = result.get("targetId")
+        if not isinstance(upstream_sid, str) or not isinstance(target_id, str):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"openBackgroundTab returned malformed result: {result!r}"))
+            return
+        # Register the session binding so future CDP commands routed by the
+        # client through this sessionId are translated upstream same as
+        # Target.attachToTarget bindings.
+        local_sid = _new_local_session_id(client.client_id)
+        self.state.bind_session(
+            client.client_id, local_sid, upstream_sid, target_id,
+            readonly=False,
+        )
+        self.state.claim_attacher(
+            target_id, client.client_id, local_sid, upstream_sid,
+        )
+        # Note the target in the visibility table so getActiveTab /
+        # uiState see the new tab. groupId is just metadata for the caller.
+        self.state.note_target_info({
+            "targetId": target_id,
+            "type": "page",
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+        })
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "sessionId": local_sid,
+            "targetId": target_id,
+            "tabId": result.get("tabId"),
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+            "groupId": result.get("groupId", -1),
+        }))
+
+    async def _handle_close_tab(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """Spec Phase B Feature 2.
+
+        Maps the client-facing LOCAL sessionId to the upstream sessionId
+        (mirroring _handle_detach's translation), invokes upstream.close_tab,
+        and tears down the local state bindings whether the close succeeded
+        or not — the tab is gone either way.
+        """
+        # Param validation runs FIRST (same rationale as openBackgroundTab).
+        # Accept either `sessionId` (per-client; for persistent-ws callers like
+        # Skill REPL) or `targetId` (global; for CLI subcommands whose
+        # transient ws can't share per-client session state).
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        local_sid = params.get("sessionId")
+        target_id_param = params.get("targetId")
+        has_sid = isinstance(local_sid, str) and local_sid
+        has_tid = isinstance(target_id_param, str) and target_id_param
+        if not has_sid and not has_tid:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserDaemon.closeTab requires params.sessionId or params.targetId"))
+            return
+        if self._close_tab is None:
+            # Lazy-open mirror of openBackgroundTab + attachActiveTab.
+            if (self._ensure_upstream is not None
+                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"closeTab failed (upstream open): {e!r}"))
+                    return
+        if self._close_tab is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32601,
+                "BrowserDaemon.closeTab requires the extension backend"))
+            return
+        # Resolve to (target_id, upstream_sid, owner_client_id, owner_local_sid).
+        # sessionId path = per-client lookup; targetId path = state.attachers
+        # global lookup, valid even across different ws clients.
+        target_id: str | None = None
+        upstream_sid: str | None = None
+        owner_client_id: int | None = None
+        owner_local_sid: str | None = None
+        if has_sid:
+            binding = client.sessions.get(local_sid)
+            if binding is not None:
+                target_id = binding.target_id
+                upstream_sid = binding.upstream_session_id
+                owner_client_id = client.client_id
+                owner_local_sid = local_sid
+        if target_id is None and has_tid:
+            target_id = target_id_param
+            attacher = self.state.attachers.get(target_id)
+            if attacher is not None:
+                owner_client_id = attacher.primary_client_id
+                owner_local_sid = attacher.primary_local_session
+                upstream_sid = attacher.upstream_session_id
+        # Fallback path: targetId given but no live attacher (original opener
+        # disconnected — common for CLI subcommands). The tab still exists in
+        # Chrome; close via targetId-only path that bypasses session lookup.
+        if upstream_sid is None and has_tid:
+            target_id = target_id_param
+            if self._close_tab_by_target_id is None:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32601,
+                    "BrowserDaemon.closeTab (by targetId) requires the extension backend"))
+                return
+            try:
+                result = await self._close_tab_by_target_id(target_id)
+            except Exception as e:
+                # Match the regular path's policy: tear down bookkeeping even
+                # on error so callers can't reuse the stale targetId. There's
+                # no session/attacher binding to drop here by construction —
+                # that's why the attacher lookup failed in the first place —
+                # so just dropping the target visibility entry is enough.
+                self.state.note_target_destroyed(target_id)
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603, f"closeTab failed: {e!r}"))
+                return
+            self.state.note_target_destroyed(target_id)
+            await self._send_to_client(client.client_id, _result_response(req_id, {
+                "ok": True,
+                "tabId": result.get("tabId"),
+            }))
+            return
+        if target_id is None or upstream_sid is None:
+            ident = local_sid if has_sid else target_id_param
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602, f"unknown sessionId/targetId {ident}"))
+            return
+        try:
+            result = await self._close_tab(upstream_sid)
+        except Exception as e:
+            # Even when upstream signals an error, tear down our bookkeeping
+            # so the caller can't reuse the (now-invalid) sessionId.
+            if owner_client_id is not None and owner_local_sid is not None:
+                self.state.unbind_session_by_local(
+                    owner_client_id, owner_local_sid)
+            self.state.note_target_destroyed(target_id)
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"closeTab failed: {e!r}"))
+            return
+        # Success: clean up the session + attacher bindings; drop the target.
+        if owner_client_id is not None and owner_local_sid is not None:
+            self.state.unbind_session_by_local(
+                owner_client_id, owner_local_sid)
+        self.state.note_target_destroyed(target_id)
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "ok": True,
+            "tabId": result.get("tabId"),
+        }))
 
     # ---- focus push -----------------------------------------------------
 
