@@ -55,6 +55,21 @@ browser-skill task wikipedia.org/lookup --title="Wikipedia"
 
 Tasks live as plain Python files under `~/.browser-skill/site-skills/<host>/tasks/`. To create one, see [the solidify section below](#when-to-suggest-saving-as-a-task).
 
+## First call: which attach should you reach for?
+
+| Goal | Use | Why |
+| --- | --- | --- |
+| Reuse a tab opened in an earlier heredoc | `switch_tab("<saved targetId>")` | Deterministic, no popups, no focus steal |
+| Spawn a new tab for automation **(default)** | `open_background(url, group="Agent")` | Does **not** steal user focus; isolated; safe for long flows |
+| Drive the user's currently-focused tab ("read my email", "what's on my screen now") | `attach_active()` | Extension backend only. **Steals focus** — only when the user literally said "use my current tab" |
+| Fresh isolated Chrome (rdp / env backend) | `new_tab(url)` | Standard `Target.createTarget`; not for extension backend |
+
+**Rule of thumb:** Unless the user said "use my current tab" or "what I'm looking at", default to `open_background()`. Multiple agents (or this agent + the user) can share one Chrome that way without colliding on a single focus.
+
+⚠️ **Always read the return value of an attach call before chaining.** If `attach_active()` / `open_background()` failed (a hook blocked the command, daemon refused, etc.), the next `type_text` / `click_at_xy` will surface as "requires sessionId" or "unknown sessionId" — that's the symptom, not the cause. The cause is the silent failure two lines up.
+
+⚠️ **`sessionId` is daemon-internal plumbing — agents don't pass it.** If you see "unknown sessionId" or "requires a sessionId", the prior attach failed. Don't try to "look up" the sessionId; re-call `attach_active()` / `open_background()` / `switch_tab()` and verify the return value before the next primitive.
+
 ## Primitives surface (pre-imported in REPL)
 
 **Navigation:** `goto_url`, `new_tab`, `switch_tab`, `list_tabs`, `current_tab`, `current_page`, `ensure_real_tab`, `iframe_target`
@@ -148,7 +163,7 @@ PY
 
 The `targetId` is stable for the life of the tab and the daemon — it's encoded from Chrome's `tabId`, not an opaque daemon-side token. If the tab is closed before heredoc N, `switch_tab` raises `CDPError` with a "call `attach_active()` / `new_tab()` to get a fresh handle" hint.
 
-For ad-hoc "just drive my current tab" usage, the boilerplate `attach_active()` at the top of every heredoc is still fine — but for multi-step automation, handle-passing is deterministic.
+`attach_active()` steals the user's focus — only use when the task is literally "drive my current tab". For everything else default to `open_background(url)` (new tab, no focus steal) or `switch_tab(<saved targetId>)` (heredoc continuity). See "First call: which attach should you reach for?" above.
 
 ## When to suggest saving as a task
 
