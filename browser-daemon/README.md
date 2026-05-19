@@ -312,3 +312,15 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | v0.6+ `OAuth2Auth` 真实装 / daemon-as-a-service / metrics push | ⏳ 未排期 |
 
 详细设计见 [design-v2.md](./design-v2.md)。
+
+## End-to-end tests with a real Chrome
+
+If you edit the extension (`chrome-extension/background.js`) or daemon
+internals, validate against a real Chrome:
+
+    uv run pytest tests/e2e/
+
+This spawns an isolated Chrome with a patched copy of the extension, talking
+to a test daemon on port 29989. It will not touch your daily Chrome.
+
+See `tests/e2e/README.md` for details.
