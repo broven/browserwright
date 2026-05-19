@@ -56,6 +56,10 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
             f"browser-daemon url --backend extension --name {TEST_NAME}"
         )
     else:  # rdp
+        # Force Mode A for RDP: the session-scoped daemon serves 'extension',
+        # so Mode B's backend-match check would reject 'rdp'. Mode A uses
+        # BS_DAEMON_URL_CMD (or BS_CDP_WS if set by caller) to resolve directly.
+        env["BS_DAEMON_MODE"] = "A"
         env["BS_DAEMON_URL_CMD"] = (
             f"browser-daemon url --backend rdp --port {TEST_RDP_PORT}"
         )
