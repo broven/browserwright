@@ -394,24 +394,25 @@ def open_background(url: str, *, group: str = "Agent") -> dict:
     answers ``-32601`` which we translate to ``CDPError``.
     """
     sess = current_session()
-    daemon = sess.daemon
-    if not hasattr(daemon, "open_background"):
+    try:
+        payload = sess.cdp.send(
+            "BrowserDaemon.openBackgroundTab",
+            url=url, groupName=group,
+        )
+    except CDPError as e:
         raise CDPError(
             method="BrowserDaemon.openBackgroundTab",
             params={"url": url, "groupName": group},
-            cdp_message="open_background requires the Mode B daemon client "
-                        "(ModeBClient)",
-        )
-    payload = daemon.open_background(url, group=group)
+            cdp_message=(
+                f"open_background failed: {e.cdp_message}. "
+                "Requires the extension backend with a running daemon."
+            ),
+        ) from e
     if not payload:
-        detail = getattr(daemon, "last_cli_error", None) or (
-            "daemon did not return a valid open-background payload "
-            "(requires the extension backend, with a running daemon)"
-        )
         raise CDPError(
             method="BrowserDaemon.openBackgroundTab",
             params={"url": url, "groupName": group},
-            cdp_message=f"open_background failed: {detail}",
+            cdp_message="daemon returned an empty payload",
         )
     target_id = payload.get("targetId")
     session_id = payload.get("sessionId")
