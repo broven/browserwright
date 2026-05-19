@@ -52,6 +52,10 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
     if backend == "extension":
+        # BD_EXTENSION_PORT drives the relay port in `browser-daemon url`.
+        # Without it, the url command falls through to DEFAULT_RELAY_PORT
+        # (19989) — the user's production daemon. This is the isolation wall.
+        env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
         env["BS_DAEMON_URL_CMD"] = (
             f"browser-daemon url --backend extension --name {TEST_NAME}"
         )
