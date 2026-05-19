@@ -140,3 +140,47 @@ def test_current_tab_returns_none_on_other_backend_without_attachment(
     from browser_skill.primitives import current_tab
     _stub_session(monkeypatch, backend="rdp", targets=[], current_target=None)
     assert current_tab() is None
+
+
+# ---- v0.5.5: switch_tab error when handle is stale ------------------------
+
+
+class _AttachFailingCDP:
+    """CDPSession stub where ``attach()`` raises CDPError — simulates a
+    stale tab handle (tab closed since the targetId was issued)."""
+    def __init__(self):
+        self._closed = False
+        from browser_skill.errors import CDPError
+        self._CDPError = CDPError
+
+    def attach(self, target_id):
+        raise self._CDPError(
+            method="Target.attachToTarget",
+            params={"targetId": target_id},
+            cdp_message="No target with given id found",
+        )
+
+    def send(self, method, **_):
+        return {}
+
+
+def test_switch_tab_stale_handle_raises_actionable(tmp_bs_home, monkeypatch):
+    """v0.5.5: passing a stale targetId (tab closed) to switch_tab must
+    raise with text that names the cause and the fix, not a bare CDP
+    error. Heredoc agents need this — they hand-off targetIds across
+    process boundaries and a closed tab is the common failure."""
+    from browser_skill.session import Session
+    import browser_skill.session as session_mod
+    sess = Session(daemon=object())
+    sess._cdp = _AttachFailingCDP()
+    sess._backend_name_cache = "rdp"
+    monkeypatch.setattr(session_mod, "_singleton", sess)
+
+    from browser_skill.errors import CDPError
+    from browser_skill.primitives import switch_tab
+    with pytest.raises(CDPError) as exc:
+        switch_tab("ghost-tab-deadbeef")
+    msg = str(exc.value)
+    assert "no longer exists" in msg
+    assert "attach_active" in msg or "new_tab" in msg
+    assert "ghost-tab-deadbeef" in msg

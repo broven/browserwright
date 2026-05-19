@@ -21,6 +21,14 @@ def attach_active() -> dict:
     operate on this tab. Raises ``CDPError`` if the daemon backend isn't
     extension or no extension is connected.
 
+    The returned ``targetId`` stays valid across heredocs as long as the tab
+    is open and the daemon is alive — print it, capture it in the agent's
+    conversation, and use ``switch_tab(targetId)`` in subsequent heredocs to
+    re-bind without another ``attach_active()`` call. That's more
+    deterministic than re-attaching the focused tab on every heredoc,
+    which can drift if the user clicks another window between calls.
+    See SKILL.md "Persisting a tab handle across heredocs".
+
     For non-extension backends (rdp/env) the existing ``current_page()``
     helper already resolves the active tab via Target.getTargets — use
     that path instead.
@@ -161,7 +169,21 @@ def current_tab() -> dict | None:
 
 
 def switch_tab(target) -> dict:
-    """``target`` = targetId string or a dict carrying ``targetId``."""
+    """Bind the current Session to ``target``.
+
+    ``target`` = targetId string or a dict carrying ``targetId``.
+
+    Primary use case is heredoc-to-heredoc continuity: capture the
+    ``targetId`` from ``attach_active()`` / ``new_tab()`` /
+    ``open_background()``, then call ``switch_tab(targetId)`` at the top
+    of subsequent heredocs to re-bind to the same tab without going
+    through another attach. Cheaper and more deterministic than
+    ``attach_active()`` (which always grabs the currently-focused tab
+    and can drift if the user clicks another window between heredocs).
+
+    Raises ``CDPError`` with an actionable message when the target no
+    longer exists (tab closed since the handle was issued).
+    """
     if isinstance(target, dict):
         target_id = target.get("targetId")
     else:
@@ -169,7 +191,20 @@ def switch_tab(target) -> dict:
     if not target_id:
         raise ValueError("switch_tab: missing targetId")
     sess = current_session()
-    sess.cdp.attach(target_id)
+    try:
+        sess.cdp.attach(target_id)
+    except CDPError as e:
+        raise CDPError(
+            method="Target.attachToTarget",
+            params={"targetId": target_id},
+            cdp_message=(
+                f"switch_tab: target {target_id!r} no longer exists "
+                f"(tab likely closed, or daemon restarted since the "
+                f"handle was issued). Call `attach_active()` "
+                f"(extension backend) or `new_tab(url)` to get a fresh "
+                f"handle. Original CDP error: {e.cdp_message}"
+            ),
+        ) from e
     sess.current_target_id = target_id
     try:
         sess.cdp.send("Target.activateTarget", targetId=target_id)
@@ -179,6 +214,14 @@ def switch_tab(target) -> dict:
 
 
 def new_tab(url: str = "about:blank") -> dict:
+    """Create a new tab and bind the Session to it.
+
+    Returns ``{targetId, url}``. The ``targetId`` stays valid across
+    heredocs as long as the tab is open and the daemon is alive — print
+    it, capture it in the agent's conversation, and use
+    ``switch_tab(targetId)`` in later heredocs to re-bind. See SKILL.md
+    "Persisting a tab handle across heredocs".
+    """
     sess = current_session()
     res = sess.cdp.send("Target.createTarget", url=url)
     target_id = res["targetId"]
