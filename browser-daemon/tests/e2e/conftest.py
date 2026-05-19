@@ -125,8 +125,11 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
 
     env = os.environ.copy()
     env["BD_NAME"] = TEST_NAME
-    # Force config to a tmp path so we don't write to ~/.config/browser-daemon
-    env["BS_DAEMON_CONFIG_PATH"] = str(tmp_path_factory.mktemp("bd-cfg"))
+    # Neutralise any externally-set BD_CONFIG so the test daemon doesn't
+    # inherit the user's toml (which may set relay_url, ports, etc.).
+    # Empty string means "no config file" — the daemon falls through to
+    # defaults, which are then overridden by our explicit CLI flags above.
+    env["BD_CONFIG"] = ""
 
     proc = subprocess.Popen(
         [
