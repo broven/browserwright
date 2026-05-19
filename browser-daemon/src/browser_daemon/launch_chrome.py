@@ -104,6 +104,14 @@ async def launch_chrome(
         # because the user-data-dir is already an isolation boundary (no
         # session cookies / no auto-login) — same posture as DevTools itself.
         "--remote-allow-origins=*",
+        # Disable OS keychain integration. On macOS, Chrome otherwise prompts
+        # for the login keychain password on every fresh-profile start ("…wants
+        # to use confidential information stored in Chromium Safe Storage…"),
+        # which blocks automation. The isolated user-data-dir has nothing
+        # encrypted to begin with, so the basic/mock store is functionally
+        # equivalent. Same defaults Playwright / Puppeteer / browser-use ship.
+        "--password-store=basic",
+        "--use-mock-keychain",
     ]
     if extra_args:
         args.extend(extra_args)

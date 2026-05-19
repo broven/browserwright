@@ -525,6 +525,9 @@ async def test_launch_chrome_passes_extra_args(monkeypatch, tmp_path, fake_chrom
     assert "--disable-features=Foo" in argv
     # extra_args appended after the existing flags, not interleaved before them
     assert argv.index("--remote-allow-origins=*") < argv.index("--load-extension=/tmp/fake-ext")
+    # Keychain prompt suppression: macOS won't ask for the login password.
+    assert "--password-store=basic" in argv
+    assert "--use-mock-keychain" in argv
     # Cleanup
     try:
         os.kill(out["extras"]["pid"], 15)
