@@ -262,6 +262,14 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
+        # Idempotency: extension may already hold chrome.debugger.attach on
+        # this tab (popup click, prior daemon lifecycle — the SW survives
+        # daemon restarts and re-announces attached tabs on reconnect, so
+        # ext.tabs is authoritative). Skip the redundant attach call to
+        # avoid "Another debugger is already attached" from Chrome.
+        existing = ext.tabs.get(tab_id)
+        if existing is not None:
+            return existing
         last_err: Exception | None = None
         for i in range(ATTACH_RETRY_LIMIT):
             try:

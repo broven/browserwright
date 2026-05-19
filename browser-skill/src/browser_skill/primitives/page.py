@@ -27,14 +27,27 @@ def attach_active() -> dict:
     """
     from collections import deque as _deque
     sess = current_session()
-    result = sess.daemon.attach_active() if hasattr(sess.daemon, "attach_active") else None
+    # Route through the long-lived ws (sess.cdp), NOT a CLI subprocess. The
+    # subprocess opens its own short-lived client connection — daemon binds
+    # the local sessionId to that ephemeral client and discards it on
+    # disconnect, so by the time the caller hands the sid to a primitive on
+    # its own connection the proxy answers "unknown sessionId".
+    try:
+        result = sess.cdp.send("BrowserDaemon.attachActiveTab")
+    except CDPError as e:
+        raise CDPError(
+            method="BrowserDaemon.attachActiveTab",
+            params={},
+            cdp_message=(e.cdp_message or
+                         "attach_active() requires the extension backend; "
+                         "start the daemon with `browser-daemon serve "
+                         "--backend extension` and load the chrome-extension/."),
+        ) from e
     if not result:
         raise CDPError(
             method="BrowserDaemon.attachActiveTab",
             params={},
-            cdp_message=("attach_active() requires the extension backend; "
-                         "start the daemon with `browser-daemon serve "
-                         "--backend extension` and load the chrome-extension/."),
+            cdp_message="empty response from daemon",
         )
     target_id = result.get("targetId")
     sid = result.get("sessionId")
@@ -51,9 +64,9 @@ def attach_active() -> dict:
     # bootstrap because attach_active routes through the extension backend
     # which auto-enables those via the relay's session setup.
     cdp_session = sess.cdp
-    from .. import cdp as _cdp_mod
+    from ..cdp import _EVENT_RING_LIMIT
     cdp_session._sessions[target_id] = sid  # type: ignore[attr-defined]
-    cdp_session._events.setdefault(sid, _deque(maxlen=_cdp_mod._EVENT_RING_LIMIT))  # type: ignore[attr-defined]
+    cdp_session._events.setdefault(sid, _deque(maxlen=_EVENT_RING_LIMIT))  # type: ignore[attr-defined]
     # Best-effort domain enables (matching CDPSession.attach()). Errors are
     # tolerated since some Chrome builds noop on certain domains.
     for domain in ("Page", "Runtime", "DOM", "Network"):

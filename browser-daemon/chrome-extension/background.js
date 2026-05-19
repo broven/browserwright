@@ -210,10 +210,11 @@ async function doAttach(id, tabId) {
       result: {
         targetInfo: {
           url: tab.url || "",
-          title: tab.title || "",
+          title: stripMarker(tab.title),
         },
       },
     });
+    markTabAttached(tabId);  // fire-and-forget; cosmetic
   } catch (e) {
     safeSend({
       type: "response",
@@ -238,8 +239,10 @@ async function doAttachActive(id) {
       });
       return;
     }
-    await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
-    attachedTabs.add(tab.id);
+    if (!attachedTabs.has(tab.id)) {
+      await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
+      attachedTabs.add(tab.id);
+    }
     await announceAttached(tab.id);
     safeSend({
       type: "response",
@@ -247,9 +250,10 @@ async function doAttachActive(id) {
       result: {
         tabId: tab.id,
         url: tab.url || "",
-        title: tab.title || "",
+        title: stripMarker(tab.title),
       },
     });
+    markTabAttached(tab.id);  // fire-and-forget; cosmetic
   } catch (e) {
     safeSend({
       type: "response",
@@ -290,8 +294,9 @@ async function doCreateTab(id, url, groupName) {
     safeSend({
       type: "response",
       id,
-      result: { tabId: tab.id, url: actualUrl, title, groupId },
+      result: { tabId: tab.id, url: actualUrl, title: stripMarker(title), groupId },
     });
+    markTabAttached(tab.id);  // fire-and-forget; cosmetic
   } catch (e) {
     safeSend({
       type: "response",
@@ -333,6 +338,7 @@ async function _ensureTabInGroup(tabId, groupName) {
 async function doCloseTab(id, tabId) {
   // Best-effort detach first so chrome.debugger doesn't try to talk to the
   // doomed tab as we tear it down. Failures here are silent.
+  markedTabs.delete(tabId);  // skip strip-prefix — tab is dying anyway
   try {
     await chrome.debugger.detach({ tabId });
   } catch (_e) {
@@ -359,6 +365,7 @@ async function doCloseTab(id, tabId) {
 
 async function doDetach(id, tabId) {
   try {
+    await unmarkTabBeforeDetach(tabId);
     await chrome.debugger.detach({ tabId });
     attachedTabs.delete(tabId);
     safeSend({ type: "response", id, result: {} });
@@ -401,7 +408,7 @@ async function doQueryActiveTab(id) {
         ? {
             tabId: tab.id,
             url: tab.url || "",
-            title: tab.title || "",
+            title: stripMarker(tab.title),
           }
         : null,
     });
@@ -420,7 +427,7 @@ async function announceAttached(tabId) {
     safeSend({
       type: "attached",
       tabId,
-      targetInfo: { url: tab.url || "", title: tab.title || "" },
+      targetInfo: { url: tab.url || "", title: stripMarker(tab.title) },
     });
   } catch (e) {
     // Tab was closed before we could read it — silently drop.
@@ -431,6 +438,114 @@ async function announceAttached(tabId) {
 function errMessage(e) {
   if (!e) return "unknown error";
   return e.message || String(e);
+}
+
+// ---- title marker: 👀 prefix on AI-attached tabs --------------------------
+//
+// Prepend 👀 to document.title on every attached tab so the user can see in
+// their browser tab strip which tab the agent is driving. Survives same-doc
+// title mutations (React/Next.js routes, jQuery, etc.) via MutationObserver
+// on document.head, and survives navigations via
+// Page.addScriptToEvaluateOnNewDocument. On graceful detach we strip the
+// prefix and disconnect the observer; on unexpected detach (DevTools steals
+// the session) the prefix persists until the user reloads — acceptable.
+
+const TITLE_PREFIX = "\u{1F440} ";  // 👀 + space
+
+const MARKER_INSTALL_SCRIPT = `
+(function() {
+  if (window.__bdTitleMarker) return;
+  const PREFIX = '\u{1F440} ';
+  function ensurePrefix() {
+    const t = document.title || '';
+    if (!t.startsWith(PREFIX)) document.title = PREFIX + t;
+  }
+  const obs = new MutationObserver(ensurePrefix);
+  function attachObs() {
+    if (!document.head) return;
+    obs.observe(document.head, { childList: true, characterData: true, subtree: true });
+    ensurePrefix();
+  }
+  if (document.head) {
+    attachObs();
+  } else {
+    document.addEventListener('DOMContentLoaded', attachObs, { once: true });
+  }
+  window.__bdTitleMarker = { obs };
+})();
+`;
+
+const MARKER_REMOVE_SCRIPT = `
+(function() {
+  const PREFIX = '\u{1F440} ';
+  try { window.__bdTitleMarker && window.__bdTitleMarker.obs.disconnect(); } catch (e) {}
+  delete window.__bdTitleMarker;
+  if (document.title && document.title.startsWith(PREFIX)) {
+    document.title = document.title.slice(PREFIX.length);
+  }
+})();
+`;
+
+// tabId → scriptIdentifier returned by Page.addScriptToEvaluateOnNewDocument
+// (needed to remove the per-document hook on detach).
+const markedTabs = new Map();
+
+function stripMarker(title) {
+  if (typeof title === "string" && title.startsWith(TITLE_PREFIX)) {
+    return title.slice(TITLE_PREFIX.length);
+  }
+  return title || "";
+}
+
+async function markTabAttached(tabId) {
+  if (markedTabs.has(tabId)) return;
+  // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
+  // (e.g. popup-attach racing daemon attach-active) coalesce.
+  markedTabs.set(tabId, "");
+  try {
+    // Page domain may not be enabled yet on a fresh chrome.debugger session;
+    // enabling is idempotent so this is safe to call repeatedly.
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+    const reg = await chrome.debugger.sendCommand(
+      { tabId },
+      "Page.addScriptToEvaluateOnNewDocument",
+      { source: MARKER_INSTALL_SCRIPT },
+    );
+    markedTabs.set(tabId, reg?.identifier || "");
+    // The above fires only on *new* documents; inject into the current one too.
+    await chrome.debugger.sendCommand(
+      { tabId },
+      "Runtime.evaluate",
+      { expression: MARKER_INSTALL_SCRIPT },
+    );
+  } catch (e) {
+    // Tab might have closed mid-attach, or chrome.debugger session is gone —
+    // not worth failing the whole attach over a cosmetic marker.
+    console.warn("[bd-relay] markTabAttached(" + tabId + ") failed:", e);
+    markedTabs.delete(tabId);
+  }
+}
+
+async function unmarkTabBeforeDetach(tabId) {
+  const identifier = markedTabs.get(tabId);
+  markedTabs.delete(tabId);
+  if (identifier === undefined) return;
+  try {
+    if (identifier) {
+      await chrome.debugger.sendCommand(
+        { tabId },
+        "Page.removeScriptToEvaluateOnNewDocument",
+        { identifier },
+      );
+    }
+    await chrome.debugger.sendCommand(
+      { tabId },
+      "Runtime.evaluate",
+      { expression: MARKER_REMOVE_SCRIPT },
+    );
+  } catch (e) {
+    // Tab closing or session already torn down — safe to ignore.
+  }
 }
 
 // ---- chrome.debugger event fan-out ----------------------------------------
@@ -448,6 +563,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source && typeof source.tabId === "number") {
     attachedTabs.delete(source.tabId);
+    // Unexpected detach (DevTools steals the session, tab crashes, etc.) —
+    // we can no longer run CDP commands, so the page-side observer keeps the
+    // 👀 prefix on the current document. It clears naturally on next
+    // navigation (addScriptToEvaluateOnNewDocument is no longer registered).
+    markedTabs.delete(source.tabId);
     safeSend({ type: "detached", tabId: source.tabId, reason });
   }
 });
@@ -478,6 +598,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
         attachedTabs.add(tab.id);
         await announceAttached(tab.id);
+        markTabAttached(tab.id);  // fire-and-forget; cosmetic
         sendResponse({ ok: true, tabId: tab.id });
       } catch (e) {
         sendResponse({ ok: false, error: errMessage(e) });
@@ -491,6 +612,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       try {
+        await unmarkTabBeforeDetach(tab.id);
         await chrome.debugger.detach({ tabId: tab.id });
         attachedTabs.delete(tab.id);
         safeSend({ type: "detached", tabId: tab.id, reason: "popup_request" });
