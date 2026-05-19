@@ -341,6 +341,31 @@ def e2e_chrome(cft_binary, patched_ext_dir):
     shutil.rmtree(handle.profile_path, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+#   Artifact dump on failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _e2e_dump_artifacts_on_failure(request, e2e_artifacts_dir):
+    """When a `real_chrome` test fails, write env into `_artifacts/<nodeid>/`."""
+    yield
+    rep = getattr(request.node, "rep_call", None)
+    if rep is not None and rep.failed:
+        outdir = e2e_artifacts_dir / request.node.name
+        outdir.mkdir(parents=True, exist_ok=True)
+        env_lines = [f"{k}={v}" for k, v in sorted(os.environ.items())
+                     if k.startswith(("BD_", "BS_", "BU_"))]
+        (outdir / "env.txt").write_text("\n".join(env_lines), encoding="utf-8")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, f"rep_{rep.when}", rep)
+
+
 @pytest.fixture
 def ext_ready(e2e_daemon, e2e_chrome):
     """Block until the extension SW has connected to the daemon's relay.
