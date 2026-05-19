@@ -366,3 +366,27 @@ def ext_ready(e2e_daemon, e2e_chrome):
         f"extension never connected within 10s; last status={last_status}; "
         f"daemon log: {e2e_daemon.log_path}"
     )
+
+
+@pytest.fixture
+def e2e_chrome_rdp(tmp_path_factory):
+    """Chrome with --remote-debugging-port for RDP-backend tests.
+    No extension — RDP backend doesn't need one. Uses regular Chrome.
+    """
+    cfg = _load_config(env={})
+    profile_name = f"bd-e2e-rdp-{uuid.uuid4().hex[:8]}"
+    out = asyncio.run(_lc_mod.launch_chrome(
+        cfg,
+        profile=profile_name,
+        persistent=False,
+        port=TEST_RDP_PORT,
+    ))
+    handle = ChromeHandle(
+        ws_url=out["ws_url"],
+        profile_path=Path(out["extras"]["profile_path"]),
+        pid=int(out["extras"]["pid"]),
+        port=TEST_RDP_PORT,
+    )
+    yield handle
+    _kill_chrome(handle.pid)
+    shutil.rmtree(handle.profile_path, ignore_errors=True)

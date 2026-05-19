@@ -17,3 +17,17 @@ def test_extension_connects_to_daemon(ext_ready):
     """L0 extension backend: a real Chrome with the patched extension loaded
     is able to dial the test daemon's relay."""
     assert ext_ready["extensions"] >= 1
+
+
+def test_rdp_backend_resolves_via_daemon(e2e_chrome_rdp):
+    """L0 RDP backend: `browser-daemon url --backend rdp --port N` returns
+    a non-empty ws URL when a Chrome is listening on that port."""
+    import subprocess
+    proc = subprocess.run(
+        ["browser-daemon", "url", "--backend", "rdp",
+         "--port", str(e2e_chrome_rdp.port)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    url = proc.stdout.strip().splitlines()[0]
+    assert url.startswith("ws://127.0.0.1:")
