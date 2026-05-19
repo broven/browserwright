@@ -404,11 +404,14 @@ def open_background(url: str, *, group: str = "Agent") -> dict:
         )
     payload = daemon.open_background(url, group=group)
     if not payload:
+        detail = getattr(daemon, "last_cli_error", None) or (
+            "daemon did not return a valid open-background payload "
+            "(requires the extension backend, with a running daemon)"
+        )
         raise CDPError(
             method="BrowserDaemon.openBackgroundTab",
             params={"url": url, "groupName": group},
-            cdp_message="daemon did not return a valid open-background payload "
-                        "(requires the extension backend, with a running daemon)",
+            cdp_message=f"open_background failed: {detail}",
         )
     target_id = payload.get("targetId")
     session_id = payload.get("sessionId")
@@ -483,11 +486,14 @@ def close_tab(
     # Backfill below the rest of the function with the resolved id for state cleanup.
     session_id = resolved_session_id
     if not payload:
+        detail = getattr(daemon, "last_cli_error", None) or (
+            "daemon did not return a valid close-tab payload "
+            "(requires the extension backend, with a running daemon)"
+        )
         raise CDPError(
             method="BrowserDaemon.closeTab",
             params={"sessionId": session_id},
-            cdp_message="daemon did not return a valid close-tab payload "
-                        "(requires the extension backend, with a running daemon)",
+            cdp_message=f"close_tab failed: {detail}",
         )
     # Clear local CDPSession state — locate any target whose stored sessionId
     # matches and drop it; clear the per-session event ring too.

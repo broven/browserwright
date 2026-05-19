@@ -316,28 +316,38 @@ class ModeBClient:
         """Phase B Feature 1 — invoke ``browser-daemon open-background``.
 
         Returns the parsed JSON result (``{sessionId,targetId,tabId,url,
-        title,groupId}``) or ``None`` if the CLI was unavailable. The
-        daemon-side handler requires backend=extension; on any other
-        backend the call surfaces an error (returncode != 0) and we
-        translate that to None so the caller can fall back / surface
-        a higher-level message.
+        title,groupId}``) or ``None`` if the CLI was unavailable. On
+        failure the captured subprocess detail is stashed on
+        ``self.last_cli_error`` so the caller can surface a meaningful
+        message instead of guessing. The daemon-side handler requires
+        backend=extension; on any other backend the call surfaces an
+        error (returncode != 0) which is recorded here verbatim.
         """
+        self.last_cli_error = None
+        cmd = ["browser-daemon", "open-background",
+               "--name", self.name,
+               "--url", url,
+               "--group", group]
         try:
             proc = subprocess.run(
-                ["browser-daemon", "open-background",
-                 "--name", self.name,
-                 "--url", url,
-                 "--group", group,
-                 "--json"],
-                capture_output=True, text=True, timeout=15,
+                cmd, capture_output=True, text=True, timeout=15,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            self.last_cli_error = f"subprocess failed: {e!r}"
             return None
         if proc.returncode != 0 or not proc.stdout.strip():
+            self.last_cli_error = (
+                f"`{' '.join(cmd)}` exit={proc.returncode}; "
+                f"stderr={proc.stderr.strip() or '<empty>'}; "
+                f"stdout={proc.stdout.strip() or '<empty>'}"
+            )
             return None
         try:
             return json.loads(proc.stdout)
         except json.JSONDecodeError:
+            self.last_cli_error = (
+                f"`{' '.join(cmd)}` returned non-JSON stdout: {proc.stdout!r}"
+            )
             return None
 
     def close_tab(
@@ -356,7 +366,8 @@ class ModeBClient:
         """
         if not session_id and not target_id:
             return None
-        cmd = ["browser-daemon", "close-tab", "--name", self.name, "--json"]
+        self.last_cli_error = None
+        cmd = ["browser-daemon", "close-tab", "--name", self.name]
         if target_id:
             cmd += ["--target-id", target_id]
         if session_id:
@@ -365,13 +376,22 @@ class ModeBClient:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=10,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            self.last_cli_error = f"subprocess failed: {e!r}"
             return None
         if proc.returncode != 0 or not proc.stdout.strip():
+            self.last_cli_error = (
+                f"`{' '.join(cmd)}` exit={proc.returncode}; "
+                f"stderr={proc.stderr.strip() or '<empty>'}; "
+                f"stdout={proc.stdout.strip() or '<empty>'}"
+            )
             return None
         try:
             return json.loads(proc.stdout)
         except json.JSONDecodeError:
+            self.last_cli_error = (
+                f"`{' '.join(cmd)}` returned non-JSON stdout: {proc.stdout!r}"
+            )
             return None
 
     def doctor(self) -> dict:
