@@ -139,8 +139,12 @@ function sleep(ms) {
 }
 
 async function maintainLoop() {
-  // Perpetual reconnect + keepalive. The pending setTimeout from `sleep`
-  // is what stops Chrome from idling the service worker.
+  // Perpetual reconnect loop. Note: contrary to a common claim, an
+  // `await sleep(...)` chain does NOT by itself keep an MV3 SW alive in
+  // Chrome 116+. The real keepalive is `pingLoop` below, which drives
+  // app-level ws frames every 20s — Chrome's reaper resets only on
+  // ws onmessage/send events, not on setTimeout callbacks or on the
+  // protocol-level PING the daemon's `websockets` lib emits.
   while (true) {
     const state = ws ? ws.readyState : WebSocket.CLOSED;
     if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
@@ -161,6 +165,22 @@ async function maintainLoop() {
     ];
     reconnectIdx += 1;
     await sleep(delay);
+  }
+}
+
+// MV3 SW lifetime keepalive. Send an app-level ping on the open ws every
+// 20s; the daemon's relay echoes a `pong`. Each send resets the SW's idle
+// reaper (Chrome 116+ counts ws sends as activity); each incoming pong's
+// `onmessage` does the same. With <30s between events, the SW stays alive
+// indefinitely. `chrome.alarms` below is a recovery net for the case
+// where the SW dies anyway (memory pressure, browser update, etc.).
+const PING_INTERVAL_MS = 20000;
+async function pingLoop() {
+  while (true) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      safeSend({ type: "ping", ts: Date.now() });
+    }
+    await sleep(PING_INTERVAL_MS);
   }
 }
 
@@ -194,6 +214,11 @@ async function handleDaemonMessage(msg) {
       return await doCreateTab(id, msg.url, msg.groupName);
     case "closeTab":
       return await doCloseTab(id, msg.tabId);
+    case "pong":
+      // App-level keepalive reply (see pingLoop). The mere fact that this
+      // onmessage fired is enough to reset Chrome's SW idle reaper — no
+      // further bookkeeping needed.
+      return;
     default:
       console.warn("[bd-relay] unknown message type:", type);
   }
@@ -652,3 +677,4 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 connect();
 maintainLoop();
+pingLoop();

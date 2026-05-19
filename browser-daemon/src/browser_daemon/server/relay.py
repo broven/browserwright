@@ -521,6 +521,22 @@ class RelayServer:
                         ext.install_id, ext.browser, ext.version)
             return
 
+        if kind == "ping":
+            # MV3 SW lifetime keepalive. Chrome only extends the SW's 30s idle
+            # timer on application-level ws frames (the `onmessage` kind);
+            # the protocol PING the `websockets` lib sends is handled by the
+            # browser internally and never reaches the SW. So the extension
+            # drives this app-level heartbeat and we echo back — both an
+            # outgoing send (in the extension) and an incoming onmessage
+            # (when this pong lands) reset the reaper.
+            try:
+                await ext.conn.send(json.dumps({
+                    "type": "pong", "ts": msg.get("ts"),
+                }))
+            except Exception:
+                pass
+            return
+
         if kind == "attached":
             tab_id = int(msg.get("tabId", -1))
             if tab_id < 0:
