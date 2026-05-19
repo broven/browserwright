@@ -107,6 +107,32 @@ class Session:
             self._cdp.close()
         self._cdp = None
 
+    @property
+    def backend_name(self) -> str:
+        """Lazy-resolved daemon backend name (``"rdp"``, ``"extension"``, …).
+
+        Primitives use this to branch on backend-specific quirks — most
+        notably extension's "you have to attach tabs explicitly" model —
+        without a round-trip on every call. Falls back to ``""`` when the
+        daemon doesn't surface backend info (older daemon / Mode A path
+        that never wired it).
+        """
+        cached = getattr(self, "_backend_name_cache", None)
+        if cached is not None:
+            return cached
+        info = None
+        getter = getattr(self.daemon, "get_backend_info", None)
+        if callable(getter):
+            try:
+                info = getter()
+            except Exception:
+                info = None
+        name = ""
+        if isinstance(info, dict):
+            name = info.get("backend") or info.get("name") or ""
+        self._backend_name_cache = name  # type: ignore[attr-defined]
+        return name
+
 
 # ---- singleton + context-var override ---------------------------------
 

@@ -112,33 +112,40 @@ ws = subprocess.check_output(["browser-daemon", "url"], text=True).strip()
 
 为什么要这条路径：用户日常使用的 Chrome（带 1Password、Bitwarden、所有书签、所有 cookie）**不能**重启加 `--remote-debugging-port`，否则丢 session、丢已登录状态、丢扩展状态。扩展模型让 daemon 既能用上用户日常 Chrome，又不要求用户改启动方式。
 
-### 一次性安装
+### 一次性安装（macOS）
 
-1. 启动 daemon：`browser-daemon serve --backend extension --name myrepl`
+1. **注册 daemon 为 LaunchAgent**：`browser-daemon install`
 
-   daemon 会同时在两个端口上监听：
-   - 本地 unix socket（Skill 通过此连）—— `/tmp/browser-daemon-myrepl.sock`
-   - relay ws server `ws://127.0.0.1:19989`（扩展通过此连）
+   写入 `~/Library/LaunchAgents/com.browser-daemon.default.plist` 并 `launchctl load`。daemon 会：
+   - 每次登录自动启动（`RunAtLoad`）
+   - 崩了 launchd 自动重启（`KeepAlive`，`Crashed=true`）
+   - 本地 unix socket 永远在 `/tmp/browser-daemon-default.sock`
+   - relay ws server 永远在 `ws://127.0.0.1:19989`（扩展通过此连）
+
+   想换 name / 端口：`browser-daemon install --name X --extension-port N`。  
+   想卸：`browser-daemon uninstall --name X`。  
+   想查：`browser-daemon list`。
 
 2. 把 `browser-daemon/chrome-extension/` 整个目录作为 **unpacked extension** 装到 Chrome：
    - 打开 `chrome://extensions/`
    - 右上角打开"开发者模式"
    - 点"加载已解压的扩展程序"，选 `chrome-extension/` 目录
 
-3. 装好后，点击工具栏的"browser-daemon relay"扩展图标，确认 popup 显示 **Connected to daemon**（绿点）。
+3. 装好后，扩展会自动连接 daemon —— 不需要点扩展图标，也不需要手动 attach 任何 tab。后续 daemon 重启 / Chrome 重启 / extension service worker idle 都由 `maintainLoop` + `chrome.alarms` + `chrome.runtime.onStartup` 自动恢复，**零手动操作**。
 
-### 使用 / per-tab attach
+### 使用 / Agent-driven attach
 
-扩展默认**不**自动 attach 任何 tab——这是有意的设计，避免一次扩展安装就让 Chrome 给每个 tab 弹 "Debugging" 横幅。
+扩展默认**不**自动 attach 任何 tab —— Chrome 的"debugger 黄条"会出现在被 attach 的 tab 上，所以"装上扩展就自动 attach 所有 tab"会让每个 tab 都长出黄条。
 
-用户用法：
+正确用法：**Agent / Skill 在需要操作 tab 时主动 attach**。三个入口：
 
-- 打开想自动化的 tab（比如 https://example.com/）
-- 点扩展图标 → **Attach this tab**
-- popup 里出现一行带 `✱` 标记的当前 tab，说明已 attach 成功
-- 此时 daemon 的 `Target.getTargets` 就会列出这个 tab，Skill 可以 `Target.attachToTarget` 拿到一个 sessionId，然后正常发 `Page.navigate` / `Page.captureScreenshot` 之类
+- `attach_active()` — 抓 Chrome focused window 的 active tab（黄条出现，因为这正是你想看到 Agent 操作的 tab）
+- `open_background(url, group="Agent")` — 后台开新 tab + 加进名为 "Agent" 的 tab group，`active:false` 不抢焦点。黄条出现在那个 tab 上但你看不见
+- `close_tab(target_id=...)` — Agent 操作完后显式关闭
 
-要释放，再点扩展图标 → **Detach this tab**。也可以 `chrome://inspect/#devices` 里手动 detach。
+对应 CLI：`browser-daemon attach-active` / `open-background --url X --group Agent` / `close-tab --target-id ext-tab-N`。
+
+用户还可以走 popup 手动 attach（点扩展图标），跟 Agent 路径并存。
 
 ### doctor / health check
 
@@ -146,7 +153,7 @@ ws = subprocess.check_output(["browser-daemon", "url"], text=True).strip()
 
 | `available` | `detail` | 含义 |
 |---|---|---|
-| `false` | "no extension relay listening on 127.0.0.1:19989…" | daemon 没起 serve，先 `browser-daemon serve --backend extension` |
+| `false` | "no extension relay listening on 127.0.0.1:19989…" | daemon 没启动 — 跑 `browser-daemon install` 一次性注册成 LaunchAgent，或临时 `browser-daemon serve --backend extension` |
 | `false` | "extension relay is running but no Chrome extension has connected yet" | daemon 起来了，但 Chrome 扩展还没装/还没启动 |
 | `true` | `"<N> extension(s) connected (install_ids=[…], attached tabs=N)"` | 健康 |
 

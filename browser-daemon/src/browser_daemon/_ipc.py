@@ -238,10 +238,13 @@ async def ping_async(name: str, timeout: float = 1.0) -> int | None:
 def ping_sync(name: str, timeout: float = 1.0) -> int | None:
     """Synchronous variant for CLI status / stop paths that don't already
     have an event loop running. Returns the daemon's PID, or None."""
+    coro = ping_async(name, timeout=timeout)
     try:
-        return asyncio.run(ping_async(name, timeout=timeout))
+        return asyncio.run(coro)
     except RuntimeError:
         # Already inside an event loop. The caller should have used ping_async.
+        # Close the coroutine explicitly so we don't leak a never-awaited warning.
+        coro.close()
         return None
 
 

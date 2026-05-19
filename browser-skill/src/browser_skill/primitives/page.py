@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..errors import CDPError, PageLoadFailed
+from ..errors import CDPError, NeedsUserConfirm, PageLoadFailed
 from ..session import current_session
 
 
@@ -100,17 +100,48 @@ def list_tabs(include_chrome: bool = True) -> list[dict]:
             "title": t.get("title", ""),
             "attached": t.get("attached", False),
         })
+    # Extension backend returns only ghost targets — tabs the user has
+    # explicitly attached. An empty list there isn't "Chrome has no tabs",
+    # it's "you haven't attached one yet"; the agent's natural next move
+    # is `attach_active()` (drive the user's focused tab) or
+    # `open_background(url)` (open a fresh tab in the agent group). Make
+    # that path discoverable instead of returning a silently-empty list.
+    if not out and sess.backend_name == "extension":
+        raise NeedsUserConfirm(
+            what="extension backend has zero attached tabs",
+            proposal=(
+                "call `attach_active()` to drive the focused-window tab, "
+                "or `open_background(url, group='Agent')` to spawn a new "
+                "background tab in the Agent group"
+            ),
+        )
     return out
 
 
 def current_tab() -> dict | None:
-    """The tab Skill is currently attached to (may be stale / chrome:// page)."""
+    """The tab Skill is currently attached to (may be stale / chrome:// page).
+
+    Mode A backends: returns ``None`` when no tab has been attached yet —
+    a legitimate "Chrome has tabs but Skill hasn't picked one" state.
+
+    Extension backend: ``None`` is never legitimate here because the
+    daemon only knows about explicitly-attached ghost targets. Raise
+    instead so the agent learns to call ``attach_active()`` /
+    ``open_background()`` first.
+    """
     sess = current_session()
-    if not sess.current_target_id:
-        return None
-    for t in list_tabs():
-        if t["targetId"] == sess.current_target_id:
-            return t
+    if sess.current_target_id:
+        for t in list_tabs():
+            if t["targetId"] == sess.current_target_id:
+                return t
+    if sess.backend_name == "extension":
+        raise NeedsUserConfirm(
+            what="no tab attached on extension backend",
+            proposal=(
+                "call `attach_active()` to attach the focused-window tab, "
+                "or `open_background(url)` to spawn a background tab"
+            ),
+        )
     return None
 
 
@@ -202,18 +233,33 @@ def goto_url(url: str) -> dict:
 def current_page() -> dict:
     """User's visually-foreground tab (US1). Auto-attaches.
 
-    Backed by ``browser-daemon active-tab --json`` (Mode A v0.1). If that
-    fails or returns ``accuracy != "heuristic-recent-activate"`` we surface
-    ``accuracy`` in the return value so the agent can decide whether to ask
-    the user.
+    Mode A backends use ``browser-daemon active-tab --json`` to find the
+    most-recently-activated target and switch to it.
 
-    When ``BS_CDP_WS`` / ``BU_CDP_WS`` is set, the daemon CLI may be querying
-    a *different* Chrome than the one we're attached to. Trust list_tabs over
-    the daemon's hint in that case — the daemon's targetId would be invalid
-    on our ws.
+    Extension backend has no notion of "active tab" outside of attached
+    ghosts, so we route through ``attach_active()`` instead — the daemon
+    asks the extension to attach Chrome's focused-window active tab right
+    now. The first call in a session triggers Chrome's yellow banner;
+    subsequent calls in the same session reuse the cached target.
+
+    When ``BS_CDP_WS`` / ``BU_CDP_WS`` is set the daemon CLI may be
+    querying a different Chrome than the one we're attached to. Trust
+    ``list_tabs`` over the daemon's hint in that case.
     """
     import os as _os
     sess = current_session()
+    if sess.backend_name == "extension":
+        if sess.current_target_id:
+            try:
+                for t in list_tabs(include_chrome=False):
+                    if t["targetId"] == sess.current_target_id:
+                        return {**t, "accuracy": "exact"}
+            except NeedsUserConfirm:
+                # Cached target got reaped (tab closed). Fall through to a
+                # fresh attach instead of bubbling the raise.
+                sess.current_target_id = None
+        info = attach_active()
+        return {**info, "accuracy": "exact"}
     explicit_ws = bool(_os.environ.get("BS_CDP_WS") or _os.environ.get("BU_CDP_WS"))
     if not explicit_ws:
         info = sess.daemon.active_tab()

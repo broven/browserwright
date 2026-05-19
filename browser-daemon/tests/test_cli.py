@@ -157,6 +157,69 @@ def test_url_auto_chain_no_warning_when_not_explicit():
         f"auto-chain should not emit explicit-autoconnect warning: {err!r}"
 
 
+# ---- LaunchAgent install (v0.5.5) ----------------------------------------
+
+
+def test_install_plist_content_includes_serve_args():
+    """The plist must spawn `browser-daemon serve --backend X --name Y` with
+    KeepAlive and RunAtLoad. Direct unit test of the generator — we don't
+    actually `launchctl load` in tests (side effects + needs a real macOS)."""
+    from browser_daemon import cli as cli_mod
+    content = cli_mod._build_plist(
+        label="com.browser-daemon.test1",
+        name="test1",
+        backend="extension",
+        extension_port=29999,
+    )
+    assert "com.browser-daemon.test1" in content
+    assert "<string>serve</string>" in content
+    assert "<string>--backend</string>" in content
+    assert "<string>extension</string>" in content
+    assert "<string>--name</string>" in content
+    assert "<string>test1</string>" in content
+    assert "<string>--extension-port</string>" in content
+    assert "<string>29999</string>" in content
+    assert "<key>RunAtLoad</key><true/>" in content
+    assert "<key>KeepAlive</key>" in content
+    assert "<key>Crashed</key><true/>" in content
+    # Successful exits don't restart — Crashed=true is the only respawn trigger.
+    assert "<key>SuccessfulExit</key><false/>" in content
+
+
+def test_install_plist_omits_extension_port_when_unspecified():
+    """No --extension-port flag in the plist when caller didn't pass one;
+    daemon falls back to its default (19989)."""
+    from browser_daemon import cli as cli_mod
+    content = cli_mod._build_plist(
+        label="com.browser-daemon.t2", name="t2",
+        backend="extension", extension_port=None,
+    )
+    assert "<string>--extension-port</string>" not in content
+
+
+def test_install_subcommand_refuses_on_non_darwin(monkeypatch):
+    """install/uninstall are macOS-only — fail loudly elsewhere instead of
+    writing a useless plist nothing knows how to load."""
+    if sys.platform == "darwin":
+        # Can't easily flip sys.platform in a subprocess test; the matching
+        # negative test runs on CI Linux. Skip locally.
+        import pytest as _pt
+        _pt.skip("darwin host — non-darwin guard is exercised in CI")
+    code, _, err = _run(["install", "--name", "t3"])
+    assert code != 0
+    assert "macOS-only" in err
+
+
+def test_list_subcommand_runs_clean():
+    """`browser-daemon list` should at minimum not crash on a host with no
+    LaunchAgents and no running daemon."""
+    code, out, err = _run(["list"])
+    assert code == 0
+    # Either "no daemon instances found" or a table with NAME header — both
+    # are acceptable shapes. We just want non-zero exit + no traceback.
+    assert "Traceback" not in err
+
+
 def test_url_json_carries_extras():
     raw = "ws://127.0.0.1:9222/devtools/browser/some-uuid"
     code, out, err = _run(["url", "--json"], env_overrides={"BD_CDP_WS": raw})

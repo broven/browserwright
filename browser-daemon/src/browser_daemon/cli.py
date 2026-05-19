@@ -148,6 +148,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_port(p_at)
     p_at.add_argument("--json", action="store_true")
 
+    # backend-info — what backend is the running daemon serving?
+    # Mode B Skill clients shell out to this to decide whether the current
+    # daemon matches their expected backend (refused-mismatch guard) and to
+    # branch primitives on backend-specific quirks (e.g. extension's "0
+    # attached tabs is actionable, not empty Chrome").
+    p_bi = sub.add_parser(
+        "backend-info",
+        help="report the running daemon's backend identity (Mode B identity probe)")
+    _add_name(p_bi)
+    p_bi.add_argument("--json", action="store_true")
+
     # attach-active (v0.5.4 — extension backend only)
     p_aa = sub.add_parser(
         "attach-active",
@@ -218,6 +229,34 @@ def _build_parser() -> argparse.ArgumentParser:
                            "use this from one-shot CLI calls since transient "
                            "ws can't share per-client session state")
     # Output is always JSON (spec §5.1 single-line discipline); no --json flag.
+
+    # install / uninstall / list — long-running service (macOS LaunchAgent).
+    # The daemon was designed as a one-shot `serve` subprocess, but for the
+    # "zero manual ops after install" extension flow it needs to be a
+    # supervised background service: starts at login, restarts on crash,
+    # and is reachable on the same socket across reboots.
+    p_inst = sub.add_parser(
+        "install",
+        help="register the daemon as a macOS LaunchAgent (auto-start + KeepAlive)")
+    _add_name(p_inst)
+    p_inst.add_argument("--backend", default="extension",
+                        choices=names(),
+                        help="backend the LaunchAgent will serve (default: extension)")
+    p_inst.add_argument("--extension-port", type=int, default=None, metavar="N",
+                        help="override the relay ws port (default 19989)")
+    p_inst.add_argument("--force", action="store_true",
+                        help="replace an existing LaunchAgent with the same name")
+
+    p_uninst = sub.add_parser(
+        "uninstall",
+        help="remove the LaunchAgent (stops auto-start)")
+    _add_name(p_uninst)
+
+    p_ls = sub.add_parser(
+        "list",
+        help="enumerate installed LaunchAgents + running daemon instances")
+    p_ls.add_argument("--json", action="store_true",
+                      help="emit JSON instead of pretty text")
 
     return p
 
@@ -365,6 +404,45 @@ def _cmd_stop(args, cfg: Config) -> int:
     return 0
 
 
+def _cmd_backend_info(args, cfg: Config) -> int:
+    """Probe the running daemon for its backend identity. Same shape as
+    `BrowserDaemon.getBackendInfo`'s ws response so the mode_b_client
+    subprocess shim can parse it directly."""
+    import asyncio
+    return asyncio.run(_run_backend_info(args, cfg))
+
+
+async def _run_backend_info(args, cfg: Config) -> int:
+    from . import _ipc
+    pid = await _ipc.ping_async(cfg.name, timeout=1.0)
+    if pid is None:
+        if args.json:
+            print(json.dumps({"running": False, "name": cfg.name},
+                             sort_keys=True))
+        else:
+            print(f"daemon[{cfg.name}] not running", file=sys.stderr)
+        return 2
+    try:
+        info = await _rpc_via_ws(
+            cfg, "BrowserDaemon.getBackendInfo", {},
+            client_label="cli-backend-info", timeout=5.0,
+        )
+    except (Unavailable, DaemonError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    # Surface as `backend` (alias of `name`) for callers like
+    # ModeBClient.assert_backend_matches that read either key.
+    payload = {
+        "running": True,
+        "name": info.get("name"),
+        "backend": info.get("name"),
+        "kind": info.get("kind"),
+        "schema_version": info.get("schema_version", 1),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
 def _cmd_stats(args, cfg: Config) -> int:
     """v0.5: query the running daemon's in-process metrics via the
     `BrowserDaemon.stats` CDP-namespace method, print to stdout.
@@ -378,7 +456,11 @@ def _cmd_stats(args, cfg: Config) -> int:
 
 async def _run_stats(args, cfg: Config) -> int:
     from . import _ipc
-    pid = _ipc.ping_sync(cfg.name, timeout=1.0)
+    # We're inside `asyncio.run()` already (via _cmd_stats). Nested
+    # asyncio.run raises RuntimeError, so use the async ping directly —
+    # ping_sync's fallback returns None and we'd misreport "not running"
+    # even when a daemon was listening.
+    pid = await _ipc.ping_async(cfg.name, timeout=1.0)
     if pid is None:
         print(f"daemon[{cfg.name}] not running", file=sys.stderr)
         return 2
@@ -756,6 +838,219 @@ def _cmd_close_tab(args, cfg: Config) -> int:
     return 0
 
 
+# ---- LaunchAgent service (macOS) ----------------------------------------
+#
+# Goal: the daemon is a long-running service, not a per-session subprocess.
+# macOS LaunchAgents are the right primitive — Linux/systemd-user support
+# is deferred (no users hitting it yet on this codebase).
+
+_LAUNCHAGENT_LABEL_PREFIX = "com.browser-daemon."
+
+
+def _launchagent_dir() -> "Path":
+    from pathlib import Path
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def _launchagent_plist_path(name: str) -> "Path":
+    return _launchagent_dir() / f"{_LAUNCHAGENT_LABEL_PREFIX}{name}.plist"
+
+
+def _resolve_browser_daemon_bin() -> str:
+    """Find the absolute path to the `browser-daemon` console script. The
+    plist needs a fully-qualified path; LaunchAgents don't inherit the
+    user's shell PATH."""
+    import shutil
+    path = shutil.which("browser-daemon")
+    if path:
+        return path
+    # Fallback to "<sys.prefix>/bin/browser-daemon".
+    from pathlib import Path
+    candidate = Path(sys.prefix) / "bin" / "browser-daemon"
+    if candidate.exists():
+        return str(candidate)
+    raise UserError(
+        "browser-daemon binary not found on PATH; "
+        "install it via pip/uv before running `browser-daemon install`"
+    )
+
+
+def _build_plist(*, label: str, name: str, backend: str,
+                 extension_port: int | None) -> str:
+    """Emit the plist content. Kept inline (no XML lib) — the schema is
+    fixed + tiny, and we avoid a dependency."""
+    bin_path = _resolve_browser_daemon_bin()
+    args = [bin_path, "serve", "--backend", backend, "--name", name]
+    if extension_port is not None:
+        args += ["--extension-port", str(extension_port)]
+    log_dir = os.path.expanduser("~/.cache/browser-daemon/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    stdout_path = f"{log_dir}/{name}.stdout.log"
+    stderr_path = f"{log_dir}/{name}.stderr.log"
+    # PATH carried over so any subprocess the daemon spawns (e.g. chrome)
+    # is discoverable. /usr/local/bin + /opt/homebrew/bin cover both
+    # Intel and Apple Silicon Homebrew layouts.
+    env_path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    arg_xml = "\n        ".join(f"<string>{a}</string>" for a in args)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        f'    <key>Label</key><string>{label}</string>\n'
+        '    <key>ProgramArguments</key>\n'
+        '    <array>\n'
+        f'        {arg_xml}\n'
+        '    </array>\n'
+        '    <key>RunAtLoad</key><true/>\n'
+        '    <key>KeepAlive</key>\n'
+        '    <dict>\n'
+        '        <key>SuccessfulExit</key><false/>\n'
+        '        <key>Crashed</key><true/>\n'
+        '    </dict>\n'
+        '    <key>EnvironmentVariables</key>\n'
+        '    <dict>\n'
+        f'        <key>PATH</key><string>{env_path}</string>\n'
+        '    </dict>\n'
+        f'    <key>StandardOutPath</key><string>{stdout_path}</string>\n'
+        f'    <key>StandardErrorPath</key><string>{stderr_path}</string>\n'
+        f'    <key>WorkingDirectory</key><string>{os.path.expanduser("~")}</string>\n'
+        '</dict>\n'
+        '</plist>\n'
+    )
+
+
+def _launchctl(*args: str) -> tuple[int, str, str]:
+    import subprocess
+    try:
+        proc = subprocess.run(["launchctl", *args],
+                              capture_output=True, text=True, timeout=10)
+        return proc.returncode, proc.stdout, proc.stderr
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return -1, "", str(e)
+
+
+def _cmd_install(args, cfg: Config) -> int:
+    if sys.platform != "darwin":
+        print("error: `install` is macOS-only (LaunchAgent); "
+              "for Linux run `browser-daemon serve` from a systemd-user "
+              "unit yourself for now", file=sys.stderr)
+        return 1
+    name = args.name or os.environ.get("BD_NAME") or "default"
+    label = f"{_LAUNCHAGENT_LABEL_PREFIX}{name}"
+    plist_path = _launchagent_plist_path(name)
+    if plist_path.exists() and not args.force:
+        print(f"error: {plist_path} already exists. "
+              f"Use --force to replace.", file=sys.stderr)
+        return 1
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    content = _build_plist(
+        label=label, name=name, backend=args.backend,
+        extension_port=args.extension_port,
+    )
+    # If --force and the plist exists, unload the old one first so launchctl
+    # picks up the new ProgramArguments cleanly.
+    if plist_path.exists():
+        _launchctl("unload", str(plist_path))
+    plist_path.write_text(content)
+    rc, _, err = _launchctl("load", "-w", str(plist_path))
+    if rc != 0:
+        print(f"error: launchctl load failed: {err.strip()}",
+              file=sys.stderr)
+        return 3
+    print(json.dumps({
+        "ok": True,
+        "name": name,
+        "label": label,
+        "plist": str(plist_path),
+        "backend": args.backend,
+        "extension_port": args.extension_port,
+    }, sort_keys=True))
+    return 0
+
+
+def _cmd_uninstall(args, cfg: Config) -> int:
+    if sys.platform != "darwin":
+        print("error: `uninstall` is macOS-only", file=sys.stderr)
+        return 1
+    name = args.name or os.environ.get("BD_NAME") or "default"
+    plist_path = _launchagent_plist_path(name)
+    if not plist_path.exists():
+        print(json.dumps({"ok": False, "name": name,
+                          "reason": "no LaunchAgent installed"},
+                         sort_keys=True))
+        return 0
+    rc, _, err = _launchctl("unload", str(plist_path))
+    # Even on unload failure (e.g. wasn't loaded), we still remove the plist.
+    plist_path.unlink()
+    payload = {"ok": True, "name": name, "removed": str(plist_path)}
+    if rc != 0 and err.strip():
+        payload["unload_warning"] = err.strip()
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def _cmd_list(args, cfg: Config) -> int:
+    from pathlib import Path
+    instances = []
+    # Installed LaunchAgents (macOS).
+    la_dir = _launchagent_dir()
+    if la_dir.exists():
+        for plist in sorted(la_dir.glob(f"{_LAUNCHAGENT_LABEL_PREFIX}*.plist")):
+            name = plist.stem[len(_LAUNCHAGENT_LABEL_PREFIX):]
+            running_pid = _ipc_ping(name)
+            instances.append({
+                "name": name,
+                "service": "launchagent",
+                "plist": str(plist),
+                "running": running_pid is not None,
+                "pid": running_pid,
+            })
+    # Also surface daemons reachable on a socket but NOT registered as
+    # LaunchAgents (manual `browser-daemon serve` invocations).
+    from . import _ipc
+    sock_dir = _ipc.sock_path("default").parent
+    seen_names = {i["name"] for i in instances}
+    if sock_dir.exists():
+        for sock in sorted(sock_dir.glob("browser-daemon-*.sock")):
+            stem = sock.stem  # e.g. "browser-daemon-myrepl"
+            name = stem[len("browser-daemon-"):]
+            if name in seen_names:
+                continue
+            running_pid = _ipc_ping(name)
+            if running_pid is None:
+                continue
+            instances.append({
+                "name": name,
+                "service": "manual",
+                "plist": None,
+                "running": True,
+                "pid": running_pid,
+            })
+    if args.json:
+        print(json.dumps({"instances": instances}, sort_keys=True))
+        return 0
+    if not instances:
+        print("no daemon instances found")
+        return 0
+    print(f"{'NAME':<20} {'SERVICE':<12} {'RUNNING':<8} {'PID':<8}")
+    for inst in instances:
+        running = "yes" if inst["running"] else "no"
+        pid = str(inst["pid"]) if inst["pid"] else "-"
+        print(f"{inst['name']:<20} {inst['service']:<12} {running:<8} {pid:<8}")
+    return 0
+
+
+def _ipc_ping(name: str) -> int | None:
+    """Tiny wrapper around ipc.ping_sync that swallows everything."""
+    try:
+        from . import _ipc
+        return _ipc.ping_sync(name, timeout=0.5)
+    except Exception:
+        return None
+
+
 _DISPATCH = {
     "url": _cmd_url,
     "doctor": _cmd_doctor,
@@ -771,10 +1066,15 @@ _DISPATCH = {
     "logs": _cmd_logs,
     # v0.5
     "stats": _cmd_stats,
+    "backend-info": _cmd_backend_info,
     # v0.5.4 — extension backend
     "attach-active": _cmd_attach_active,
     "open-background": _cmd_open_background,
     "close-tab": _cmd_close_tab,
+    # v0.5.5 — LaunchAgent service (macOS) so the daemon is long-running.
+    "install": _cmd_install,
+    "uninstall": _cmd_uninstall,
+    "list": _cmd_list,
 }
 
 
