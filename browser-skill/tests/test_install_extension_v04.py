@@ -3,7 +3,7 @@
 Skill mirrors the daemon's v0.4 ship without a Skill version bump:
 ``install.py`` probes ``browser-daemon doctor --json`` for an
 ``extension`` backend entry with ``available=true``. When present,
-wizard option 4 surfaces as live and the persisted preference becomes
+wizard option 3 surfaces as live and the persisted preference becomes
 ``daemon.preferred_backend = "extension"``.
 
 All tests are pure mocks — no real daemon, no real Chrome, no popup risk
@@ -122,7 +122,7 @@ def test_chrome_extension_path_returns_none_when_daemon_missing(monkeypatch):
     assert install.chrome_extension_path() is None
 
 
-# ---- wizard end-to-end (option 4) -----------------------------------
+# ---- wizard end-to-end (option 3) -----------------------------------
 
 
 def _drive_wizard(monkeypatch, inputs, *, ext_live=True, ext_dir=None):
@@ -153,8 +153,8 @@ def _drive_wizard(monkeypatch, inputs, *, ext_live=True, ext_dir=None):
 
 def test_wizard_choice_4_available_writes_preference(monkeypatch, tmp_bs_home,
                                                      capsys):
-    # inputs: choice=4, persist=y.
-    rc = _drive_wizard(monkeypatch, ["4", "y"], ext_live=True,
+    # inputs: choice=3, persist=y.
+    rc = _drive_wizard(monkeypatch, ["3", "y"], ext_live=True,
                        ext_dir="/opt/browser-daemon/chrome-extension")
     out = capsys.readouterr().out
     assert rc == 0
@@ -172,7 +172,7 @@ def test_wizard_choice_4_available_writes_preference(monkeypatch, tmp_bs_home,
 
 
 def test_wizard_choice_4_unavailable_blocks(monkeypatch, tmp_bs_home, capsys):
-    rc = _drive_wizard(monkeypatch, ["4"], ext_live=False, ext_dir=None)
+    rc = _drive_wizard(monkeypatch, ["3"], ext_live=False, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 1
     assert "Extension backend is not yet available" in out
@@ -189,7 +189,7 @@ def test_wizard_choice_4_available_no_path_falls_back_to_hint(monkeypatch,
                                                               capsys):
     # Wizard should still complete; just print the generic hint instead of
     # an absolute path.
-    rc = _drive_wizard(monkeypatch, ["4", "y"], ext_live=True, ext_dir=None)
+    rc = _drive_wizard(monkeypatch, ["3", "y"], ext_live=True, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 0
     assert "browser-daemon extension-path --json" in out
@@ -203,7 +203,7 @@ def test_wizard_extension_option_renders_as_coming_when_unavailable(monkeypatch,
     rc = _drive_wizard(monkeypatch, ["1", "n"], ext_live=False, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "coming v0.4 — not yet available" in out
+    assert "daemon reports extension backend not yet available" in out
 
 
 def test_wizard_extension_option_renders_live_when_available(monkeypatch,
@@ -212,6 +212,4 @@ def test_wizard_extension_option_renders_live_when_available(monkeypatch,
     rc = _drive_wizard(monkeypatch, ["1", "n"], ext_live=True, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "coming v0.4" not in out
-    # Live label still mentions the v0.4 tag.
-    assert "v0.4" in out
+    assert "daemon reports extension backend not yet available" not in out

@@ -93,7 +93,7 @@ def test_list_tabs_raises_on_extension_with_zero_ghosts(tmp_bs_home, monkeypatch
 
 
 def test_list_tabs_returns_empty_on_other_backend(tmp_bs_home, monkeypatch):
-    """On rdp/autoconnect/env an empty getTargets is legitimate. No raise."""
+    """On rdp/env an empty getTargets is legitimate. No raise."""
     from browser_skill.primitives import list_tabs
     _stub_session(monkeypatch, backend="rdp", targets=[])
     assert list_tabs() == []

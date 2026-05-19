@@ -1,5 +1,7 @@
 # browser-skill — Design
 
+> **历史说明（2026-05）**：原先的 `autoconnect` backend 已经彻底删除。要驱动用户日常 Chrome，请使用 `extension` backend。下文保留的 `autoconnect` 字眼属于历史决策记录，**不再反映当前实现**。
+
 本文是 Layer 2 (Skill) 的开发者视角设计文档。三层架构里：
 
 - **Layer 1 (Daemon)** — 按 Layer 2 提出的需求，提供 CDP WebSocket + 一组浏览器进程级原语。Skill 是它的客户，**Skill 的体验是 daemon 的 KPI**。daemon 实现细节见 `../browser-daemon/design.md` / `design-v2.md`。

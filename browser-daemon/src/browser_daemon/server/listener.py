@@ -436,10 +436,9 @@ class _UpstreamHolder:
                 logger.warning("drain pre-open buffers failed: %r", e)
 
     async def _open_chrome_upstream(self, cfg: Config) -> None:
-        # Mark this resolve as Mode-B-originated. The autoconnect backend
-        # uses this to bypass its rate-limit defense — Mode B holds one
-        # upstream ws across many client connections, so the popup-storm
-        # rationale doesn't apply.
+        # Mark this resolve as Mode-B-originated. Reserved for future
+        # backends that need to diverge per call site (Mode A short-conn
+        # vs Mode B long-running daemon).
         from .. import resolver as _resolver_mod
         ctx_token = _resolver_mod.caller_context.set("mode_b_serve")
         try:
@@ -454,8 +453,8 @@ class _UpstreamHolder:
 
         # v0.5: when backend=cloud, ask the cloud config's AuthProvider to
         # produce headers + ssl_context for the upstream ws handshake. For
-        # every other backend (env/rdp/autoconnect) the provider is None
-        # and connect runs unchanged.
+        # every other backend (env/rdp) the provider is None and connect
+        # runs unchanged.
         additional_headers: dict[str, str] = {}
         ssl_context = None
         if cfg.backend == "cloud":

@@ -1,5 +1,7 @@
 # browser-daemon — Design v2
 
+> **历史说明（2026-05）**：原先的 `autoconnect` backend（通过 Chrome `--remote-debugging-port=9222` 直连日常浏览器）已经彻底删除。要驱动用户日常 Chrome，请使用 `extension` backend。下文保留的 `autoconnect` 字眼属于历史决策记录，**不再反映当前实现**。
+
 **状态**：v1 draft，所有节实质内容已落。基于 `browser-skill/design.md` §D（Daemon ↔ Skill 边界）+ skill-architect 通过 SendMessage 签字的 US1-4 整合 + 双向澄清往返。每条 daemon 设计决策都 trace 回 §3 硬/软需求清单。
 
 > 历史参考：`./design.md`（v0，前一轮架构师笔记，结构性决策已被本文件覆盖，但 §2 实测约束源自该文件，物理事实不可变）；`./design-review.md`（旧版的逐节 critique，已退役，有用素材吸收到本文件附录 A/B）。

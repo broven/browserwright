@@ -89,8 +89,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_url.add_argument("--json", action="store_true", help="emit a JSON object instead of a bare URL")
     p_url.add_argument("--mode-b-proxy", action="store_true",
                        help="instead of upstream ws, output the daemon socket endpoint (v0.2)")
-    p_url.add_argument("--quiet", action="store_true",
-                       help="suppress the autoconnect popup-hazard stderr warning")
     _add_name(p_url)
 
     # serve (v0.2)
@@ -265,7 +263,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_common(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--backend", choices=names(),
-                    help="pin to one backend; otherwise the chain runs env -> rdp -> autoconnect")
+                    help="pin to one backend; otherwise the chain runs env -> rdp "
+                         "(extension and cloud require explicit --backend)")
     sp.add_argument("--timeout", type=float, default=None,
                     help="per-backend timeout in seconds (default 5)")
     sp.add_argument("--config", help="optional toml config path; otherwise reads BD_CONFIG")
@@ -308,25 +307,6 @@ def _run(coro):
 
 
 def _cmd_url(args, cfg: Config) -> int:
-    # P0 defense: warn loudly when the explicit `autoconnect` backend is
-    # selected for a Mode A short-conn — every call there triggers a Chrome
-    # popup and Chrome 144+ may freeze on accumulation. Skip when --quiet,
-    # --mode-b-proxy (Mode B doesn't actually open ws here), or when the
-    # backend wasn't explicitly chosen (auto chain — autoconnect comes last).
-    if (cfg.backend == "autoconnect"
-            and not getattr(args, "quiet", False)
-            and not getattr(args, "mode_b_proxy", False)):
-        print(
-            "WARNING: autoconnect path triggers Chrome's 'Allow remote "
-            "debugging' popup per ws handshake; Chrome 144+ may freeze on "
-            "accumulation. Consider `browser-daemon serve --backend "
-            "autoconnect` to reuse a single popup, or "
-            "`browser-daemon launch-chrome --port <N> --profile <P>` for "
-            "an isolated Chrome with zero popups. "
-            "Pass --quiet to suppress this warning.",
-            file=sys.stderr,
-        )
-
     # --mode-b-proxy → output the daemon socket endpoint, not an upstream URL.
     # (Spec §6.1: bare socket path on POSIX, host:port + token on Windows.)
     if getattr(args, "mode_b_proxy", False):

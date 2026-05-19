@@ -24,13 +24,13 @@ def test_global_set_preference_writes(tmp_bs_home, fresh_modules):
 def test_global_preference_history(tmp_bs_home, fresh_modules):
     from browser_skill.memory import global_memory, read_daemon_preferred_backend
 
+    global_memory().set_preference("daemon.preferred_backend", "rdp", confirm=False)
     global_memory().set_preference("daemon.preferred_backend", "extension", confirm=False)
-    global_memory().set_preference("daemon.preferred_backend", "autoconnect", confirm=False)
-    assert read_daemon_preferred_backend() == "autoconnect"
+    assert read_daemon_preferred_backend() == "extension"
     body = global_memory().read()
     daemon = body["frontmatter"]["daemon"]
     # old value preserved in notes (spec §C.3 exception clause).
-    assert "extension" in str(daemon.get("notes", ""))
+    assert "rdp" in str(daemon.get("notes", ""))
 
 
 def test_site_bootstrap_lazy_create(tmp_bs_home, fresh_modules):

@@ -1,4 +1,4 @@
-"""Interactive install wizard (spec §10 v0.1 install wizard, updated for #75).
+"""Interactive install wizard.
 
 Goal: walk a fresh user through the Chrome-source options the daemon
 supports and persist their pick into ``global.md`` so future Skill processes
@@ -6,19 +6,19 @@ auto-connect via the right backend.
 
 Choices (order matters — the default is option 1):
 
-  1. 隔离 profile (rdp + browser-daemon launch-chrome) — **Recommended**.
-     Zero popups, zero banner, doesn't touch the user's daily Chrome.
+  1. 隔离 profile (rdp + browser-daemon launch-chrome) — **Recommended for
+     scraping / dev work**. Zero popups, zero banner, doesn't touch the
+     user's daily Chrome.
   2. 指纹浏览器 (rdp + custom port) — AdsPower / MultiLogin / GoLogin /
      比特浏览器, etc. User supplies the port number.
-  3. 用日常 Chrome (autoconnect) — convenient but **dangerous on Chrome 144+**:
-     each new ws triggers an "Allow remote debugging?" popup and Chrome
-     accumulates these until it freezes (see chrome-popup-accumulation-bug).
-     We still expose it for power users who want one Chrome with `repl start`.
-  4. Browser extension relay — v0.4 placeholder. Surfaced as live only if
-     the daemon's ``doctor`` reports an ``extension`` backend available.
+  3. Browser extension relay — drive the user's daily Chrome without any
+     popups or banners. Requires loading the unpacked extension from
+     ``browser-daemon/chrome-extension/``. Surfaced as live when the
+     daemon's ``doctor`` reports the extension backend available.
+  4. Cloud / remote browser (Browser Use / Browserless / Hyperbrowser) —
+     hosted Chrome via auth provider.
 
-Detection is minimal in v0.1 — we ask the user. spec §11 has the proactive
-detection task on the v0.2 backlog.
+Detection is minimal — we ask the user.
 """
 from __future__ import annotations
 
@@ -41,16 +41,11 @@ _OPTIONS: list[Tuple[str, str, str, str]] = [
     ("2", "rdp",
      "指纹浏览器 (rdp + 自定义端口)",
      "AdsPower / MultiLogin / GoLogin / 比特浏览器 等；你已开好对应 profile。"),
-    ("3", "autoconnect",
-     "用日常 Chrome (autoconnect)  ⚠️ Chrome 144+ popup-accumulation risk",
-     "复用你日常的 Chrome；每次新 ws 弹一次 'Allow remote debugging'。\n"
-     "     Chrome 144+ 会累积这些 popup，超阈值可能冻结 Chrome。\n"
-     "     如果选这条，强烈建议立刻 `browser-skill repl start` 复用一条 ws。"),
-    ("4", "extension",
-     "Browser extension relay  (v0.4)",
-     "通过加载到 Chrome 的扩展中继 CDP，零 popup、零横幅；v0.4 实装中。"),
-    ("5", "cloud",
-     "Cloud/Remote browser (Browser Use / Browserless / Hyperbrowser)  (v0.5)",
+    ("3", "extension",
+     "Browser extension relay (drives your daily Chrome, no popup)",
+     "通过加载到 Chrome 的扩展中继 CDP，零 popup、零横幅；连接日常 Chrome 的唯一路径。"),
+    ("4", "cloud",
+     "Cloud/Remote browser (Browser Use / Browserless / Hyperbrowser)",
      "远程 Chrome 服务，通过 daemon 内置 AuthProvider 抽象处理 \n"
      "     Bearer / Basic / mTLS 鉴权。零本地 Chrome 进程。"),
 ]
@@ -358,19 +353,6 @@ def _write_daemon_cloud_config(provider_hint: str, auth_kind: str,
     return path
 
 
-def _wipe_autoconnect_warned_marker() -> None:
-    """Older builds dropped a ``.autoconnect_warned`` flag in $BS_HOME so the
-    inline auto-suggest only printed once. With #75 the inline path *aborts*
-    instead of warning, so the marker is meaningless — clean it up if the
-    user re-runs the wizard."""
-    home = os.path.expanduser(os.environ.get("BS_HOME", "~/.browser-skill"))
-    path = os.path.join(home, ".autoconnect_warned")
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
 _VALID_CLOUD_PROVIDERS = ("browser-use", "browserless", "hyperbrowser", "generic")
 _VALID_CLOUD_AUTH_KINDS = ("bearer", "basic", "mtls")
 # Auth kinds the wizard recognises by name but refuses (until shipped).
@@ -465,9 +447,9 @@ def run() -> int:
     print("browser-skill install wizard")
     print("=" * 32)
     print()
-    # Single shared doctor probe (spec H3 zero-side-effect contract). Both
-    # option 4 (extension) and option 5 (cloud) consume the same dict so
-    # the wizard pays at most one subprocess regardless of backend count.
+    # Single shared doctor probe (spec H3 zero-side-effect contract). Options
+    # 3 (extension) and 4 (cloud) consume the same dict so the wizard pays
+    # at most one subprocess regardless of backend count.
     backends = _wizard_doctor_backends()
     ext_live = _backend_available_from(backends, "extension")
     cloud_entry = _cloud_backend_entry(backends)
@@ -476,10 +458,10 @@ def run() -> int:
 
     print("Pick how Skill should connect to Chrome:")
     for key, _backend, label, desc in _OPTIONS:
-        if key == "4" and not ext_live:
-            shown_label = label.replace("(v0.4)", "(coming v0.4 — not yet available)")
-        elif key == "5" and not cloud_live:
-            shown_label = label.replace("(v0.5)", "(coming v0.5 — not yet available)")
+        if key == "3" and not ext_live:
+            shown_label = f"{label}  (daemon reports extension backend not yet available)"
+        elif key == "4" and not cloud_live:
+            shown_label = f"{label}  (daemon reports cloud backend not yet available)"
         else:
             shown_label = label
         print(f"  {key}. {shown_label}")
@@ -487,24 +469,24 @@ def run() -> int:
             print(f"     {ln}")
     print()
 
-    choice = _prompt("Choose 1 / 2 / 3 / 4 / 5", default="1")
+    choice = _prompt("Choose 1 / 2 / 3 / 4", default="1")
     match = next((o for o in _OPTIONS if o[0] == choice), None)
     if match is None:
         print(f"unknown choice: {choice!r}", file=sys.stderr)
         return 1
     _key, backend, label, _desc = match
 
-    if choice == "4" and not ext_live:
+    if choice == "3" and not ext_live:
         print()
         print("Extension backend is not yet available in your installed daemon.")
         print("Re-run this wizard after upgrading to a daemon build that ships")
-        print("the v0.4 extension backend, or pick option 1 / 2 / 3 for now.")
+        print("the extension backend, or pick option 1 / 2 / 4 for now.")
         return 1
-    if choice == "5" and not cloud_live:
+    if choice == "4" and not cloud_live:
         print()
         print("Cloud backend is not yet available in your installed daemon.")
         print("Re-run this wizard after upgrading to a daemon build that ships")
-        print("the v0.5 cloud backend, or pick option 1 / 2 / 3 / 4 for now.")
+        print("the cloud backend, or pick option 1 / 2 / 3 for now.")
         return 1
 
     extra_note = label
@@ -518,18 +500,7 @@ def run() -> int:
             return 1
         extra_note = f"{label}, port={port}"
 
-    if choice == "3":
-        print()
-        print("⚠️  autoconnect path accumulates Chrome 144+ Allow popups.")
-        print("    We strongly recommend running `browser-skill repl start`")
-        print("    immediately after install so subsequent calls re-use a")
-        print("    single long-lived ws. Inline heredoc on autoconnect will")
-        print("    refuse to run unless BS_FORCE_AUTOCONNECT_INLINE=1 is set.")
-        if not _yesno("Continue with autoconnect anyway?", default_yes=False):
-            print("aborted. Re-run the wizard and pick 1 / 2 / 4 / 5 if you like.")
-            return 0
-
-    if choice == "5":
+    if choice == "4":
         # Pre-fill prompts from doctor's ``extras`` when the daemon
         # already has a cloud config — re-running install shouldn't make
         # the user re-type unchanged fields.
@@ -580,7 +551,6 @@ def run() -> int:
     # everything cloud-relevant is co-located in one frontmatter section.
     for k, v in cloud_fields.items():
         mem.set_preference(f"daemon.{k}", v, confirm=False)
-    _wipe_autoconnect_warned_marker()
     print(f"wrote daemon.preferred_backend = {backend!r} to {mem.path}")
     if cloud_fields:
         # Daemon reads ``~/.config/browser-daemon/config.toml`` at
@@ -610,10 +580,6 @@ def run() -> int:
         print("  - Make sure your fingerprint browser is open on the chosen port.")
         print("  - Then `browser-skill repl start` (optional).")
     elif choice == "3":
-        print("  - Run `browser-skill repl start` once to share a long-lived ws.")
-        print("  - Inline heredoc remains blocked unless you set"
-              " BS_FORCE_AUTOCONNECT_INLINE=1.")
-    elif choice == "4":
         ext_dir = chrome_extension_path()
         print("  1. Install the unpacked Chrome extension:")
         if ext_dir:
@@ -634,7 +600,7 @@ def run() -> int:
         print("     Verify with: `browser-daemon doctor --json` →")
         print("     look for `extension` backend `available=true` + `ws_url` set.")
         print("  4. Then `browser-skill repl start` (optional but recommended).")
-    elif choice == "5":
+    elif choice == "4":
         provider = cloud_fields["cloud_provider_hint"]
         auth_kind = cloud_fields["cloud_auth_kind"]
         print("  1. Make sure `browser-daemon` v0.5+ (with cloud backend) is installed.")

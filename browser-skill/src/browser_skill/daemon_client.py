@@ -114,9 +114,8 @@ class DaemonClient:
         """
         cmd = [self._daemon_bin, "active-tab", "--json"]
         # ``active-tab`` opens a transient CDP ws on the upstream Chrome to
-        # learn the most-recent ``Target.activateTarget``. On a cold daemon
-        # with autoconnect that includes Chrome's Allow dialog wait, so 2s
-        # was too tight in practice.
+        # learn the most-recent ``Target.activateTarget``. 8s gives slow
+        # cold-start cases (e.g. first-time extension attach) headroom.
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
         except (FileNotFoundError, subprocess.TimeoutExpired):

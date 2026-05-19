@@ -160,15 +160,15 @@ def test_default_backend_toml_key_is_parsed(tmp_path, monkeypatch):
     wrote it expecting the auto chain to lock onto one backend, and
     instead saw it fall back as if no preference were set."""
     cfg_file = tmp_path / "c.toml"
-    cfg_file.write_text('default_backend = "autoconnect"\n')
+    cfg_file.write_text('default_backend = "extension"\n')
     cfg = load(env={"BD_CONFIG": str(cfg_file)})
-    assert cfg.backend == "autoconnect"
+    assert cfg.backend == "extension"
 
 
 def test_env_BD_BACKEND_overrides_toml_default_backend(tmp_path):
     """Precedence: BD_BACKEND env wins over toml default_backend."""
     cfg_file = tmp_path / "c.toml"
-    cfg_file.write_text('default_backend = "autoconnect"\n')
+    cfg_file.write_text('default_backend = "extension"\n')
     cfg = load(env={"BD_CONFIG": str(cfg_file), "BD_BACKEND": "rdp"})
     assert cfg.backend == "rdp"
 
@@ -176,7 +176,7 @@ def test_env_BD_BACKEND_overrides_toml_default_backend(tmp_path):
 def test_cli_backend_overrides_both_env_and_toml(tmp_path):
     """Precedence: CLI --backend wins over both BD_BACKEND and toml."""
     cfg_file = tmp_path / "c.toml"
-    cfg_file.write_text('default_backend = "autoconnect"\n')
+    cfg_file.write_text('default_backend = "extension"\n')
     cfg = load(
         env={"BD_CONFIG": str(cfg_file), "BD_BACKEND": "rdp"},
         cli_backend="env",
@@ -186,8 +186,8 @@ def test_cli_backend_overrides_both_env_and_toml(tmp_path):
 
 def test_default_backend_unset_keeps_auto_chain():
     """When nothing sets backend, cfg.backend stays None — resolver falls
-    back through env/rdp/autoconnect order. Sanity to make sure we didn't
-    accidentally default the backend to something."""
+    back through env/rdp order. Sanity to make sure we didn't accidentally
+    default the backend to something."""
     cfg = load(env={})
     assert cfg.backend is None
 
@@ -233,27 +233,7 @@ def test_bd_port_quiet_env_suppresses_deprecation_warning(capsys):
     assert "deprecated" not in captured.err.lower()
 
 
-# ---- v0.5.3 F-5: [backends.autoconnect].profile_paths + .relay_url -------
-
-
-def test_toml_autoconnect_profile_paths_is_parsed(tmp_path):
-    """README has advertised `[backends.autoconnect].profile_paths` since
-    v0.1 but parser silently ignored it. v0.5.3 parses + prepends to the
-    platform default list (so user-supplied paths take precedence)."""
-    cfg_file = tmp_path / "c.toml"
-    cfg_file.write_text("""\
-[backends.autoconnect]
-profile_paths = ["~/custom/chrome", "/tmp/other-chrome"]
-""")
-    cfg = load(env={"BD_CONFIG": str(cfg_file)})
-    assert cfg.backends.autoconnect.profile_paths == [
-        "~/custom/chrome", "/tmp/other-chrome",
-    ]
-
-
-def test_toml_autoconnect_profile_paths_default_empty():
-    cfg = load(env={})
-    assert cfg.backends.autoconnect.profile_paths == []
+# ---- v0.5.3 F-5: [backends.extension].relay_url --------------------------
 
 
 def test_toml_extension_relay_url_is_parsed(tmp_path):
@@ -282,34 +262,6 @@ relay_url = "ws://127.0.0.1:29988"
     backend = ExtensionBackend(cfg)
     assert backend._port == 29988  # noqa: SLF001 (test seam)
 
-
-def test_autoconnect_scan_prepends_custom_profile_paths(tmp_path, monkeypatch):
-    """End-to-end: a DevToolsActivePort under the user's custom profile_paths
-    must be found by `_scan_profiles`."""
-    from browser_daemon.backends import autoconnect as ac_mod
-    from pathlib import Path
-
-    custom = tmp_path / "custom-profile"
-    custom.mkdir()
-    port_file = custom / "DevToolsActivePort"
-    port_file.write_text("12345\n/devtools/browser/custom-uuid\n")
-
-    cfg_file = tmp_path / "c.toml"
-    cfg_file.write_text(f"""\
-[backends.autoconnect]
-profile_paths = [{str(custom)!r}]
-""")
-    cfg = load(env={"BD_CONFIG": str(cfg_file)})
-
-    # Stub platform defaults to NOT include the custom dir, proving the
-    # prepend is what reaches the scan.
-    monkeypatch.setattr(ac_mod, "profile_paths", lambda: [])
-    backend = ac_mod.AutoconnectBackend(cfg)
-    extras = backend._extra_paths()  # noqa: SLF001
-    assert custom in extras
-
-    scan = ac_mod._scan_profiles(extra=extras)
-    assert any(s.port == "12345" for s in scan)
 
 
 # ---- v0.5.3 Task #24: extension port precedence (CLI > env > toml port

@@ -20,32 +20,25 @@ ws://127.0.0.1:<port>/devtools/browser/<browser-id>
 
 `browser-daemon` 做的就是"无论你选哪种，告诉我 URL 长什么样"这件事，把发现/授权/fallback 逻辑封在一处。
 
-## ⚠️ Chrome 144+ Allow-popup accumulation hazard
+## Driving the user's daily Chrome
 
-The `autoconnect` backend (DevToolsActivePort path) triggers Chrome's "Allow remote debugging?" popup **every** new WebSocket handshake (Chrome 144+ has zero memory between connections — verified empirically in `../browser-connection.md`). Worse: **Chrome itself has a bug where accumulating popups past some internal threshold can freeze the browser process**.
-
-To protect users, the daemon does NOT trust developer discipline — it ships two layers of automatic defense:
-
-1. **Rate-limit** — successful `autoconnect` resolves are throttled to one per 60 seconds, persisted via a timestamp file under `$XDG_RUNTIME_DIR` (cross-invocation). A second `browser-daemon url --backend autoconnect` within the window raises a clear `Unavailable` with both alternatives spelled out.
-2. **Stderr warning** — `browser-daemon url --backend autoconnect` always prints a popup-hazard warning. Use `--quiet` only when you're sure you understand the trade-off (CI / known scripted flows).
-
-**Two supported paths for repeated work** (use these, not autoconnect short-conn):
+The legacy `autoconnect` backend (connect via Chrome's `--remote-debugging-port=9222` with the "Allow remote debugging?" popup-per-ws hazard on Chrome 144+) was removed in 2026-05. To drive the user's daily Chrome, use the **extension** backend:
 
 ```bash
-# Path A: Mode B long-running daemon — one popup per daemon lifetime, all
-# client connections share the same upstream ws.
-$ browser-daemon serve --backend autoconnect --name myrepl &
-$ browser-daemon url --name myrepl --mode-b-proxy   # ↦ /tmp/browser-daemon-myrepl.sock
+# 1. Load the unpacked extension once (browser-daemon ships it under chrome-extension/).
+$ browser-daemon extension-path --json    # prints the absolute path
+# In Chrome: chrome://extensions → toggle Developer mode → Load unpacked → pick that path.
 
-# Path B: Isolated Chrome on its own profile — zero popups, banner stays
-# off-screen because the spawned Chrome runs detached.
+# 2. Start the relay (typically as a LaunchAgent / systemd unit).
+$ browser-daemon serve --backend extension --name default
+```
+
+Zero popups, zero banner. For scripted work without touching the user's browser, prefer an isolated Chrome instead:
+
+```bash
 $ browser-daemon launch-chrome --port 9333 --profile dev --persistent
 ws://127.0.0.1:9333/devtools/browser/abc-...
 ```
-
-Autoconnect Mode A short-conn (`browser-daemon url --backend autoconnect`) is **interactive use only** — one-off CLI invocations where the user is in front of the screen and can dismiss popups deliberately. Never script it in a loop.
-
-**Expert escape hatch**: `BD_FORCE_AUTOCONNECT_RECONNECT=1` bypasses the rate-limit. Documented hazard: may freeze your Chrome.
 
 ## Quickstart
 
@@ -102,8 +95,7 @@ ws = subprocess.check_output(["browser-daemon", "url"], text=True).strip()
 |---|---|---|
 | `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析） | 1（最高） |
 | `rdp` | 假设 Chrome 启动时带了 `--remote-debugging-port=9222`，HTTP 探测 `/json/version` | 2 |
-| `autoconnect` | 扫描 Chrome user-data-dir 找 `DevToolsActivePort` 文件，再拼 ws URL | 3 |
-| `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**v0.4 起真实装**。 | 默认不在链中，需 `--backend extension` 显式选 |
+| `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**驱动用户日常 Chrome 的唯一路径**。 | 默认不在链中，需 `--backend extension` 显式选 |
 | `cloud` | 远程托管浏览器（Browser Use / Browserless / Hyperbrowser），daemon Mode B 自连 upstream ws 时按 AuthProvider 注入 `Authorization: Bearer ...` / mTLS client cert（v0.1 `env` backend 只能 URL-embedded token，所以专门拆这条）。**v0.5 起真实装**。 | 默认不在链中，需 `--backend cloud` 显式选 |
 
 ## v0.4 extension backend
@@ -250,7 +242,7 @@ $ browser-daemon stats --name myrepl --json | jq '.proxy_pre_open_overflow_total
 
 字段：`ts`（ISO-8601 UTC）、`level`、`logger`、`msg`，可选 `extra`（来自 `logger.info(..., extra={...})`）、可选 `exc_info`。
 
-无 `--backend` 时按 `env → rdp → autoconnect` 顺序尝试，第一个返回 URL 就用它。
+无 `--backend` 时按 `env → rdp` 顺序尝试，第一个返回 URL 就用它（`extension` 和 `cloud` 需要显式 `--backend` 选）。
 
 ## 配置（可选）
 
@@ -259,15 +251,10 @@ $ browser-daemon stats --name myrepl --json | jq '.proxy_pre_open_overflow_total
 ```toml
 # 覆盖默认 fallback chain 的首选 backend（与 `BD_BACKEND` 等价；
 # CLI `--backend` 仍最高优先级）
-default_backend = "autoconnect"
+default_backend = "extension"
 
 [backends.rdp]
 port = 9222
-
-[backends.autoconnect]
-# 自定义 Chrome user-data-dir。这些路径 **prepend** 到平台默认列表前，
-# 用户可以加非默认 profile dir 而不丢平台 default 覆盖
-profile_paths = ["~/Library/Application Support/Google/Chrome"]
 
 [backends.extension]
 # 覆盖 daemon 内 extension relay ws server 的绑定地址（默认 ws://127.0.0.1:19989）
@@ -299,8 +286,7 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_CHROME_BINARY` | 指定 Chrome 可执行文件路径（`launch-chrome` 用） |
 | `BD_IDLE_CLOSE_AFTER` | Mode B serve idle 关 upstream 的秒数；不设/≤0 = 永不 |
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
-| `BD_FORCE_AUTOCONNECT_RECONNECT` | 绕过 `autoconnect` 60s rate-limit（仅当你完全理解 Chrome 144+ 弹窗累积 hazard 时）|
-| `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias（v0.5.3 起）。**v0.4 popup-storm 根因防御**：之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
+| `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
 | `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988，但需要进一步避冲突（多 daemon 实例等）时用这个 |
 | `BD_CLOUD_ENDPOINT` / `BD_CLOUD_AUTH_KIND` / `BD_CLOUD_PROVIDER_HINT` | cloud backend 配置 env shortcut（v0.5 起），等价 `[backends.cloud].*` toml key |
 | `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE` | EXPERT ESCAPE：绕过 launch-chrome 拒绝用户 default profile 的 guard。truthy 值 `1`/`true`/`yes`/`on`/`y`（case-insensitive）unlock。**仅当你完全理解会永久暴露日常 Chrome 给 CDP popup hazard 时** |

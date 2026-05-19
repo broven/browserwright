@@ -59,11 +59,11 @@ class DaemonBackendMismatch(BrowserSkillError):
     """Mode-B daemon is alive but serving a different backend than the
     one the caller asked for / configured (REVIEW.md F-5d).
 
-    Surface case: a daemon was last started against ``autoconnect`` under
+    Surface case: a daemon was last started against ``extension`` under
     ``BD_NAME=foo``; the operator now wants ``rdp`` for that same name.
     Without an identity check, Skill would silently reuse the stale
-    daemon and hit the user's Chrome via autoconnect. This error makes
-    the mismatch loud + actionable.
+    daemon and target the wrong Chrome. This error makes the mismatch
+    loud + actionable.
     """
 
     exit_code = 2

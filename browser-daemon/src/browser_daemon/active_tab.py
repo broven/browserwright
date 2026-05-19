@@ -7,9 +7,9 @@ a fresh ws, runs `Target.getTargets`, picks the page target with the most-recent
 tab clicks (Chrome UI clicks don't fire CDP `Target.activateTarget`), and that
 limit is documented for the Skill.
 
-Caller-visible side effect: this opens a ws. On `autoconnect`, that means a
-popup, every call. The Skill is supposed to route around this via long-lived
-REPL daemon (see browser-skill design §A.5). This CLI is the fallback.
+Caller-visible side effect: this opens a ws. The Skill is supposed to route
+around per-call ws cost via the long-lived REPL daemon
+(see browser-skill design §A.5). This CLI is the fallback.
 """
 from __future__ import annotations
 

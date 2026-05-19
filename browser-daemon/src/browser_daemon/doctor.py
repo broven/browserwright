@@ -34,7 +34,6 @@ _UX_COST_RANK = {
     "none": 0,
     "banner": 1,
     "extension-permission": 2,
-    "popup-per-ws+banner": 3,
 }
 
 
@@ -134,8 +133,8 @@ def _asdict(r) -> dict:
 def _pick_recommended(entries: list[dict]) -> str | None:
     """Pick the available backend with the lowest UX cost.
 
-    Tie-break: registry order (env before rdp before autoconnect, then
-    extension, then cloud) via Python's stable `min`.
+    Tie-break: registry order (env before rdp before extension, then cloud)
+    via Python's stable `min`.
 
     v0.5.3 REVIEW.md F-10: dropped the `!= "extension"` exclusion. v0.1 had
     it because extension was hard-coded `available=false`; v0.4 shipped the
@@ -166,9 +165,6 @@ def _needs_action(backend_name: str) -> str | None:
         to the v0.4-shipped install path.
       - `cloud` row added (v0.5 ship — was missing entirely).
     """
-    if backend_name == "autoconnect":
-        return ("first time: tick chrome://inspect/#remote-debugging checkbox then accept "
-                "the Allow popup")
     if backend_name == "env":
         return "set BD_CDP_WS or BD_CDP_URL to your CDP endpoint"
     if backend_name == "rdp":
@@ -176,8 +172,8 @@ def _needs_action(backend_name: str) -> str | None:
     if backend_name == "extension":
         return ("load the unpacked extension from browser-daemon/chrome-extension/ "
                 "(chrome://extensions/ → enable Developer mode → Load unpacked); "
-                "or run `browser-skill install` option 4")
+                "or run `browser-skill install` option 3")
     if backend_name == "cloud":
         return ("configure [backends.cloud] in config.toml (endpoint + auth_kind + "
-                "auth subtable); or run `browser-skill install` option 5")
+                "auth subtable); or run `browser-skill install` option 4")
     return None

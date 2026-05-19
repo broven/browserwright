@@ -5,19 +5,6 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _disable_production_hardening_by_default(monkeypatch):
-    """v0.5.0 (F-4b): production hardening is on by default for real
-    users but off for tests — the suite drives CLI entry points and
-    inline runs through mocked transports, so the port-9222 listener
-    and daemon-url checks would tip false-positive on dev boxes where
-    Chrome is already running. Tests that *want* to exercise hardening
-    (``tests/test_p0_hardening.py``) flip ``BS_PRODUCTION_HARDENING``
-    back on explicitly via ``monkeypatch.setenv``.
-    """
-    monkeypatch.setenv("BS_PRODUCTION_HARDENING", "0")
-
-
 @pytest.fixture
 def tmp_bs_home(tmp_path, monkeypatch):
     """Reset the global_memory singleton to a tmp_path-rooted home.

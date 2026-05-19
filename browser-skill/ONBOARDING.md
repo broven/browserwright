@@ -31,17 +31,20 @@ Are you running scripted / iterative tests?
 ├── yes → use the isolated profile (wizard option 1 — recommended).
 │         `browser-daemon launch-chrome --port 9333 --profile /tmp/bs-dev`
 │         then `BD_PORT=9333 BD_BACKEND=rdp browser-skill ...`
-└── no → are you doing a one-off live verify against real Chrome?
-        ├── yes → use option 3 (autoconnect) once, then `browser-skill
-        │         repl start` so subsequent calls reuse the ws.
+└── no → are you driving the user's daily Chrome?
+        ├── yes → option 3 (extension backend) — load the unpacked relay
+        │         extension once; subsequent calls reuse the same ws,
+        │         zero popups.
         └── do you have a special browser source?
             ├── fingerprint browser (AdsPower / MultiLogin / GoLogin /
             │   比特浏览器) → option 2, supply the port your tool exposes
-            ├── unpacked Chrome extension → option 4 (v0.4 extension
-            │   backend; daemon ships an unpacked extension dir)
             └── cloud / remote Chrome (Browser Use, Browserless,
-                Hyperbrowser, generic CDP-compatible) → option 5 (v0.5)
+                Hyperbrowser, generic CDP-compatible) → option 4
 ```
+
+> The legacy `autoconnect` backend (Chrome `--remote-debugging-port=9222`
+> with the per-ws Allow popup) was removed in 2026-05. `extension` is the
+> only path that drives the user's daily Chrome.
 
 The install wizard codifies this same decision tree —
 `browser-skill install` and answer the prompts.
@@ -67,7 +70,6 @@ src/browser_skill/
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
 tests/
-├── test_autoconnect_inline_abort.py     P0 #75 gate (12 tests)
 ├── test_install_extension_v04.py        v0.4 wizard wire (12 tests)
 ├── test_install_cloud_v05.py            v0.5 cloud wizard + config writer (17 tests)
 ├── test_e2e_bugs_v031.py                4 AI-E2E bug regressions (22 tests)
@@ -144,7 +146,7 @@ follow.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `inline heredoc exits with code 2 + "Refusing..."` | autoconnect backend + no shared ws | `browser-skill repl start` OR set `BS_FORCE_AUTOCONNECT_INLINE=1` for one-off CI |
+| `inline heredoc fails with `Target.createTarget requires sessionId in extension backend`` | `new_tab()` doesn't support the extension backend | use `open_background(url)` or `attach_active()` to bind to an existing tab; or run against `BD_BACKEND=rdp` with an isolated profile |
 | `memory show --site=news.ycombinator.com` returns empty but bundled dir exists | pre-v0.3.1 user-written `~/.browser-skill/site-skills/news/` shadowing the eTLD+1 stem | The `_read_candidates()` fallback should pick it up automatically; if not, run `browser-skill index rebuild` |
 | `solidify(...)` raises `AttributeError: 'str' has no attribute 'items'` | args-schema is flat (`{"q": "str"}`) | Use the dict shape: `{"q": {"type": "str", "required": True}}` — `_validate_args_schema` rejects the flat form with a clear `ValueError` in v0.3.1+ |
 | `propose_solidify()` returns a dict with `ready: False` but agent expected None | v0.3.1 changed the contract — `propose_solidify` always returns a dict now, check `out["ready"]` and surface `out["reasons"]` / `out["warnings"]` to the user | this is correct behaviour, not a bug |

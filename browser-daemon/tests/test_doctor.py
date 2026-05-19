@@ -24,7 +24,7 @@ EXPECTED_BACKEND_KEYS = {
     "ux_warning", "needs_user_action", "ux_cost", "extras",
 }
 EXPECTED_TOP_KEYS = {"schema_version", "recommended", "backends"}
-KNOWN_UX_COSTS = {"none", "banner", "popup-per-ws+banner",
+KNOWN_UX_COSTS = {"none", "banner",
                   "extension-permission", "auth-required"}
 
 
@@ -48,7 +48,7 @@ async def test_doctor_every_backend_has_full_key_set(monkeypatch):
     _patch_all_unavailable(monkeypatch)
     out = await doctor_mod.doctor(load(env={}))
     seen_names = {entry["name"] for entry in out["backends"]}
-    assert seen_names == {"env", "rdp", "autoconnect", "extension", "cloud"}
+    assert seen_names == {"env", "rdp", "extension", "cloud"}
     for entry in out["backends"]:
         assert set(entry.keys()) == EXPECTED_BACKEND_KEYS, (
             f"backend {entry['name']!r} schema drift: {set(entry.keys()) ^ EXPECTED_BACKEND_KEYS}"
@@ -58,13 +58,13 @@ async def test_doctor_every_backend_has_full_key_set(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_doctor_recommended_picks_lowest_ux_cost(monkeypatch):
-    """When both rdp (none) and autoconnect (popup) are available, rdp wins."""
+    """When both rdp (none) and extension (extension-permission) are
+    available, rdp wins on ux-cost rank."""
     _patch_each(monkeypatch, {
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
-        "autoconnect": DoctorResult("autoconnect", available=True, ux_cost="popup-per-ws+banner"),
-        "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
-        "cloud":       DoctorResult("cloud", available=False, ux_cost="none"),
+        "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
+        "cloud":       DoctorResult("cloud", available=False, ux_cost="auth-required"),
     })
     out = await doctor_mod.doctor(load(env={}))
     assert out["recommended"] == "rdp"
@@ -117,14 +117,13 @@ async def test_doctor_backend_filter_keeps_full_shape(monkeypatch):
     _patch_each(monkeypatch, {
         "env":         DoctorResult("env", available=True, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
-        "autoconnect": DoctorResult("autoconnect", available=True, ux_cost="popup-per-ws+banner"),
         "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
         "cloud":       DoctorResult("cloud", available=False, ux_cost="none"),
     })
     out = await doctor_mod.doctor(load(env={}), backend="rdp")
     # all 5 backends still appear, but the non-rdp ones say "skipped"
     names = {e["name"] for e in out["backends"]}
-    assert names == {"env", "rdp", "autoconnect", "extension", "cloud"}
+    assert names == {"env", "rdp", "extension", "cloud"}
     other_entries = [e for e in out["backends"] if e["name"] != "rdp"]
     for e in other_entries:
         assert e["available"] is False
@@ -138,7 +137,6 @@ def _patch_all_unavailable(monkeypatch):
     _patch_each(monkeypatch, {
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=False, ux_cost="none"),
-        "autoconnect": DoctorResult("autoconnect", available=False, ux_cost="popup-per-ws+banner"),
         "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
         "cloud":       DoctorResult("cloud", available=False, ux_cost="none"),
     })
@@ -163,7 +161,7 @@ def _patch_each(monkeypatch, probes: dict[str, DoctorResult]):
             raise AssertionError("doctor should never call resolve()")
 
     stubs = [_Stub(probes[name]) for name in
-             ["env", "rdp", "autoconnect", "extension", "cloud"]]
+             ["env", "rdp", "extension", "cloud"]]
     monkeypatch.setattr(doctor_mod, "all_backends", lambda cfg: stubs)
 
 
@@ -178,7 +176,6 @@ async def test_recommended_picks_extension_when_only_one_available(monkeypatch):
     _patch_each(monkeypatch, {
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=False, ux_cost="none"),
-        "autoconnect": DoctorResult("autoconnect", available=False, ux_cost="popup-per-ws+banner"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
         "cloud":       DoctorResult("cloud", available=False, ux_cost="auth-required"),
     })
@@ -193,7 +190,6 @@ async def test_recommended_rdp_still_beats_extension_on_ux_cost(monkeypatch):
     _patch_each(monkeypatch, {
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
-        "autoconnect": DoctorResult("autoconnect", available=False, ux_cost="popup-per-ws+banner"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
         "cloud":       DoctorResult("cloud", available=False, ux_cost="auth-required"),
     })

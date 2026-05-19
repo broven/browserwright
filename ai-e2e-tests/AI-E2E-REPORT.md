@@ -1,5 +1,7 @@
 # AI E2E Report — browser-skill vs. design.md §0
 
+> **历史说明（2026-05）**：本报告写于 `autoconnect` backend 还在的版本，下文 `autoconnect` 引用属于历史快照，**不再反映当前实现**。当前驱动日常 Chrome 走 `extension` backend。
+
 **Latest runs:**
 - v0.3 baseline (`AI-E2E-REPORT.auto.md`, `transcripts/US*.json`) — 2026-05-18, 4/4 PASS
 - **v0.3.1 + daemon 0.4.1 re-run** (`AI-E2E-REPORT.rerun.auto.md`,

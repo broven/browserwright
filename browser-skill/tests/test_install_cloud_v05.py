@@ -113,7 +113,7 @@ def test_menu_shows_cloud_as_coming_when_unavailable(monkeypatch, tmp_bs_home,
     rc = _drive_wizard(monkeypatch, ["1", "n"], cloud_live=False)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "coming v0.5 — not yet available" in out
+    assert "daemon reports cloud backend not yet available" in out
 
 
 def test_menu_shows_cloud_as_live_when_available(monkeypatch, tmp_bs_home,
@@ -121,13 +121,13 @@ def test_menu_shows_cloud_as_live_when_available(monkeypatch, tmp_bs_home,
     rc = _drive_wizard(monkeypatch, ["1", "n"], cloud_live=True)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "coming v0.5" not in out
+    assert "daemon reports cloud backend not yet available" not in out
     assert "Cloud/Remote browser" in out
 
 
 def test_choice_5_blocked_when_cloud_unavailable(monkeypatch, tmp_bs_home,
                                                   capsys):
-    rc = _drive_wizard(monkeypatch, ["5"], cloud_live=False)
+    rc = _drive_wizard(monkeypatch, ["4"], cloud_live=False)
     out = capsys.readouterr().out
     assert rc == 1
     assert "Cloud backend is not yet available" in out
@@ -145,9 +145,9 @@ def test_wizard_choice_5_bearer_flow_writes_references(monkeypatch,
                                                         tmp_bs_home,
                                                         tmp_path,
                                                         capsys):
-    # inputs: choice=5, provider, auth_kind, envvar, endpoint, persist=y
+    # inputs: choice=4, provider, auth_kind, envvar, endpoint, persist=y
     inputs = [
-        "5",                    # menu choice
+        "4",                    # menu choice
         "browser-use",          # provider
         "bearer",               # auth_kind
         "BROWSER_USE_API_KEY",  # bearer env-var name
@@ -200,7 +200,7 @@ def test_wizard_choice_5_basic_flow_writes_env_var_refs(monkeypatch,
     ``password_env`` from ``[backends.cloud.auth.basic]``. The wizard
     collects the env-var **names**, never the secret itself."""
     inputs = [
-        "5",
+        "4",
         "browserless",
         "basic",
         "BROWSERLESS_USER",                          # username_env name
@@ -244,7 +244,7 @@ def test_wizard_choice_5_basic_rejects_url_with_embedded_creds(monkeypatch,
     ``embed_in_url=true`` territory and would put the secret in
     Skill memory — wizard refuses and points at env-var names."""
     inputs = [
-        "5",
+        "4",
         "browserless",
         "basic",
         "BROWSERLESS_USER",
@@ -273,7 +273,7 @@ def test_wizard_choice_5_mtls_flow_writes_cert_and_key_paths(monkeypatch,
     to write ``cert_path``/``key_path``; that was a guess from the
     forward-prep era and is fixed in this release."""
     inputs = [
-        "5",
+        "4",
         "hyperbrowser",
         "mtls",
         "/opt/certs/client.crt",
@@ -302,7 +302,7 @@ def test_wizard_choice_5_mtls_flow_writes_cert_and_key_paths(monkeypatch,
 
 def test_wizard_choice_5_rejects_unknown_provider(monkeypatch, tmp_bs_home,
                                                   capsys):
-    rc = _drive_wizard(monkeypatch, ["5", "bogus-provider"], cloud_live=True)
+    rc = _drive_wizard(monkeypatch, ["4", "bogus-provider"], cloud_live=True)
     err = capsys.readouterr().err
     assert rc == 1
     assert "unknown provider" in err
@@ -311,7 +311,7 @@ def test_wizard_choice_5_rejects_unknown_provider(monkeypatch, tmp_bs_home,
 
 def test_wizard_choice_5_rejects_unknown_auth_kind(monkeypatch, tmp_bs_home,
                                                    capsys):
-    rc = _drive_wizard(monkeypatch, ["5", "browser-use", "totp"],
+    rc = _drive_wizard(monkeypatch, ["4", "browser-use", "totp"],
                        cloud_live=True)
     err = capsys.readouterr().err
     assert rc == 1
@@ -527,7 +527,7 @@ def test_wizard_choice_5_oauth2_rejected_as_coming_v06(monkeypatch,
     is v0.6 work. The wizard must reject with a version-specific hint
     instead of a generic "unknown auth_kind" so the user knows when to
     expect it."""
-    inputs = ["5", "browser-use", "oauth2"]
+    inputs = ["4", "browser-use", "oauth2"]
     rc = _drive_wizard(monkeypatch, inputs, cloud_live=True)
     err = capsys.readouterr().err
     assert rc == 1
@@ -556,7 +556,7 @@ def test_wizard_prefills_from_doctor_extras(monkeypatch, tmp_bs_home,
     }
     # User presses Enter through every prompt to accept the defaults
     # (provider, auth_kind, envvar, endpoint), then confirms persist.
-    inputs = ["5", "", "", "", "", "y"]
+    inputs = ["4", "", "", "", "", "y"]
     rc = _drive_wizard(monkeypatch, inputs, cloud_live=True,
                        cloud_extras=extras, tmp_path=tmp_path)
     out = capsys.readouterr().out

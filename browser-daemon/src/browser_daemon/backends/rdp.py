@@ -162,7 +162,7 @@ def _find_matching_profile(want_port: int) -> Path | None:
     """Walk PROFILES, return the first whose DevToolsActivePort line 1 == want_port
     AND whose line 2 is a non-empty ws path.
 
-    Multiple matches → mtime-newest, mirroring autoconnect's tie-break.
+    Multiple matches → mtime-newest.
     """
     matches: list[tuple[float, Path]] = []
     for base in profile_paths():

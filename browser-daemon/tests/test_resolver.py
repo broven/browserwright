@@ -61,7 +61,6 @@ async def test_fallback_skips_unavailable_to_next(monkeypatch):
         _StubBackend("env", exc=Unavailable("BD_CDP_WS not set",
                                             attempts={"env": "no env var"})),
         _StubBackend("rdp", result=ResolveResult(ws_url="ws://rdp/", backend="rdp")),
-        _StubBackend("autoconnect", exc=Unavailable("nope")),
     ]
     _patch_chain(monkeypatch, chain)
     res = await resolver_mod.resolve(load(env={}))
@@ -73,12 +72,11 @@ async def test_all_unavailable_aggregates_attempts(monkeypatch):
     chain = [
         _StubBackend("env", exc=Unavailable("e", attempts={"env": "e why"})),
         _StubBackend("rdp", exc=Unavailable("r", attempts={"rdp": "r why"})),
-        _StubBackend("autoconnect", exc=Unavailable("a", attempts={"autoconnect": "a why"})),
     ]
     _patch_chain(monkeypatch, chain)
     with pytest.raises(Unavailable) as exc:
         await resolver_mod.resolve(load(env={}))
-    assert set(exc.value.attempts.keys()) >= {"env", "rdp", "autoconnect"}
+    assert set(exc.value.attempts.keys()) >= {"env", "rdp"}
 
 
 @pytest.mark.asyncio
@@ -114,7 +112,6 @@ async def test_extension_skipped_in_auto_chain(monkeypatch):
     chain = [
         _StubBackend("env", result=res_marker),
         _StubBackend("rdp"),
-        _StubBackend("autoconnect"),
         _StubBackend("extension", exc=Unavailable("not in v0.1")),
     ]
     _patch_chain(monkeypatch, chain)

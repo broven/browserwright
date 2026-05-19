@@ -49,7 +49,7 @@ def test_list_backends_json_shape():
 
     assert data["schema_version"] == SCHEMA_VERSION
     names = {b["name"] for b in data["backends"]}
-    assert names == {"env", "rdp", "autoconnect", "extension", "cloud"}
+    assert names == {"env", "rdp", "extension", "cloud"}
 
 
 def test_doctor_json_schema_v1():
@@ -77,8 +77,7 @@ def test_url_with_bd_cdp_ws_outputs_bare_url():
 
 
 def test_url_no_backend_available_exit_code_2():
-    """No env var, no Chrome on 9222, no autoconnect profile (we use an empty
-    HOME via env override to force that)."""
+    """No env var, no Chrome on 9222 — empty HOME via env override."""
     code, out, err = _run(
         ["url", "--backend", "env"],
         env_overrides={"BD_CDP_WS": "", "BD_CDP_URL": ""},
@@ -96,65 +95,6 @@ def test_unknown_backend_exit_code_1():
     # `--backend` is a `choices=` argument so it shortcircuits at parse time.
     assert code == 2
     assert "totally-fake" in (out + err)
-
-
-# Patch B warning prefix — we assert on this exact substring so the test
-# stays robust against the rate-limit error message (which Patch A formats
-# differently and which uses overlapping vocabulary).
-_PATCH_B_PREFIX = "WARNING: autoconnect path triggers"
-
-
-def _isolated_runtime_dir(tmp_dir_root: str = "/tmp") -> str:
-    """Each CLI test gets a fresh XDG_RUNTIME_DIR so the autoconnect
-    timestamp file (Patch A) doesn't leak between tests."""
-    import tempfile
-    return tempfile.mkdtemp(prefix="bd-cli-", dir=tmp_dir_root)
-
-
-def test_url_explicit_autoconnect_emits_stderr_warning():
-    """P0 defense Patch B: `url --backend autoconnect` warns about popup
-    accumulation on stderr. The warning fires BEFORE the resolve attempt,
-    so it's always visible regardless of whether Chrome is reachable.
-    """
-    rt = _isolated_runtime_dir()
-    code, out, err = _run(
-        ["url", "--backend", "autoconnect"],
-        env_overrides={"XDG_RUNTIME_DIR": rt,
-                       # Force-bypass rate-limit so this test focuses on
-                       # the Patch B warning, not Patch A's behavior.
-                       "BD_FORCE_AUTOCONNECT_RECONNECT": "1"},
-    )
-    assert _PATCH_B_PREFIX in err, \
-        f"missing Patch B warning prefix in stderr: {err!r}"
-
-
-def test_url_explicit_autoconnect_quiet_suppresses_warning():
-    """--quiet must hide the Patch B warning. Rate-limit errors (Patch A)
-    can still appear — they're orthogonal."""
-    rt = _isolated_runtime_dir()
-    code, out, err = _run(
-        ["url", "--backend", "autoconnect", "--quiet"],
-        env_overrides={"XDG_RUNTIME_DIR": rt,
-                       "BD_FORCE_AUTOCONNECT_RECONNECT": "1"},
-    )
-    assert _PATCH_B_PREFIX not in err, \
-        f"--quiet should suppress Patch B warning: {err!r}"
-
-
-def test_url_auto_chain_no_warning_when_not_explicit():
-    """Patch B warning fires ONLY on `--backend autoconnect`. Without
-    --backend, the resolver auto-chain might fall through to autoconnect —
-    but the user didn't explicitly opt in, so the explicit warning would
-    be noise (env / rdp / autoconnect cascade is the default flow).
-    """
-    rt = _isolated_runtime_dir()
-    code, out, err = _run(
-        ["url"],
-        env_overrides={"XDG_RUNTIME_DIR": rt,
-                       "BD_FORCE_AUTOCONNECT_RECONNECT": "1"},
-    )
-    assert _PATCH_B_PREFIX not in err, \
-        f"auto-chain should not emit explicit-autoconnect warning: {err!r}"
 
 
 # ---- LaunchAgent install (v0.5.5) ----------------------------------------

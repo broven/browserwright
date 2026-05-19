@@ -17,7 +17,7 @@ An AI-agent–friendly stack for driving a real Chrome from the terminal over CD
 
 Chrome 144+ fires an "Allow remote debugging?" popup for **every** new CDP WebSocket on the default profile, and **accumulating popups can freeze Chrome**. See `browser-connection.md` for the field notes.
 
-**Never** loop autoconnect against your daily Chrome. The default install path uses an isolated Chrome profile (see §Usage below); the daemon also enforces a 60-second rate-limit on autoconnect as a backstop.
+That's why the legacy `autoconnect` backend (which connected via Chrome's `--remote-debugging-port=9222`) was removed in 2026-05. To drive your daily Chrome, use the `extension` backend — load the unpacked relay extension once and the daemon talks to Chrome through it, zero popups. For scripted work, use an isolated Chrome profile (the default install path).
 
 ## Prerequisites
 
@@ -87,8 +87,8 @@ wait_for_load()
 print(page_info())
 PY
 
-# (b) Long-lived REPL — long sessions, autoconnect-friendly
-browser-skill repl start                      # one popup if autoconnect, then none
+# (b) Long-lived REPL — long sessions, single shared upstream ws
+browser-skill repl start
 browser-skill exec 'print(page_info())'
 browser-skill exec 'click_at_xy(120, 240)'
 browser-skill repl status
@@ -105,9 +105,8 @@ browser-skill task wikipedia.org/lookup --title="Wikipedia"
 | Scenario | Backend | How |
 |---|---|---|
 | Scripts / iterative work *(default)* | `rdp` + isolated Chrome | `browser-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=rdp` |
-| Your daily Chrome | `autoconnect` + `repl start` | one popup, then reuse ws |
+| Your daily Chrome | `extension` | `browser-daemon serve --backend extension` + load `browser-daemon/chrome-extension/` once; zero popups |
 | Fingerprint browser (AdsPower / MultiLogin / 比特浏览器) | `rdp` | point `BD_PORT` at the tool's exposed port |
-| Zero popups via Chrome extension | `extension` | `browser-daemon serve --backend extension` + load `browser-daemon/chrome-extension/` |
 | Remote Chrome (Browser Use / Browserless / Hyperbrowser) | `cloud` | `browser-daemon serve --backend cloud --provider <name>` + auth env vars |
 
 Interactive wizard: `browser-skill install` — walks the decision tree and writes your pick to `~/.browser-skill/global.md`.

@@ -2,6 +2,8 @@
 
 本文是开发者视角的设计文档。用户视角看 [README.md](./README.md)。
 
+> **历史说明（2026-05）**：原先的 `autoconnect` backend（通过 Chrome `--remote-debugging-port=9222` 直连日常浏览器，每次新 ws 会弹一次"Allow remote debugging?"）已经彻底删除。要驱动用户日常 Chrome，请使用 `extension` backend — 一次加载未打包扩展之后零 popup。下文中保留的 `autoconnect` 字眼属于历史决策记录，**不再反映当前实现**。
+
 ## 1. 目标 / 非目标
 
 ### 目标

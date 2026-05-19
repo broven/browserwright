@@ -42,7 +42,7 @@ async def test_connecting_to_connected_records_ws_url():
 @pytest.mark.asyncio
 async def test_set_connected_with_popup_records_resolved_at():
     s = _state()
-    await s.begin_connecting("autoconnect")
+    await s.begin_connecting("rdp")
     before = time.time()
     await s.set_connected("ws://chrome/x", was_popup=True)
     assert s.last_popup_resolved_at is not None

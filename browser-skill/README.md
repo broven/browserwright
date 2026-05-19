@@ -29,18 +29,12 @@ The console script `browser-skill` is registered automatically. The daemon
 ## Usage
 
 ```bash
-# inline heredoc (zero ceremony) — INTERACTIVE USE ONLY on autoconnect.
-# Skill aborts the heredoc with exit 2 when the daemon would pick the
-# autoconnect backend, because each call would fire a Chrome Allow popup
-# and Chrome 144+ accumulates those popups until it freezes. Use one of
-# the alternatives below instead, or set BS_FORCE_AUTOCONNECT_INLINE=1
-# if you really know what you're doing.
+# inline heredoc (zero ceremony) — works with any backend.
 browser-skill <<'PY'
 print(page_info())
 PY
 
-# Long-lived REPL daemon — the canonical autoconnect-friendly path.
-# One popup at `repl start`, then zero for the rest of the session.
+# Long-lived REPL daemon — single shared upstream ws for the whole session.
 browser-skill repl start
 browser-skill exec "print(page_info())"
 browser-skill repl stop
@@ -52,10 +46,16 @@ BD_PORT=9333 BD_BACKEND=rdp browser-skill <<'PY'
 print(page_info())
 PY
 
+# Extension backend — drives the user's daily Chrome via the unpacked
+# relay extension, zero popups. See ../browser-daemon/README.md for setup.
+BD_BACKEND=extension browser-skill <<'PY'
+print(page_info())
+PY
+
 # task invocation:
 browser-skill task wikipedia.org/lookup --title="Wikipedia"
 
-# install wizard (defaults to isolated profile; autoconnect is gated):
+# install wizard (defaults to isolated profile):
 browser-skill install
 
 # daemon health:
@@ -127,15 +127,9 @@ user with that dialog. Two safe paths:
    and grab the ws URL from `http://127.0.0.1:9333/json/version`.
 
 2. **One-shot live "does it actually work" verify against the user's real
-   Chrome** is fine — but the user is asked to click Allow once and then
-   `browser-skill repl start` so the next N calls reuse the ws.
-
-The inline heredoc **refuses to run** with exit code 2 when the daemon would
-pick the autoconnect backend (or any backend whose `ux_cost` mentions
-`popup`) and no Mode B socket or Skill REPL daemon is available to absorb
-the cost. The error message points the agent at `browser-skill repl start`
-or `browser-daemon launch-chrome --profile …`. Escape hatch:
-`BS_FORCE_AUTOCONNECT_INLINE=1` (one-off CI smoke tests, etc.).
+   Chrome** uses the `extension` backend — load the unpacked relay
+   extension once and subsequent calls all reuse the same upstream ws,
+   zero popups.
 
 ## v0.4 — Browser-extension relay (zero popups, zero banner)
 
@@ -143,7 +137,7 @@ or `browser-daemon launch-chrome --profile …`. Escape hatch:
 through the extension's `chrome.debugger` permission. It bypasses both the
 "Allow remote debugging?" popup and the persistent CDP banner because the
 extension itself holds the debugger handle. The Skill side is wired through
-`browser-skill install` option 4; the daemon side requires Mode B
+`browser-skill install` option 3; the daemon side requires Mode B
 (`browser-daemon serve --backend extension`).
 
 End-to-end setup (run once, then forget it):
@@ -167,14 +161,14 @@ print(page_info())
 PY
 
 # 5. Persist the preference so future installs / agents keep using extension:
-browser-skill install   # → choose 4
+browser-skill install   # → choose 3
 ```
 
 `browser-daemon doctor --json` lists the extension backend with
-`available=true` once the relay is alive. The Skill install wizard's option 4
-auto-flips from "coming v0.4 — not yet available" to live based on that
-doctor signal — no Skill release required to surface a freshly-shipped
-daemon backend.
+`available=true` once the relay is alive. The Skill install wizard's option 3
+auto-flips from "(daemon reports extension backend not yet available)" to
+live based on that doctor signal — no Skill release required to surface a
+freshly-shipped daemon backend.
 
 ## v0.5 — Cloud / remote-browser backend
 
@@ -188,16 +182,12 @@ credential injection so Skill never has to see the secret itself.
 
 | Backend | Picked via | Chrome process | Popup | Banner | Credentials live in |
 |---|---|---|---|---|---|
-| `autoconnect` | wizard option **3** | user's daily Chrome | 1 per ws (Chrome 144+ **accumulates**) | yes | n/a |
 | `rdp` (isolated profile) | wizard option **1** (default) — `browser-daemon launch-chrome` | dedicated background user-data-dir | ❌ | ❌ | n/a |
 | `rdp` (fingerprint browser) | wizard option **2** — user runs AdsPower / MultiLogin / etc. | user's fingerprint browser | ❌ | ❌ | n/a |
-| `extension` | wizard option **4** — load unpacked extension | user's Chrome via `chrome.debugger` | ❌ | ❌ | n/a |
-| `cloud` (v0.5) | wizard option **5** | none (remote) | ❌ | ❌ | env var name / file path / URL-embedded — **never the secret itself** |
+| `extension` | wizard option **3** — load unpacked extension | user's daily Chrome via `chrome.debugger` | ❌ | ❌ | n/a |
+| `cloud` | wizard option **4** | none (remote) | ❌ | ❌ | env var name / file path / URL-embedded — **never the secret itself** |
 
-The inline-heredoc popup-cost gate (`BS_FORCE_AUTOCONNECT_INLINE`)
-applies only to `autoconnect`. `cloud`'s `ux_cost` is `"auth-required"`
-and does not trip the gate — the daemon will surface auth failures via
-ordinary CDP error paths, no popup involved.
+`cloud`'s `ux_cost` is `"auth-required"` — the daemon surfaces auth failures via ordinary CDP error paths, no popup involved.
 
 ### Setup walkthrough
 
@@ -207,10 +197,10 @@ browser-daemon doctor --json
 # → look for {"name": "cloud", "available": true, "ux_cost": "auth-required",
 #             "extras": {"provider": ..., "auth_kind": ..., ...}}
 
-# 2. Run the wizard — pick option 5.
+# 2. Run the wizard — pick option 4.
 browser-skill install
 #   ...
-#   Choose 1 / 2 / 3 / 4 / 5 [1]: 5
+#   Choose 1 / 2 / 3 / 4 [1]: 4
 #   Provider (browser-use / browserless / hyperbrowser / generic) [browser-use]:
 #   Auth kind (bearer / basic / mtls; oauth2 coming v0.6) [bearer]:
 #   ...
@@ -350,25 +340,17 @@ shipped: `type_text`, `press_key`, `fill_input`, `scroll`,
 from 23 → 36. Two primitives remain deferred to v0.6 with explicit
 footnotes in `design.md` §A.2: `handle_dialog`, `try_recover_from_drift`.
 
-**Production hardening (F-4b)** — the popup-defense assertions that
-previously only lived in the ai-e2e harness are now in the CLI
-entry points (`repl start`, `task`, inline heredoc). `assert_safe_environment()`
-refuses to start when Chrome's autoconnect default port `:9222` is
-listening (almost always the user's daily Chrome); `assert_daemon_url_safe()`
-cross-checks `browser-daemon url` to catch the `BD_PORT=<typo>` class
-of misconfigurations. Opt-out: `BS_PRODUCTION_HARDENING=0`. Targeted
-bypass: `BS_ALLOW_PORT_9222_LISTENER=1`.
+**Production hardening (F-4b) — removed (2026-05)** — the popup-defense
+assertions previously lived in `_hardening.py` and gated `repl start`,
+`task`, and the inline heredoc against the `autoconnect` backend's
+Chrome 144+ popup-accumulation hazard. With autoconnect deleted, the
+gate no longer has a purpose; the module and its tests were dropped.
 
-**Inline gate strengthened (F-4d)** — `BS_CDP_WS` no longer
-short-circuits the popup-cost gate when it points at `:9222`. The
-gate now refuses with a clear actionable error unless
-`BS_FORCE_AUTOCONNECT_INLINE=1` is set explicitly.
-
-**Mode-B identity check (F-5d)** — `auto_client()` now invokes
+**Mode-B identity check (F-5d)** — `auto_client()` invokes
 `assert_backend_matches()` on the resolved Mode-B daemon when the
 caller pinned a backend (`backend=` arg / `BD_BACKEND` env). Catches
-the "BD_NAME=foo daemon was last started against autoconnect,
-operator now wants rdp" silent-reuse failure mode. Raises
+the "BD_NAME=foo daemon was last started against backend X,
+operator now wants Y" silent-reuse failure mode. Raises
 `DaemonBackendMismatch` with a daemon-restart command in the message.
 
 **Coverage & contract hygiene (F-7 / F-9 / F-12 / F-13 / F-16 / F-17)** —

@@ -49,11 +49,13 @@ DAEMON_BIN = DAEMON_VENV_BIN / "browser-daemon"
 ISOLATED_PROFILE = Path("/tmp/ai-e2e-profile")
 BS_HOME = Path("/tmp/ai-e2e-bs-home")
 ISOLATED_PORT = 9444
-# The canonical autoconnect / `rdp` default port. If a Chrome is listening
-# here when our harness starts, it's almost certainly the user's daily
-# Chrome — refusing to start prevents a stray daemon-side fallback from
-# punching into it. Kept as a module constant so it's easy to grep.
-AUTOCONNECT_DEFAULT_PORT = 9222
+# Chrome's default debugging port. If a Chrome is listening here when our
+# harness starts, it's almost certainly the user's daily Chrome — refusing
+# to start prevents a stray daemon-side fallback from punching into it
+# (the legacy `autoconnect` backend was removed in 2026-05, but the port
+# is still Chrome's default debugger surface). Kept as a module constant
+# so it's easy to grep.
+CHROME_DEFAULT_DEBUG_PORT = 9222
 TRANSCRIPT_DIR = HERE / "transcripts"
 # Auto-generated raw report (pass/fail + transcript excerpts). The
 # human-written findings report at HERE / "AI-E2E-REPORT.md" is preserved
@@ -202,10 +204,10 @@ def _kill_listeners_on_port(port: int) -> None:
 
 
 def assert_safe_environment(*, allow_port_9222_listener: bool = False) -> None:
-    """Refuse to start if the autoconnect default port has a listener.
+    """Refuse to start if the Chrome default debug port has a listener.
 
     Rationale: any Chrome on `:9222` is, by convention, the user's daily
-    Chrome (running with autoconnect / `DevToolsActivePort`). Our test
+    Chrome (Chrome 144+ auto-enables CDP on the default port). Our test
     Chrome lives on a different port, so we never have a legitimate reason
     to find one here. If we do, the safe play is to bail out *before* any
     daemon fallback chain can drift onto it and pop the Allow dialog.
@@ -217,13 +219,13 @@ def assert_safe_environment(*, allow_port_9222_listener: bool = False) -> None:
     daily Chrome is up, the harness will only proceed when
     `browser-daemon url` resolves to our isolated port.
     """
-    if ISOLATED_PORT == AUTOCONNECT_DEFAULT_PORT:
+    if ISOLATED_PORT == CHROME_DEFAULT_DEBUG_PORT:
         return
-    if _port_is_listening("127.0.0.1", AUTOCONNECT_DEFAULT_PORT):
+    if _port_is_listening("127.0.0.1", CHROME_DEFAULT_DEBUG_PORT):
         if allow_port_9222_listener:
             print(
                 f"[setup] WARNING: a Chrome is listening on "
-                f":{AUTOCONNECT_DEFAULT_PORT} (likely the user's daily Chrome). "
+                f":{CHROME_DEFAULT_DEBUG_PORT} (likely the user's daily Chrome). "
                 f"Proceeding because --allow-port-9222-listener was given. "
                 f"The daemon-url assertion remains the load-bearing safety "
                 f"check; it must point at :{ISOLATED_PORT} or the harness "
@@ -233,13 +235,13 @@ def assert_safe_environment(*, allow_port_9222_listener: bool = False) -> None:
             return
         raise RuntimeError(
             f"REFUSING TO START: a Chrome is already listening on "
-            f":{AUTOCONNECT_DEFAULT_PORT} (the autoconnect default port). "
+            f":{CHROME_DEFAULT_DEBUG_PORT} (the Chrome default debug port). "
             f"This is almost certainly the user's daily Chrome. The "
             f"harness's isolated Chrome lives on :{ISOLATED_PORT}, but the "
-            f"browser-daemon fallback chain can drift to :{AUTOCONNECT_DEFAULT_PORT} "
+            f"browser-daemon fallback chain can drift to :{CHROME_DEFAULT_DEBUG_PORT} "
             f"and trigger an 'Allow remote debugging' popup that accumulates "
             f"and can freeze Chrome (per memory: chrome-popup-accumulation-bug). "
-            f"Either shut down the Chrome on :{AUTOCONNECT_DEFAULT_PORT}, or "
+            f"Either shut down the Chrome on :{CHROME_DEFAULT_DEBUG_PORT}, or "
             f"pass --allow-port-9222-listener if you understand the risk "
             f"(the daemon-url resolution check downstream will still refuse "
             f"to proceed unless the daemon actually points at :{ISOLATED_PORT})."
@@ -275,7 +277,7 @@ def assert_daemon_resolves_to_isolated(env: dict[str, str]) -> None:
             f"REFUSING TO START: `browser-daemon url` resolved to {url!r}, "
             f"which does NOT contain {expected_substr!r}. The harness is "
             f"misconfigured — daemon would point browser-skill at the wrong "
-            f"Chrome (likely the user's daily Chrome via autoconnect). "
+            f"Chrome (likely the user's daily Chrome on :9222). "
             f"Check env_for_agent(): BD_CDP_URL should be set to "
             f"http://127.0.0.1:{ISOLATED_PORT}."
         )
@@ -430,8 +432,8 @@ def env_for_agent() -> dict[str, str]:
     #   - BD_RDP_PORT=9444 directs rdp at our isolated port
     # The chain-lock (BD_BACKEND pinned, no fallback) is still the
     # critical safety property — if rdp fails for any reason, the
-    # resolver raises BackendUnavailable instead of cascading to
-    # autoconnect / user's daily Chrome.
+    # resolver raises BackendUnavailable instead of cascading anywhere
+    # that might touch the user's daily Chrome.
     env["BD_BACKEND"] = "rdp"
     env["BD_RDP_PORT"] = str(ISOLATED_PORT)
     env["BS_HOME"] = str(BS_HOME)
@@ -451,13 +453,11 @@ def env_for_agent() -> dict[str, str]:
     # rdp backend is the only path that can succeed.
     env.pop("BD_CDP_WS", None)
     env.pop("BD_CDP_URL", None)
-    # Defense-in-depth safety env. As of browser-daemon 0.3.0 this var is
-    # not consumed by the daemon (it's a no-op), but it's the natural name
-    # for the hardening the daemon team has on its plate (filed alongside
-    # BD_RDP_PORT). When they ship it, this becomes a hard block; setting
-    # it pre-emptively means the harness opts in to the safety net as soon
-    # as it exists. If daemon picks a different env name, update here.
-    env["BD_DISABLE_AUTOCONNECT"] = "1"
+    # autoconnect backend was removed in 2026-05, so there's no longer
+    # a backend that could silently target the user's daily Chrome via
+    # port 9222. The harness still refuses to start when a Chrome is
+    # listening on 9222 (see _assert_safe_environment above) as a
+    # belt-and-braces guard.
     # Make sure the agent's subprocesses (browser-skill -> httpx) don't
     # route 127.0.0.1 through the user's local proxy (ClashX-style).
     env["NO_PROXY"] = "127.0.0.1,localhost,*"
@@ -1020,7 +1020,7 @@ EXT_FAKE_INSTALL_ID = "ai-e2e-fake-ext"
 def assert_extension_relay_safe() -> None:
     """Refuse to proceed if the extension relay port has a foreign listener.
 
-    Mirror of `assert_safe_environment()` for the autoconnect :9222 case.
+    Mirror of `assert_safe_environment()` for the :9222 listener case.
     The user's `playwriter-ws-server` lives on :19988 (which is the
     daemon's hardcoded DEFAULT_RELAY_PORT pre-0.5.3); we pick :19989 to
     avoid it, but if SOMETHING else has claimed :19989 too we don't
@@ -1687,7 +1687,7 @@ def main() -> int:
         "--allow-port-9222-listener", action="store_true",
         help=(
             "Override the pre-flight check that refuses to start when a "
-            "Chrome is listening on :9222 (the autoconnect default port, "
+            "Chrome is listening on :9222 (the Chrome default debug port, "
             "i.e. the user's daily Chrome). Use only when you've verified "
             "the daemon's env routing (BD_CDP_URL → isolated port) prevents "
             "the harness from touching that Chrome. The downstream daemon-url "

@@ -9,9 +9,8 @@ filesystem reads. The Skill opens the ws downstream. (§2.3 banner sync.)
 
 The `caller_context` ContextVar communicates to backends whether the resolve
 is happening on the Mode A short-conn path or inside the Mode B long-running
-daemon. Today only the autoconnect backend reads this — it short-circuits its
-rate-limit when the caller is the long-running daemon. Async-safe by virtue
-of contextvars.
+daemon. Reserved for future backends that need to diverge per call site.
+Async-safe by virtue of contextvars.
 """
 from __future__ import annotations
 
@@ -34,7 +33,9 @@ async def resolve(cfg: Config):
     """Return a ResolveResult for the first backend that succeeds.
 
     cfg.backend pinning behavior:
-    - None  -> try every backend in registry order (env > rdp > autoconnect > extension)
+    - None  -> try every backend in registry order (env > rdp), then bail.
+              `extension` and `cloud` are deliberately excluded from the
+              auto-fallback (see _CHAIN_OPT_OUT below).
     - str   -> try only that one
     """
     if cfg.backend is not None:

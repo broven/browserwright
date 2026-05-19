@@ -11,7 +11,6 @@ from typing import Callable
 from .base import Backend
 from .env import EnvBackend
 from .rdp import RdpBackend
-from .autoconnect import AutoconnectBackend
 from .extension import ExtensionBackend
 from .cloud import CloudBackend
 
@@ -20,12 +19,11 @@ from .cloud import CloudBackend
 # Order is the documented fallback order: cheapest + most explicit first.
 # `cloud` requires explicit config (endpoint + auth_kind) so we register it
 # at the end — `resolver.resolve()` skips it in the fallback chain via
-# the same exclusion list that already covers `extension`. Users must opt
+# the same exclusion list that also covers `extension`. Users must opt
 # in with `--backend cloud` or `BD_BACKEND=cloud`.
 _REGISTRY: list[tuple[str, Callable[..., Backend]]] = [
     ("env", EnvBackend),
     ("rdp", RdpBackend),
-    ("autoconnect", AutoconnectBackend),
     ("extension", ExtensionBackend),
     ("cloud", CloudBackend),
 ]

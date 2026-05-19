@@ -74,7 +74,6 @@ def _parse_kv_args(args: list[str]) -> dict:
 
 
 def _cmd_repl(args: list[str]) -> int:
-    from . import _hardening
     from .errors import BrowserSkillError
     from .repl import client, server
 
@@ -84,11 +83,6 @@ def _cmd_repl(args: list[str]) -> int:
     sub = args[0]
     rest = args[1:]
     if sub == "start":
-        try:
-            _hardening.assert_safe_or_warn()
-        except _hardening.ProductionHardeningRefused as e:
-            print(str(e), file=sys.stderr)
-            return 2
         server.start(daemonize="--foreground" not in rest)
         return 0
     if sub == "stop":
@@ -118,15 +112,9 @@ def _cmd_repl(args: list[str]) -> int:
 
 
 def _cmd_task(args: list[str]) -> int:
-    from . import _hardening
     if not args:
         print("usage: browser-skill task <site>/<name> [--key=val ...]", file=sys.stderr)
         return 1
-    try:
-        _hardening.assert_safe_or_warn()
-    except _hardening.ProductionHardeningRefused as e:
-        print(str(e), file=sys.stderr)
-        return 2
     spec = args[0]
     if "/" not in spec:
         print("task spec must be <site>/<name>", file=sys.stderr)

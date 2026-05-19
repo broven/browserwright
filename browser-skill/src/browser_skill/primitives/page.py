@@ -21,9 +21,9 @@ def attach_active() -> dict:
     operate on this tab. Raises ``CDPError`` if the daemon backend isn't
     extension or no extension is connected.
 
-    For non-extension backends (rdp/autoconnect/env) the existing
-    ``current_page()`` helper already resolves the active tab via
-    Target.getTargets — use that path instead.
+    For non-extension backends (rdp/env) the existing ``current_page()``
+    helper already resolves the active tab via Target.getTargets — use
+    that path instead.
     """
     from collections import deque as _deque
     sess = current_session()
@@ -347,8 +347,8 @@ def open_background(url: str, *, group: str = "Agent") -> dict:
     ``sess.current_target_id`` points at the new tab and subsequent primitives
     (``js``, ``capture_screenshot``, etc.) operate on it.
 
-    Extension backend only. On other backends (rdp, autoconnect, cloud) the
-    daemon answers ``-32601`` which we translate to ``CDPError``.
+    Extension backend only. On other backends (rdp, cloud) the daemon
+    answers ``-32601`` which we translate to ``CDPError``.
     """
     sess = current_session()
     daemon = sess.daemon

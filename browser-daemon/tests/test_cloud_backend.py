@@ -244,22 +244,20 @@ async def test_cloud_backend_not_in_auto_fallback_chain(monkeypatch):
     `[backends.cloud]` row sits in config.toml. Otherwise users with old
     config could silently authenticate against the wrong service.
 
-    We patch the env/rdp/autoconnect backends to all raise Unavailable
-    and assert the resolver's aggregated error does NOT mention "cloud".
+    We patch the env/rdp backends to all raise Unavailable and assert the
+    resolver's aggregated error does NOT mention "cloud".
     """
     from browser_daemon.errors import Unavailable
 
     async def boom(*a, **kw):
         raise Unavailable("nope", attempts={})
 
-    # Patch every Unavailable-raiser; cloud is configured, env/rdp/autoconnect
-    # all fail → resolver should aggregate WITHOUT consulting cloud.
+    # Patch every Unavailable-raiser; cloud is configured, env/rdp all fail
+    # → resolver should aggregate WITHOUT consulting cloud.
     monkeypatch.setattr(
         "browser_daemon.backends.env.EnvBackend.resolve", boom)
     monkeypatch.setattr(
         "browser_daemon.backends.rdp.RdpBackend.resolve", boom)
-    monkeypatch.setattr(
-        "browser_daemon.backends.autoconnect.AutoconnectBackend.resolve", boom)
 
     cloud_called = {"flag": False}
 
@@ -350,8 +348,8 @@ password_env = "PASS"
 @pytest.mark.asyncio
 async def test_probe_ux_cost_is_auth_required():
     """v0.5 new enum value. Skill install wizard reads ux_cost to render
-    badges; `auth-required` distinguishes cloud from rdp (none) / autoconnect
-    (popup) / extension (extension-permission)."""
+    badges; `auth-required` distinguishes cloud from rdp (none) /
+    extension (extension-permission)."""
     cfg = _cfg_with(
         endpoint="wss://x/cdp",
         auth_kind="bearer",

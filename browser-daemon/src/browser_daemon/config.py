@@ -39,19 +39,6 @@ class RdpConfig:
 
 
 @dataclass
-class AutoconnectConfig:
-    """v0.5.3 REVIEW.md F-5: parse the `[backends.autoconnect].profile_paths`
-    key (README has advertised it since v0.1 but the parser silently
-    ignored it). When populated, these custom paths **prepend** the
-    hardcoded `platforms.profile_paths()` list so users can include a
-    non-default profile dir without losing the platform defaults.
-
-    Empty list (default) = use platform defaults unchanged.
-    """
-    profile_paths: list[str] = field(default_factory=list)
-
-
-@dataclass
 class ExtensionConfig:
     """v0.5.3 REVIEW.md F-5 / Task #24: relay endpoint config.
 
@@ -123,7 +110,6 @@ class CloudConfig:
 class BackendsConfig:
     rdp: RdpConfig = field(default_factory=RdpConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
-    autoconnect: AutoconnectConfig = field(default_factory=AutoconnectConfig)
     extension: ExtensionConfig = field(default_factory=ExtensionConfig)
 
 
@@ -208,15 +194,7 @@ def load(
     rdp = backends.get("rdp", {}) if isinstance(backends.get("rdp"), dict) else {}
     if "port" in rdp and isinstance(rdp["port"], int):
         cfg.backends.rdp.port = rdp["port"]
-    # v0.5.3 REVIEW.md F-5: parse the two long-advertised `[backends.*]`
-    # subtables that the parser was silently ignoring. autoconnect.profile_paths
-    # PREPENDS the platform default list (caller in autoconnect.py merges).
     # extension.relay_url substitutes for DEFAULT_RELAY_PORT when set.
-    ac = backends.get("autoconnect", {}) if isinstance(backends.get("autoconnect"), dict) else {}
-    if isinstance(ac.get("profile_paths"), list):
-        cfg.backends.autoconnect.profile_paths = [
-            str(p) for p in ac["profile_paths"] if isinstance(p, str)
-        ]
     ext = backends.get("extension", {}) if isinstance(backends.get("extension"), dict) else {}
     if isinstance(ext.get("relay_url"), str):
         cfg.backends.extension.relay_url = ext["relay_url"]

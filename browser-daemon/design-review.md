@@ -1,5 +1,7 @@
 # browser-daemon — Design Review
 
+> **历史说明（2026-05）**：原先的 `autoconnect` backend 已经彻底删除。下文保留的 `autoconnect` 字眼属于历史 review 记录，**不再反映当前实现**。
+
 伴随 `design.md` 的 architecture-review。逐节 critique，只写有补充/异议的部分，正文文档已经扎实的地方不复述。
 
 ---
