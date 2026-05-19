@@ -32,3 +32,6 @@ where = ["src"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "real_chrome: end-to-end test that launches a real Chrome + extension (skipped unless explicitly selected)",
+]
