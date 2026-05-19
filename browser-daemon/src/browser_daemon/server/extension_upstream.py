@@ -51,6 +51,23 @@ _UNSUPPORTED_BROWSER_METHODS = frozenset({
 })
 
 
+def _build_requires_session_error(method: str) -> str:
+    return (
+        f"{method!r} requires a sessionId in extension backend — "
+        "no tab attached. Attach one first via "
+        "BrowserDaemon.attachActiveTab (focused tab) or "
+        "BrowserDaemon.openBackgroundTab (background tab), then retry."
+    )
+
+
+def _build_unknown_session_error(session_id: str) -> str:
+    return (
+        f"unknown sessionId {session_id!r} — likely from a transient ws "
+        "(e.g. CLI subprocess) which the daemon has since released. "
+        "Re-attach from the same ws that will send subsequent commands."
+    )
+
+
 def _new_upstream_session_id(tab_id: int) -> str:
     """Synthetic upstream sessionId. Format chosen so the upstream side
     parser in `UpstreamSession.from_id` can recover the tabId without an
@@ -242,12 +259,12 @@ class ExtensionUpstream:
                         await self._respond(req_id, {})
                         return
             await self._error(req_id, -32601,
-                              f"{method!r} requires a sessionId in extension backend")
+                              _build_requires_session_error(method or "<unknown>"))
             return
 
         tab_id = self._sessions.get(session_id) or _tab_id_from_session_id(session_id)
         if tab_id is None:
-            await self._error(req_id, -32602, f"unknown sessionId {session_id!r}")
+            await self._error(req_id, -32602, _build_unknown_session_error(session_id))
             return
 
         try:
