@@ -23,10 +23,12 @@ def test_rdp_backend_resolves_via_daemon(e2e_chrome_rdp):
     """L0 RDP backend: `browser-daemon url --backend rdp --port N` returns
     a non-empty ws URL when a Chrome is listening on that port."""
     import subprocess
+    from .conftest import scrubbed_env
+    env = scrubbed_env()
     proc = subprocess.run(
         ["browser-daemon", "url", "--backend", "rdp",
          "--port", str(e2e_chrome_rdp.port)],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=10, env=env,
     )
     assert proc.returncode == 0, f"stderr: {proc.stderr}"
     url = proc.stdout.strip().splitlines()[0]

@@ -33,6 +33,17 @@ TEST_RDP_PORT = 29990
 TEST_NAME = "bd-e2e"
 
 
+def scrubbed_env() -> dict[str, str]:
+    """Return os.environ with BD_*/BS_*/BU_* vars stripped.
+
+    Prevents the user's shell environment from leaking into test
+    subprocesses (e.g. BD_RDP_PORT, BD_BACKEND, BS_DAEMON_URL_CMD).
+    Callers re-add only the vars they need for isolation.
+    """
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(("BD_", "BS_", "BU_"))}
+
+
 def pytest_collection_modifyitems(config, items):
     """Auto-mark every test in tests/e2e/ (except _patch_extension test) as
     `real_chrome`, and skip them unless the user asked for them.

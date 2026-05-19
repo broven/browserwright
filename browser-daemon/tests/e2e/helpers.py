@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from .conftest import TEST_EXT_PORT, TEST_NAME, TEST_RDP_PORT
+from .conftest import TEST_EXT_PORT, TEST_NAME, TEST_RDP_PORT, scrubbed_env
 
 
 @dataclass
@@ -45,7 +45,7 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
             "`pip install -e browser-skill[test]`"
         )
 
-    env = os.environ.copy()
+    env = scrubbed_env()
     env["BD_NAME"] = TEST_NAME
     env["BS_DAEMON_BACKEND"] = backend
     # Bypass proxy for localhost
