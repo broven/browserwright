@@ -89,7 +89,11 @@ def test_list_tabs_raises_on_extension_with_zero_ghosts(tmp_bs_home, monkeypatch
     with pytest.raises(NeedsUserConfirm) as exc_info:
         list_tabs()
     assert "extension" in str(exc_info.value).lower()
-    assert "attach_active" in (exc_info.value.proposal or "")
+    proposal = exc_info.value.proposal or ""
+    assert "open_background" in proposal
+    assert "attach_active" in proposal
+    # Default rule: open_background listed before attach_active.
+    assert proposal.index("open_background") < proposal.index("attach_active")
 
 
 def test_list_tabs_returns_empty_on_other_backend(tmp_bs_home, monkeypatch):

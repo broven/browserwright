@@ -133,9 +133,10 @@ def list_tabs(include_chrome: bool = True) -> list[dict]:
         raise NeedsUserConfirm(
             what="extension backend has zero attached tabs",
             proposal=(
-                "call `attach_active()` to drive the focused-window tab, "
-                "or `open_background(url, group='Agent')` to spawn a new "
-                "background tab in the Agent group"
+                "call `open_background(url, group='Agent')` to spawn a new "
+                "background tab in the Agent group (does not steal user focus), "
+                "or `attach_active()` to drive the focused-window tab if the "
+                "task is explicitly 'use my current tab'"
             ),
         )
     return out
@@ -161,8 +162,10 @@ def current_tab() -> dict | None:
         raise NeedsUserConfirm(
             what="no tab attached on extension backend",
             proposal=(
-                "call `attach_active()` to attach the focused-window tab, "
-                "or `open_background(url)` to spawn a background tab"
+                "call `open_background(url, group='Agent')` to spawn a "
+                "background tab (does not steal user focus), or "
+                "`attach_active()` to attach the focused-window tab if "
+                "the task is explicitly 'use my current tab'"
             ),
         )
     return None
