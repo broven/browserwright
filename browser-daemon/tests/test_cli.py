@@ -197,6 +197,60 @@ def test_install_plist_omits_extension_port_when_unspecified():
     assert "<string>--extension-port</string>" not in content
 
 
+def test_install_rejects_invalid_name():
+    """H-2 regression: --name must be alphanumeric/(dot)/dash/underscore so
+    it can't escape ~/Library/LaunchAgents/ or land malformed XML in the
+    plist. The check fires before any filesystem write — the upstream
+    config-level `check_name` is the first line of defense (and rejects
+    everything outside [A-Za-z0-9_-]{1,64}); the install-level
+    `_validate_daemon_name` is the belt-and-suspenders second guard. We
+    accept either error message — the security guarantee is "this path
+    NEVER touches the filesystem"."""
+    # Path-traversal attempt — must error out, never write a plist.
+    code, _, err = _run(["install", "--name", "../../tmp/evil"])
+    assert code == 1
+    assert "1-64" in err or "[A-Za-z0-9" in err
+    # XML-special chars (would corrupt the plist if interpolated raw).
+    code, _, err = _run(["install", "--name", "weird<chars>"])
+    assert code == 1
+    # Slash in the middle is invalid too.
+    code, _, err = _run(["install", "--name", "weird/name"])
+    assert code == 1
+
+
+def test_uninstall_rejects_invalid_name():
+    """Same name guard applies to uninstall (otherwise an attacker who can
+    craft args could unlink arbitrary plist paths via the un-validated
+    LaunchAgent dir join)."""
+    code, _, err = _run(["uninstall", "--name", "../../tmp/evil"])
+    assert code == 1
+
+
+def test_build_plist_escapes_special_characters_in_binary_path(monkeypatch):
+    """H-2 unit test: even after the name guard, every interpolated string
+    runs through xml.sax.saxutils.escape. We exercise the binary-path path
+    because real macOS paths can legitimately contain spaces and brackets
+    (e.g. "/Applications/Some <App>/.../browser-daemon")."""
+    import plistlib
+    from browser_daemon import cli as cli_mod
+
+    weird_path = "/path/with <special> & chars/browser-daemon"
+    monkeypatch.setattr(cli_mod, "_resolve_browser_daemon_bin",
+                        lambda: weird_path)
+    content = cli_mod._build_plist(
+        label="com.browser-daemon.escape-test",
+        name="escape-test",
+        backend="extension",
+        extension_port=None,
+    )
+    # If the escape works, plistlib will round-trip it cleanly. If raw chars
+    # leaked in, plistlib raises an XML parse error.
+    parsed = plistlib.loads(content.encode())
+    assert parsed["ProgramArguments"][0] == weird_path
+    # Sanity: Label / name etc. round-trip too.
+    assert parsed["Label"] == "com.browser-daemon.escape-test"
+
+
 def test_install_subcommand_refuses_on_non_darwin(monkeypatch):
     """install/uninstall are macOS-only — fail loudly elsewhere instead of
     writing a useless plist nothing knows how to load."""

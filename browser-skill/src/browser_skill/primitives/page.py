@@ -88,10 +88,10 @@ def attach_readonly(target_id: str) -> str:
 def list_tabs(include_chrome: bool = True) -> list[dict]:
     sess = current_session()
     res = sess.cdp.send("Target.getTargets")
+    # Page-type targets, unfiltered — used for the "any attached at all?" check.
+    raw_pages = [t for t in res.get("targetInfos", []) if t.get("type") == "page"]
     out: list[dict] = []
-    for t in res.get("targetInfos", []):
-        if t.get("type") != "page":
-            continue
+    for t in raw_pages:
         if not include_chrome and t.get("url", "").startswith(_INTERNAL):
             continue
         out.append({
@@ -101,12 +101,14 @@ def list_tabs(include_chrome: bool = True) -> list[dict]:
             "attached": t.get("attached", False),
         })
     # Extension backend returns only ghost targets — tabs the user has
-    # explicitly attached. An empty list there isn't "Chrome has no tabs",
-    # it's "you haven't attached one yet"; the agent's natural next move
-    # is `attach_active()` (drive the user's focused tab) or
-    # `open_background(url)` (open a fresh tab in the agent group). Make
-    # that path discoverable instead of returning a silently-empty list.
-    if not out and sess.backend_name == "extension":
+    # explicitly attached. Zero ghosts isn't "Chrome has no tabs", it's
+    # "you haven't attached one yet"; the agent's next move is
+    # `attach_active()` (drive the user's focused tab) or
+    # `open_background(url)` (open a fresh tab in the agent group). Decide
+    # based on the unfiltered page-target count — a ghost on chrome://newtab/
+    # IS attached, just hidden by include_chrome=False; falsely raising
+    # there would silently clear the cached attachment in current_page().
+    if not raw_pages and sess.backend_name == "extension":
         raise NeedsUserConfirm(
             what="extension backend has zero attached tabs",
             proposal=(

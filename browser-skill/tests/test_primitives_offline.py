@@ -57,9 +57,11 @@ def test_redaction_blocks_remember(tmp_bs_home, fresh_modules, capsys):
 
 class _StubCDP:
     """Minimal CDPSession stand-in: send() returns whatever we set."""
-    _closed = False
     def __init__(self, payload):
         self.payload = payload
+        # Per-instance — class-level would let one test's mutation leak
+        # into another (Session.cdp's "_closed" guard reads this).
+        self._closed = False
     def send(self, method, **_):
         return self.payload
 
@@ -95,6 +97,31 @@ def test_list_tabs_returns_empty_on_other_backend(tmp_bs_home, monkeypatch):
     from browser_skill.primitives import list_tabs
     _stub_session(monkeypatch, backend="rdp", targets=[])
     assert list_tabs() == []
+
+
+def test_list_tabs_chrome_only_ghost_on_extension_does_not_raise(
+        tmp_bs_home, monkeypatch):
+    """H-1 regression: a ghost target IS attached even when it's on
+    ``chrome://newtab/``. Filtering with ``include_chrome=False`` must
+    return ``[]`` (legitimate "no real pages"), NOT raise NeedsUserConfirm
+    (which would tell the agent to attach_active() and silently clear the
+    cached current_target_id in current_page())."""
+    from browser_skill.primitives import list_tabs
+    # One page-type ghost target, but its URL is chrome-internal.
+    ghost = {
+        "targetId": "ext-tab-7",
+        "type": "page",
+        "url": "chrome://newtab/",
+        "title": "New Tab",
+        "attached": True,
+    }
+    _stub_session(monkeypatch, backend="extension", targets=[ghost])
+    # include_chrome=False filters the ghost out — but raw_pages != [] so
+    # the raise must NOT fire.
+    assert list_tabs(include_chrome=False) == []
+    # And the unfiltered call returns the ghost (sanity check that the
+    # session was wired correctly).
+    assert len(list_tabs(include_chrome=True)) == 1
 
 
 def test_current_tab_raises_on_extension_without_attachment(tmp_bs_home, monkeypatch):

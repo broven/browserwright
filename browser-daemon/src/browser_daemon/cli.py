@@ -18,7 +18,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+from xml.sax.saxutils import escape as _xml_escape
 from typing import NoReturn
 
 from . import __version__
@@ -409,6 +411,7 @@ def _cmd_backend_info(args, cfg: Config) -> int:
     `BrowserDaemon.getBackendInfo`'s ws response so the mode_b_client
     subprocess shim can parse it directly."""
     import asyncio
+    _validate_daemon_name(cfg.name)
     return asyncio.run(_run_backend_info(args, cfg))
 
 
@@ -846,6 +849,29 @@ def _cmd_close_tab(args, cfg: Config) -> int:
 
 _LAUNCHAGENT_LABEL_PREFIX = "com.browser-daemon."
 
+# Per the IPC contract (see `_ipc._NAME_RE`) but a touch wider — we accept
+# dots too because LaunchAgent labels routinely contain them. The cap stays
+# 64 chars to keep filesystem paths bounded.
+_DAEMON_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+
+
+def _validate_daemon_name(name: str) -> str:
+    """Reject anything outside ``[A-Za-z0-9._-]{1,64}`` BEFORE it touches the
+    filesystem (plist path), the LaunchAgent label, or any XML interpolation.
+
+    Without this guard ``--name '../../tmp/evil'`` would write the plist
+    outside ``~/Library/LaunchAgents`` and ``--name 'weird<chars>'`` would
+    yield malformed plist XML. We also rely on this elsewhere to keep
+    cli-level handling consistent with `_ipc.check_name`'s socket-naming
+    constraint.
+    """
+    if not _DAEMON_NAME_RE.match(name or ""):
+        raise UserError(
+            "--name must be alphanumeric/dot/dash/underscore, 1-64 chars; "
+            f"got {name!r}"
+        )
+    return name
+
 
 def _launchagent_dir() -> "Path":
     from pathlib import Path
@@ -878,27 +904,32 @@ def _resolve_browser_daemon_bin() -> str:
 def _build_plist(*, label: str, name: str, backend: str,
                  extension_port: int | None) -> str:
     """Emit the plist content. Kept inline (no XML lib) — the schema is
-    fixed + tiny, and we avoid a dependency."""
+    fixed + tiny, and we avoid a dependency. Every interpolated value passes
+    through ``xml.sax.saxutils.escape`` (belt + suspenders alongside the
+    ``_validate_daemon_name`` guard the callers must run first). Pure: no
+    side effects — the caller is responsible for creating the log dir.
+    """
     bin_path = _resolve_browser_daemon_bin()
     args = [bin_path, "serve", "--backend", backend, "--name", name]
     if extension_port is not None:
         args += ["--extension-port", str(extension_port)]
     log_dir = os.path.expanduser("~/.cache/browser-daemon/logs")
-    os.makedirs(log_dir, exist_ok=True)
     stdout_path = f"{log_dir}/{name}.stdout.log"
     stderr_path = f"{log_dir}/{name}.stderr.log"
     # PATH carried over so any subprocess the daemon spawns (e.g. chrome)
     # is discoverable. /usr/local/bin + /opt/homebrew/bin cover both
-    # Intel and Apple Silicon Homebrew layouts.
+    # Intel and Apple Silicon Homebrew layouts. Constant, no escape needed.
     env_path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
-    arg_xml = "\n        ".join(f"<string>{a}</string>" for a in args)
+    arg_xml = "\n        ".join(
+        f"<string>{_xml_escape(a)}</string>" for a in args
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
         '<plist version="1.0">\n'
         '<dict>\n'
-        f'    <key>Label</key><string>{label}</string>\n'
+        f'    <key>Label</key><string>{_xml_escape(label)}</string>\n'
         '    <key>ProgramArguments</key>\n'
         '    <array>\n'
         f'        {arg_xml}\n'
@@ -913,9 +944,9 @@ def _build_plist(*, label: str, name: str, backend: str,
         '    <dict>\n'
         f'        <key>PATH</key><string>{env_path}</string>\n'
         '    </dict>\n'
-        f'    <key>StandardOutPath</key><string>{stdout_path}</string>\n'
-        f'    <key>StandardErrorPath</key><string>{stderr_path}</string>\n'
-        f'    <key>WorkingDirectory</key><string>{os.path.expanduser("~")}</string>\n'
+        f'    <key>StandardOutPath</key><string>{_xml_escape(stdout_path)}</string>\n'
+        f'    <key>StandardErrorPath</key><string>{_xml_escape(stderr_path)}</string>\n'
+        f'    <key>WorkingDirectory</key><string>{_xml_escape(os.path.expanduser("~"))}</string>\n'
         '</dict>\n'
         '</plist>\n'
     )
@@ -938,6 +969,7 @@ def _cmd_install(args, cfg: Config) -> int:
               "unit yourself for now", file=sys.stderr)
         return 1
     name = args.name or os.environ.get("BD_NAME") or "default"
+    _validate_daemon_name(name)
     label = f"{_LAUNCHAGENT_LABEL_PREFIX}{name}"
     plist_path = _launchagent_plist_path(name)
     if plist_path.exists() and not args.force:
@@ -945,6 +977,10 @@ def _cmd_install(args, cfg: Config) -> int:
               f"Use --force to replace.", file=sys.stderr)
         return 1
     plist_path.parent.mkdir(parents=True, exist_ok=True)
+    # Create the log dir before launchctl tries to write to it. Kept out of
+    # `_build_plist` so the generator stays pure / unit-testable (N-1).
+    log_dir = os.path.expanduser("~/.cache/browser-daemon/logs")
+    os.makedirs(log_dir, exist_ok=True)
     content = _build_plist(
         label=label, name=name, backend=args.backend,
         extension_port=args.extension_port,
@@ -956,6 +992,9 @@ def _cmd_install(args, cfg: Config) -> int:
     plist_path.write_text(content)
     rc, _, err = _launchctl("load", "-w", str(plist_path))
     if rc != 0:
+        # Rollback: remove the just-written plist so a re-run isn't blocked
+        # by the "already exists" check (L-3).
+        plist_path.unlink(missing_ok=True)
         print(f"error: launchctl load failed: {err.strip()}",
               file=sys.stderr)
         return 3
@@ -975,6 +1014,7 @@ def _cmd_uninstall(args, cfg: Config) -> int:
         print("error: `uninstall` is macOS-only", file=sys.stderr)
         return 1
     name = args.name or os.environ.get("BD_NAME") or "default"
+    _validate_daemon_name(name)
     plist_path = _launchagent_plist_path(name)
     if not plist_path.exists():
         print(json.dumps({"ok": False, "name": name,

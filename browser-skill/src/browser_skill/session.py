@@ -123,9 +123,20 @@ class Session:
         info = None
         getter = getattr(self.daemon, "get_backend_info", None)
         if callable(getter):
+            # Narrow the catch to the failure modes the underlying clients
+            # actually surface: ModeBClient.get_backend_info wraps subprocess
+            # plumbing (FileNotFoundError, TimeoutExpired) and JSON parsing.
+            # OSError covers low-level I/O. AttributeError is here to absorb
+            # the "Mode A client missing some inner shim" edge case rather
+            # than letting an internal bug crash backend-name resolution.
+            # Truly unexpected exceptions propagate.
+            import json as _json
+            import subprocess as _subprocess
             try:
                 info = getter()
-            except Exception:
+            except (AttributeError, OSError,
+                    _subprocess.CalledProcessError, _subprocess.TimeoutExpired,
+                    _json.JSONDecodeError):
                 info = None
         name = ""
         if isinstance(info, dict):

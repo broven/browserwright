@@ -242,8 +242,9 @@ def ping_sync(name: str, timeout: float = 1.0) -> int | None:
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        # Already inside an event loop. The caller should have used ping_async.
-        # Close the coroutine explicitly so we don't leak a never-awaited warning.
+        # asyncio.run() refused — typically because we're already inside a
+        # running loop, but other policy errors raise too. The coroutine may
+        # or may not have been awaited; .close() is a safe no-op when it has.
         coro.close()
         return None
 

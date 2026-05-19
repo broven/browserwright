@@ -483,6 +483,46 @@ async def test_v03_pre_open_buffer_overflow_surfaces_to_client(slow_daemon):
         assert seen_success_id_zero, "expected the first buffered frame to replay"
 
 
+# ---- M-3 regression: `_run_stats` nested-loop fix ------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_stats_against_live_daemon_does_not_misreport_not_running(
+        daemon):
+    """M-3 regression for the nested asyncio.run bug.
+
+    Before the fix, `_run_stats` called `ping_sync` (which itself wraps
+    `asyncio.run`) from inside the loop spun up by `_cmd_stats`. The inner
+    `asyncio.run` raised RuntimeError, caller swallowed it → ping returned
+    None → "daemon not running" got printed even though the daemon was alive.
+
+    We can't easily intercept stdout from inside the in-process daemon
+    fixture, so we exercise `_run_stats` directly with a fake args struct
+    and verify it returns 0 (not 2) and produces a JSON snapshot.
+    """
+    import io
+    import contextlib
+    from browser_daemon import cli as cli_mod
+    from browser_daemon.config import load as load_cfg
+
+    cfg = load_cfg(cli_name=daemon.name)
+    cfg.backend = daemon.backend
+
+    class _Args:
+        json = True
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = await cli_mod._run_stats(_Args(), cfg)
+    assert rc == 0, "stats against a live daemon should succeed (M-3)"
+    text = out.getvalue()
+    # The stats snapshot must contain at least one counter from observability.
+    # We don't pin a specific key — just ensure it's a non-empty JSON object.
+    payload = json.loads(text)
+    assert isinstance(payload, dict)
+    assert len(payload) > 0, "expected at least one metric in the snapshot"
+
+
 # ---- v0.5.3 F-3: upstreamConnecting / upstreamReady events --------------
 
 
