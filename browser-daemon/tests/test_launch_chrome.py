@@ -488,6 +488,50 @@ async def test_launch_chrome_env_var_unlocks_default_profile_guard(
         pass
 
 
+# ---- E2E harness: extra_args parameter ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_passes_extra_args(monkeypatch, tmp_path, fake_chrome):
+    """extra_args list is appended verbatim to the Chrome argv."""
+    captured: list[list[str]] = []
+
+    real_popen = lc_mod.subprocess.Popen
+
+    def fake_popen(args, **kw):
+        args_list = list(args)
+        # Only capture the real Chrome launch, not the --version validation call
+        if "--version" not in args_list:
+            captured.append(args_list)
+        return real_popen(args, **kw)
+
+    monkeypatch.setattr(lc_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+
+    cfg = load(env={"XDG_CACHE_HOME": str(tmp_path / "cache"),
+                    "XDG_RUNTIME_DIR": str(tmp_path / "run")})
+    out = await lc_mod.launch_chrome(
+        cfg,
+        profile="isolated",
+        chrome_binary=str(fake_chrome),
+        port=51234,
+        extra_args=["--load-extension=/tmp/fake-ext", "--disable-features=Foo"],
+    )
+    assert out["schema_version"] == 1
+    assert captured, "Popen never called"
+    argv = captured[0]
+    assert "--load-extension=/tmp/fake-ext" in argv
+    assert "--disable-features=Foo" in argv
+    # extra_args appended after the existing flags, not interleaved before them
+    assert argv.index("--remote-allow-origins=*") < argv.index("--load-extension=/tmp/fake-ext")
+    # Cleanup
+    try:
+        os.kill(out["extras"]["pid"], 15)
+    except ProcessLookupError:
+        pass
+
+
 # ---- v0.5 Task #12: discover_chrome_binary validates --version -----------
 
 

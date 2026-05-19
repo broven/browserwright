@@ -41,6 +41,7 @@ async def launch_chrome(
     port: int | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     allow_default_profile: bool = False,
+    extra_args: list[str] | None = None,
 ) -> dict:
     """Launch Chrome detached with --remote-debugging-port + isolated profile.
 
@@ -49,6 +50,10 @@ async def launch_chrome(
 
     `allow_default_profile=True` (or env `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE=1`)
     is the expert escape hatch for the §11 guard — see `_check_not_default_profile`.
+
+    `extra_args` (optional list) is appended to the Chrome argv verbatim, after
+    the framework's own flags. Used by the E2E harness to inject
+    `--load-extension=...`. Caller is responsible for shell-escaping.
     """
     check_name(profile)
 
@@ -100,6 +105,8 @@ async def launch_chrome(
         # session cookies / no auto-login) — same posture as DevTools itself.
         "--remote-allow-origins=*",
     ]
+    if extra_args:
+        args.extend(extra_args)
     proc = subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
