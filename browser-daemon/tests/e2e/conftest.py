@@ -287,35 +287,40 @@ def _launch_cft_with_extension(
         start_new_session=True,
     )
 
-    # Wait for DevToolsActivePort
-    active_file = profile_dir / "DevToolsActivePort"
-    deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        try:
-            lines = active_file.read_text().splitlines()
-            if len(lines) >= 2 and lines[0].strip() and lines[1].strip():
-                port = int(lines[0].strip())
-                ws_path = lines[1].strip()
-                ws_url = f"ws://127.0.0.1:{port}{ws_path}"
-                return ChromeHandle(
-                    ws_url=ws_url,
-                    profile_path=profile_dir,
-                    pid=proc.pid,
-                    port=port,
+    # Wait for DevToolsActivePort. On ANY failure path, kill Chrome and
+    # remove the profile dir so we don't leak processes or tmpdir space.
+    try:
+        active_file = profile_dir / "DevToolsActivePort"
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            try:
+                lines = active_file.read_text().splitlines()
+                if len(lines) >= 2 and lines[0].strip() and lines[1].strip():
+                    port = int(lines[0].strip())
+                    ws_path = lines[1].strip()
+                    ws_url = f"ws://127.0.0.1:{port}{ws_path}"
+                    return ChromeHandle(
+                        ws_url=ws_url,
+                        profile_path=profile_dir,
+                        pid=proc.pid,
+                        port=port,
+                    )
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"Chrome for Testing exited with code {proc.returncode}"
                 )
-        except (FileNotFoundError, OSError, ValueError):
-            pass
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"Chrome for Testing exited with code {proc.returncode}"
-            )
-        time.sleep(0.2)
+            time.sleep(0.2)
 
-    proc.terminate()
-    raise RuntimeError(
-        f"Chrome for Testing did not write DevToolsActivePort within 15s; "
-        f"profile={profile_dir}"
-    )
+        raise RuntimeError(
+            f"Chrome for Testing did not write DevToolsActivePort within 15s; "
+            f"profile={profile_dir}"
+        )
+    except BaseException:
+        _kill_chrome(proc.pid)
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
 
 
 @pytest.fixture(scope="session")
