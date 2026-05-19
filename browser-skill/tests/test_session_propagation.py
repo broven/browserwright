@@ -111,3 +111,35 @@ def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):
     # Local state is cleaned up after a successful close.
     assert "ext-tab-99" not in sess.cdp._sessions
     assert sess.current_target_id is None
+
+
+def test_attached_session_raises_on_extension_without_attach(monkeypatch):
+    """On extension backend, _attached_session() must refuse to silently
+    auto-attach the user's focused tab — raise NeedsUserConfirm with both
+    open_background AND attach_active named, with open_background listed
+    FIRST (the new default rule)."""
+    from browser_skill.errors import NeedsUserConfirm
+    from browser_skill.primitives.interact import _attached_session
+
+    _stub_session_for_ws(monkeypatch, backend="extension")  # no target attached
+    with pytest.raises(NeedsUserConfirm) as exc_info:
+        _attached_session()
+    proposal = exc_info.value.proposal or ""
+    assert "open_background" in proposal
+    assert "attach_active" in proposal
+    # Default rule: open_background listed before attach_active.
+    assert proposal.index("open_background") < proposal.index("attach_active")
+
+
+def test_attached_session_auto_attaches_on_rdp(monkeypatch):
+    """On rdp/env backends (isolated Chrome), _attached_session() may still
+    auto-attach via current_page() — no user collision there."""
+    from browser_skill.primitives.interact import _attached_session
+
+    sess = _stub_session_for_ws(monkeypatch, backend="rdp")
+    # Pre-seed a current_target_id so current_page() short-circuits and
+    # _attached_session returns the cached sid. (We're asserting the
+    # extension-only branch does NOT fire here, not full rdp behaviour.)
+    sess.current_target_id = "rdp-target-1"
+    sid = _attached_session()
+    assert sid == "sid-cached"  # from _StubCDP.attach default
