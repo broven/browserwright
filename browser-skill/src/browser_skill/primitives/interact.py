@@ -9,7 +9,6 @@ goes through ``current_session().cdp.send(method, session=sid, ...)``.
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time
 from typing import Any, Iterable, Optional, Union
@@ -47,18 +46,170 @@ def click_at_xy(x: float, y: float, button: str = "left", clicks: int = 1) -> di
     return {"x": x, "y": y, "button": button, "clicks": clicks}
 
 
-_HAS_RETURN = re.compile(r"\breturn\b")
+def _has_top_level_return(src: str) -> bool:
+    """``True`` iff ``src`` contains a ``return`` keyword at top level.
+
+    Top level means not nested inside any ``()``, ``[]``, ``{}``, string,
+    template literal, line/block comment, or regex literal. Used by
+    ``js()`` to decide whether to auto-wrap the expression in an IIFE so
+    the caller can write ``js("return foo.bar")`` ergonomically without
+    misclassifying already-IIFE expressions like
+    ``js("(()=>{return arr.map(...)})()")`` (whose ``return`` is nested
+    inside parens and must NOT trigger a re-wrap — that was the
+    silent-None bug pre-v0.5.5).
+
+    Template-literal interpolations (``${...}``) are treated as opaque:
+    we don't scan inside them. Returns *inside* a template's ``${}``
+    won't be detected as top-level, which is fine — that pattern is
+    vanishingly rare and the user can pass ``raw=True`` if needed.
+    """
+    n = len(src)
+    i = 0
+    depth = 0
+    in_str: Optional[str] = None  # quote char, or None
+    in_line_comment = False
+    in_block_comment = False
+    # Tracks whether the previous non-space token could plausibly be
+    # followed by a regex literal (vs. a division). Crude but enough
+    # to skip /.../ regex bodies without false-positives on a/b/c.
+    prev_significant = ""
+
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if c == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if c == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+                prev_significant = c
+                i += 1
+                continue
+            # Template-literal interpolation: ${ ... }. Skip to the
+            # matching '}' — we don't try to scan inside.
+            if in_str == "`" and c == "$" and nxt == "{":
+                inner_depth = 1
+                j = i + 2
+                while j < n and inner_depth > 0:
+                    if src[j] == "{":
+                        inner_depth += 1
+                    elif src[j] == "}":
+                        inner_depth -= 1
+                    j += 1
+                i = j
+                continue
+            i += 1
+            continue
+
+        # Comments
+        if c == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if c == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        # Regex literal: only if the previous significant char allows
+        # a regex (not after an identifier, ')', ']', or numeric literal).
+        if c == "/" and prev_significant not in (")", "]", "_", "$"
+                                                 ) and not (prev_significant.isalnum()):
+            # Skip /.../flags
+            j = i + 1
+            while j < n and src[j] != "/":
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "\n":
+                    # Newline before closing '/': not a regex after all.
+                    break
+                j += 1
+            else:
+                # Hit end-of-string without closing /; bail out of regex.
+                j = i
+            if j < n and src[j] == "/":
+                # Consume trailing flags
+                j += 1
+                while j < n and src[j].isalpha():
+                    j += 1
+                i = j
+                prev_significant = "/"
+                continue
+
+        if c in ('"', "'", "`"):
+            in_str = c
+            i += 1
+            continue
+        if c in "({[":
+            depth += 1
+            prev_significant = c
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            prev_significant = c
+            i += 1
+            continue
+        # Top-level "return" keyword. Reject ``foo.return`` (member access:
+        # reserved words are legal property names in JS) by treating ``.``
+        # as a keyword-blocker. Same for optional-chain ``?.return``.
+        if (depth == 0 and c == "r" and src[i:i + 6] == "return"):
+            before_ok = (i == 0) or not (src[i - 1].isalnum()
+                                         or src[i - 1] in ("_", "$", "."))
+            after_ok = (i + 6 >= n) or not (src[i + 6].isalnum()
+                                            or src[i + 6] in ("_", "$"))
+            if before_ok and after_ok:
+                return True
+        if not c.isspace():
+            prev_significant = c
+        i += 1
+    return False
 
 
-def js(expression: str, target_id: Optional[str] = None) -> Any:
-    """Evaluate JS in the page. If ``expression`` contains a ``return`` keyword
-    it's wrapped in an IIFE so the caller doesn't have to. ``target_id`` lets
-    you target a specific iframe / popup (use ``iframe_target(url)`` once
-    that helper lands)."""
+def js(expression: str, target_id: Optional[str] = None, *,
+       raw: bool = False) -> Any:
+    """Evaluate JS in the page via ``Runtime.evaluate``.
+
+    If ``expression`` contains a *top-level* ``return`` keyword it's
+    wrapped in an IIFE so the caller can write ``js("return foo.bar")``
+    ergonomically. The scanner skips strings, template literals,
+    comments, and any ``return`` nested inside ``()/[]/{}`` — so
+    already-IIFE expressions like ``js("(()=>{ return arr.map(...) })()")``
+    are NOT re-wrapped (pre-v0.5.5 they were, which silently produced
+    ``None`` because the outer wrapper had no return).
+
+    Pass ``raw=True`` to skip auto-wrap entirely (escape hatch for
+    expressions where the scanner misfires).
+
+    ``target_id`` lets you target a specific iframe / popup via
+    ``iframe_target(url)``.
+
+    Returns the deserialized result, or ``None`` when JS returned
+    ``undefined``. Raises ``CDPError`` when the result is
+    non-serializable (DOM nodes, Map/Set, circular refs, functions) —
+    wrap the relevant fields with ``JSON.stringify()`` or return
+    primitive properties instead. Previously such results silently
+    became ``None``, which was the second half of the v0.5.4
+    silent-None bug.
+    """
     sess = current_session()
     sid = sess.cdp.attach(target_id) if target_id else _attached_session()
     code = expression
-    if _HAS_RETURN.search(expression):
+    if not raw and _has_top_level_return(expression):
         code = f"(function(){{ {expression} }})()"
     try:
         res = sess.cdp.send(
@@ -75,8 +226,29 @@ def js(expression: str, target_id: Optional[str] = None) -> Any:
         text = det.get("exception", {}).get("description") or det.get("text", "JS exception")
         raise CDPError(method="Runtime.evaluate",
                        params={"expression": expression}, cdp_message=text)
-    value = res.get("result", {}).get("value")
-    return value
+    result = res.get("result", {})
+    if "value" in result:
+        return result["value"]
+    # No ``value`` field. CDP omits it for two distinct cases — distinguish:
+    #   * ``undefined`` — legitimate "function returned no value", map to None
+    #   * everything else (object/function/symbol with no value) —
+    #     non-serializable; the silent-None trap pre-v0.5.5.
+    ty = result.get("type")
+    if ty == "undefined":
+        return None
+    desc = (result.get("description") or result.get("subtype")
+            or ty or "<unknown>")
+    raise CDPError(
+        method="Runtime.evaluate",
+        params={"expression": expression},
+        cdp_message=(
+            f"non-serializable JS result (type={ty!r}, desc={desc!r}). "
+            f"Runtime.evaluate with returnByValue cannot serialize DOM "
+            f"nodes, Map/Set, functions, or circular refs. Wrap the "
+            f"fields you need with JSON.stringify() or return primitive "
+            f"properties (e.g. ``el.id``, ``el.textContent``) instead."
+        ),
+    )
 
 
 # ---- keyboard ----------------------------------------------------------
