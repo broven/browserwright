@@ -1,0 +1,33 @@
+description: "v2 SDK sub-agent E2E — browser-skill"
+
+extensions:
+  - "file://hooks.py:run_hook"
+
+maxConcurrency: 1
+
+prompts:
+  - "{{task}}"
+
+providers:
+  - id: "file://provider.py"
+    config:
+      model: "claude-sonnet-4-6"
+      max_turns: 25
+
+tests:
+  # ── Case A: connect + open + summarize ──────────────────────
+  - vars:
+      task: "用浏览器打开 https://example.com，告诉我这个页面在讲什么。"
+    assert:
+      - type: python
+        value: "file://scorers/case_a.py:get_assert"
+      - type: llm-rubric
+        value: "The output mentions that example.com is an illustrative or example domain used for documentation purposes"
+
+  - vars:
+      task: "Open https://example.com in a browser and tell me what the page is about."
+    assert:
+      - type: python
+        value: "file://scorers/case_a.py:get_assert"
+      - type: llm-rubric
+        value: "The output mentions that example.com is an illustrative or example domain used for documentation purposes"

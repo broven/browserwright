@@ -7,11 +7,17 @@ Dispatches:
   beforeAll  -> start_session()
   afterAll   -> stop_session()
   beforeEach -> reset_workspace (via workspace.py)
+
+NOTE: promptfoo runs each Python hook call in a separate process via wrapper.py,
+so module-level state does NOT persist between calls. We use a JSON state file
+to persist PIDs/paths across beforeAll → beforeEach → afterAll.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import signal
 import sys
 from pathlib import Path
 
@@ -23,15 +29,12 @@ if str(_DAEMON_E2E) not in sys.path:
 
 from _patch_extension import patch_extension_dir  # noqa: E402
 from _real_browser import (  # noqa: E402
-    ChromeHandle,
-    DaemonHandle,
     find_cft_binary,
     kill_chrome,
     launch_cft_with_extension,
     poll_status,
     scrubbed_env,
     spawn_daemon,
-    stop_daemon,
 )
 from workspace import build_workspace, reset_workspace  # noqa: E402
 
@@ -46,26 +49,41 @@ EXT_SOURCE_DIR = _REPO_ROOT / "browser-daemon" / "chrome-extension"
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "_workspace"
 ARTIFACTS_DIR = Path(__file__).resolve().parent / "_artifacts"
 
-# ---------------------------------------------------------------------------
-#  Module-level state (session singleton)
-# ---------------------------------------------------------------------------
-_daemon: DaemonHandle | None = None
-_chrome: ChromeHandle | None = None
-_patched_ext: Path | None = None
+# State file persists PIDs across promptfoo's per-call Python processes.
+_STATE_FILE = ARTIFACTS_DIR / "_session_state.json"
+
+
+def _save_state(state: dict) -> None:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    _STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _load_state() -> dict | None:
+    if _STATE_FILE.exists():
+        return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    return None
+
+
+def _clear_state() -> None:
+    if _STATE_FILE.exists():
+        _STATE_FILE.unlink()
 
 
 def start_session() -> None:
     """Start daemon + Chrome for Testing. Called once per eval run."""
-    global _daemon, _chrome, _patched_ext
+    # Clean up any leftover session from a previous crashed run
+    old = _load_state()
+    if old:
+        _cleanup_from_state(old)
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = ARTIFACTS_DIR / "daemon.log"
 
     # 1. Patch extension
-    _patched_ext = patch_extension_dir(EXT_SOURCE_DIR, relay_port=EXT_PORT)
+    patched_ext = patch_extension_dir(EXT_SOURCE_DIR, relay_port=EXT_PORT)
 
     # 2. Spawn daemon
-    _daemon = spawn_daemon(
+    daemon = spawn_daemon(
         EXT_PORT,
         DAEMON_NAME,
         log_path,
@@ -80,37 +98,60 @@ def start_session() -> None:
             "npx @puppeteer/browsers install chrome@stable "
             "--path /tmp/chrome-for-testing"
         )
-    _chrome = launch_cft_with_extension(cft, _patched_ext, rdp_port=RDP_PORT)
+    chrome = launch_cft_with_extension(cft, patched_ext, rdp_port=RDP_PORT)
 
     # 4. Wait until extension connects
     poll_status(
         EXT_PORT,
         timeout=15.0,
-        proc=_daemon.proc,
+        proc=daemon.proc,
         log_path=log_path,
         require_extensions=1,
     )
 
-    # 5. Build initial workspace (reset if leftover from previous run)
-    reset_workspace(WORKSPACE_ROOT)
+    # 5. Build initial workspace
+    import subprocess
+    subprocess.run(["rm", "-rf", str(WORKSPACE_ROOT)], check=False)
+    build_workspace(WORKSPACE_ROOT)
+
+    # 6. Persist state for other hook calls
+    _save_state({
+        "daemon_pid": daemon.proc.pid,
+        "chrome_pid": chrome.pid,
+        "chrome_profile": str(chrome.profile_path),
+        "patched_ext": str(patched_ext),
+    })
+
+
+def _cleanup_from_state(state: dict) -> None:
+    """Kill processes and clean up paths from saved state."""
+    chrome_pid = state.get("chrome_pid")
+    if chrome_pid:
+        try:
+            kill_chrome(chrome_pid)
+        except Exception:
+            pass
+
+    daemon_pid = state.get("daemon_pid")
+    if daemon_pid:
+        try:
+            os.kill(daemon_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    for key in ("chrome_profile", "patched_ext"):
+        p = state.get(key)
+        if p:
+            shutil.rmtree(p, ignore_errors=True)
+
+    _clear_state()
 
 
 def stop_session() -> None:
     """Tear down Chrome + daemon. Called once at eval end."""
-    global _daemon, _chrome, _patched_ext
-
-    if _chrome is not None:
-        kill_chrome(_chrome.pid)
-        shutil.rmtree(_chrome.profile_path, ignore_errors=True)
-        _chrome = None
-
-    if _daemon is not None:
-        stop_daemon(_daemon)
-        _daemon = None
-
-    if _patched_ext is not None:
-        shutil.rmtree(_patched_ext, ignore_errors=True)
-        _patched_ext = None
+    state = _load_state()
+    if state:
+        _cleanup_from_state(state)
 
 
 def run_hook(hook_name: str, context: dict) -> None:

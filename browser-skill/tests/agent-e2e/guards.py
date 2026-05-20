@@ -38,13 +38,18 @@ def _allow() -> SyncHookJSONOutput:
 
 
 async def pre_tool_use(
-    input_data: PreToolUseHookInput,
+    input_data: PreToolUseHookInput | dict,
     tool_use_id: str | None,
     context: HookContext,
 ) -> SyncHookJSONOutput:
     """Guard callback for PreToolUse events."""
-    tool = input_data.tool_name
-    inp = input_data.tool_input
+    # SDK may pass a dict or a typed dataclass depending on the transport.
+    if isinstance(input_data, dict):
+        tool = input_data.get("tool_name", "")
+        inp = input_data.get("tool_input", {})
+    else:
+        tool = input_data.tool_name
+        inp = input_data.tool_input
 
     if tool in _ALWAYS_ALLOW:
         return _allow()

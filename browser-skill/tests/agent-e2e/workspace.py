@@ -11,8 +11,8 @@ The workspace layout mirrors what a real agent sees:
 """
 from __future__ import annotations
 
-import os
 import shutil
+import subprocess
 from pathlib import Path
 
 # Locate the real skill/ directory (repo root / skill/).
@@ -29,6 +29,8 @@ def build_workspace(root: Path) -> None:
 
     for name in _SYMLINKS:
         dst = skill_dir / name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
         dst.symlink_to(SKILL_SRC / name)
 
     for name in _COPIES:
@@ -39,7 +41,35 @@ def build_workspace(root: Path) -> None:
 
 
 def reset_workspace(root: Path) -> None:
-    """Tear down and rebuild *root* to pristine state."""
-    if root.exists():
-        shutil.rmtree(root)
-    build_workspace(root)
+    """Reset mutable parts of the workspace without removing the root dir.
+
+    This avoids issues with sub-agent processes that may still hold the
+    workspace as their CWD.
+    """
+    skill_dir = root / "skill"
+    bs_dir = root / ".browser-skill"
+
+    # Restore memory.md (the only mutable copy)
+    mem = skill_dir / "memory.md"
+    if skill_dir.exists():
+        if mem.exists():
+            mem.unlink()
+        shutil.copy2(SKILL_SRC / "memory.md", mem)
+
+    # Reset .browser-skill/site-skills/ (wipe and recreate)
+    ss = bs_dir / "site-skills"
+    if ss.exists():
+        shutil.rmtree(ss, ignore_errors=True)
+    ss.mkdir(parents=True, exist_ok=True)
+
+    # Ensure symlinks are intact
+    for name in _SYMLINKS:
+        dst = skill_dir / name
+        if not dst.is_symlink():
+            if dst.exists():
+                dst.unlink()
+            dst.symlink_to(SKILL_SRC / name)
+
+    # If workspace doesn't exist at all, full build
+    if not skill_dir.exists():
+        build_workspace(root)
