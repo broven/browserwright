@@ -1,0 +1,7 @@
+_workspace/
+_artifacts/
+node_modules/
+.venv-agent-e2e/
+__pycache__/
+*.pyc
+package-lock.json
