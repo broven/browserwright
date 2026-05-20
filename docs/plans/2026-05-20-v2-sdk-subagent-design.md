@@ -16,6 +16,21 @@ Agent SDK 的 sub-agent，只让它看 `skill/` 下的 `.md` 文档，看 **skil
 
 v2 不替代 v1，两者独立共存。
 
+## 工作模式：case = 北极星 spec，skill 是被测对象
+
+这几个 case 是为**最终目标状态**设计的，**不是**验证 skill 现状。现在的 skill 大概率满足
+不了全部 case。工作模式是 test-driven：
+
+- case 措辞/断言确认无误的前提下，skill 跑红 → **改 skill**（文档 `skill/*.md` 或代码
+  `browser-skill/src/`）直到通过，而不是改 case 迁就现状。
+- **严禁过拟合**：不为过测试而特化 skill。不 hardcode 测试用例的 URL/措辞，不加针对 test 的
+  special-case 分支。每个改动必须是"让 skill 对**这一类**任务更好用"的通用改进 —— 任何换个
+  措辞 / 换个站点就失效的改法都是过拟合，要拒绝。
+- 红/绿之外加一道**过拟合 review**：每次为过 case 改了 skill，自问"这个改动对真实用户的同类
+  任务也有用吗？还是只为骗过这条 test？"
+- **多变体抵御过拟合**：每个 case 配多个话术变体（中英文、不同措辞、不同站点）。变体共用一套
+  断言；若只有一种措辞能过，说明改窄了，是过拟合信号。
+
 ## 框架选型：promptfoo
 
 调研了 promptfoo vs Inspect AI（UK AISI）。结论：**promptfoo，中-高置信度**。
@@ -167,7 +182,8 @@ promptfoo 原生 HTML/JSON report。在此之上每 case fail 时 scorer dump �
 7. **Case E**（独立轻量，不依赖 daemon，可随时插）。
 8. **README** + sonnet→opus matrix + CI 决策。
 
-后面扩展 case 是机械工。
+每个 case 步骤（2、4-7）走 TDD 循环：**写 case + 变体 → 跑（大概率红，因为 case 是北极星）
+→ 改 skill 到绿 → 过拟合 review**。骨架（步骤 1）只验通路、不改 skill。
 
 ## 开放问题（留给实现计划）
 
