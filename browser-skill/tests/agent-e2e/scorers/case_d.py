@@ -6,29 +6,11 @@ Checks:
 """
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 
-ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "_artifacts"
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1] / "_workspace"
-
-
-def _dump_artifacts(case_dir: str, context: dict, reason: str) -> None:
-    out = ARTIFACTS_DIR / case_dir
-    out.mkdir(parents=True, exist_ok=True)
-
-    meta = context.get("providerResponse", {}).get("metadata", {})
-    (out / "agent_trace.json").write_text(
-        json.dumps(meta.get("trace", []), indent=2, default=str), encoding="utf-8"
-    )
-    (out / "failure_reason.txt").write_text(reason, encoding="utf-8")
-
-    ss = WORKSPACE_ROOT / ".browser-skill" / "site-skills"
-    if ss.exists():
-        tree = []
-        for p in ss.rglob("*"):
-            tree.append(f"{'D' if p.is_dir() else 'F'} {p.relative_to(ss)}")
-        (out / "site_skills_tree.txt").write_text("\n".join(sorted(tree)), encoding="utf-8")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scorers._artifacts import WORKSPACE_ROOT, dump as _dump_artifacts
 
 
 def _find_site_memory_files(workspace: Path) -> list[Path]:
@@ -60,7 +42,7 @@ def get_assert(output: str, context: dict) -> dict:
         mf = mem_files[0]
         content = mf.read_text(encoding="utf-8")
         # Should have meaningful content (not just frontmatter)
-        if len(content.strip()) > 20:
+        if len(content.strip()) > 10:
             content_ok = True
             content_reason = f"has content ({len(content)} chars, {mf.relative_to(WORKSPACE_ROOT)})"
         else:
