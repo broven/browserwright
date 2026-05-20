@@ -364,8 +364,16 @@ def _cmd_stop(args, cfg: Config) -> int:
 
     We do NOT trust the pid file alone — we ping first to verify it's our
     daemon, then signal that pid. (Mirrors browser-harness `_ipc.identify`.)
+
+    PID-reuse guard: between the ping and the kill the daemon could die and the
+    OS recycle its pid for an unrelated process. We fingerprint the pid's
+    process start-time and re-verify it just before each signal; if it changed,
+    the pid was reused and we refuse to signal it. When the platform can't
+    report a start-time (``proc_start_time`` → None), we degrade to the old
+    behaviour rather than block the stop.
     """
     from . import _ipc
+    from . import platforms
     import signal, time
 
     pid = _ipc.ping_sync(cfg.name, timeout=1.0)
@@ -375,6 +383,21 @@ def _cmd_stop(args, cfg: Config) -> int:
         _ipc.cleanup_endpoint(cfg.name)
         print(f"no live daemon at name={cfg.name!r}; cleaned up stale files",
               file=sys.stderr)
+        return 0
+
+    start0 = platforms.proc_start_time(pid)
+
+    def _same_process() -> bool:
+        """True if pid still names the daemon we pinged. Unknowable (None
+        start-time) counts as True so the guard never blocks a legit stop."""
+        if start0 is None:
+            return True
+        return platforms.proc_start_time(pid) == start0
+
+    if not _same_process():
+        _ipc.cleanup_endpoint(cfg.name)
+        print(f"daemon pid {pid} was recycled by another process; not "
+              f"signalling it", file=sys.stderr)
         return 0
     try:
         os.kill(pid, signal.SIGTERM)
@@ -387,11 +410,15 @@ def _cmd_stop(args, cfg: Config) -> int:
         if _ipc.ping_sync(cfg.name, timeout=0.3) is None:
             return 0
         time.sleep(0.1)
-    # Still alive — force.
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    # Still alive — force, but only if the pid is still the same process.
+    if _same_process():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        print(f"daemon pid {pid} was recycled before SIGKILL; not signalling "
+              f"it", file=sys.stderr)
     _ipc.cleanup_endpoint(cfg.name)
     return 0
 

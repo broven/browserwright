@@ -100,6 +100,39 @@ Tasks live as plain Python files under `~/.browser-skill/site-skills/<host>/task
 
 **Site:** `list_site_skills`, `load_site_skill`, `run_task`, `run_tasks_concurrent`
 
+## Extending the primitive surface — `agent_helpers.py`
+
+The primitives above are the *frozen* surface (they ship in `browser-skill/src/`). When you hit something the surface can't do cleanly — a site's hidden file input, a multi-step widget you keep re-typing, a parsing helper — **write a reusable helper instead of inlining it again.** Drop a function into:
+
+```
+~/.browser-skill/agent_helpers.py        #  ($BS_HOME/agent_helpers.py)
+```
+
+Every heredoc loads this file **after** the core primitives, so your helper can call any of them directly:
+
+```python
+# ~/.browser-skill/agent_helpers.py
+def upload_via_hidden_input(selector, path):
+    """Reveal a display:none <input type=file> then upload."""
+    js(f'document.querySelector({selector!r}).style.display = "block"')
+    upload_file(selector, path)
+```
+
+Next heredoc, `upload_via_hidden_input` is already in scope — no import:
+
+```bash
+BD_SESSION=$sid browser-skill <<'PY'
+open_background("https://example.com/upload")
+upload_via_hidden_input("#file", "/tmp/x.png")
+PY
+```
+
+**Rules of the extension point:**
+
+- Names starting with `_` stay private (not injected) — use them for internals.
+- **You may not shadow a core primitive.** A helper named `goto_url` / `click_at_xy` / etc. is *refused* with a stderr warning and the core one is kept — rename it. The surface extends, it never silently redefines.
+- This is the *helper* (cross-task primitive) layer. A whole site flow still belongs in a **task** (see below). Rule of thumb: reach for `agent_helpers.py` when 2+ tasks would reuse the same building block.
+
 ## Canonical workflows
 
 ### Screenshot a page
@@ -207,6 +240,7 @@ browser-daemon stats --name default # observability counters when serve is runni
 - **[tasks.md](./tasks.md)** — ships with this skill. Read on demand, only when about to solidify a flow into a task.
 - `~/.browser-skill/global.md` — daemon-level persistent config (port, default backend). Optional. Set via `remember_preference("daemon.preferred_backend", "rdp")`.
 - `~/.browser-skill/site-skills/<eTLD+1>/memory.md` — per-site facts. Append-only.
+- `~/.browser-skill/agent_helpers.py` — agent-authored helpers, hot-loaded into every heredoc namespace after the core primitives. See "Extending the primitive surface" above. Edit with the `Write` / `Edit` tools.
 
 ## When NOT to use this skill
 

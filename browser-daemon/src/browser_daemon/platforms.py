@@ -12,7 +12,50 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 from pathlib import Path
+
+
+def proc_start_time(pid: int) -> str | None:
+    """Best-effort process start-time fingerprint, used to detect PID reuse
+    before signalling a daemon (see ``cli._cmd_stop``).
+
+    Returns an opaque but *stable* string identifying when the process started,
+    or ``None`` when the platform can't answer (no such pid, or unsupported) —
+    callers must treat ``None`` as "can't verify" and fall back, never as a
+    match.
+
+    - Linux: field 22 (``starttime``, in clock ticks since boot) of
+      ``/proc/<pid>/stat``.
+    - macOS / BSD: ``ps -o lstart= -p <pid>`` (a stable wall-clock string).
+    """
+    # Linux fast path — no subprocess.
+    try:
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            data = stat.read_text()
+            # comm (field 2) is parenthesised and may contain spaces/parens;
+            # split after the final ')' so positional fields stay aligned.
+            rparen = data.rfind(")")
+            if rparen != -1:
+                # After "pid (comm) " the remaining fields start at state
+                # (field 3). starttime is field 22 → index 22 - 3 = 19.
+                fields = data[rparen + 2:].split()
+                if len(fields) > 19:
+                    return fields[19]
+    except (OSError, ValueError, IndexError):
+        pass
+    # macOS / BSD — ask ps for the start timestamp.
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=3.0)
+        if out.returncode == 0:
+            s = out.stdout.strip()
+            return s or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
 
 
 def profile_paths() -> list[Path]:
