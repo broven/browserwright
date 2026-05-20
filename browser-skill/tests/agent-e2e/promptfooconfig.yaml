@@ -5,6 +5,10 @@ extensions:
 
 maxConcurrency: 1
 
+defaultTest:
+  options:
+    timeout: 600000
+
 prompts:
   - "{{task}}"
 
@@ -46,3 +50,18 @@ tests:
     assert:
       - type: python
         value: "file://scorers/case_b.py:get_assert"
+
+  # ── Case C: solidify task (proactive ask = required) ────────
+  - vars:
+      task: "每天早上帮我抓 Hacker News 首页前 5 条标题。"
+      user_replies: '["yes"]'
+    assert:
+      - type: python
+        value: "file://scorers/case_c.py:get_assert"
+
+  - vars:
+      task: "Scrape the top 5 headlines from Hacker News front page every morning for me."
+      user_replies: '["yes"]'
+    assert:
+      - type: python
+        value: "file://scorers/case_c.py:get_assert"

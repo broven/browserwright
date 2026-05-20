@@ -167,12 +167,14 @@ The `targetId` is stable for the life of the tab and the daemon — it's encoded
 
 ## When to suggest saving as a task
 
-After a working flow, ask the user "Want me to save this as a reusable task?" if **any** of these hold:
+After completing a working flow, **you MUST ask the user for confirmation before saving** — never save a task without explicit user approval. Ask something like "Want me to save this as a reusable task?" if **any** of these hold:
 
 - The user mentioned a recurring need ("每天", "每小时", "monitor", "watch", "notify me when X").
 - The flow has 3+ non-trivial steps the user would otherwise re-type.
 - The user just ran two heredocs with small variations.
 - The output looks like a feed, dashboard, or scheduled scrape.
+
+**Important: always ask first, then wait for the user's answer.** Do not save the task proactively — the user may want to adjust the flow, rename it, or skip saving entirely. Only after the user confirms ("yes", "go ahead", etc.) should you proceed.
 
 If they say yes, read [tasks.md](./tasks.md) for the storage layout and template, then use the `Write` tool to drop the files into `~/.browser-skill/site-skills/<host>/`. No CLI scaffolding call needed — the filesystem is the database.
 

@@ -34,7 +34,11 @@ import guards
 
 SYSTEM_PROMPT = (
     "You are a coding agent. The user will give you a task. "
-    "Tools you can use are documented in ./SKILL.md (read it first). "
+    "Your current working directory contains SKILL.md — read it first "
+    "(use the Read tool with the relative path 'SKILL.md'). "
+    "It documents the browser-skill CLI and how to use it. "
+    "Follow its instructions precisely, including when to ask for "
+    "user confirmation before taking actions like saving tasks. "
     "Do the task."
 )
 

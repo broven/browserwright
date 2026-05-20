@@ -78,10 +78,16 @@ def start_session() -> None:
 
     # Force-kill anything on our ports (in case state file was lost)
     import subprocess as _sp
+    import time as _time
     for port in (EXT_PORT, RDP_PORT):
         _sp.run(f"lsof -ti :{port} | xargs kill -9 2>/dev/null",
                 shell=True, capture_output=True)
-    import time; time.sleep(1)
+    # Wait for ports to be released (TIME_WAIT)
+    from _real_browser import port_free
+    for _ in range(60):
+        if port_free(EXT_PORT):
+            break
+        _time.sleep(0.5)
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = ARTIFACTS_DIR / "daemon.log"

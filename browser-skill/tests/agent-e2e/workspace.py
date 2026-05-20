@@ -52,9 +52,14 @@ def reset_workspace(root: Path) -> None:
     # Restore memory.md (the only mutable copy)
     mem = skill_dir / "memory.md"
     if skill_dir.exists():
-        if mem.exists():
+        try:
             mem.unlink()
-        shutil.copy2(SKILL_SRC / "memory.md", mem)
+        except FileNotFoundError:
+            pass
+        mem.write_text(
+            (SKILL_SRC / "memory.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
 
     # Reset .browser-skill/site-skills/ (wipe and recreate)
     ss = bs_dir / "site-skills"
