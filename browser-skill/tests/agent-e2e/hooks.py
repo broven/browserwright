@@ -76,6 +76,13 @@ def start_session() -> None:
     if old:
         _cleanup_from_state(old)
 
+    # Force-kill anything on our ports (in case state file was lost)
+    import subprocess as _sp
+    for port in (EXT_PORT, RDP_PORT):
+        _sp.run(f"lsof -ti :{port} | xargs kill -9 2>/dev/null",
+                shell=True, capture_output=True)
+    import time; time.sleep(1)
+
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = ARTIFACTS_DIR / "daemon.log"
 

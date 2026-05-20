@@ -35,7 +35,15 @@ def call_api(prompt: str, options: dict, context: dict) -> dict:
     config = options.get("config", {})
     model = config.get("model", "claude-sonnet-4-6")
     max_turns = config.get("max_turns", 25)
+
+    # user_replies can come from provider config or test vars (as JSON string)
     user_replies = config.get("user_replies", None)
+    if user_replies is None:
+        vars_ = context.get("vars", {})
+        replies_str = vars_.get("user_replies")
+        if replies_str:
+            import json as _json
+            user_replies = _json.loads(replies_str)
 
     env = _build_env()
 

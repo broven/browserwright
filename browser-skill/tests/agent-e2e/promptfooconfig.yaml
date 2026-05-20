@@ -31,3 +31,18 @@ tests:
         value: "file://scorers/case_a.py:get_assert"
       - type: llm-rubric
         value: "The output mentions that example.com is an illustrative or example domain used for documentation purposes"
+
+  # ── Case B: save preference to memory.md ────────────────────
+  - vars:
+      task: "我以后做这类自动化都用 extension backend 连我日常 Chrome，记住这个偏好。"
+      user_replies: '["yes, go ahead"]'
+    assert:
+      - type: python
+        value: "file://scorers/case_b.py:get_assert"
+
+  - vars:
+      task: "From now on, always use the extension backend for browser automation. Remember this preference."
+      user_replies: '["yes, go ahead"]'
+    assert:
+      - type: python
+        value: "file://scorers/case_b.py:get_assert"
