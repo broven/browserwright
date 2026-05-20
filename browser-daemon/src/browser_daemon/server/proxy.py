@@ -106,6 +106,9 @@ class Router:
         self._close_tab: Callable[[str], Awaitable[dict]] | None = None
         self._close_tab_by_target_id: (
             Callable[[str], Awaitable[dict]] | None) = None
+        # P5: per-session teardown (extension backend only). Closes the
+        # session's owned tabs, keeps borrowed ones.
+        self._end_session: Callable[[str], Awaitable[dict]] | None = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -673,9 +676,14 @@ class Router:
             await self._send_to_client(client.client_id, _result_response(req_id, payload))
             return
         if method == "BrowserDaemon.getBackendInfo":
+            from ..backends import kind_for
+            # Report the live backend's real kind (extension is LOCAL_RELAY),
+            # not a hardcoded UPSTREAM_WS. Unknown/unresolved names ("auto")
+            # fall back to UPSTREAM_WS.
+            kind = kind_for(self.state.backend_name) or "UPSTREAM_WS"
             await self._send_to_client(client.client_id, _result_response(req_id, {
                 "name": self.state.backend_name,
-                "kind": "UPSTREAM_WS",
+                "kind": kind,
                 "ux_warnings": [],
                 "schema_version": 1,
             }))
@@ -737,8 +745,11 @@ class Router:
                     req_id, -32601,
                     "BrowserDaemon.attachActiveTab requires the extension backend"))
                 return
+            attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            attach_session = attach_params.get("session")
+            attach_session = attach_session if isinstance(attach_session, str) and attach_session else None
             try:
-                info = await self._attach_active_tab()
+                info = await self._attach_active_tab(session_id=attach_session)
             except Exception as e:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32000, f"attach active failed: {e!r}"))
@@ -800,6 +811,9 @@ class Router:
         if method == "BrowserDaemon.closeTab":
             await self._handle_close_tab(client, msg, req_id)
             return
+        if method == "BrowserDaemon.endSession":
+            await self._handle_end_session(client, msg, req_id)
+            return
         await self._send_to_client(client.client_id, _error_response(
             req_id, -32601, f"unknown BrowserDaemon method: {method}"))
 
@@ -852,8 +866,11 @@ class Router:
                 req_id, -32601,
                 "BrowserDaemon.openBackgroundTab requires the extension backend"))
             return
+        session = params.get("session")
+        session = session if isinstance(session, str) and session else None
         try:
-            result = await self._open_background_tab(url, group_name=group_name)
+            result = await self._open_background_tab(
+                url, group_name=group_name, session_id=session)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"openBackgroundTab failed: {e!r}"))
@@ -892,6 +909,41 @@ class Router:
             "title": result.get("title", ""),
             "groupId": result.get("groupId", -1),
         }))
+
+    async def _handle_end_session(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """P5.4: tear down a browser-skill session's extension workspace —
+        close owned tabs, keep borrowed ones. Requires backend=extension."""
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        session = params.get("session")
+        if not isinstance(session, str) or not session:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserDaemon.endSession requires params.session"))
+            return
+        if self._end_session is None:
+            # Lazy-open mirror of openBackgroundTab.
+            if (self._ensure_upstream is not None
+                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603, f"endSession failed (upstream open): {e!r}"))
+                    return
+        if self._end_session is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32601,
+                "BrowserDaemon.endSession requires the extension backend"))
+            return
+        try:
+            result = await self._end_session(session)
+        except Exception as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"endSession failed: {e!r}"))
+            return
+        await self._send_to_client(client.client_id, _result_response(req_id, result))
 
     async def _handle_close_tab(
         self, client: ClientState, msg: dict, req_id: int | None,

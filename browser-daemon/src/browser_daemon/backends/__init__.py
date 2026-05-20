@@ -36,6 +36,14 @@ def all_backends(cfg) -> list[Backend]:
 def names() -> list[str]:
     return [name for name, _ in _REGISTRY]
 
+def kind_for(name: str) -> str | None:
+    """The ``BackendKind`` of a registered backend (class attribute, no
+    instantiation), or ``None`` for unknown/unresolved names like ``"auto"``."""
+    for n, factory in _REGISTRY:
+        if n == name:
+            return getattr(factory, "kind", None)
+    return None
+
 
 def get_backend(name: str, cfg) -> Backend:
     from ..errors import UserError
@@ -48,4 +56,4 @@ def get_backend(name: str, cfg) -> Backend:
     )
 
 
-__all__ = ["Backend", "all_backends", "names", "get_backend"]
+__all__ = ["Backend", "all_backends", "names", "get_backend", "kind_for"]

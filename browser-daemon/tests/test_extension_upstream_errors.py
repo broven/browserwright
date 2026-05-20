@@ -14,6 +14,17 @@ def test_requires_sessionid_error_mentions_recovery_methods():
     assert "BrowserDaemon.openBackgroundTab" in msg
 
 
+def test_create_target_error_names_real_verbs():
+    """4c: Target.createTarget must fast-fail with a message naming the real
+    tab-opening verbs (new_page / openBackgroundTab), not the misleading
+    'requires a sessionId'."""
+    from browser_daemon.server.extension_upstream import _build_create_target_error
+    msg = _build_create_target_error()
+    assert "new_page" in msg
+    assert "openBackgroundTab" in msg
+    assert "sessionId" not in msg
+
+
 def test_unknown_sessionid_error_mentions_subprocess_cause():
     """'unknown sessionId' must hint that the binding was likely released
     by a transient ws (CLI subprocess) so the client knows to re-attach

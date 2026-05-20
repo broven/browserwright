@@ -55,6 +55,19 @@ class DaemonUnavailable(BrowserSkillError):
         super().__init__(f"daemon unavailable: {detail}")
 
 
+class NoSession(BrowserSkillError):
+    """No BD_SESSION provided. Refuse rather than silently sharing a browser (P1)."""
+
+    exit_code = 2
+
+    def __init__(self, detail: str = ""):
+        self.detail = detail
+        super().__init__(
+            "no session: run `browser-skill session new --backend <extension|rdp> ...` "
+            "first, then pass --session <id> (or BD_SESSION=<id>) on every call. " + detail
+        )
+
+
 class DaemonBackendMismatch(BrowserSkillError):
     """Mode-B daemon is alive but serving a different backend than the
     one the caller asked for / configured (REVIEW.md F-5d).

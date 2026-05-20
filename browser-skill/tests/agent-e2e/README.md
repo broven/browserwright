@@ -18,14 +18,6 @@ PROMPTFOO_PYTHON_TIMEOUT=600000 \
   npx promptfoo eval -c promptfooconfig.yaml --no-cache
 ```
 
-### Case E only (triggering, no daemon needed)
-
-```bash
-cd browser-skill/tests/agent-e2e
-PROMPTFOO_PYTHON=.venv-agent-e2e/bin/python \
-  npx promptfoo eval -c promptfooconfig-trigger.yaml --no-cache
-```
-
 ### View results
 
 ```bash
@@ -36,10 +28,8 @@ npx promptfoo view
 
 ```
 promptfooconfig.yaml      # Case A-D: full daemon + Chrome
-promptfooconfig-trigger.yaml  # Case E: lightweight trigger test
 hooks.py                  # beforeAll: daemon+Chrome, beforeEach: workspace reset
 provider.py               # claude-agent-sdk wrapper for Cases A-D
-provider_trigger.py       # lightweight skill-routing for Case E
 agent_runner.py           # ClaudeSDKClient wrapper with mock-user
 guards.py                 # PreToolUse hook: restrict tools
 workspace.py              # Build/reset isolated workspace
@@ -48,7 +38,6 @@ scorers/
   case_b.py               # Save preference to memory.md
   case_c.py               # Solidify task (recurring need)
   case_d.py               # Site memory (explicit write)
-  case_e.py               # Skill auto-triggering (recall)
 _workspace/               # gitignored, rebuilt each run
 _artifacts/               # gitignored, dumped on failure
 ```
@@ -71,7 +60,6 @@ v1 and v2 can run in parallel without conflicts.
 | B | Save preference to memory.md | User preference section updated, table intact |
 | C | Solidify task (recurring need) | Intent to save, task file created, valid Python |
 | D | Site memory (explicit write) | Site memory file created with content |
-| E | Skill auto-triggering | Agent picks browser-skill from skill list |
 
 ## Work mode: north-star spec
 

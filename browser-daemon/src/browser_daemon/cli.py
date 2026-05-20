@@ -230,6 +230,16 @@ def _build_parser() -> argparse.ArgumentParser:
                            "ws can't share per-client session state")
     # Output is always JSON (spec §5.1 single-line discipline); no --json flag.
 
+    # end-session (P5 — extension backend only)
+    p_es = sub.add_parser(
+        "end-session",
+        help="tear down a browser-skill session's tabs: close owned, keep borrowed",
+    )
+    _add_name(p_es)
+    p_es.add_argument("--session", required=True,
+                      help="the browser-skill session id whose tabs to clean up")
+    # Output is always JSON (single-line discipline); no --json flag.
+
     # install / uninstall / list — long-running service (macOS LaunchAgent).
     # The daemon was designed as a one-shot `serve` subprocess, but for the
     # "zero manual ops after install" extension flow it needs to be a
@@ -821,6 +831,27 @@ def _cmd_close_tab(args, cfg: Config) -> int:
     return 0
 
 
+def _cmd_end_session(args, cfg: Config) -> int:
+    """P5: tear down a browser-skill session's extension tabs (owned closed,
+    borrowed kept). Prints the {closed, kept} JSON result."""
+    try:
+        result = _run(_rpc_via_ws(
+            cfg,
+            "BrowserDaemon.endSession",
+            {"session": args.session},
+            client_label="cli-end-session",
+            timeout=10.0,
+        ))
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 # ---- LaunchAgent service (macOS) ----------------------------------------
 #
 # Goal: the daemon is a long-running service, not a per-session subprocess.
@@ -1091,6 +1122,7 @@ _DISPATCH = {
     "attach-active": _cmd_attach_active,
     "open-background": _cmd_open_background,
     "close-tab": _cmd_close_tab,
+    "end-session": _cmd_end_session,
     # v0.5.5 — LaunchAgent service (macOS) so the daemon is long-running.
     "install": _cmd_install,
     "uninstall": _cmd_uninstall,

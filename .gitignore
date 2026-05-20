@@ -34,9 +34,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+
 # Project-specific generated artifacts
-ai-e2e-tests/transcripts/
-ai-e2e-tests/AI-E2E-REPORT*.auto.md
 .github/scheduled_tasks.lock
 
 # Local-only Claude state
@@ -47,3 +46,4 @@ node_modules/
 
 # E2E test artifacts
 browser-daemon/tests/e2e/_artifacts/
+browser-daemon/tests/e2e/_bs_home/

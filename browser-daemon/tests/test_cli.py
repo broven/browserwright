@@ -227,3 +227,14 @@ def test_url_json_carries_extras():
     assert data["schema_version"] == 1
     assert data["backend"] == "env"
     assert isinstance(data["extras"], dict)
+
+
+def test_end_session_subcommand_registered():
+    """P5: `browser-daemon end-session --session ID` parses and is dispatched."""
+    from browser_daemon import cli
+
+    assert "end-session" in cli._DISPATCH
+    parser = cli._build_parser()
+    args = parser.parse_args(["end-session", "--session", "7", "--name", "d"])
+    assert args.cmd == "end-session"
+    assert args.session == "7"

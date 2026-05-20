@@ -33,6 +33,11 @@ class RdpBackend(Backend):
         self._cfg = cfg
         self.port = cfg.backends.rdp.port
 
+    def caps(self) -> dict:
+        # --create launches/owns an isolated Chrome and can use real browser
+        # contexts for per-session isolation (P4).
+        return {"owns_browser": True, "supports_browser_context": True}
+
     # ------------------------------------------------------------------ probe
 
     async def probe(self) -> DoctorResult:

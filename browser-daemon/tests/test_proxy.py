@@ -181,7 +181,23 @@ async def test_browserdaemon_get_backend_info_self_answered():
         "id": 2, "method": "BrowserDaemon.getBackendInfo",
     }))
     assert cap.upstream == []
-    assert cap.per_client[client.client_id][-1]["result"]["name"] == "rdp"
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["name"] == "rdp"
+    assert result["kind"] == "UPSTREAM_WS"  # rdp is an upstream-ws backend
+
+
+@pytest.mark.asyncio
+async def test_browserdaemon_get_backend_info_reports_extension_kind():
+    """4a: under the extension backend, kind must be LOCAL_RELAY, not the
+    old hardcoded UPSTREAM_WS."""
+    state, router, cap, (client,) = _setup()
+    state.backend_name = "extension"
+    await router.route_from_client(client, json.dumps({
+        "id": 2, "method": "BrowserDaemon.getBackendInfo",
+    }))
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["name"] == "extension"
+    assert result["kind"] == "LOCAL_RELAY"
 
 
 @pytest.mark.asyncio
@@ -240,7 +256,7 @@ async def test_attach_active_with_callback_binds_session_and_attacher():
     correctly under the returned sessionId."""
     state, router, cap, (client,) = _setup()
 
-    async def fake_attach_active():
+    async def fake_attach_active(*, session_id=None):
         return {
             "sessionId": "UPSTREAM-XSID-1",
             "targetId": "ext-tab-77",
@@ -276,7 +292,7 @@ async def test_attach_active_callback_failure_returns_error():
     than a hung request."""
     state, router, cap, (client,) = _setup()
 
-    async def boom():
+    async def boom(*, session_id=None):
         raise RuntimeError("relay says no")
 
     router._attach_active_tab = boom
@@ -633,7 +649,7 @@ async def test_open_background_with_callback_binds_session_and_attacher():
     ownership registered with the daemon-allocated LOCAL sessionId."""
     state, router, cap, (client,) = _setup()
 
-    async def _fake_open(url: str, group_name: str | None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         assert url == "https://example.com/"
         assert group_name == "Agent"
         return {
@@ -699,7 +715,7 @@ async def test_close_tab_with_callback_cleans_session_state():
     state, router, cap, (client,) = _setup()
     upstream_sid = "UPSTREAM-SID-99"
 
-    async def _fake_open(url: str, group_name: str | None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         return {
             "sessionId": upstream_sid,
             "targetId": "ext-tab-99",
@@ -761,7 +777,7 @@ async def test_close_tab_by_target_id_works_across_client_boundary():
     global state.attachers table, not just the local client's sessions."""
     state, router, cap, (alice, bob) = _setup("alice", "bob")
 
-    async def _fake_open(url: str, group_name: str | None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         return {
             "sessionId": "UPSTREAM-SID-77",
             "targetId": "ext-tab-77",
@@ -810,7 +826,7 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
     still has an entry)."""
     state, router, cap, (alice, bob) = _setup("alice", "bob")
 
-    async def _fake_open(url: str, group_name: str | None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         return {
             "sessionId": "UPSTREAM-SID-88",
             "targetId": "ext-tab-88",
@@ -891,3 +907,39 @@ async def test_pre_open_buffer_browserdaemon_namespace_bypasses_gate():
     assert "result" in resp
 
 
+
+
+# ---- P5: BrowserDaemon.endSession dispatch --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_end_session_dispatch_invokes_callback():
+    """P5: BrowserDaemon.endSession routes to the wired callback with the
+    session id and returns its {closed, kept} result."""
+    state, router, cap, (client,) = _setup()
+    seen: list[str] = []
+
+    async def _fake_end(session_id: str) -> dict:
+        seen.append(session_id)
+        return {"closed": [30], "kept": [88]}
+
+    router._end_session = _fake_end
+    await router.route_from_client(client, json.dumps({
+        "id": 9, "method": "BrowserDaemon.endSession",
+        "params": {"session": "A"},
+    }))
+    assert seen == ["A"]
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 9
+    assert resp["result"] == {"closed": [30], "kept": [88]}
+
+
+@pytest.mark.asyncio
+async def test_end_session_requires_session_param():
+    state, router, cap, (client,) = _setup()
+    router._end_session = None
+    await router.route_from_client(client, json.dumps({
+        "id": 9, "method": "BrowserDaemon.endSession",
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["error"]["code"] == -32602

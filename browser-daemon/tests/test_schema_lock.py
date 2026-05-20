@@ -72,6 +72,8 @@ V2_BROWSER_DAEMON_METHODS = frozenset({
     # Phase B: extension-backend-only verbs.
     "BrowserDaemon.openBackgroundTab",
     "BrowserDaemon.closeTab",
+    # P5: per-session teardown (extension backend only).
+    "BrowserDaemon.endSession",
 })
 
 

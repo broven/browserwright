@@ -361,3 +361,89 @@ async def test_close_tab_unknown_session_raises_value_error():
     async with _ext_upstream() as (relay, upstream, captured, ext):
         with pytest.raises(ValueError):
             await upstream.close_tab("not-a-real-session-id")
+
+
+# ---- P5: per-session ownership + end_session cleanup ----------------------
+
+
+async def _open_owned(upstream, ext, url, tab_id, group_id, session_id):
+    async def respond():
+        cmd = await ext.next_command()
+        await ext.respond(cmd["id"], result={
+            "tabId": tab_id, "url": url, "title": "t", "groupId": group_id,
+        })
+    r = asyncio.create_task(respond())
+    out = await upstream.open_background_tab(url, group_name="Agent",
+                                            session_id=session_id)
+    await r
+    return out
+
+
+@pytest.mark.asyncio
+async def test_sessions_own_distinct_groups_and_tabs():
+    """P5.1/5.2: two sessions get distinct groups; each owns its own tab."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await _open_owned(upstream, ext, "https://a/", 10, 100, "A")
+        await _open_owned(upstream, ext, "https://b/", 20, 200, "B")
+        assert upstream._owned["A"] == {10}
+        assert upstream._owned["B"] == {20}
+        assert upstream._groups["A"] == 100
+        assert upstream._groups["B"] == 200
+        # session B can't see session A's tab
+        assert 10 not in upstream._owned["B"]
+
+
+@pytest.mark.asyncio
+async def test_attach_active_records_borrowed_not_owned():
+    """P5.3: an attached focused tab is borrowed, not owned."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        async def respond_attach():
+            cmd = await ext.next_command()
+            await ext.respond(cmd["id"], result={
+                "tabId": 77, "url": "https://focused/", "title": "F"})
+        r = asyncio.create_task(respond_attach())
+        await upstream.attach_active_tab(session_id="A")
+        await r
+        assert upstream._borrowed["A"] == {77}
+        assert 77 not in upstream._owned.get("A", set())
+
+
+@pytest.mark.asyncio
+async def test_end_session_closes_owned_keeps_borrowed():
+    """P5.4: end_session closes owned tabs, keeps borrowed ones."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await _open_owned(upstream, ext, "https://owned/", 30, 300, "A")
+
+        async def respond_attach():
+            cmd = await ext.next_command()
+            await ext.respond(cmd["id"], result={
+                "tabId": 88, "url": "https://borrowed/", "title": "B"})
+        r = asyncio.create_task(respond_attach())
+        await upstream.attach_active_tab(session_id="A")
+        await r
+
+        async def respond_close():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "closeTab"
+            assert cmd["tabId"] == 30
+            await ext.respond(cmd["id"], result={"ok": True, "tabId": 30})
+        c = asyncio.create_task(respond_close())
+        result = await upstream.end_session("A")
+        await c
+
+        assert result == {"closed": [30], "kept": [88]}
+        # tracking cleared
+        assert "A" not in upstream._owned
+        assert "A" not in upstream._borrowed
+
+
+@pytest.mark.asyncio
+async def test_session_info_live_fields():
+    """P5.5: session_info reports group id, owned/borrowed counts, sample url."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await _open_owned(upstream, ext, "https://owned/", 40, 400, "A")
+        info = upstream.session_info("A")
+        assert info["group_id"] == 400
+        assert info["owned_tabs"] == 1
+        assert info["borrowed_tabs"] == 0
+        assert info["sample_url"] == "https://owned/"

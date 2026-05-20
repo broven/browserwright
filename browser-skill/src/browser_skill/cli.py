@@ -1,7 +1,8 @@
 """Top-level ``browser-skill`` CLI dispatch.
 
-Subcommands (v0.1):
-  repl start | stop | status | exec '<code>'
+Subcommands:
+  session new | end | list | prune        (P2: explicit session creation)
+  whoami --session=ID
   task <site>/<name> [--arg=val ...]    NOT IN v0.1 ENTRY: minimal stub
   install
   doctor
@@ -29,10 +30,11 @@ Usage:
   print(page_info())
   PY
 
-  browser-skill repl start
-  browser-skill repl stop
-  browser-skill repl status
-  browser-skill exec '<python>'
+  browser-skill session new --backend=<extension|rdp> [--create | --attach=PORT] [--name=NAME]
+  browser-skill session end --session=ID
+  browser-skill session list [--json]
+  browser-skill session prune [--idle=SECONDS]
+  browser-skill whoami --session=ID
 
   browser-skill task <site>/<name> [--key=value ...] [--isolated]
   browser-skill list-tasks [--site SITE] [--query Q] [--json]
@@ -71,44 +73,6 @@ def _parse_kv_args(args: list[str]) -> dict:
             except (TypeError, ValueError):
                 out[key] = value
     return out
-
-
-def _cmd_repl(args: list[str]) -> int:
-    from .errors import BrowserSkillError
-    from .repl import client, server
-
-    if not args:
-        print("usage: browser-skill repl {start|stop|status|exec}", file=sys.stderr)
-        return 1
-    sub = args[0]
-    rest = args[1:]
-    if sub == "start":
-        server.start(daemonize="--foreground" not in rest)
-        return 0
-    if sub == "stop":
-        return server.stop()
-    if sub == "status":
-        return server.status()
-    if sub == "exec":
-        if not rest:
-            code = sys.stdin.read()
-        else:
-            code = rest[0]
-        if not client.is_repl_running():
-            print("repl daemon not running. start with `browser-skill repl start`",
-                  file=sys.stderr)
-            return 2
-        reply = client.send_exec(code)
-        if reply.get("stdout"):
-            sys.stdout.write(reply["stdout"])
-        if reply.get("stderr"):
-            sys.stderr.write(reply["stderr"])
-        if reply.get("exception"):
-            sys.stderr.write(json.dumps(reply["exception"]) + "\n")
-            return 3
-        return 0
-    print(f"unknown repl subcommand: {sub}", file=sys.stderr)
-    return 1
 
 
 def _cmd_task(args: list[str]) -> int:
@@ -421,6 +385,88 @@ def _cmd_memory(args: list[str]) -> int:
     return 1
 
 
+def _cmd_session(args: list[str]) -> int:
+    """``browser-skill session {new|end|list|prune} ...`` (P2)."""
+    from . import session_create
+    from . import session_registry as reg
+
+    if not args:
+        print("usage: browser-skill session {new|end|list|prune} ...", file=sys.stderr)
+        return 1
+    sub = args[0]
+    kw = _parse_kv_args(args[1:])
+
+    if sub == "new":
+        backend = kw.get("backend")
+        if backend not in ("extension", "rdp"):
+            print("usage: browser-skill session new --backend=<extension|rdp> "
+                  "[--create | --attach=PORT] [--name=NAME]", file=sys.stderr)
+            return 1
+        try:
+            sid = session_create.new(
+                backend=backend, create=bool(kw.get("create")),
+                attach=kw.get("attach"), name=kw.get("name"),
+            )
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(sid)  # token-frugal: bare id
+        return 0
+
+    if sub == "end":
+        from .errors import NoSession
+        from .session_ctx import resolve_session
+        try:
+            rec = resolve_session(kw.get("session"))
+        except NoSession as e:
+            print(str(e), file=sys.stderr)
+            return e.exit_code
+        print(session_create.end(rec))
+        return 0
+
+    if sub == "list":
+        rows = reg.list_all()
+        if kw.get("json"):
+            sys.stdout.write(json.dumps(rows, indent=2, default=str) + "\n")
+            return 0
+        if not rows:
+            print("(no sessions)")
+            return 0
+        for r in rows:
+            print(f"  {r['id']:>3}  {r['backend']:9s} {r['owner']:6s} "
+                  f"{(r.get('name') or '-'):16s} {r['daemon_endpoint']}")
+        return 0
+
+    if sub == "prune":
+        idle = kw.get("idle", 3600)
+        pruned = session_create.reap(idle_seconds=float(idle))
+        print(f"pruned {len(pruned)} idle session(s).")
+        return 0
+
+    print(f"unknown session subcommand: {sub}", file=sys.stderr)
+    return 1
+
+
+def _cmd_whoami(args: list[str]) -> int:
+    """``browser-skill whoami --session=ID`` — the ledger view of a session.
+
+    Live-browser fields (group/tab count/sample URL) are filled by a daemon
+    round-trip in Phase 5/6; for now we print only ledger-known fields.
+    """
+    from .errors import NoSession
+    from .session_ctx import resolve_session
+
+    kw = _parse_kv_args(args)
+    try:
+        rec = resolve_session(kw.get("session"))
+    except NoSession as e:
+        print(str(e), file=sys.stderr)
+        return e.exit_code
+    view = {k: rec.get(k) for k in ("id", "backend", "owner", "name", "daemon_endpoint")}
+    sys.stdout.write(json.dumps(view, default=str) + "\n")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -439,11 +485,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     if cmd in {"--version", "version"}:
         print(__version__)
         sys.exit(0)
-    if cmd == "repl":
-        sys.exit(_cmd_repl(rest))
-    if cmd == "exec":
-        # shorthand for `repl exec`
-        sys.exit(_cmd_repl(["exec", *rest]))
     if cmd == "task":
         sys.exit(_cmd_task(rest))
     if cmd == "doctor":
@@ -467,6 +508,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_selftest(rest))
     if cmd == "sub":
         sys.exit(_cmd_sub(rest))
+    if cmd == "session":
+        sys.exit(_cmd_session(rest))
+    if cmd == "whoami":
+        sys.exit(_cmd_whoami(rest))
 
     # Catch heredoc usage: `cat foo.py | browser-skill`.
     print(f"unknown command: {cmd!r}", file=sys.stderr)

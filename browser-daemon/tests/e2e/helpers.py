@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from .conftest import TEST_EXT_PORT, TEST_NAME, TEST_RDP_PORT, scrubbed_env
 
@@ -47,6 +49,7 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
 
     env = scrubbed_env()
     env["BD_NAME"] = TEST_NAME
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / TEST_NAME)
     env["BS_DAEMON_BACKEND"] = backend
     # Bypass proxy for localhost
     env["no_proxy"] = "127.0.0.1,localhost"
@@ -70,14 +73,53 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
     if extra_env:
         env.update(extra_env)
 
-    proc = subprocess.run(
-        [skill_bin],
-        input=script,
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=timeout,
-    )
+    # P1 session model: inline `browser-skill <<PY` refuses to run unless a
+    # ledger session is explicitly in scope. E2E helpers create a lightweight
+    # ledger record directly in the isolated BS_HOME so tests don't depend on
+    # the developer's session state. Avoid `browser-skill session new` here:
+    # for RDP it would spawn a detached per-session daemon, while these tests
+    # intentionally force Mode A via BS_DAEMON_URL_CMD / BS_CDP_WS.
+    created_session_id = None
+    if "BD_SESSION" not in env:
+        import json
+        import time
+
+        created_session_id = f"e2e-{uuid.uuid4().hex}"
+        sessions_dir = Path(env["BS_HOME"]) / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        ledger_path = sessions_dir / "ledger.json"
+        now = time.time()
+        record = {
+            "id": created_session_id,
+            "backend": backend,
+            "daemon_endpoint": TEST_NAME if backend == "extension" else f"e2e-rdp-{created_session_id}",
+            "workspace": None,
+            "owner": "attach",
+            "name": "e2e-run-skill",
+            "created_at": now,
+            "last_seen": now,
+        }
+        ledger_path.write_text(
+            json.dumps({"next_id": 1, "sessions": {created_session_id: record}}),
+            encoding="utf-8",
+        )
+        env["BD_SESSION"] = created_session_id
+
+    try:
+        proc = subprocess.run(
+            [skill_bin],
+            input=script,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=timeout,
+        )
+    finally:
+        if created_session_id is not None:
+            try:
+                ledger_path.unlink()
+            except OSError:
+                pass
     return SkillResult(
         returncode=proc.returncode,
         stdout=proc.stdout,

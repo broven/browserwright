@@ -1,13 +1,10 @@
 """``browser-skill <<'PY' ... PY`` — single-shot heredoc execution.
 
-Dispatch order:
-
-  1. If a long-lived Skill REPL daemon is already running
-     (`/tmp/browser-skill.sock`) → send the snippet over it. Single
-     shared ws across calls, no per-call connection cost.
-
-  2. Otherwise exec the snippet in-process. The daemon (extension /
-     rdp / cloud) is reached on demand via the standard session client.
+The snippet is always exec'd **in-process**. The daemon (extension / rdp /
+cloud) is reached on demand via the session client resolved from the current
+``BD_SESSION``. The old cross-process Skill REPL daemon was removed (P3): it
+froze ``BD_NAME``/backend into a shared singleton and forwarded heredocs
+without their env — the documented cross-talk accident.
 """
 from __future__ import annotations
 
@@ -21,7 +18,6 @@ from typing import IO
 from ..errors import BrowserSkillError, serialize
 from ..session import current_session
 from . import _namespace
-from .client import is_repl_running, send_exec
 
 
 def run(stdin: IO[str]) -> int:
@@ -32,24 +28,18 @@ def run(stdin: IO[str]) -> int:
               file=sys.stderr)
         return 1
 
-    # (1) re-use the Skill REPL daemon when present — single shared ws.
-    if is_repl_running():
-        try:
-            reply = send_exec(code)
-        except Exception as e:  # noqa: BLE001
-            print(f"repl daemon error: {e}", file=sys.stderr)
-            return 2
-        if reply.get("stdout"):
-            sys.stdout.write(reply["stdout"])
-        if reply.get("stderr"):
-            sys.stderr.write(reply["stderr"])
-        if reply.get("exception"):
-            sys.stderr.write(json.dumps(reply["exception"]) + "\n")
-            return _exit_code_for(reply["exception"].get("type"))
-        return 0
+    # P1: refuse loudly at the entrypoint when no session is in scope, rather
+    # than silently sharing a browser via the import-time default.
+    from ..errors import NoSession
+    from ..session_ctx import resolve_session
+    try:
+        resolve_session()
+    except NoSession as e:
+        print(str(e), file=sys.stderr)
+        return e.exit_code
 
-    # (2) Otherwise run in-process. Capture stdout so we can also record it in
-    # the session history (which propose_solidify reads).
+    # Run in-process. Capture stdout so we can also record it in the session
+    # history (which propose_solidify reads).
     globals_ = _namespace.build_globals()
     buf = io.StringIO()
     try:
@@ -73,12 +63,3 @@ def run(stdin: IO[str]) -> int:
     sys.stdout.write(buf.getvalue())
     current_session().record(code, ok=True, stdout=buf.getvalue())
     return 0
-
-
-def _exit_code_for(type_name: str | None) -> int:
-    return {
-        "AuthWall": 4,
-        "Captcha": 5,
-        "DaemonUnavailable": 2,
-        "NeedsUserConfirm": 1,
-    }.get(type_name or "", 3)

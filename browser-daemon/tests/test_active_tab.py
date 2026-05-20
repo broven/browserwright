@@ -42,6 +42,32 @@ async def test_picks_most_recent_eligible_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_extension_routes_through_relay_not_resolve(monkeypatch):
+    """4b: under the extension backend, active-tab must route through the relay
+    (BrowserDaemon.getActiveTab), never resolve() — which always raises
+    Unavailable for a LOCAL_RELAY backend."""
+    calls = {"resolve": 0, "relay": 0}
+
+    async def boom_resolve(cfg):
+        calls["resolve"] += 1
+        raise AssertionError("resolve() must not be called for extension")
+
+    async def fake_relay(cfg):
+        calls["relay"] += 1
+        return {"targetId": "T", "url": "https://x/", "title": "x",
+                "accuracy": "relay", "since_seconds": None}
+
+    monkeypatch.setattr(at_mod, "resolve", boom_resolve)
+    monkeypatch.setattr(at_mod, "_active_tab_via_relay", fake_relay)
+
+    cfg = load(env={})
+    cfg.backend = "extension"
+    info = await at_mod.active_tab(cfg)
+    assert calls == {"resolve": 0, "relay": 1}
+    assert info["targetId"] == "T"
+
+
+@pytest.mark.asyncio
 async def test_no_eligible_page_returns_none(monkeypatch):
     """Only chrome:// + extensions — no real page open. spec §5.4: empty
     output + exit 2 is the contract; the function-level signal is None."""

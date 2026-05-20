@@ -39,6 +39,12 @@ async def active_tab(cfg: Config) -> dict[str, Any] | None:
     Shape (spec §5.4 --json):
         {targetId, url, title, accuracy, since_seconds}
     """
+    # The extension backend is a LOCAL_RELAY — there's no externally-resolvable
+    # browser ws (resolve() raises Unavailable). Route through the running
+    # daemon's BrowserDaemon.getActiveTab RPC instead (P4b).
+    if cfg.backend == "extension":
+        return await _active_tab_via_relay(cfg)
+
     rr = await resolve(cfg)
     targets = await _fetch_targets(rr.ws_url, cfg.timeout)
     eligible = [
@@ -75,6 +81,58 @@ async def active_tab(cfg: Config) -> dict[str, Any] | None:
         "title": pick.get("title", ""),
         "accuracy": "heuristic-recent-activate",
         "since_seconds": since_seconds,
+    }
+
+
+async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
+    """Ask the running daemon for the active tab over its Mode B socket.
+
+    The extension backend answers ``BrowserDaemon.getActiveTab`` from relay
+    state (no upstream browser ws to open). Returns the same dict shape as the
+    Mode A path, or ``None`` when the daemon reports no eligible tab.
+    """
+    import asyncio
+    import json
+
+    import websockets
+
+    from . import _ipc
+
+    async def _drain(ws) -> dict:
+        for _ in range(20):
+            raw = await asyncio.wait_for(ws.recv(), timeout=cfg.timeout)
+            msg = json.loads(raw)
+            if msg.get("id") == 1:
+                return msg
+        raise Unavailable("active-tab: no id=1 response from daemon relay")
+
+    if _ipc.IS_WINDOWS:
+        port, token = _ipc.read_port_file(cfg.name)
+        if port is None:
+            raise Unavailable("active-tab: no daemon running (extension relay)")
+        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-active-tab"
+        async with websockets.connect(url, compression=None) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "BrowserDaemon.getActiveTab"}))
+            msg = await _drain(ws)
+    else:
+        path = _ipc.sock_path(cfg.name)
+        if not path.exists():
+            raise Unavailable("active-tab: no daemon running (extension relay)")
+        async with websockets.unix_connect(
+                str(path), uri="ws://localhost/?client=cli-active-tab",
+                compression=None) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "BrowserDaemon.getActiveTab"}))
+            msg = await _drain(ws)
+
+    result = msg.get("result") or {}
+    if not result.get("targetId"):
+        return None
+    return {
+        "targetId": result.get("targetId"),
+        "url": result.get("url"),
+        "title": result.get("title", ""),
+        "accuracy": result.get("accuracy", "unknown"),
+        "since_seconds": result.get("since_seconds"),
     }
 
 

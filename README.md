@@ -7,10 +7,8 @@ An AI-agent–friendly stack for driving a real Chrome from the terminal over CD
 ├── browser-daemon/   Layer 1 — CDP WebSocket URL resolver (5 backends)
 ├── browser-skill/    Layer 2 — REPL / primitives / site skills / memory / solidify
 ├── skill/            Claude Code skill bundle (symlink this to ~/.claude/skills/browser-skill)
-├── ai-e2e-tests/     Claude Agent SDK harness exercising 4 user stories end-to-end
 ├── browser-connection.md   Why this stack exists (CDP discovery, Chrome 144+ popups)
-├── HANDOFF-v0.5.md         Version-by-version delivery history
-└── REVIEW.md               Independent code review
+└── README.md
 ```
 
 ## ⚠️ Before you start
@@ -138,28 +136,18 @@ The `skill/` directory at the repo root is a Claude Code skill bundle. Symlink i
 
 The skill always recommends the isolated-Chrome path, so it won't spam Allow popups against your daily Chrome.
 
-## ai-e2e-tests
-
-```bash
-( cd ai-e2e-tests && python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt )
-
-( cd ai-e2e-tests && .venv/bin/python harness.py --dry-run )   # validate harness, no Claude needed
-( cd ai-e2e-tests && .venv/bin/python harness.py )             # real Claude agent, ~5 min
-```
-
-Needs `ANTHROPIC_API_KEY` or an authenticated Claude Code OAuth token. See `ai-e2e-tests/README.md`.
-
 ## Uninstall
 
 ```bash
 rm ~/.local/bin/browser-daemon ~/.local/bin/browser-skill
 rm ~/.claude/skills/browser-skill
-rm -rf browser-daemon/.venv browser-skill/.venv ai-e2e-tests/.venv
+rm -rf browser-daemon/.venv browser-skill/.venv
 rm -rf ~/.cache/browser-daemon ~/.browser-skill
 ```
 
 ## Further reading
 
+- `TESTING.md` — map of all test suites, what each covers, and how to run them
 - `browser-connection.md` — *why* this stack exists (CDP discovery paths, Chrome 144+ popup mechanics)
 - `browser-daemon/README.md` — backend internals, env vars, `config.toml`
 - `browser-skill/README.md` — full primitive surface, v0.4 / v0.5 release notes

@@ -60,6 +60,18 @@ def _build_requires_session_error(method: str) -> str:
     )
 
 
+def _build_create_target_error() -> str:
+    """Target.createTarget can't be honored by the extension backend (it can't
+    issue browser-level CDP). The old code reported the misleading 'requires a
+    sessionId' error; instead point clients at the real tab-opening verbs."""
+    return (
+        "Target.createTarget is not supported by the extension backend — "
+        "it cannot open browser-level targets. Open a tab via the skill "
+        "primitive new_page() (or BrowserDaemon.openBackgroundTab for a "
+        "background tab) instead."
+    )
+
+
 def _build_unknown_session_error(session_id: str) -> str:
     return (
         f"unknown sessionId {session_id!r} — likely from a transient ws "
@@ -117,6 +129,64 @@ class ExtensionUpstream:
         # Map: upstream sessionId → tabId (for the rare path where commands
         # specify sessionId without our naming convention).
         self._sessions: dict[str, int] = {}
+        # P5 per-(skill)session tab ownership. ``owner`` keys are the
+        # browser-skill session ids the caller threads through openBackgroundTab
+        # / attachActiveTab. Owned tabs are closed on end_session; borrowed
+        # (attached) tabs are kept (the user already had them open).
+        self._owned: dict[str, set[int]] = {}
+        self._borrowed: dict[str, set[int]] = {}
+        self._groups: dict[str, int] = {}        # session → tab-group id
+        self._tab_url: dict[int, str] = {}        # tab_id → last-known url
+
+    # ---- P5 per-session ownership helpers --------------------------------
+
+    def _record_owned(self, session_id: str, tab_id: int, *, group_id: int = -1,
+                      url: str = "") -> None:
+        self._owned.setdefault(session_id, set()).add(tab_id)
+        if isinstance(group_id, int) and group_id >= 0:
+            self._groups[session_id] = group_id
+        if url:
+            self._tab_url[tab_id] = url
+
+    def _record_borrowed(self, session_id: str, tab_id: int, *, url: str = "") -> None:
+        self._borrowed.setdefault(session_id, set()).add(tab_id)
+        if url:
+            self._tab_url[tab_id] = url
+
+    def session_info(self, session_id: str) -> dict:
+        """Live view of a session's tabs (P5.5): group id, owned/borrowed tab
+        counts, and a sample url. Used to fill `whoami`'s live fields."""
+        owned = sorted(self._owned.get(session_id, set()))
+        borrowed = sorted(self._borrowed.get(session_id, set()))
+        sample = next((self._tab_url.get(t, "") for t in owned + borrowed
+                       if self._tab_url.get(t)), "")
+        return {
+            "session_id": session_id,
+            "group_id": self._groups.get(session_id, -1),
+            "owned_tabs": len(owned),
+            "borrowed_tabs": len(borrowed),
+            "sample_url": sample,
+        }
+
+    async def end_session(self, session_id: str) -> dict:
+        """Tear down a session's workspace (P5.4): close owned tabs, keep
+        borrowed ones (the user opened them), and drop the session's tracking.
+        Returns ``{closed: [...], kept: [...]}``."""
+        owned = sorted(self._owned.pop(session_id, set()))
+        borrowed = sorted(self._borrowed.pop(session_id, set()))
+        self._groups.pop(session_id, None)
+        closed: list[int] = []
+        for tab_id in owned:
+            try:
+                await self._relay.close_tab(tab_id)
+                closed.append(tab_id)
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+            # Evict any fabricated CDP sessions bound to a closed tab.
+            for sid in [s for s, t in self._sessions.items() if t == tab_id]:
+                self._sessions.pop(sid, None)
+            self._tab_url.pop(tab_id, None)
+        return {"closed": closed, "kept": borrowed}
 
     @property
     def ws_url(self) -> str | None:
@@ -247,6 +317,13 @@ class ExtensionUpstream:
             # Best effort: report -32601 since extensions can't issue
             # browser-level CDP without a session.
             if isinstance(method, str) and method.startswith("Target."):
+                # Target.createTarget: the extension can't open browser-level
+                # targets — fast-fail with a message naming the real verbs
+                # (new_page / openBackgroundTab) rather than the misleading
+                # "requires a sessionId".
+                if method == "Target.createTarget":
+                    await self._error(req_id, -32601, _build_create_target_error())
+                    return
                 # Target.activateTarget(targetId) → translate to chrome.tabs.update
                 if method == "Target.activateTarget":
                     target_id = params.get("targetId")
@@ -275,15 +352,20 @@ class ExtensionUpstream:
         except Exception as e:
             await self._error(req_id, -32603, f"relay send failed: {e!r}")
 
-    async def attach_active_tab(self) -> dict:
+    async def attach_active_tab(self, *, session_id: str | None = None) -> dict:
         """Daemon-driven attach: relay asks the extension for its focused-
         window active tab, attaches it, and we fabricate a sessionId the
         same shape `Target.attachToTarget` would. Returned dict is what the
         Skill client should see: `{sessionId, targetId, tabId, url, title}`.
+
+        When ``session_id`` is given (P5), the tab is recorded as **borrowed**
+        by that session — end_session keeps it (the user already had it open).
         """
         ghost = await self._relay.attach_active_tab(timeout=10.0)
         sid = _new_upstream_session_id(ghost.tab_id)
         self._sessions[sid] = ghost.tab_id
+        if session_id is not None:
+            self._record_borrowed(session_id, ghost.tab_id, url=ghost.url)
         return {
             "sessionId": sid,
             "targetId": ghost.target_id,
@@ -297,13 +379,21 @@ class ExtensionUpstream:
         url: str,
         *,
         group_name: str | None = "Agent",
+        session_id: str | None = None,
     ) -> dict:
         """Open a background tab via the relay, fabricate a sessionId, and
-        return ``{sessionId, targetId, tabId, url, title, groupId}``."""
+        return ``{sessionId, targetId, tabId, url, title, groupId}``.
+
+        When ``session_id`` is given (P5), the tab is recorded as **owned** by
+        that session and its group is tracked — end_session closes it."""
         gt = await self._relay.create_background_tab(url, group_name=group_name)
         sid = _new_upstream_session_id(gt.tab_id)
         self._sessions[sid] = gt.tab_id
         group_id = getattr(gt, "group_id", -1)
+        if session_id is not None:
+            self._record_owned(session_id, gt.tab_id,
+                               group_id=int(group_id) if isinstance(group_id, int) else -1,
+                               url=gt.url)
         return {
             "sessionId": sid,
             "targetId": gt.target_id,

@@ -42,14 +42,24 @@ from .errors import DaemonUnavailable
 
 
 class Session:
-    def __init__(self, daemon=None):
+    def __init__(self, daemon=None, *, record=None):
         # ``daemon`` is duck-typed: either a ``ModeAClient`` (subprocess-based)
         # or a ``ModeBClient`` (long-lived socket). Both expose
         # ``resolve_ws_url`` / ``ws_url`` semantics through the matching
         # methods we use below.
+        #
+        # ``record`` is a resolved session ledger record (P1). When given, the
+        # daemon endpoint comes from ``record["daemon_endpoint"]`` rather than
+        # the import-time default — this is how multiple agents stay isolated.
+        # Stored as ``session_record`` to avoid shadowing the ``record()`` method.
+        self.session_record = record
         if daemon is None:
-            from .mode_b_client import auto_client
-            daemon = auto_client()
+            if record is not None:
+                from .mode_b_client import client_for_session
+                daemon = client_for_session(record)
+            else:
+                from .mode_b_client import auto_client
+                daemon = auto_client()
         self.daemon = daemon
         self._cdp: Optional[CDPSession] = None
         self._cdp_lock = threading.Lock()

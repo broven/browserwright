@@ -36,16 +36,20 @@ from typing import Any, Optional
 from .errors import DaemonBackendMismatch, DaemonUnavailable
 
 
-_DEFAULT_NAME = os.environ.get("BD_NAME", "default")
+def _default_name() -> str:
+    """Live ``BD_NAME`` lookup. NOT a module-level constant: freezing identity
+    at import time was the silent cross-talk root (P1). Callers resolving a
+    session pass an explicit endpoint via :func:`client_for_session` instead."""
+    return os.environ.get("BD_NAME", "default")
 
 
-def _default_socket_path(name: str = _DEFAULT_NAME) -> Path:
+def _default_socket_path(name: Optional[str] = None) -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    return Path(base) / f"browser-daemon-{name}.sock"
+    return Path(base) / f"browser-daemon-{name or _default_name()}.sock"
 
 
-def _windows_port_file(name: str = _DEFAULT_NAME) -> Path:
-    return Path(os.environ.get("TEMP", "/tmp")) / f"browser-daemon-{name}.port"
+def _windows_port_file(name: Optional[str] = None) -> Path:
+    return Path(os.environ.get("TEMP", "/tmp")) / f"browser-daemon-{name or _default_name()}.port"
 
 
 class ModeBClient:
@@ -54,8 +58,8 @@ class ModeBClient:
     open. Active-tab / disconnect / uiState are sent over the same socket.
     """
 
-    def __init__(self, *, name: str = _DEFAULT_NAME):
-        self.name = name
+    def __init__(self, *, name: Optional[str] = None):
+        self.name = name or _default_name()
         self._endpoint: Optional[str] = None
         self._transport: Optional[str] = None  # "unix" or "tcp"
         self._token: Optional[str] = None
@@ -414,6 +418,15 @@ class ModeBClient:
             return {"schema_version": 1, "backends": [],
                     "error": "doctor output was not JSON",
                     "skill_synthetic": True}
+
+
+# ---- factory: build a client bound to a resolved session ------------
+
+def client_for_session(record: dict) -> ModeBClient:
+    """Build a Mode B client whose endpoint comes from the session *record*
+    (P1), not the import-time default. ``record["daemon_endpoint"]`` is the
+    daemon name/socket this session is bound to."""
+    return ModeBClient(name=record["daemon_endpoint"])
 
 
 # ---- factory: auto-pick Mode B → Mode A ------------------------------

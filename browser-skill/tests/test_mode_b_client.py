@@ -201,3 +201,34 @@ def test_force_a_env_picks_mode_a(monkeypatch):
     monkeypatch.setenv("BS_DAEMON_MODE", "A")
     client = auto_client()
     assert isinstance(client, ModeAClient)
+
+
+def test_client_uses_session_daemon_endpoint(tmp_bs_home, monkeypatch):
+    """P1: the endpoint a call talks to comes from the session record, not a
+    frozen module-level ``"default"``."""
+    from browser_skill import mode_b_client
+    from browser_skill import session_registry as reg
+
+    sid = reg.allocate(backend="rdp", daemon_endpoint="browser-daemon-s7.sock",
+                       owner="create")
+    c = mode_b_client.client_for_session(reg.get(sid))
+    assert c.name == "browser-daemon-s7.sock"  # not "default"
+
+
+def test_default_name_is_not_frozen_at_import(monkeypatch):
+    """BD_NAME is read live, so changing it after import takes effect."""
+    from browser_skill import mode_b_client
+
+    monkeypatch.setenv("BD_NAME", "live-changed")
+    assert mode_b_client.ModeBClient().name == "live-changed"
+
+
+def test_session_built_from_record_uses_endpoint(tmp_bs_home):
+    """Threading a record into Session picks the record's daemon endpoint."""
+    from browser_skill import session_registry as reg
+    from browser_skill.session import Session
+
+    sid = reg.allocate(backend="rdp", daemon_endpoint="browser-daemon-s9.sock",
+                       owner="create")
+    sess = Session(record=reg.get(sid))
+    assert sess.daemon.name == "browser-daemon-s9.sock"

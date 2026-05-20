@@ -35,9 +35,8 @@ class DaemonClient:
     """Mode A subprocess client.
 
     Stateless except for a cached ws URL. Methods are sync — they fork
-    ``browser-daemon`` for each call. That's acceptable for v0.1 because
-    the long-lived REPL daemon (see ``repl.server``) only resolves once at
-    startup and then re-uses the CDP ws via the in-process CDP transport.
+    ``browser-daemon`` for each call. Within one heredoc the CDP ws is
+    resolved once and re-used via the in-process CDP transport.
     """
 
     def __init__(

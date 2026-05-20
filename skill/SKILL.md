@@ -1,6 +1,6 @@
 ---
 name: browser-skill
-description: Layer-2 CDP browser automation CLI. Use when the user asks to drive a real Chrome via terminal — open pages, click, fill forms, screenshot, scrape, run scripted browser tasks, or build/solidify reusable site skills. Triggers include "browser-skill", "browser-daemon", "drive my Chrome", "automate the browser via CDP", "open this page and click X", "screenshot this URL", "scrape this site", "solidify this flow into a task". Sits on top of browser-daemon (Layer 1, CDP-URL resolver) and bundles three REPL forms, primitives, per-site memory, and a solidify pipeline.
+description: Layer-2 CDP browser automation CLI. Use when the user asks to drive a real Chrome via terminal — open pages, click, fill forms, screenshot, scrape, run scripted browser tasks, or build/solidify reusable site skills. Triggers include "browser-skill", "browser-daemon", "drive my Chrome", "automate the browser via CDP", "open this page and click X", "screenshot this URL", "scrape this site", "solidify this flow into a task". Sits on top of browser-daemon (Layer 1, CDP-URL resolver) and bundles session-scoped invocation forms, primitives, per-site memory, and a solidify pipeline.
 allowed-tools: Bash(browser-skill:*), Bash(browser-daemon:*)
 ---
 
@@ -9,7 +9,7 @@ allowed-tools: Bash(browser-skill:*), Bash(browser-daemon:*)
 Two CLIs work together:
 
 - **`browser-daemon`** (Layer 1) — resolves a Chrome CDP WebSocket URL. Backends: `env / rdp / extension / cloud`. Also has `launch-chrome` to spawn an isolated Chrome.
-- **`browser-skill`** (Layer 2) — the agent-facing surface. REPL forms, primitives, site skills, memory, solidify.
+- **`browser-skill`** (Layer 2) — the agent-facing surface. Invocation forms, primitives, site skills, memory, solidify.
 
 Both ship from the same repo. If they're not on `$PATH`, see the repo's root `README.md` for the install steps.
 
@@ -21,31 +21,45 @@ If the user expresses a preference about a kind of work that isn't yet captured 
 
 > **Note**: The legacy `autoconnect` backend (which used Chrome's `--remote-debugging-port=9222` and triggered an Allow popup on every ws handshake) was removed. To drive the user's daily Chrome, use the `extension` backend — load the unpacked extension once and connect via the daemon's relay; zero popups.
 
-## Three invocation forms
+## Sessions: create once, pass everywhere (P1 isolation)
+
+A **session** is the isolation key that lets multiple agents drive browsers without interfering. Creation is **explicit**, usage is **transparent**:
+
+```bash
+# Create a session (pick the backend/mode — see the decision rule below). Prints a short id.
+sid=$(browser-skill session new --backend=extension --name=research)
+# OR: browser-skill session new --backend=rdp --create        # owns a fresh isolated Chrome
+# OR: browser-skill session new --backend=rdp --attach=9222    # attaches to a running browser
+
+# Then every call carries the id — via --session or BD_SESSION.
+BD_SESSION=$sid browser-skill <<'PY'
+new_page("https://news.ycombinator.com")
+print(page_info())
+PY
+
+browser-skill whoami --session=$sid       # inspect the session
+browser-skill session end --session=$sid   # who created, closes; attach only reminds
+```
+
+**No session → loud refusal.** A heredoc with no `BD_SESSION` exits 2 with guidance — the daemon is never silently shared.
+
+**Before `session new`, consult decision memory.** Match the task to a recorded `situation → decision`; on a hit, auto-start with that backend+mode. On a miss, **ask the user which browser to use** (the three modes above), then record the answer so the next similar task doesn't re-prompt. Programmatically this is `session_create.choose(situation)` (hit → decision; miss → `NeedsUserConfirm` listing the modes) followed by `memory.session_decisions.record(situation, decision)`.
+
+## Two invocation forms
 
 ### 1. Inline heredoc — quick one-off scripts
 
 ```bash
-browser-skill <<'PY'
-new_tab("https://news.ycombinator.com")
+BD_SESSION=$sid browser-skill <<'PY'
+new_page("https://news.ycombinator.com")
 wait_for_load()
 print(page_info())
 PY
 ```
 
-All primitives are pre-imported. The daemon auto-resolves. First call may need `BD_PORT=<port> BD_BACKEND=rdp` env if isolated Chrome is running on a non-default port, or `BD_BACKEND=extension` for the extension relay.
+All primitives are pre-imported. The endpoint comes from the session record — no import-time `BD_NAME` default.
 
-### 2. REPL daemon — long sessions, single shared ws
-
-```bash
-browser-skill repl start                # single shared upstream ws for the session
-browser-skill exec 'print(page_info())'
-browser-skill exec 'click_at_xy(120, 240)'
-browser-skill repl status
-browser-skill repl stop
-```
-
-### 3. Task — pre-solidified reusable flow
+### 2. Task — pre-solidified reusable flow
 
 ```bash
 browser-skill list-tasks                          # discover bundled site skills
@@ -70,7 +84,7 @@ Tasks live as plain Python files under `~/.browser-skill/site-skills/<host>/task
 
 ⚠️ **`sessionId` is daemon-internal plumbing — agents don't pass it.** If you see "unknown sessionId" or "requires a sessionId", the prior attach failed. Don't try to "look up" the sessionId; re-call `attach_active()` / `open_background()` / `switch_tab()` and verify the return value before the next primitive.
 
-## Primitives surface (pre-imported in REPL)
+## Primitives surface (pre-imported in the heredoc namespace)
 
 **Navigation:** `goto_url`, `new_tab`, `switch_tab`, `list_tabs`, `current_tab`, `current_page`, `ensure_real_tab`, `iframe_target`
 

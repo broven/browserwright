@@ -46,6 +46,11 @@ class ExtensionBackend(Backend):
         # toml relay_url > DEFAULT_RELAY_PORT.
         self._host, self._port = cfg.backends.extension.resolved_host_port()
 
+    def caps(self) -> dict:
+        # Attaches to the user's existing Chrome; isolates sessions via tab
+        # groups, not browser contexts (P4).
+        return {"owns_browser": False, "supports_browser_context": False}
+
     async def probe(self) -> DoctorResult:
         """HTTP GET 127.0.0.1:19989/__status__.
 

@@ -21,14 +21,6 @@ providers:
 tests:
   # ── Case A: connect + open + summarize ──────────────────────
   - vars:
-      task: "用浏览器打开 https://example.com，告诉我这个页面在讲什么。"
-    assert:
-      - type: python
-        value: "file://scorers/case_a.py:get_assert"
-      - type: llm-rubric
-        value: "The output mentions that example.com is an illustrative or example domain used for documentation purposes"
-
-  - vars:
       task: "Open https://example.com in a browser and tell me what the page is about."
     assert:
       - type: python
@@ -38,41 +30,22 @@ tests:
 
   # ── Case B: save preference to memory.md ────────────────────
   - vars:
-      task: "我以后做这类自动化都用 extension backend 连我日常 Chrome，记住这个偏好。"
-      user_replies: '["yes, go ahead"]'
-    assert:
-      - type: python
-        value: "file://scorers/case_b.py:get_assert"
-
-  - vars:
       task: "From now on, always use the extension backend for browser automation. Remember this preference."
       user_replies: '["yes, go ahead"]'
     assert:
       - type: python
         value: "file://scorers/case_b.py:get_assert"
 
-  # ── Case C: solidify task (proactive ask = required) ────────
+  # ── Case C: scrape the top 5 Hacker News headlines (one-shot) ──
   - vars:
-      task: "每天早上帮我抓 Hacker News 首页前 5 条标题。"
-      user_replies: '["yes"]'
+      task: "Scrape the top 5 story titles from the Hacker News front page (https://news.ycombinator.com) and list them for me."
     assert:
       - type: python
         value: "file://scorers/case_c.py:get_assert"
-
-  - vars:
-      task: "Scrape the top 5 headlines from Hacker News front page every morning for me."
-      user_replies: '["yes"]'
-    assert:
-      - type: python
-        value: "file://scorers/case_c.py:get_assert"
+      - type: llm-rubric
+        value: "The output lists about five distinct story titles that plausibly come from the Hacker News front page (short headline-like phrases, not an error or a refusal)."
 
   # ── Case D: site memory (explicit write) ───────────────────
-  - vars:
-      task: "用浏览器打开 https://example.com，顺便把这个站点需要注意的坑记到 site memory 里。"
-    assert:
-      - type: python
-        value: "file://scorers/case_d.py:get_assert"
-
   - vars:
       task: "Open https://example.com in a browser and save any quirks or notes about this site to site memory."
     assert:
