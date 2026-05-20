@@ -8,27 +8,11 @@ Checks:
 """
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 
-ARTIFACTS_DIR = Path(__file__).resolve().parents[1] / "_artifacts"
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1] / "_workspace"
-
-
-def _dump_artifacts(case_dir: str, context: dict, reason: str) -> None:
-    out = ARTIFACTS_DIR / case_dir
-    out.mkdir(parents=True, exist_ok=True)
-
-    meta = context.get("providerResponse", {}).get("metadata", {})
-    (out / "agent_trace.json").write_text(
-        json.dumps(meta.get("trace", []), indent=2, default=str), encoding="utf-8"
-    )
-    (out / "failure_reason.txt").write_text(reason, encoding="utf-8")
-
-    # Snapshot memory.md
-    mem = WORKSPACE_ROOT / "skill" / "memory.md"
-    if mem.exists():
-        (out / "memory.md").write_text(mem.read_text(encoding="utf-8"), encoding="utf-8")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scorers._artifacts import WORKSPACE_ROOT, dump as _dump_artifacts
 
 
 def get_assert(output: str, context: dict) -> dict:

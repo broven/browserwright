@@ -42,8 +42,7 @@ def call_api(prompt: str, options: dict, context: dict) -> dict:
         vars_ = context.get("vars", {})
         replies_str = vars_.get("user_replies")
         if replies_str:
-            import json as _json
-            user_replies = _json.loads(replies_str)
+            user_replies = json.loads(replies_str)
 
     env = _build_env()
 
