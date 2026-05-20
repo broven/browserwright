@@ -42,5 +42,8 @@ ai-e2e-tests/AI-E2E-REPORT*.auto.md
 # Local-only Claude state
 .claude/settings.local.json
 
+# Node
+node_modules/
+
 # E2E test artifacts
 browser-daemon/tests/e2e/_artifacts/
