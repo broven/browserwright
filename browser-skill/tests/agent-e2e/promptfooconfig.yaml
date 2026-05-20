@@ -65,3 +65,16 @@ tests:
     assert:
       - type: python
         value: "file://scorers/case_c.py:get_assert"
+
+  # ── Case D: site memory (explicit write) ───────────────────
+  - vars:
+      task: "用浏览器打开 https://example.com，顺便把这个站点需要注意的坑记到 site memory 里。"
+    assert:
+      - type: python
+        value: "file://scorers/case_d.py:get_assert"
+
+  - vars:
+      task: "Open https://example.com in a browser and save any quirks or notes about this site to site memory."
+    assert:
+      - type: python
+        value: "file://scorers/case_d.py:get_assert"
