@@ -88,13 +88,20 @@ def _msg_to_trace(msg: Any) -> dict[str, Any]:
 
 
 def _count_failed_bash(trace: list[dict[str, Any]]) -> int:
-    """Count tool_use Bash blocks that were followed by an error result."""
+    """Count Bash tool_use blocks that produced a nonzero exit code."""
     count = 0
+    last_was_bash = False
     for entry in trace:
-        if entry.get("type") == "UserMessage":
+        if entry.get("type") == "AssistantMessage":
+            last_was_bash = any(
+                b.get("type") == "tool_use" and b.get("name") == "Bash"
+                for b in entry.get("content", [])
+            )
+        elif entry.get("type") == "UserMessage" and last_was_bash:
             content = entry.get("content", "")
-            if "error" in content.lower() or "exit code" in content.lower():
+            if "exit code" in content.lower() and "exit code 0" not in content.lower():
                 count += 1
+            last_was_bash = False
     return count
 
 
@@ -110,8 +117,11 @@ def _last_assistant_text(trace: list[dict[str, Any]]) -> str:
 
 def _looks_like_question(text: str) -> bool:
     """Heuristic: did the agent ask the user something?"""
-    indicators = ["?", "确认", "save as task", "want me to", "shall i",
-                  "would you like", "should i", "是否", "要不要"]
+    indicators = [
+        "?", "确认", "save as task", "want me to", "shall i",
+        "would you like", "should i", "是否", "要不要",
+        "store", "persist", "创建", "save this", "记住",
+    ]
     lower = text.lower()
     return any(ind in lower for ind in indicators)
 
@@ -128,6 +138,9 @@ async def run_agent(
     """Run a sub-agent against the workspace and return structured results."""
     run_env = env or {}
 
+    # Tell the guard where the workspace is so it can scope path checks.
+    guards.WORKSPACE_ROOT = workspace
+
     options = ClaudeAgentOptions(
         cwd=str(workspace / "skill"),
         tools=["Bash", "Read", "Write", "Edit", "Grep", "Glob"],
@@ -137,6 +150,9 @@ async def run_agent(
         env={
             **run_env,
             "PATH": os.environ.get("PATH", ""),
+            # Real HOME is needed for Claude CLI auth (~/.claude/.credentials.json).
+            # browser-skill isolation is handled by BS_HOME env var (set in provider.py)
+            # and the path-scoping guard blocks Write/Read outside workspace.
             "HOME": os.environ.get("HOME", ""),
         },
         max_turns=max_turns,
