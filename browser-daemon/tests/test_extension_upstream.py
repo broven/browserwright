@@ -437,6 +437,91 @@ async def test_end_session_closes_owned_keeps_borrowed():
         assert "A" not in upstream._borrowed
 
 
+# ---- session-reconnect-recovery ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recover_session_reattaches_tabs_and_rebuilds_state():
+    """recover_session queries the group, re-attaches each tab, rebuilds
+    _sessions/_owned/_groups, and returns the representative target."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        async def responder():
+            # 1) queryGroup
+            q = await ext.next_command()
+            assert q["type"] == "queryGroup"
+            assert q["groupName"] == "sess-1"
+            await ext.respond(q["id"], result={
+                "groupId": 9,
+                "tabs": [
+                    {"tabId": 50, "url": "https://a/", "title": "A",
+                     "active": False, "lastAccessed": 100},
+                    {"tabId": 51, "url": "https://b/", "title": "B",
+                     "active": True, "lastAccessed": 300},
+                ],
+            })
+            # 2) attach for each tab (order may vary; just ack twice).
+            for _ in range(2):
+                a = await ext.next_command()
+                assert a["type"] == "attach"
+                await ext.respond(a["id"], result={
+                    "targetInfo": {"url": "", "title": ""}})
+
+        r = asyncio.create_task(responder())
+        result = await upstream.recover_session("bs-session-1", "sess-1")
+        await r
+
+        assert sorted(result["recovered"]) == [50, 51]
+        assert result["groupId"] == 9
+        # representative = max lastAccessed = tab 51
+        assert result["tabId"] == 51
+        assert result["targetId"] == "ext-tab-51"
+        assert result["sessionId"].startswith("ext-sid-51-")
+        # state rebuilt
+        assert upstream._owned["bs-session-1"] == {50, 51}
+        assert upstream._groups["bs-session-1"] == 9
+        assert set(upstream._sessions.values()) >= {50, 51}
+
+
+@pytest.mark.asyncio
+async def test_recover_session_empty_group_raises():
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        async def responder():
+            q = await ext.next_command()
+            await ext.respond(q["id"], result={"groupId": -1, "tabs": []})
+
+        r = asyncio.create_task(responder())
+        with pytest.raises((RuntimeError, ValueError)):
+            await upstream.recover_session("bs-x", "missing-group")
+        await r
+
+
+@pytest.mark.asyncio
+async def test_end_session_group_fallback_when_owned_empty():
+    """When _owned has nothing for the session but a group_name is given,
+    end_session recovers the group's tabs and closes them."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        async def responder():
+            q = await ext.next_command()
+            assert q["type"] == "queryGroup"
+            assert q["groupName"] == "sess-2"
+            await ext.respond(q["id"], result={
+                "groupId": 3,
+                "tabs": [
+                    {"tabId": 60, "url": "https://x/", "title": "x",
+                     "active": True, "lastAccessed": 1},
+                ],
+            })
+            c = await ext.next_command()
+            assert c["type"] == "closeTab"
+            assert c["tabId"] == 60
+            await ext.respond(c["id"], result={"ok": True, "tabId": 60})
+
+        r = asyncio.create_task(responder())
+        result = await upstream.end_session("never-tracked", group_name="sess-2")
+        await r
+        assert result["closed"] == [60]
+
+
 @pytest.mark.asyncio
 async def test_session_info_live_fields():
     """P5.5: session_info reports group id, owned/borrowed counts, sample url."""

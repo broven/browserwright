@@ -32,7 +32,7 @@ def test_create_launches_chrome_and_serve(tmp_bs_home, spawned):
 
 
 def test_attach_points_daemon_at_port(tmp_bs_home, spawned):
-    sid = session_create.new(backend="rdp", attach=9222)
+    sid = session_create.new(backend="rdp", attach=9222, name="fp")
     cmds = spawned["spawn"]
     # exactly one serve, pointed at the given port; no launch-chrome
     assert all("launch-chrome" not in c for c in cmds)

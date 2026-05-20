@@ -211,6 +211,21 @@ class RelayServer:
         return await self._request(ext, {"type": "queryActiveTab"},
                                    timeout=timeout)
 
+    async def query_group_tabs(self, group_name: str, *,
+                               timeout: float = 5.0) -> dict | None:
+        """Session-reconnect-recovery: ask the extension for the tabs of the
+        tab group whose title == ``group_name`` (the durable per-session
+        anchor). Returns ``{"groupId":int,"tabs":[{tabId,url,title,active,
+        lastAccessed}, ...]}`` — ``groupId == -1`` / empty tabs when no group
+        matches. Returns None when no extension is connected (mirrors
+        query_active_tab's caller-falls-back contract)."""
+        ext = self._pick_active_extension()
+        if ext is None:
+            return None
+        return await self._request(
+            ext, {"type": "queryGroup", "groupName": group_name},
+            timeout=timeout)
+
     async def attach_active_tab(self, *,
                                 timeout: float = 10.0) -> GhostTarget:
         """Daemon-driven equivalent of the popup's "Attach this tab" — asks

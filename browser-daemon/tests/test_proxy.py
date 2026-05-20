@@ -935,6 +935,91 @@ async def test_end_session_dispatch_invokes_callback():
 
 
 @pytest.mark.asyncio
+async def test_recover_session_missing_group_name_returns_invalid_params():
+    """No params → -32602 (validation FIRST so the schema-lock smoke test
+    sees code != -32601 'unknown method')."""
+    state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserDaemon.recoverSession",
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 1
+    assert resp["error"]["code"] == -32602
+    assert "groupName" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_recover_session_without_callback_returns_method_not_found():
+    state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 2, "method": "BrowserDaemon.recoverSession",
+        "params": {"groupName": "sess"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["error"]["code"] == -32601
+    assert "extension backend" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_recover_session_with_callback_binds_and_returns_payload():
+    """Happy path: callback wired + valid groupName → session binding +
+    attacher claimed, payload (incl. recovered list) returned."""
+    state, router, cap, (client,) = _setup()
+    seen: list[tuple] = []
+
+    async def _fake_recover(bs_session, group_name) -> dict:
+        seen.append((bs_session, group_name))
+        return {
+            "sessionId": "UPSTREAM-SID-7",
+            "targetId": "ext-tab-7",
+            "tabId": 7,
+            "url": "https://recovered/",
+            "title": "Recovered",
+            "groupId": 4,
+            "recovered": [7, 8],
+        }
+
+    router._recover_session = _fake_recover
+    await router.route_from_client(client, json.dumps({
+        "id": 3, "method": "BrowserDaemon.recoverSession",
+        "params": {"groupName": "my-session", "bsSession": "bs-42"},
+    }))
+    assert seen == [("bs-42", "my-session")]
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 3
+    result = resp["result"]
+    assert result["targetId"] == "ext-tab-7"
+    assert result["tabId"] == 7
+    assert result["groupId"] == 4
+    assert result["recovered"] == [7, 8]
+    local_sid = result["sessionId"]
+    assert local_sid != "UPSTREAM-SID-7"
+    binding = client.sessions[local_sid]
+    assert binding.upstream_session_id == "UPSTREAM-SID-7"
+    assert binding.target_id == "ext-tab-7"
+    assert binding.readonly is False
+    own = state.attachers["ext-tab-7"]
+    assert own.primary_client_id == client.client_id
+    assert own.primary_local_session == local_sid
+
+
+@pytest.mark.asyncio
+async def test_recover_session_callback_failure_returns_error():
+    state, router, cap, (client,) = _setup()
+
+    async def _fake_recover(bs_session, group_name) -> dict:
+        raise RuntimeError("empty group")
+
+    router._recover_session = _fake_recover
+    await router.route_from_client(client, json.dumps({
+        "id": 4, "method": "BrowserDaemon.recoverSession",
+        "params": {"groupName": "empty"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["error"]["code"] == -32603
+
+
+@pytest.mark.asyncio
 async def test_end_session_requires_session_param():
     state, router, cap, (client,) = _setup()
     router._end_session = None

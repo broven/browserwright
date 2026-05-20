@@ -66,10 +66,12 @@ def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
     result = open_background("https://example.com", group="Agent-Test")
 
     # Wire shape: exactly one BrowserDaemon.openBackgroundTab over sess.cdp.
+    # The session id threads through as the plain CDP param ``bsSession``
+    # (None here — the stub session is not bound to a ledger record).
     assert sess.cdp.calls == [
         ("BrowserDaemon.openBackgroundTab",
          {"session": None, "url": "https://example.com",
-          "groupName": "Agent-Test"}),
+          "groupName": "Agent-Test", "bsSession": None}),
     ], f"unexpected wire calls: {sess.cdp.calls!r}"
 
     # The sid IS pre-registered in the local session map so a follow-up
@@ -85,6 +87,31 @@ def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
         "groupId": 7,
     }
     assert sess.current_target_id == "ext-tab-42"
+
+
+def test_open_background_derives_group_and_bssession_from_ledger(
+    tmp_bs_home, monkeypatch
+):
+    """open_background(url) with no explicit group, on a session named
+    --name=cf-bots, must carry groupName='cf-bots' and bsSession=<sid> on the
+    wire (derived from BD_SESSION → ledger)."""
+    from browser_skill import session_registry as reg
+    from browser_skill.primitives.page import open_background
+
+    sid = reg.allocate(backend="extension", daemon_endpoint="default",
+                       owner="attach", name="cf-bots")
+    monkeypatch.setenv("BD_SESSION", sid)
+
+    sess = _stub_session_for_ws(monkeypatch, response={
+        "sessionId": "ws-sid-1", "targetId": "ext-tab-1", "tabId": 1,
+        "url": "https://x.test", "title": "X", "groupId": 3,
+    })
+    open_background("https://x.test")
+
+    method, params = sess.cdp.calls[0]
+    assert method == "BrowserDaemon.openBackgroundTab"
+    assert params["groupName"] == "cf-bots"
+    assert params["bsSession"] == sid
 
 
 def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):

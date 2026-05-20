@@ -30,7 +30,7 @@ Usage:
   print(page_info())
   PY
 
-  browser-skill session new --backend=<extension|rdp> [--create | --attach=PORT] [--name=NAME]
+  browser-skill session new --backend=<extension|rdp> --name=NAME [--create | --attach=PORT]
   browser-skill session end --session=ID
   browser-skill session list [--json]
   browser-skill session prune [--idle=SECONDS]
@@ -400,7 +400,7 @@ def _cmd_session(args: list[str]) -> int:
         backend = kw.get("backend")
         if backend not in ("extension", "rdp"):
             print("usage: browser-skill session new --backend=<extension|rdp> "
-                  "[--create | --attach=PORT] [--name=NAME]", file=sys.stderr)
+                  "--name=NAME [--create | --attach=PORT]", file=sys.stderr)
             return 1
         try:
             sid = session_create.new(

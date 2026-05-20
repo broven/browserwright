@@ -114,19 +114,47 @@ def test_session_new_extension_registers_attach(tmp_bs_home, capsys):
     assert rows[0]["name"] == "research"
 
 
+def test_session_new_extension_requires_name(tmp_bs_home, capsys):
+    from browser_skill import session_registry as reg
+
+    rc = _main(["session", "new", "--backend=extension"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "--name" in err
+    assert reg.list_all() == []  # nothing persisted on rejection
+
+
+def test_session_new_duplicate_name_rejected(tmp_bs_home, capsys):
+    from browser_skill import session_registry as reg
+
+    rc = _main(["session", "new", "--backend=extension", "--name=dup"])
+    first = capsys.readouterr().out.strip()
+    assert rc == 0
+
+    rc = _main(["session", "new", "--backend=extension", "--name=dup"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    # message names the conflicting session id so a code agent can act
+    assert first in err
+    # the first session is still in the ledger; no second one was created
+    rows = reg.list_all()
+    assert len(rows) == 1
+    assert rows[0]["id"] == first
+
+
 def test_session_new_rdp_create_vs_attach(tmp_bs_home, capsys, monkeypatch):
     from browser_skill import session_create
     from browser_skill import session_registry as reg
 
     monkeypatch.setattr(session_create, "_launch_daemon", lambda *a, **k: None)
 
-    rc = _main(["session", "new", "--backend=rdp", "--create"])
+    rc = _main(["session", "new", "--backend=rdp", "--create", "--name=cr"])
     sid_create = capsys.readouterr().out.strip()
     assert rc == 0
     assert reg.get(sid_create)["owner"] == "create"
     assert reg.get(sid_create)["daemon_endpoint"] == f"browser-daemon-s{sid_create}"
 
-    rc = _main(["session", "new", "--backend=rdp", "--attach=9222"])
+    rc = _main(["session", "new", "--backend=rdp", "--attach=9222", "--name=at"])
     sid_attach = capsys.readouterr().out.strip()
     assert rc == 0
     assert reg.get(sid_attach)["owner"] == "attach"

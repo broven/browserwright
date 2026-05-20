@@ -109,6 +109,11 @@ class Router:
         # P5: per-session teardown (extension backend only). Closes the
         # session's owned tabs, keeps borrowed ones.
         self._end_session: Callable[[str], Awaitable[dict]] | None = None
+        # Session-reconnect-recovery (extension backend only). Rebuilds a
+        # session's tab bindings from the durable tab group titled with the
+        # session name. Signature: (bs_session | None, group_name) -> dict.
+        self._recover_session: (
+            Callable[[str | None, str], Awaitable[dict]] | None) = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -814,6 +819,9 @@ class Router:
         if method == "BrowserDaemon.endSession":
             await self._handle_end_session(client, msg, req_id)
             return
+        if method == "BrowserDaemon.recoverSession":
+            await self._handle_recover_session(client, msg, req_id)
+            return
         await self._send_to_client(client.client_id, _error_response(
             req_id, -32601, f"unknown BrowserDaemon method: {method}"))
 
@@ -866,7 +874,10 @@ class Router:
                 req_id, -32601,
                 "BrowserDaemon.openBackgroundTab requires the extension backend"))
             return
-        session = params.get("session")
+        # The browser-skill session id now arrives as `bsSession` (the skill
+        # stopped using a reserved kwarg). Keep accepting the legacy `session`
+        # param so a mixed-version skill still binds ownership correctly.
+        session = params.get("bsSession") or params.get("session")
         session = session if isinstance(session, str) and session else None
         try:
             result = await self._open_background_tab(
@@ -910,6 +921,83 @@ class Router:
             "groupId": result.get("groupId", -1),
         }))
 
+    async def _handle_recover_session(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """Session-reconnect-recovery.
+
+        After a reconnect / daemon restart the in-memory session→tab bindings
+        are gone, but the Chrome tab group (title == session name) persists.
+        Recover the tabs from that group, re-attach, and register a regular
+        client-side binding for the representative tab so subsequent CDP
+        commands route through the normal sessionId translation path (mirrors
+        openBackgroundTab). Requires backend=extension."""
+        # Param validation runs FIRST (schema-lock smoke test calls every
+        # method with no params and asserts code != -32601 'unknown method').
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        group_name = params.get("groupName")
+        if not isinstance(group_name, str) or not group_name:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserDaemon.recoverSession requires params.groupName"))
+            return
+        if self._recover_session is None:
+            # Lazy-open mirror of openBackgroundTab.
+            if (self._ensure_upstream is not None
+                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"recoverSession failed (upstream open): {e!r}"))
+                    return
+        if self._recover_session is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32601,
+                "BrowserDaemon.recoverSession requires the extension backend"))
+            return
+        bs_session = params.get("bsSession")
+        bs_session = bs_session if isinstance(bs_session, str) and bs_session else None
+        try:
+            result = await self._recover_session(bs_session, group_name)
+        except Exception as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"recoverSession failed: {e!r}"))
+            return
+        upstream_sid = result.get("sessionId")
+        target_id = result.get("targetId")
+        if not isinstance(upstream_sid, str) or not isinstance(target_id, str):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"recoverSession returned malformed result: {result!r}"))
+            return
+        # Register the representative tab's session binding (same as
+        # openBackgroundTab) so the client can drive it immediately.
+        local_sid = _new_local_session_id(client.client_id)
+        self.state.bind_session(
+            client.client_id, local_sid, upstream_sid, target_id,
+            readonly=False,
+        )
+        self.state.claim_attacher(
+            target_id, client.client_id, local_sid, upstream_sid,
+        )
+        self.state.note_target_info({
+            "targetId": target_id,
+            "type": "page",
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+        })
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "sessionId": local_sid,
+            "targetId": target_id,
+            "tabId": result.get("tabId"),
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+            "groupId": result.get("groupId", -1),
+            "recovered": result.get("recovered", []),
+        }))
+
     async def _handle_end_session(
         self, client: ClientState, msg: dict, req_id: int | None,
     ) -> None:
@@ -922,6 +1010,8 @@ class Router:
                 req_id, -32602,
                 "BrowserDaemon.endSession requires params.session"))
             return
+        group_name = params.get("groupName")
+        group_name = group_name if isinstance(group_name, str) and group_name else None
         if self._end_session is None:
             # Lazy-open mirror of openBackgroundTab.
             if (self._ensure_upstream is not None
@@ -938,7 +1028,13 @@ class Router:
                 "BrowserDaemon.endSession requires the extension backend"))
             return
         try:
-            result = await self._end_session(session)
+            # Pass group_name only when provided so callbacks with the legacy
+            # single-arg signature stay compatible (session-reconnect-recovery
+            # fallback closes the group's tabs when _owned is empty).
+            if group_name is not None:
+                result = await self._end_session(session, group_name)
+            else:
+                result = await self._end_session(session)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"endSession failed: {e!r}"))

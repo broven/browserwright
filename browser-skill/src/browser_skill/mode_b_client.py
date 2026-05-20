@@ -64,6 +64,9 @@ class ModeBClient:
         self._transport: Optional[str] = None  # "unix" or "tcp"
         self._token: Optional[str] = None
         self._cached_ws: Optional[str] = None
+        # client label sent on the ws query string for daemon observability;
+        # session-bound clients override this with ``skill-s<id>``.
+        self._client_label: str = "skill-repl"
 
     # ---- endpoint discovery ---------------------------------------------
 
@@ -158,12 +161,14 @@ class ModeBClient:
         s.close()
         return True
 
-    def ws_url(self, *, client_label: str = "skill-repl") -> str:
+    def ws_url(self, *, client_label: Optional[str] = None) -> str:
         """Return a ``ws+unix://`` or ``ws://`` URL the ``CDPSession`` can open.
 
         Caches the result; call ``invalidate()`` to force a re-resolve (e.g.
         after a 1011 close).
         """
+        if client_label is None:
+            client_label = self._client_label
         if self._cached_ws:
             return self._cached_ws
         ep = self.discover()
@@ -425,8 +430,16 @@ class ModeBClient:
 def client_for_session(record: dict) -> ModeBClient:
     """Build a Mode B client whose endpoint comes from the session *record*
     (P1), not the import-time default. ``record["daemon_endpoint"]`` is the
-    daemon name/socket this session is bound to."""
-    return ModeBClient(name=record["daemon_endpoint"])
+    daemon name/socket this session is bound to.
+
+    The connection carries the session identity as its client label
+    (``skill-s<id>``) for daemon-side observability; falls back to the default
+    ``skill-repl`` when the record has no id."""
+    client = ModeBClient(name=record["daemon_endpoint"])
+    sid = record.get("id")
+    if sid:
+        client._client_label = f"skill-s{sid}"
+    return client
 
 
 # ---- factory: auto-pick Mode B → Mode A ------------------------------

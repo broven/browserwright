@@ -382,6 +382,46 @@ async def test_create_background_tab_without_group_name_omits_group_field():
 
 
 @pytest.mark.asyncio
+async def test_query_group_tabs_sends_query_group_and_parses_response():
+    """Session-reconnect-recovery: relay sends {type:queryGroup,groupName}
+    and surfaces the extension's {groupId, tabs:[...]} response."""
+    async with _relay_running() as relay:
+        ext = _MockExtension()
+        await ext.connect(relay.port)
+        await relay.wait_ready(timeout=2.0)
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "queryGroup"
+            assert cmd["groupName"] == "my-session"
+            await ext.respond(cmd["id"], result={
+                "groupId": 5,
+                "tabs": [
+                    {"tabId": 11, "url": "https://a/", "title": "A",
+                     "active": True, "lastAccessed": 200},
+                    {"tabId": 12, "url": "https://b/", "title": "B",
+                     "active": False, "lastAccessed": 100},
+                ],
+            })
+
+        r = asyncio.create_task(respond())
+        info = await relay.query_group_tabs("my-session")
+        await r
+
+        assert info["groupId"] == 5
+        assert [t["tabId"] for t in info["tabs"]] == [11, 12]
+
+
+@pytest.mark.asyncio
+async def test_query_group_tabs_no_extension_returns_none():
+    """No extension connected → None (caller falls back), mirroring
+    query_active_tab."""
+    async with _relay_running() as relay:
+        info = await relay.query_group_tabs("anything")
+        assert info is None
+
+
+@pytest.mark.asyncio
 async def test_close_tab_sends_close_message():
     """Phase B Feature 2: relay sends a closeTab ws frame and pops the ghost
     target from the table when the extension acks."""

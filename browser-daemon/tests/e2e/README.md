@@ -17,15 +17,26 @@ or `~/.cache/puppeteer`. RDP-backend tests use your regular Chrome.
 
 ## Running
 
-    # Run the full E2E suite (~60-90s)
-    cd browser-daemon
-    uv run pytest tests/e2e/
+Use the runner — it works from **any git worktree** with no setup:
 
-    # Or by marker
-    uv run pytest -m real_chrome
+    # Whole suite (~60-90s)
+    tests/e2e/run.sh
 
-    # One file
-    uv run pytest tests/e2e/test_l2_user_flows.py -v
+    # Pass pytest flags through / target one file
+    tests/e2e/run.sh -v
+    tests/e2e/run.sh tests/e2e/test_l2_user_flows.py -v
+
+Why a runner instead of plain `uv run pytest tests/e2e/`: the harness drives
+`browser-skill` via `shutil.which` and spawns the daemon via `sys.executable`,
+so BOTH packages must resolve to the *current* checkout. The installed scripts
+/ project `.venv`s point at the main checkout, and the two packages are
+separate uv projects (no workspace), so plain `uv run` would test
+worktree-daemon + stale-skill. `run.sh` layers the sibling worktree's
+browser-skill into the daemon env with `--with ../browser-skill` (all relative
+paths) and clears any stale test daemon on port 29989 first.
+
+If you're NOT in a worktree (main checkout, browser-skill installed on PATH),
+plain `uv run pytest tests/e2e/` / `uv run pytest -m real_chrome` also works.
 
 The default `uv run pytest tests/` does NOT run these -- they require a head
 of display and a few seconds per case, which we keep out of the inner loop.

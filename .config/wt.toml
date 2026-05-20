@@ -1,0 +1,26 @@
+# .config/wt.toml — browser-skill / browser-daemon worktree lifecycle
+#
+# Source of truth. Conductor and Superset wrappers (conductor.json,
+# .superset/config.json) are generated from this file via:
+#   bash .claude/skills/worktree-config/scripts/generate_wrappers.sh .
+#
+# All commands run from the worktree root (repo root). No path template
+# variables are needed — all paths are relative. No env fallback chains
+# needed — no dynamic ports/workspace names.
+
+# Pre-warm uv envs for both packages so the first `uv run` in a fresh
+# worktree is instant rather than resolving deps on-demand.
+[post-create]
+sync-daemon = "cd browser-daemon && uv sync --extra test"
+sync-skill  = "cd browser-skill  && uv sync --extra test"
+
+# Unit tests for both packages. agent-e2e is excluded: it requires the
+# claude_agent_sdk (not in the default venv) and a live Chrome extension.
+# Real-Chrome e2e can be run separately via: cd browser-daemon && tests/e2e/run.sh
+[pre-merge]
+test-daemon = "cd browser-daemon && uv run --extra test python -m pytest -q"
+test-skill  = "cd browser-skill  && uv run --extra test python -m pytest -q --ignore=tests/agent-e2e"
+
+# Kill any stale test daemon on port 29989 left by an interrupted e2e run.
+[pre-remove]
+cleanup-e2e = "lsof -ti :29989 2>/dev/null | xargs kill 2>/dev/null || true"

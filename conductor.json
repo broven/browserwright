@@ -1,0 +1,7 @@
+{
+  "scripts": {
+    "setup": "wt hook post-create --yes || true",
+    "run": "bash browser-daemon/tests/e2e/run.sh",
+    "archive": "wt hook pre-remove --yes || true"
+  }
+}

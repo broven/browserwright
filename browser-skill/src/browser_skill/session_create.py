@@ -124,15 +124,22 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     - ``rdp --attach <target>`` → attaches to an already-running browser; the
       target (port/recipe) is recorded and the browser is left alone on end.
     """
+    name = name.strip() if isinstance(name, str) else None
+    if not name:
+        raise ValueError(
+            "session new requires --name=NAME — a short, globally-unique label "
+            "(e.g. --name=cf-bots). It becomes the Chrome tab group title and "
+            "the reconnect-recovery anchor for this session."
+        )
     if backend == "extension":
         return reg.allocate(backend="extension",
                             daemon_endpoint=_shared_extension_endpoint(),
-                            owner="attach", name=name)
+                            owner="attach", name=name, unique_name=True)
     if backend == "rdp":
         owner = "create" if create else "attach"
         workspace = {"target": attach} if attach is not None else None
         sid = reg.allocate(backend="rdp", daemon_endpoint="", owner=owner,
-                           name=name, workspace=workspace)
+                           name=name, workspace=workspace, unique_name=True)
         reg.update(sid, daemon_endpoint=_rdp_endpoint(sid))
         _launch_daemon(sid, create=create, target=attach)
         return sid
@@ -176,8 +183,14 @@ def _end_extension_workspace(record: dict) -> None:
     attach-owned); only the background tabs this session opened are closed,
     borrowed tabs are kept."""
     endpoint = record.get("daemon_endpoint") or _shared_extension_endpoint()
-    _run(["browser-daemon", "end-session", "--name", endpoint,
-          "--session", record["id"]])
+    cmd = ["browser-daemon", "end-session", "--name", endpoint,
+           "--session", record["id"]]
+    # Thread the durable group title so the daemon can fall back to closing
+    # tabs by group when its in-memory owned-tab table was wiped (restart).
+    group_name = record.get("name")
+    if group_name:
+        cmd += ["--group-name", group_name]
+    _run(cmd)
 
 
 def end(record: dict) -> str:

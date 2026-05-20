@@ -214,6 +214,8 @@ async function handleDaemonMessage(msg) {
       return await doCreateTab(id, msg.url, msg.groupName);
     case "closeTab":
       return await doCloseTab(id, msg.tabId);
+    case "queryGroup":
+      return await doQueryGroup(id, msg.groupName);
     case "pong":
       // App-level keepalive reply (see pingLoop). The mere fact that this
       // onmessage fired is enough to reset Chrome's SW idle reaper — no
@@ -437,6 +439,43 @@ async function doQueryActiveTab(id) {
           }
         : null,
     });
+  } catch (e) {
+    safeSend({
+      type: "response",
+      id,
+      error: { code: -32000, message: errMessage(e) },
+    });
+  }
+}
+
+async function doQueryGroup(id, groupName) {
+  // Session-reconnect-recovery anchor: a session's durable identity is its
+  // tab-group title (groups survive SW respawn / daemon restart). The daemon
+  // asks us for the tabs of the group whose title == the session name so it
+  // can re-attach the debugger and rebuild its in-memory session→tab map.
+  try {
+    if (typeof groupName !== "string" || !groupName) {
+      throw new Error("queryGroup requires a groupName");
+    }
+    const matching = await chrome.tabGroups.query({ title: groupName });
+    if (!Array.isArray(matching) || matching.length === 0) {
+      safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
+      return;
+    }
+    // Mirror the dedup in _ensureTabInGroup: pick the smallest group id.
+    matching.sort((a, b) => a.id - b.id);
+    const groupId = matching[0].id;
+    const tabs = await chrome.tabs.query({ groupId });
+    const out = (Array.isArray(tabs) ? tabs : []).map((tab) => ({
+      tabId: tab.id,
+      url: tab.url || "",
+      title: stripMarker(tab.title),
+      active: !!tab.active,
+      lastAccessed: tab.lastAccessed || 0,
+    }));
+    // Most-recently-accessed first so the daemon can pick a representative tab.
+    out.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    safeSend({ type: "response", id, result: { groupId, tabs: out } });
   } catch (e) {
     safeSend({
       type: "response",

@@ -66,6 +66,8 @@ def attach_active() -> dict:
             cdp_message=f"malformed daemon response: {result!r}",
         )
     sess.current_target_id = target_id
+    from ..session_runtime import persist_target
+    persist_target(target_id, sess=sess)
     # Register the daemon-minted session in CDPSession's tables so subsequent
     # send(method, session=sid) calls work, mirroring CDPSession.attach()'s
     # post-attach state. We skip the regular Page/Runtime/DOM/Network.enable
@@ -154,6 +156,10 @@ def current_tab() -> dict | None:
     ``open_background()`` first.
     """
     sess = current_session()
+    if not sess.current_target_id:
+        # Transparent reconnect-recovery before declaring "no tab".
+        from ..session_runtime import ensure_session_target
+        ensure_session_target(sess)
     if sess.current_target_id:
         for t in list_tabs():
             if t["targetId"] == sess.current_target_id:
@@ -209,6 +215,8 @@ def switch_tab(target) -> dict:
             ),
         ) from e
     sess.current_target_id = target_id
+    from ..session_runtime import persist_target
+    persist_target(target_id, sess=sess)
     try:
         sess.cdp.send("Target.activateTarget", targetId=target_id)
     except CDPError:
@@ -230,6 +238,8 @@ def new_tab(url: str = "about:blank") -> dict:
     target_id = res["targetId"]
     sess.cdp.attach(target_id)
     sess.current_target_id = target_id
+    from ..session_runtime import persist_target
+    persist_target(target_id, sess=sess)
     if url not in ("", "about:blank"):
         # ``Target.createTarget`` returns before the URL is actually loading,
         # and an empty about:blank may pass readyState=='complete' the first
@@ -319,6 +329,16 @@ def current_page() -> dict:
                 # Cached target got reaped (tab closed). Fall through to a
                 # fresh attach instead of bubbling the raise.
                 sess.current_target_id = None
+        # Transparent reconnect-recovery: re-attach to this session's tab
+        # (ledger.runtime fast path → group anchor) before grabbing the
+        # user's focused tab via attach_active().
+        from ..session_runtime import ensure_session_target
+        recovered = ensure_session_target(sess)
+        if recovered:
+            for t in list_tabs(include_chrome=False):
+                if t["targetId"] == recovered:
+                    return {**t, "accuracy": "exact"}
+            return {"targetId": recovered, "accuracy": "exact"}
         info = attach_active()
         return {**info, "accuracy": "exact"}
     explicit_ws = bool(_os.environ.get("BS_CDP_WS") or _os.environ.get("BU_CDP_WS"))
@@ -383,12 +403,29 @@ def ensure_real_tab() -> dict | None:
     return tabs[0]
 
 
-def open_background(url: str, *, group: str = "Agent") -> dict:
+def _session_name_and_id(sess) -> tuple[Any, Any]:
+    """Resolve the current session's (name, id) from the bound record or
+    BD_SESSION→ledger. Either may be None when no session is in scope."""
+    rec = getattr(sess, "session_record", None)
+    if not isinstance(rec, dict):
+        try:
+            from ..session_ctx import resolve_session
+            rec = resolve_session()
+        except Exception:
+            rec = None
+    if isinstance(rec, dict):
+        return rec.get("name"), rec.get("id")
+    return None, None
+
+
+def open_background(url: str, *, group: Optional[str] = None) -> dict:
     """Phase B Feature 1 — open a new Chrome tab in the background.
 
     The tab is created with ``active: false`` so the user's currently-focused
-    tab keeps focus; the new tab is placed in a Chrome tab group titled
-    ``group`` (default "Agent") and ``chrome.debugger`` is attached. Returns
+    tab keeps focus; the new tab is placed in a Chrome tab group and
+    ``chrome.debugger`` is attached. The group title defaults to the current
+    session's ``name`` (the durable reconnect-recovery anchor); pass an
+    explicit ``group=`` to override. Returns
     ``{"targetId","tabId","url","title","groupId"}``. After this call,
     ``sess.current_target_id`` points at the new tab and subsequent primitives
     (``js``, ``capture_screenshot``, etc.) operate on it.
@@ -397,10 +434,13 @@ def open_background(url: str, *, group: str = "Agent") -> dict:
     answers ``-32601`` which we translate to ``CDPError``.
     """
     sess = current_session()
+    name, sid = _session_name_and_id(sess)
+    if group is None:
+        group = name  # may stay None if no session/name resolvable
     try:
         payload = sess.cdp.send(
             "BrowserDaemon.openBackgroundTab",
-            url=url, groupName=group,
+            url=url, groupName=group, bsSession=sid,
         )
     except CDPError as e:
         raise CDPError(
@@ -426,14 +466,10 @@ def open_background(url: str, *, group: str = "Agent") -> dict:
             cdp_message=f"daemon returned incomplete payload: {payload!r}",
         )
     # Pre-register the daemon-minted sessionId in the CDPSession's session
-    # map so subsequent primitives that ask for the active session reuse it
-    # without a duplicate Target.attachToTarget roundtrip. We also ensure
-    # the per-session event ring exists.
-    cdp = sess.cdp
-    cdp._sessions[target_id] = session_id
-    from collections import deque  # local import: avoid module-level cost
-    cdp._events.setdefault(session_id, deque(maxlen=1024))
-    sess.current_target_id = target_id
+    # map (reused by recovery) and persist the binding to the ledger cache.
+    from ..session_runtime import persist_target, register_recovered
+    register_recovered(sess, payload)
+    persist_target(target_id, group_id=payload.get("groupId"), sess=sess)
     return {
         "targetId": target_id,
         "tabId": payload.get("tabId"),

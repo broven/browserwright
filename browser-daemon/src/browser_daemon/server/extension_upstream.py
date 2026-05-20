@@ -168,13 +168,26 @@ class ExtensionUpstream:
             "sample_url": sample,
         }
 
-    async def end_session(self, session_id: str) -> dict:
+    async def end_session(self, session_id: str,
+                          group_name: str | None = None) -> dict:
         """Tear down a session's workspace (P5.4): close owned tabs, keep
         borrowed ones (the user opened them), and drop the session's tracking.
-        Returns ``{closed: [...], kept: [...]}``."""
+        Returns ``{closed: [...], kept: [...]}``.
+
+        Session-reconnect-recovery fallback: when ``_owned`` for this session is
+        empty/missing (lost across a reconnect / daemon restart) AND
+        ``group_name`` is given, recover the tabs from the durable tab group
+        and close those instead."""
         owned = sorted(self._owned.pop(session_id, set()))
         borrowed = sorted(self._borrowed.pop(session_id, set()))
         self._groups.pop(session_id, None)
+        if not owned and group_name:
+            info = await self._relay.query_group_tabs(group_name)
+            if info and info.get("tabs"):
+                owned = sorted({
+                    t.get("tabId") for t in info["tabs"]
+                    if isinstance(t.get("tabId"), int)
+                })
         closed: list[int] = []
         for tab_id in owned:
             try:
@@ -401,6 +414,63 @@ class ExtensionUpstream:
             "url": gt.url,
             "title": gt.title,
             "groupId": int(group_id) if isinstance(group_id, int) else -1,
+        }
+
+    async def recover_session(self, session_id: str | None,
+                              group_name: str) -> dict:
+        """Session-reconnect-recovery: after an extension↔daemon reconnect or a
+        daemon restart, the in-memory session→tab bindings are gone but the
+        Chrome tab group (title == session name) survives. Query that group,
+        re-attach the debugger to each of its tabs, rebuild ``_sessions`` /
+        ``_owned`` / ``_groups``, and return a representative target with the
+        same shape as ``open_background_tab``.
+
+        Raises (proxy maps to a CDP error) when no group matches or it has no
+        tabs."""
+        info = await self._relay.query_group_tabs(group_name)
+        if not info or not info.get("tabs"):
+            raise RuntimeError(
+                f"no recoverable tabs for group {group_name!r} "
+                "(group missing or empty)")
+        group_id = int(info.get("groupId", -1))
+        tabs = info["tabs"]
+        recovered: list[int] = []
+        # tab_id → (sid, url, title, lastAccessed) for picking a representative.
+        meta: dict[int, dict] = {}
+        for tab in tabs:
+            tab_id = tab.get("tabId")
+            if not isinstance(tab_id, int):
+                continue
+            # Idempotent: re-attaches the debugger (relay short-circuits if the
+            # ghost already exists from a popup attach / re-announce).
+            await self._relay.attach_tab(tab_id)
+            sid = _new_upstream_session_id(tab_id)
+            self._sessions[sid] = tab_id
+            url = str(tab.get("url", ""))
+            if session_id:
+                self._record_owned(session_id, tab_id,
+                                   group_id=group_id, url=url)
+            recovered.append(tab_id)
+            meta[tab_id] = {
+                "sid": sid,
+                "url": url,
+                "title": str(tab.get("title", "")),
+                "lastAccessed": tab.get("lastAccessed", 0) or 0,
+            }
+        if not recovered:
+            raise RuntimeError(
+                f"group {group_name!r} had tabs but none had a usable tabId")
+        # Representative tab: most-recently-accessed, else first.
+        rep_id = max(recovered, key=lambda t: meta[t]["lastAccessed"])
+        rep = meta[rep_id]
+        return {
+            "sessionId": rep["sid"],
+            "targetId": f"ext-tab-{rep_id}",
+            "tabId": rep_id,
+            "url": rep["url"],
+            "title": rep["title"],
+            "groupId": group_id,
+            "recovered": recovered,
         }
 
     async def close_tab(self, session_id: str) -> dict:

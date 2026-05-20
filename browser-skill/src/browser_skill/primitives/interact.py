@@ -20,6 +20,13 @@ from ..session import current_session
 def _attached_session() -> str:
     sess = current_session()
     if not sess.current_target_id:
+        # Transparent reconnect-recovery: re-attach to this session's own tab
+        # across daemon restart / extension reconnect / new process. This does
+        # NOT steal the user's focused tab — it re-binds the tab this session
+        # already owns (anchored on the durable tab-group title == name).
+        from ..session_runtime import ensure_session_target
+        if ensure_session_target(sess):
+            return sess.cdp.attach(sess.current_target_id)
         # Extension backend: do NOT silently steal the user's focused tab
         # (current_page() would call attach_active() and grab it). Raise
         # with named next steps; open_background listed first (default).

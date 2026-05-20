@@ -238,6 +238,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_name(p_es)
     p_es.add_argument("--session", required=True,
                       help="the browser-skill session id whose tabs to clean up")
+    p_es.add_argument("--group-name", default=None,
+                      help="durable tab-group title for session-reconnect "
+                           "recovery: when the daemon lost this session's "
+                           "owned-tab tracking (reconnect / restart), close "
+                           "the tabs in this group instead")
     # Output is always JSON (single-line discipline); no --json flag.
 
     # install / uninstall / list — long-running service (macOS LaunchAgent).
@@ -861,11 +866,14 @@ def _cmd_close_tab(args, cfg: Config) -> int:
 def _cmd_end_session(args, cfg: Config) -> int:
     """P5: tear down a browser-skill session's extension tabs (owned closed,
     borrowed kept). Prints the {closed, kept} JSON result."""
+    es_params: dict = {"session": args.session}
+    if getattr(args, "group_name", None):
+        es_params["groupName"] = args.group_name
     try:
         result = _run(_rpc_via_ws(
             cfg,
             "BrowserDaemon.endSession",
-            {"session": args.session},
+            es_params,
             client_label="cli-end-session",
             timeout=10.0,
         ))

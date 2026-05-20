@@ -567,6 +567,9 @@ class _UpstreamHolder:
         self.router._close_tab = ext.close_tab
         self.router._close_tab_by_target_id = ext.close_tab_by_target_id
         self.router._end_session = ext.end_session  # P5 per-session teardown
+        # Session-reconnect-recovery: rebuild a session's tab bindings from the
+        # durable tab group whose title == the session name.
+        self.router._recover_session = ext.recover_session
         await self.state.set_connected(ext.ws_url or "ext://relay",
                                        was_popup=False)
 
@@ -626,6 +629,7 @@ class _UpstreamHolder:
         self.router._close_tab = None
         self.router._close_tab_by_target_id = None
         self.router._end_session = None
+        self.router._recover_session = None
         if up is not None:
             try:
                 await up.close(code=1000, reason=reason)

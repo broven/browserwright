@@ -74,6 +74,8 @@ V2_BROWSER_DAEMON_METHODS = frozenset({
     "BrowserDaemon.closeTab",
     # P5: per-session teardown (extension backend only).
     "BrowserDaemon.endSession",
+    # Session-reconnect-recovery (extension backend only).
+    "BrowserDaemon.recoverSession",
 })
 
 

@@ -27,9 +27,10 @@ A **session** is the isolation key that lets multiple agents drive browsers with
 
 ```bash
 # Create a session (pick the backend/mode — see the decision rule below). Prints a short id.
+# --name is required and must be globally unique; it becomes the Chrome tab group title and the reconnect-recovery anchor for the session.
 sid=$(browser-skill session new --backend=extension --name=research)
-# OR: browser-skill session new --backend=rdp --create        # owns a fresh isolated Chrome
-# OR: browser-skill session new --backend=rdp --attach=9222    # attaches to a running browser
+# OR: browser-skill session new --backend=rdp --create --name=build      # owns a fresh isolated Chrome
+# OR: browser-skill session new --backend=rdp --attach=9222 --name=cf-bots # attaches to a running browser
 
 # Then every call carries the id — via --session or BD_SESSION.
 BD_SESSION=$sid browser-skill <<'PY'
