@@ -242,6 +242,7 @@ async function doAttach(id, tabId) {
       },
     });
     markTabAttached(tabId);  // fire-and-forget; cosmetic
+    keepTabRendered(tabId);  // fire-and-forget; keep off-screen tab rendering
   } catch (e) {
     safeSend({
       type: "response",
@@ -281,6 +282,7 @@ async function doAttachActive(id) {
       },
     });
     markTabAttached(tab.id);  // fire-and-forget; cosmetic
+    keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
   } catch (e) {
     safeSend({
       type: "response",
@@ -324,6 +326,7 @@ async function doCreateTab(id, url, groupName) {
       result: { tabId: tab.id, url: actualUrl, title: stripMarker(title), groupId },
     });
     markTabAttached(tab.id);  // fire-and-forget; cosmetic
+    keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
   } catch (e) {
     safeSend({
       type: "response",
@@ -561,6 +564,27 @@ function stripMarker(title) {
   return title || "";
 }
 
+async function keepTabRendered(tabId) {
+  // Make a backgrounded tab behave as if the user is viewing it, so pages
+  // that only render/advance when focused+visible keep working off-screen:
+  // unthrottles requestAnimationFrame, keeps document.hasFocus() true, and
+  // stops Chrome from freezing/discarding the tab. fire-and-forget; each
+  // command is independently guarded so an unsupported one doesn't sink the
+  // other, and a failure never fails the attach (cosmetic-ish, like markTab).
+  try {
+    await chrome.debugger.sendCommand(
+      { tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
+  } catch (e) {
+    console.warn("[bd-relay] setFocusEmulationEnabled(" + tabId + ") failed:", e);
+  }
+  try {
+    await chrome.debugger.sendCommand(
+      { tabId }, "Page.setWebLifecycleState", { state: "active" });
+  } catch (e) {
+    console.warn("[bd-relay] setWebLifecycleState(" + tabId + ") failed:", e);
+  }
+}
+
 async function markTabAttached(tabId) {
   if (markedTabs.has(tabId)) return;
   // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
@@ -663,6 +687,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         attachedTabs.add(tab.id);
         await announceAttached(tab.id);
         markTabAttached(tab.id);  // fire-and-forget; cosmetic
+        keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
         sendResponse({ ok: true, tabId: tab.id });
       } catch (e) {
         sendResponse({ ok: false, error: errMessage(e) });
