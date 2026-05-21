@@ -139,6 +139,7 @@ class RelayServer:
             compression=None,
             ping_interval=20,
             ping_timeout=20,
+            max_size=None,  # screenshots can exceed the 1 MiB default
         )
         # Discover the actually-bound port (for port=0 tests).
         for sock in self._server.sockets:
