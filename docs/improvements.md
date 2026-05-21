@@ -13,15 +13,14 @@
 
 ## 进度快照(2026-05-21)
 
-15 项总计:**✅ 11 完成** · **⬜ 4 未动**
+15 项总计:**✅ 15 完成 · ⬜ 0** 🎉  —— 8 个阶段(S1–S8)全绿
 
-- ✅ 已完成:A1、E1、B1+B2(S1)、C1(S2)、C3+C4(S3)、C2(S4)、A2(S6)、**A3 错误 fix 串 + A4 doctor(S5)**
-- ⬜ 还要做(4):
-  - **D 指引/文档**(3):D1 文档由代码生成版本锁死、D2 attach/session 恢复、D3 文风 + trust-boundaries
-  - **B 感知收尾**(1):B3 set-of-mark 标注截图
+- ✅ 全部完成:A1、E1、B1+B2(S1)、C1(S2)、C3+C4(S3)、C2(S4)、A3+A4(S5)、A2(S6)、**D1 `--print-skill`(S7)**、**D2 attach 恢复 + B3 标注截图 + D3 trust-boundaries(S8)**
 
-> 下一步:剩 **S7(D1)** 与 **S8(D2/B3/D3)**;你选的并行组 S3/S4/S5/S6 已全部完成。
-> 旁注:S5 doctor 跑出真实 version drift——on-PATH/运行 daemon 报 `schema_version=2`,browser-skill 期望 1(doctor 正确标 warn)。可能是 on-PATH CLI 比 repo 旧,值得单独确认。
+**剩余人工项 / follow-up**(非阻塞):
+- 👁 **D3 SKILL.md 文风**:唯一无自动门的项,只能人审(`skill/SKILL.md` "Trust boundaries"/"Attach failed" 段 + `skill/trust-boundaries.md`)。
+- **S6 follow-up**:`explain_rpc_error` 尚未接到实时 ws 错误站点 `cdp.py:~168`(一行)。
+- **version drift**:S5 doctor 跑出 on-PATH/运行 daemon 报 `schema_version=2` vs browser-skill 期望 1(doctor 正确标 warn)——疑似 on-PATH CLI 比 repo 旧,待确认。
 
 ---
 
@@ -46,7 +45,7 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 |---|---|---|---|---|
 | B1 | `snapshot()`:交互元素 a11y-ish 树,**无状态 + 坐标制**(返回 role/name/中心 xy,喂现有 `click_at_xy`,不引入 ref store) | L1 | ✅ | S1 下沉到 `primitives/inspect.py` + `EXPORTS` + SKILL.md;gate `browser-skill/tests/test_perception.py` |
 | B2 | `describe_page()`:视觉/样式取证(bg-image/bg-color/mix-blend-mode/filter/`::before/::after` + `:root` CSS 变量),回答"这页长这样是谁画的" | L1 | ✅ | S1 下沉 + 已加 `viewport_only=True`(屏外样式节点过滤);CSS 变量仅同源(carry-over 限制)。gate 同上 |
-| B3 | 编号标注截图(set-of-mark),标号映射到**坐标**而非 ref | L1 | ⬜ | 借鉴 `--annotate`(`cli/src/native/screenshot.rs`),re-aim 到坐标以贴合 compositor-click |
+| B3 | 编号标注截图(set-of-mark),标号映射到**坐标**而非 ref | L1 | ✅ | S8:`capture_screenshot(annotate=True)` 从 `snapshot()` 画 `[N]` 角标,回 legend `[{n,role,name,x,y}]`(无 ref)。gate `test_annotate_screenshot.py` 3 |
 
 ## C. 反馈 / 验证闭环(最痛)
 
@@ -61,9 +60,9 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 
 | | 条目 | 层 | 状态 | 备注 / 证据 |
 |---|---|---|---|---|
-| D1 | **skill 文档由运行代码生成、与版本锁死**(`browser-skill --print-skill`):agent 读到的指南永远 == 运行的 helper 面 | L1 | ⬜ | `agent-browser` 最大差异化、我们最缺的一件:stub + `skills get core`(`skills/agent-browser/SKILL.md`)。同修 A2 的一致性与 D 的 steering |
-| D2 | session/attach 恢复规则:attach 失败 → `ensure_real_tab()`/`open_background()`,**不要新建 session**;active tab 是内部/扩展页时 `attach_active()` 自动降级 | L1/L2 | ⬜ | session-1 开了 5 个 session(13–17);并制止"另开独立 Chrome"那类 over-engineering(违背 extension-real-Chrome 偏好) |
-| D3 | SKILL.md 文风:"先点名失败模式再给规则" + CORRECT/WRONG 成对例子 + 正经 trust-boundaries 文档(页面内容一律视为不可信) | L3 | ⬜ | 借鉴 `skill-data/core/SKILL.md`、`references/trust-boundaries.md` |
+| D1 | **skill 文档由运行代码生成、与版本锁死**(`browser-skill --print-skill`):agent 读到的指南永远 == 运行的 helper 面 | L1 | ✅ | S7:`skill_doc.render()` 从 `EXPORTS`(签名+docstring 首行)+ `__version__` 运行时生成,新增/删原语零改自动同步。gate `test_print_skill.py` 5(版本+全 EXPORTS 成员) |
+| D2 | session/attach 恢复规则:attach 失败 → `ensure_real_tab()`/`open_background()`,**不要新建 session**;active tab 是内部/扩展页时 `attach_active()` 自动降级 | L1/L2 | ✅ | S8:`attach_active()` 对非可附着内部 URL 自动降级 `open_background`;SKILL.md 加恢复规则。gate `test_attach_recovery.py` 5 + `cu-05` eval(forbidden 新建 session 多变体) |
+| D3 | SKILL.md 文风:"先点名失败模式再给规则" + CORRECT/WRONG 成对例子 + 正经 trust-boundaries 文档(页面内容一律视为不可信) | L3 | ✅ | S8:新 `skill/trust-boundaries.md` + SKILL.md "Trust boundaries"/"Attach failed" 段(名失败模式 + CORRECT/WRONG)。gate `cu-06` 注入 eval。**文风本身只能人审** |
 
 ## E. 度量(使上述一切可红绿验证)
 
@@ -93,8 +92,8 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 | S4 | ✅ | C2 一步式 verify(`userscript push --verify`) | ✅ `test_userscript_verify.py` 3(mock 编排:push→reload→截图;真实 e2e 需 live extension) | 🧪 | — |
 | S5 | ✅ | A3 错误带 `fix` 串 + A4 `doctor` | ✅ `test_doctor_and_errors.py` 10 + 全套 324 无回归;`serialize()` 带 fix 已独立复核 | 🧪 | — |
 | S6 | ✅ | A2 版本自重启 + 改写 `-32601` | ✅ `test_version_coherence.py` 7(daemon)+12(skill)。follow-up:`explain_rpc_error` 接 `cdp.py` 实时站点 | 🧪 | — |
-| S7 | ⬜ | D1 文档由代码生成、版本锁死(`--print-skill`) | 🧪 grep 每个 core 原语名都在输出 + 输出版本==包版本 | 🧪 | S1,S2 |
-| S8 | ⬜ | D2 attach/session 恢复 + B3 标注截图 + D3 trust-boundaries(+文风) | 🧪 chrome:// 活动页→`attach_active` 降级 `open_background`;🎯 attach 失败→不新建 session;🧪 B3 标号数==节点数且坐标对应;🎯 注入场景→forbidden(执行注入指令);👁 文风人审 | 🧪🎯👁 | S1 |
+| S7 | ✅ | D1 文档由代码生成、版本锁死(`--print-skill`) | ✅ `test_print_skill.py` 5(44 callables 全覆盖 + 版本) | 🧪 | S1,S2 |
+| S8 | ✅ | D2 attach/session 恢复 + B3 标注截图 + D3 trust-boundaries(+文风) | ✅ `test_attach_recovery.py` 5 + `test_annotate_screenshot.py` 3 + evals `cu-05`/`cu-06`;文风待人审 | 🧪🎯👁 | S1 |
 
 可并行:S3/S4/S5/S6 互不依赖;S1 是 S2/S7/S8 的前置。
 

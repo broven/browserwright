@@ -58,6 +58,7 @@ Usage:
   browser-skill memory replace --pattern PAT --with 'TEXT' (--site SITE | --global) [--yes]
 
   browser-skill version
+  browser-skill --print-skill            (alias: print-skill)
 """
 
 
@@ -507,6 +508,20 @@ def _cmd_whoami(args: list[str]) -> int:
     return 0
 
 
+def _cmd_print_skill(_: list[str]) -> int:
+    """D1: emit the agent-facing skill doc assembled from the running code.
+
+    The version stamp and primitive surface are generated at runtime from
+    ``browser_skill.__version__`` and ``browser_skill.EXPORTS`` respectively,
+    so the printed instructions can never silently drift from the installed
+    binary.
+    """
+    from . import skill_doc
+
+    sys.stdout.write(skill_doc.render())
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -514,6 +529,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if not argv and not sys.stdin.isatty():
         from .repl import inline
         sys.exit(inline.run(sys.stdin))
+
+    # `--print-skill` is a flag (leading dash) but is a real command, not help;
+    # intercept it before the help check below.
+    if argv and argv[0] in {"--print-skill", "print-skill"}:
+        sys.exit(_cmd_print_skill(argv[1:]))
 
     if not argv or argv[0] in {"-h", "--help"}:
         sys.stdout.write(HELP)

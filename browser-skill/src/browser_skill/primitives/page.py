@@ -12,6 +12,28 @@ _INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://",
              "chrome-extension://", "about:")
 
 
+def _is_nonattachable_internal_url_error(msg: str | None) -> bool:
+    """Does this CDP/daemon error mean 'the active tab is an internal page the
+    debugger can't attach to'?
+
+    Chrome's ``chrome.debugger.attach`` rejects internal surfaces with messages
+    like ``Cannot access a chrome-extension:// URL`` /
+    ``Cannot access contents of url "chrome://..."`` /
+    ``Cannot attach to this target (devtools://...)``. We match on the *internal
+    scheme* appearing alongside an access/attach refusal, so the detection
+    generalizes across schemes (chrome://, chrome-extension://, devtools://,
+    chrome-untrusted://) and Chrome's slightly-varying wording — not one
+    hardcoded string.
+    """
+    if not msg:
+        return False
+    low = msg.lower()
+    mentions_internal = any(scheme in low for scheme in _INTERNAL)
+    refuses = ("cannot access" in low or "cannot attach" in low
+               or "cannot be attached" in low)
+    return mentions_internal and refuses
+
+
 def attach_active() -> dict:
     """v0.5.4: extension-backend-only. Attach the user's currently-focused-
     window active tab in Chrome without requiring a popup click.
@@ -43,6 +65,16 @@ def attach_active() -> dict:
     try:
         result = sess.cdp.send("BrowserDaemon.attachActiveTab")
     except CDPError as e:
+        # D2 recovery: the user's *focused* tab may be an internal page Chrome's
+        # debugger refuses to attach to (chrome://, chrome-extension://,
+        # devtools://, a New Tab Page, …). That's not a fatal error — it just
+        # means "the active tab isn't drivable". Instead of bubbling the raise
+        # (which in session-1 led the agent to spawn five fresh sessions), fall
+        # back to open_background(): a new, attachable background tab the agent
+        # can drive without stealing user focus. Kept generic — any
+        # non-attachable internal URL triggers it, no scheme hardcoded.
+        if _is_nonattachable_internal_url_error(e.cdp_message):
+            return open_background("about:blank", group="Agent")
         raise CDPError(
             method="BrowserDaemon.attachActiveTab",
             params={},

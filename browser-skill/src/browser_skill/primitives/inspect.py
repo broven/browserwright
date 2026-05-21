@@ -46,20 +46,42 @@ def page_info() -> dict:
 
 
 def capture_screenshot(path: Optional[str] = None, *, full: bool = False,
-                       max_dim: Optional[int] = None) -> str:
+                       max_dim: Optional[int] = None, annotate: bool = False):
     """Capture a PNG screenshot. Writes to ``path`` (or /tmp/screenshot-N.png)
-    and returns the absolute path. Set ``full=True`` for a full-page capture."""
+    and returns the absolute path. Set ``full=True`` for a full-page capture.
+
+    Set ``annotate=True`` for a **set-of-mark** capture: numbered ``[N]`` labels
+    are overlaid on the page's interactive elements (the ones ``snapshot()``
+    reports), and the return value becomes a dict
+    ``{"path": <png path>, "legend": [{"n", "role", "name", "x", "y"}, ...]}``.
+    Each ``[N]`` maps to that element's center ``(x, y)`` — feed it straight
+    into ``click_at_xy(x, y)``. This is coordinate-keyed, not ref-keyed: there
+    is no element handle to store, the marks are just a visual index over the
+    same coordinates ``snapshot()`` already returns.
+
+    Without ``annotate`` the return value is a bare path string (unchanged).
+    """
     sess = current_session()
     sid = sess.cdp.attach(sess.current_target_id) if sess.current_target_id else None
     if sid is None:
         from .page import current_page
         current_page()
         sid = sess.cdp.attach(sess.current_target_id)
-    params: dict[str, Any] = {"format": "png"}
-    if full:
-        params["captureBeyondViewport"] = True
-    res = sess.cdp.send("Page.captureScreenshot", session=sid, **params)
-    raw = base64.b64decode(res["data"])
+
+    legend: Optional[list] = None
+    if annotate:
+        legend = _draw_set_of_mark()
+
+    try:
+        params: dict[str, Any] = {"format": "png"}
+        if full:
+            params["captureBeyondViewport"] = True
+        res = sess.cdp.send("Page.captureScreenshot", session=sid, **params)
+        raw = base64.b64decode(res["data"])
+    finally:
+        if annotate:
+            _clear_set_of_mark()
+
     if max_dim:
         raw = _downscale_png(raw, max_dim=max_dim)
     if not path:
@@ -72,7 +94,86 @@ def capture_screenshot(path: Optional[str] = None, *, full: bool = False,
                 break
             i += 1
     Path(path).write_bytes(raw)
-    return str(Path(path).resolve())
+    abs_path = str(Path(path).resolve())
+    if annotate:
+        return {"path": abs_path, "legend": legend or []}
+    return abs_path
+
+
+# ---------------------------------------------------------------------------
+# B3: set-of-mark annotation. Overlay numbered [N] badges on the interactive
+# nodes snapshot() reports, keyed to their center coordinates (no ref store).
+# ---------------------------------------------------------------------------
+
+_MARK_CONTAINER_ID = "__bs_setofmark__"
+
+_DRAW_MARK_JS = r"""
+return (function(nodes){
+  var prev = document.getElementById("__bs_setofmark__");
+  if (prev) prev.remove();
+  var box = document.createElement("div");
+  box.id = "__bs_setofmark__";
+  box.style.cssText = "position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none";
+  for (var i=0;i<nodes.length;i++){
+    var n = nodes[i];
+    var tag = document.createElement("div");
+    tag.textContent = "" + n.n;
+    tag.style.cssText =
+      "position:fixed;transform:translate(-50%,-50%);left:"+n.x+"px;top:"+n.y+"px;"+
+      "background:#ff0066;color:#fff;font:bold 12px/1 monospace;padding:2px 4px;"+
+      "border-radius:3px;box-shadow:0 0 0 1px #fff;white-space:nowrap";
+    box.appendChild(tag);
+  }
+  (document.body || document.documentElement).appendChild(box);
+  return nodes.length;
+})(__NODES__);
+"""
+
+_CLEAR_MARK_JS = (
+    "var e=document.getElementById('%s'); if(e) e.remove(); return true;"
+    % _MARK_CONTAINER_ID
+)
+
+
+def _draw_set_of_mark() -> list:
+    """Compute the legend from ``snapshot()``'s interactive nodes and draw a
+    numbered badge at each node's center. Returns the legend list.
+
+    The legend is derived from the SAME snapshot the marks are drawn from, so
+    each ``[n]``'s ``(x, y)`` is exactly the center ``snapshot()`` reports (and
+    that ``click_at_xy`` expects). Generic: works for any page's interactive
+    set, no site/selector hardcoded.
+    """
+    from .interact import js  # avoid import cycle
+
+    snap = snapshot(text=False)
+    nodes = snap.get("nodes", []) if isinstance(snap, dict) else []
+    legend = []
+    for i, n in enumerate(nodes):
+        legend.append({
+            "n": i,
+            "role": n.get("role"),
+            "name": n.get("name"),
+            "x": n.get("x"),
+            "y": n.get("y"),
+        })
+    code = _DRAW_MARK_JS.replace("__NODES__", json.dumps(legend))
+    try:
+        js(code)
+    except Exception:
+        # Drawing is best-effort; the legend (coordinates) is the load-bearing
+        # output, so we still return it even if the overlay failed to paint.
+        pass
+    return legend
+
+
+def _clear_set_of_mark() -> None:
+    from .interact import js  # avoid import cycle
+
+    try:
+        js(_CLEAR_MARK_JS)
+    except Exception:
+        pass
 
 
 def _downscale_png(data: bytes, *, max_dim: int) -> bytes:
