@@ -135,6 +135,19 @@ class ModeBClient:
         except OSError:
             return False
 
+    def wait_until_alive(self, timeout: float = 8.0, interval: float = 0.2) -> bool:
+        """Poll :meth:`is_alive` until the daemon answers or ``timeout`` passes.
+        Used after a respawn so the caller doesn't race the new daemon's bind.
+        Returns whether the daemon came up in time."""
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.invalidate()
+            if self.is_alive():
+                return True
+            time.sleep(interval)
+        return False
+
     def _ping(self, ep: dict) -> bool:
         """Open a short-lived raw socket to the daemon endpoint and verify
         it's responsive. We avoid a CDP request because the upstream may
@@ -424,6 +437,132 @@ class ModeBClient:
                     "error": "doctor output was not JSON",
                     "skill_synthetic": True}
 
+    # ---- S6 (A2-a): daemon ↔ code version coherence --------------------
+    #
+    # A daemon that's been running across a package upgrade speaks the OLD
+    # protocol — newer RPC methods come back as -32601 "unknown method", which
+    # looks like a mysterious failure (the session-1 pothole). We detect the
+    # version skew up front and restart the daemon so it picks up the new code.
+
+    def running_daemon_version(self) -> Optional[str]:
+        """Version the *running* daemon advertises via ``status --json``.
+
+        Returns ``None`` when the daemon isn't reachable OR is too old to
+        advertise a version. A missing version is deliberately indistinguishable
+        from "no daemon" here; the coherence guard disambiguates via
+        :meth:`is_alive`."""
+        try:
+            proc = subprocess.run(
+                ["browser-daemon", "status", "--name", self.name, "--json"],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        try:
+            info = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return None
+        v = info.get("version")
+        return v if isinstance(v, str) and v else None
+
+    def installed_daemon_version(self) -> Optional[str]:
+        """Version of the ``browser-daemon`` package installed on disk, read
+        from ``browser-daemon version``. ``None`` when it can't be determined
+        (in which case the coherence guard declines to act — better than
+        thrash-restarting on a comparison we can't make)."""
+        try:
+            proc = subprocess.run(
+                ["browser-daemon", "version"],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        # Output shape: "browser-daemon X.Y.Z" — take the last whitespace token.
+        text = (proc.stdout or "").strip()
+        if not text:
+            return None
+        return text.split()[-1] or None
+
+    def _stop_daemon(self) -> None:
+        """Stop the running daemon (mirrors the PID-guarded ``stop`` CLI)."""
+        try:
+            subprocess.run(
+                ["browser-daemon", "stop", "--name", self.name],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    def _spawn_daemon(self) -> None:
+        """Spawn a fresh daemon. Detached so it outlives this process, mirroring
+        how cold-start launches ``serve``."""
+        try:
+            subprocess.Popen(
+                ["browser-daemon", "serve", "--name", self.name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+        except FileNotFoundError:
+            pass
+
+    def ensure_version_coherent(self) -> bool:
+        """If the running daemon's version differs from the installed package
+        version (or it advertises none at all), stop + respawn it so the new
+        code takes effect. Returns ``True`` iff a restart was performed.
+
+        No-ops (returns ``False``) when:
+          - there's no daemon running at all (cold-start owns spawning), or
+          - the installed version can't be determined (can't compare safely).
+
+        Generic by construction: it never inspects RPC methods or specific
+        version strings — any future skew is handled the same way."""
+        installed = self.installed_daemon_version()
+        if installed is None:
+            return False
+        running = self.running_daemon_version()
+        if running is None:
+            # Distinguish "no daemon" (don't touch) from "daemon too old to
+            # report a version" (stale → restart).
+            if not self.is_alive():
+                return False
+        elif running == installed:
+            return False
+        # running is None-but-alive (legacy) OR running != installed → stale.
+        self._stop_daemon()
+        self._spawn_daemon()
+        self.invalidate()
+        return True
+
+    # ---- S6 (A2-b): rewrite -32601 "unknown method" --------------------
+
+    @staticmethod
+    def is_stale_method_error(error: Any) -> bool:
+        """True iff a JSON-RPC error object is a ``-32601`` "method not found".
+        Generic — keys only on the standard code, never on a method name."""
+        return isinstance(error, dict) and error.get("code") == -32601
+
+    def explain_rpc_error(self, method: str, error: Any) -> str:
+        """Turn a JSON-RPC error object into a human-actionable message.
+
+        For ``-32601`` (unknown method) — the signature of a daemon running
+        older code than what's installed — we rewrite the raw envelope into a
+        clear "the daemon is stale, restart it" message that names the offending
+        method. Any other code is surfaced as its own message verbatim (those
+        are real protocol errors, not staleness)."""
+        if self.is_stale_method_error(error):
+            return (
+                f"the running daemon doesn't have method {method!r} — it is "
+                f"likely stale (older than the installed code). Restart it with "
+                f"`browser-daemon stop && browser-daemon serve`."
+            )
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        return f"RPC {method!r} failed: {error!r}"
+
 
 # ---- factory: build a client bound to a resolved session ------------
 
@@ -463,6 +602,10 @@ def auto_client(mode: Optional[str] = None, *, backend: Optional[str] = None):
         return ModeAClient(backend=backend)
     if mode == "B":
         mb = ModeBClient()
+        # S6 (A2-a): a daemon running older code than what's installed speaks
+        # the old protocol — restart it before we lean on newer RPCs.
+        if mb.ensure_version_coherent():
+            mb.wait_until_alive()
         if not mb.is_alive():
             raise DaemonUnavailable(
                 f"Mode B socket not reachable (BD_NAME={mb.name!r}); "
@@ -473,6 +616,9 @@ def auto_client(mode: Optional[str] = None, *, backend: Optional[str] = None):
     # auto
     mb = ModeBClient()
     if mb.is_alive():
+        # S6: restart a stale daemon (running an older build) before reuse.
+        if mb.ensure_version_coherent():
+            mb.wait_until_alive()
         mb.assert_backend_matches(requested_backend or "")
         return mb
     return ModeAClient(backend=backend)

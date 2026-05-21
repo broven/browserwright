@@ -89,11 +89,17 @@ Tasks live as plain Python files under `~/.browser-skill/site-skills/<host>/task
 
 ## Primitives surface (pre-imported in the heredoc namespace)
 
-**Navigation:** `goto_url`, `new_tab`, `switch_tab`, `list_tabs`, `current_tab`, `current_page`, `ensure_real_tab`, `iframe_target`
+**Navigation:** `goto_url`, `new_tab`, `reload(hard=False)`, `switch_tab`, `list_tabs`, `current_tab`, `current_page`, `ensure_real_tab`, `iframe_target`
 
 **Interaction:** `click_at_xy(x, y)`, `type_text`, `press_key`, `fill_input`, `scroll`, `dispatch_key`, `upload_file`
 
-**Inspection:** `js(code)`, `cdp(method, params)`, `page_info()`, `capture_screenshot()`
+- **You fully drive the browser** — navigate, reload, switch tabs, scroll, click. Never ask the user to perform a browser action you can perform yourself. A stale tab is `reload()`, not "please refresh".
+
+**Inspection:** `js(code)`, `cdp(method, params)`, `page_info()`, `capture_screenshot()`, `snapshot()`, `describe_page()`, `diff_snapshot(before, after=None)`
+
+- `snapshot()` — what can I act on, and where? Returns interactive nodes (role/name + center `(x,y)` to feed `click_at_xy`); use it instead of hunting selectors before a click.
+- `describe_page()` — what paints/styles this page? Surfaces backgrounds, gradients, blend/filter/overlays, `::before/::after`, and `:root` CSS vars; use it when reasoning about visual design or theming, not interaction. Pass `viewport_only=True` to ignore off-screen style nodes.
+- `diff_snapshot(before, after=None)` — did my action change the page? Cheap post-action verification: `before = snapshot()`, act, then `diff_snapshot(before)` (takes a fresh snapshot internally) to confirm the action changed what you expected. Returns `{added, removed, changed, unchanged, summary}` matched by role+name(+position bucket). Stateless — pass the prior snapshot explicitly; nothing is stored.
 
 **Waiting:** `wait`, `wait_for_load`, `wait_for_element`, `wait_for_network_idle`, `drain_events`
 

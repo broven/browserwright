@@ -60,10 +60,16 @@ def test_doctor_runs_without_daemon(tmp_path):
             "PATH": "/usr/bin:/bin",
         },
     )
-    assert r.returncode == 0
+    # A4: doctor is now CI-style — a missing daemon is a hard fail, so the
+    # exit code is nonzero and the body is the {status,message,fix} table.
+    assert r.returncode != 0
     info = json.loads(r.stdout)
     assert info["schema_version"] == 1
     assert "skill_version" in info
+    assert "checks" in info
+    fails = [c for c in info["checks"] if c["status"] == "fail"]
+    assert fails
+    assert all(c["fix"].strip() for c in fails)
 
 
 def test_list_tasks_smoke(tmp_path):

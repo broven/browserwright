@@ -301,6 +301,32 @@ def goto_url(url: str) -> dict:
     return {"url": url}
 
 
+def reload(*, hard: bool = False) -> dict:
+    """Reload the currently attached tab, then wait for it to finish loading.
+
+    First-class refresh primitive: issues ``Page.reload`` (``ignoreCache=hard``
+    bypasses the HTTP cache, the equivalent of Ctrl/Cmd-Shift-R) and blocks on
+    ``wait_for_load()``. Use this instead of ``goto_url(current_url)`` to get the
+    page to re-fetch — it's what you reach for when a tab is stale or an action
+    didn't take. Returns the post-reload ``page_info()`` dict.
+
+    Requires a tab to be attached; auto-attaches via ``current_page()`` if the
+    session has no current target yet.
+    """
+    from .inspect import cdp, page_info
+
+    sess = current_session()
+    if not sess.current_target_id:
+        current_page()
+    sid = sess.cdp.attach(sess.current_target_id)
+    try:
+        cdp("Page.reload", session_id=sid, ignoreCache=hard)
+    except CDPError as e:
+        raise PageLoadFailed(url="(reload)", reason=e.cdp_message) from e
+    wait_for_load()
+    return page_info()
+
+
 def current_page() -> dict:
     """User's visually-foreground tab (US1). Auto-attaches.
 

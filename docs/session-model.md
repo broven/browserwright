@@ -121,7 +121,6 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 - `browser-daemon/design-v2.md`
 - `browser-daemon/design-review.md`
 - `browser-skill/design.md`
-- `ai-e2e-tests/AI-E2E-REPORT.md` 及全部 `AI-E2E-REPORT.*.auto.md`(机器生成的测试快照,应 `.gitignore`)
 - `docs/plans/` 下全部(均为已实现功能的 AI 计划/交接稿)
 
 **保留(load-bearing,勿删)**:`skill/SKILL.md`、`skill/memory.md`、`browser-skill/SKILL.md`、`browser-skill/ONBOARDING.md`、`src/.../site_skills_starter/*/SKILL.md|memory.md`、各 `README.md`、`browser-connection.md`(Chrome CDP 现场笔记,有价值,后续可 trim)。

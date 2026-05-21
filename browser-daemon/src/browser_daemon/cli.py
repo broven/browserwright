@@ -548,13 +548,14 @@ async def _run_stats(args, cfg: Config) -> int:
 def _cmd_status(args, cfg: Config) -> int:
     """Report endpoint + liveness. JSON shape used by Skill for status pings."""
     from . import _ipc
-    pid = _ipc.ping_sync(cfg.name, timeout=1.0)
+    pid, version = _ipc.ping_status_sync(cfg.name, timeout=1.0)
     ep = _ipc.endpoint_describe(cfg.name)
     status = {
         "schema_version": 1,
         "name": cfg.name,
         "alive": pid is not None,
         "pid": pid,
+        "version": version,
         "endpoint": ep,
     }
     if args.json:

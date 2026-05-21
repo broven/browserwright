@@ -33,6 +33,8 @@ from .primitives import (
     close_tab,
     current_page,
     current_tab,
+    describe_page,
+    diff_snapshot,
     dispatch_key,
     drain_events,
     ensure_real_tab,
@@ -48,6 +50,7 @@ from .primitives import (
     new_tab,
     open_background,
     page_info,
+    reload,
     press_key,
     propose_solidify,
     remember,
@@ -55,6 +58,7 @@ from .primitives import (
     remember_preference,
     run_task,
     scroll,
+    snapshot,
     solidify,
     switch_tab,
     type_text,
@@ -67,7 +71,7 @@ from .primitives import (
 
 EXPORTS = [
     # navigation / tabs
-    "goto_url", "new_tab", "switch_tab", "list_tabs", "current_tab",
+    "goto_url", "new_tab", "reload", "switch_tab", "list_tabs", "current_tab",
     "current_page", "ensure_real_tab", "iframe_target",
     "attach_readonly", "attach_active",
     "open_background", "close_tab",
@@ -76,6 +80,10 @@ EXPORTS = [
     "dispatch_key", "upload_file",
     # JS + visual + raw CDP
     "js", "cdp", "page_info", "capture_screenshot",
+    # perception (read-only: what can I act on + where / what paints this page)
+    "snapshot", "describe_page",
+    # verification (did my action change the page? — diff two snapshots)
+    "diff_snapshot",
     # waiting + events
     "wait", "wait_for_load", "wait_for_element", "wait_for_network_idle",
     "drain_events",

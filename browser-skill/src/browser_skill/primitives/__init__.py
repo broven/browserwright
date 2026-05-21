@@ -22,7 +22,10 @@ from .http import http_get  # noqa: F401
 from .inspect import (  # noqa: F401
     capture_screenshot,
     cdp,
+    describe_page,
+    diff_snapshot,
     page_info,
+    snapshot,
 )
 from .interact import (  # noqa: F401
     click_at_xy,
@@ -49,6 +52,7 @@ from .page import (  # noqa: F401
     list_tabs,
     new_tab,
     open_background,
+    reload,
     switch_tab,
     wait,
     wait_for_load,

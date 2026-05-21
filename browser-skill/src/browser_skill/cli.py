@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -112,32 +113,41 @@ def _cmd_task(args: list[str]) -> int:
 
 
 def _cmd_doctor(args: list[str]) -> int:
+    """A4: a ``{status, message, fix}`` check table.
+
+    ``doctor --json`` emits the machine form; default prints human-readable.
+    Every ``fail`` check carries a non-empty ``fix`` (enforced in
+    ``doctor_checks``). Exits nonzero (CI-style) if any check fails.
+    """
     from .daemon_client import DaemonClient
 
     cli = DaemonClient()
-    info = cli.doctor()
+    info = cli.doctor_checks()
     info["skill_version"] = __version__
+    checks = info.get("checks", [])
+    any_fail = any(c.get("status") == "fail" for c in checks)
+
     if "--json" in args:
         sys.stdout.write(json.dumps(info, indent=2, default=str) + "\n")
-        return 0
+        return 1 if any_fail else 0
+
     print(f"browser-skill {__version__}")
     print()
-    backends = info.get("backends", [])
-    if not backends:
-        print("(no backend info — is browser-daemon installed?)")
-        if info.get("error"):
-            print(f"  error: {info['error']}")
-        return 0
-    for b in backends:
-        name = b.get("name", "?")
-        avail = "✓" if b.get("available") else "✗"
-        cost = b.get("ux_cost", "?")
-        ws_url = b.get("ws_url", "")
-        print(f"  {avail} {name:14s} ux_cost={cost} ws={ws_url}")
-        if b.get("ux_warning"):
-            print(f"     warning: {b['ux_warning']}")
-        if b.get("needs_user_action"):
-            print(f"     ! {b['needs_user_action']}")
+    glyph = {"pass": "✓", "warn": "!", "fail": "✗"}
+    for c in checks:
+        status = c.get("status", "?")
+        mark = glyph.get(status, "?")
+        name = c.get("name", "?")
+        print(f"  {mark} {name:14s} {c.get('message', '')}")
+        # Always surface the recovery action for non-pass checks so the
+        # human/agent reading the output has a next step.
+        if status != "pass" and c.get("fix"):
+            print(f"     fix: {c['fix']}")
+    print()
+    if any_fail:
+        print("doctor: FAIL — address the fixes above.")
+        return 1
+    print("doctor: ok")
     return 0
 
 
@@ -450,7 +460,30 @@ def _cmd_session(args: list[str]) -> int:
 
 
 def _cmd_userscript(args: list[str]) -> int:
-    result = subprocess.run(["browser-daemon", "userscript", *args])
+    # ``--verify`` is a browser-skill-level convenience on ``push``: after a
+    # successful push, reload the live tab and screenshot it so the agent sees
+    # the effect in one step instead of the manual push→reload→screenshot
+    # ritual. It is NOT a daemon flag, so strip it before delegating.
+    verify = "--verify" in args
+    fwd = [a for a in args if a != "--verify"]
+
+    result = subprocess.run(["browser-daemon", "userscript", *fwd])
+    if result.returncode != 0:
+        # Push failed — don't reload/screenshot a stale state. Surface the
+        # push failure so the agent fixes the script first.
+        return result.returncode
+
+    if verify and fwd and fwd[0] in ("push", "install"):
+        # Reload the currently-active matching tab, let it settle, then grab a
+        # fresh screenshot. Self-contained: reload via raw CDP (no dependency
+        # on a reload() primitive another agent may be adding concurrently).
+        from .api import capture_screenshot, cdp
+
+        cdp("Page.reload")
+        time.sleep(1.0)  # brief settle for the reloaded page to paint
+        shot = capture_screenshot()
+        print(shot)
+
     return result.returncode
 
 

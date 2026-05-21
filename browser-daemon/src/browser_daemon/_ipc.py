@@ -158,51 +158,87 @@ def cleanup_endpoint(name: str) -> None:
 
 
 def make_pong_body(pid: int) -> bytes:
-    """Daemon side: build the /__ping__ response body."""
-    return json.dumps({"pong": True, "pid": pid}).encode()
+    """Daemon side: build the /__ping__ response body.
+
+    Carries the daemon's package version so a client can detect a *stale*
+    daemon (running older code than what's installed on disk) and auto-restart
+    it — S6 (A2-a). A daemon too old to know about this field simply omits it;
+    the parser treats a missing version as stale.
+    """
+    from . import __version__
+    return json.dumps(
+        {"pong": True, "pid": pid, "version": __version__}).encode()
 
 
-async def ping_async(name: str, timeout: float = 1.0) -> int | None:
-    """Async client-side ping. Returns the daemon's reported PID, or None
-    when the endpoint is not a live daemon (refused / wrong / no response).
+def parse_pong(body: bytes) -> tuple[int | None, str | None]:
+    """Client side: extract ``(pid, version)`` from a /__ping__ pong body.
+
+    Returns ``(None, None)`` for anything that isn't our pong shape. ``version``
+    is ``None`` when the daemon predates version-advertising — callers treat
+    that as stale (one needless restart on first upgrade beats silent failure).
+    """
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(payload, dict) or payload.get("pong") is not True:
+        return None, None
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or pid <= 0 or pid > (1 << 31):
+        return None, None
+    version = payload.get("version")
+    if not isinstance(version, str) or not version:
+        version = None
+    return pid, version
+
+
+async def ping_status_async(
+    name: str, timeout: float = 1.0,
+) -> tuple[int | None, str | None]:
+    """Async client-side ping returning ``(pid, version)``.
+
+    ``pid`` is None when the endpoint is not a live daemon (refused / wrong /
+    no response). ``version`` is the daemon's advertised package version, or
+    None if the daemon is too old to advertise one (S6 — treated as stale).
 
     Used by `serve` cold-start to decide whether the existing socket file
     belongs to a live daemon (=> exit 0, idempotent) or a stale corpse
     (=> unlink + bind fresh).
     """
+    none = (None, None)
     try:
         if IS_WINDOWS:
             port, _ = read_port_file(name)
             if port is None:
-                return None
+                return none
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port), timeout=timeout)
         else:
             p = sock_path(name)
             if not p.exists():
-                return None
+                return none
             reader, writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(str(p)), timeout=timeout)
     except (OSError, asyncio.TimeoutError):
-        return None
+        return none
     try:
         try:
             writer.write(b"GET /__ping__ HTTP/1.1\r\nHost: localhost\r\n\r\n")
             await asyncio.wait_for(writer.drain(), timeout=timeout)
         except (BrokenPipeError, ConnectionResetError, OSError, asyncio.TimeoutError):
             # The peer closed/crashed mid-write — definitely not our daemon.
-            return None
+            return none
         # Read until double-CRLF, then up to a reasonable body size.
         data = b""
         deadline = asyncio.get_running_loop().time() + timeout
         while b"\r\n\r\n" not in data and len(data) < 4096:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                return None
+                return none
             try:
                 chunk = await asyncio.wait_for(reader.read(1024), timeout=remaining)
             except asyncio.TimeoutError:
-                return None
+                return none
             if not chunk:
                 break
             data += chunk
@@ -212,21 +248,11 @@ async def ping_async(name: str, timeout: float = 1.0) -> int | None:
             data += body
         except asyncio.TimeoutError:
             pass
-        # Extract pid from JSON body — defensive parse, anything-not-our-shape = stale
         idx = data.find(b"\r\n\r\n")
         if idx < 0:
-            return None
-        body_bytes = data[idx + 4:]
-        try:
-            payload = json.loads(body_bytes.decode("utf-8", errors="replace"))
-        except (ValueError, UnicodeDecodeError):
-            return None
-        if not isinstance(payload, dict) or payload.get("pong") is not True:
-            return None
-        pid = payload.get("pid")
-        if not isinstance(pid, int) or pid <= 0 or pid > (1 << 31):
-            return None
-        return pid
+            return none
+        # Defensive parse, anything-not-our-shape = stale.
+        return parse_pong(data[idx + 4:])
     finally:
         try:
             writer.close()
@@ -235,18 +261,32 @@ async def ping_async(name: str, timeout: float = 1.0) -> int | None:
             pass
 
 
-def ping_sync(name: str, timeout: float = 1.0) -> int | None:
-    """Synchronous variant for CLI status / stop paths that don't already
-    have an event loop running. Returns the daemon's PID, or None."""
-    coro = ping_async(name, timeout=timeout)
+async def ping_async(name: str, timeout: float = 1.0) -> int | None:
+    """Async client-side ping. Returns the daemon's reported PID, or None
+    when the endpoint is not a live daemon. Thin wrapper over
+    :func:`ping_status_async` for callers that only care about liveness/pid."""
+    pid, _version = await ping_status_async(name, timeout=timeout)
+    return pid
+
+
+def ping_status_sync(
+    name: str, timeout: float = 1.0,
+) -> tuple[int | None, str | None]:
+    """Synchronous ``(pid, version)`` probe for CLI paths without a running
+    loop. Returns ``(None, None)`` when nothing answers."""
+    coro = ping_status_async(name, timeout=timeout)
     try:
         return asyncio.run(coro)
     except RuntimeError:
-        # asyncio.run() refused — typically because we're already inside a
-        # running loop, but other policy errors raise too. The coroutine may
-        # or may not have been awaited; .close() is a safe no-op when it has.
         coro.close()
-        return None
+        return None, None
+
+
+def ping_sync(name: str, timeout: float = 1.0) -> int | None:
+    """Synchronous variant for CLI status / stop paths that don't already
+    have an event loop running. Returns the daemon's PID, or None."""
+    pid, _version = ping_status_sync(name, timeout=timeout)
+    return pid
 
 
 # ---- POSIX socket bind helper ---------------------------------------------

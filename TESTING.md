@@ -18,7 +18,7 @@ Chrome / extension / RDP / cloud browser
 
 - `browser-daemon` tests mostly prove the low-level browser connection and CDP proxy work.
 - `browser-skill` tests mostly prove the agent-facing API, session model, memory, and primitives work.
-- `browser-daemon/tests/e2e`, `browser-skill/tests/agent-e2e`, and `ai-e2e-tests` exercise larger end-to-end paths.
+- `browser-daemon/tests/e2e` and `browser-skill/tests/agent-e2e` exercise larger end-to-end paths.
 
 ## Test locations
 
@@ -27,7 +27,7 @@ browser-daemon/tests/              pytest: daemon unit + integration tests
 browser-daemon/tests/e2e/          pytest: real Chrome + extension + daemon E2E
 browser-skill/tests/               pytest: skill unit + offline integration tests
 browser-skill/tests/agent-e2e/     promptfoo + Claude SDK agent E2E, plus harness tests
-ai-e2e-tests/                      custom Python AI E2E harness
+evals/                             text-level skills-eval (command-choice gating)
 .github/workflows/                 CI entry points
 ```
 
@@ -217,71 +217,27 @@ npx promptfoo view
 
 This suite is currently intended for local/manual runs rather than required CI.
 
-## 5. `ai-e2e-tests/`
+## 5. `evals/`
 
-Custom Python AI E2E harness. This is separate from the promptfoo suite.
+Text-level skills-eval harness (see `evals/README.md`). Feeds `skill/SKILL.md` +
+a task prompt to an agent CLI and scores the **commands it emits** (not their live
+effect) with a two-tier gate: deterministic pattern match (`expected` must hit,
+`forbidden` must not, multi-variant to resist overfitting) + an optional LLM judge.
+Cheap and deterministic — the fast red/green signal for SKILL.md steering edits.
 
-Purpose:
-
-- start an isolated Chrome
-- configure `browser-daemon` and `browser-skill`
-- optionally launch a real Claude agent through the Claude Agent SDK
-- run user-story prompts
-- record transcripts and an auto-report
-
-Files:
-
-```text
-ai-e2e-tests/README.md
-ai-e2e-tests/harness.py
-ai-e2e-tests/fake_cloud_server.py
-ai-e2e-tests/fake_extension.py
-ai-e2e-tests/requirements.txt
-```
-
-Run dry-run, no Claude auth or API cost:
+Run cost-free (canned transcripts), exits 1 on any failure:
 
 ```bash
-cd ai-e2e-tests
-python3.11 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python harness.py --dry-run
-```
-
-Run live agent mode:
-
-```bash
-cd ai-e2e-tests
-.venv/bin/python harness.py
-```
-
-Live mode needs one of:
-
-- `ANTHROPIC_API_KEY`
-- a logged-in Claude Code session
-- CI-provided `CLAUDE_CODE_OAUTH_TOKEN`
-
-Outputs:
-
-```text
-ai-e2e-tests/AI-E2E-REPORT*.md
-ai-e2e-tests/transcripts/*.json
+python3 evals/run.py --mock            # zero-cost CI gate
+python3 evals/run.py --mock --json     # machine-readable
+python3 evals/run.py --case cu-01      # one real run via codex
 ```
 
 ## CI
 
-Current visible workflow:
-
-```text
-.github/workflows/ai-e2e.yml
-```
-
-It runs:
-
-- `ai-e2e-tests/harness.py --dry-run` on PR/push
-- live Claude Agent SDK runs only via manual `workflow_dispatch`
-
-The promptfoo suite under `browser-skill/tests/agent-e2e/` is currently documented as local/manual.
+No CI is set up — all suites run locally. `python3 evals/run.py --mock`
+(cost-free, exits 1 on failure) and the pytest suites are the local gates; the
+promptfoo suite under `browser-skill/tests/agent-e2e/` is local/manual.
 
 ## Suggested local check order
 
@@ -317,10 +273,10 @@ cd ../browser-skill && python -m pytest tests -q
 # real browser e2e
 cd ../browser-daemon && uv run pytest tests/e2e/ -v
 
-# AI e2e dry-run
-cd ../ai-e2e-tests && .venv/bin/python harness.py --dry-run
+# skills-eval (cost-free, command-choice gate)
+cd .. && python3 evals/run.py --mock
 
-# optional/manual: promptfoo full suite and AI live suite
+# optional/manual: promptfoo full suite
 ```
 
 ## Coverage gaps to keep in mind

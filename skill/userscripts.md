@@ -48,6 +48,23 @@ Supported v1 metadata directives:
 4. Verify the intended effect.
 5. If red, edit the file, push again, reload or reopen the target page, and re-verify.
 
+### One-step verify with `--verify`
+
+If the target tab is already open, `--verify` collapses steps 2–4 into one
+command: push, reload the live tab, and capture a fresh screenshot.
+
+```bash
+browser-skill userscript push something.user.js --verify
+```
+
+On a successful push it reloads the currently-active matching tab, lets it
+settle, captures a screenshot, and prints the screenshot path so you see the
+result without a separate reload→screenshot round-trip. If the push fails it
+returns the failure and does **not** reload/screenshot a stale page — fix the
+script and push again. `--verify` is a browser-skill convenience and is never
+forwarded to the daemon. Open the target tab first; `--verify` reloads whatever
+tab is currently active, it does not navigate for you.
+
 ## Verification menu
 
 - UI change: capture a DOM snapshot or screenshot and inspect the visible result.
