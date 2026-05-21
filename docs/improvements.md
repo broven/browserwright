@@ -17,10 +17,10 @@
 
 - ✅ 全部完成:A1、E1、B1+B2(S1)、C1(S2)、C3+C4(S3)、C2(S4)、A3+A4(S5)、A2(S6)、**D1 `--print-skill`(S7)**、**D2 attach 恢复 + B3 标注截图 + D3 trust-boundaries(S8)**
 
-**剩余人工项 / follow-up**(非阻塞):
-- 👁 **D3 SKILL.md 文风**:唯一无自动门的项,只能人审(`skill/SKILL.md` "Trust boundaries"/"Attach failed" 段 + `skill/trust-boundaries.md`)。
-- **S6 follow-up**:`explain_rpc_error` 尚未接到实时 ws 错误站点 `cdp.py:~168`(一行)。
-- **version drift**:S5 doctor 跑出 on-PATH/运行 daemon 报 `schema_version=2` vs browser-skill 期望 1(doctor 正确标 warn)——疑似 on-PATH CLI 比 repo 旧,待确认。
+**收尾 — 全部已处理**:
+- ✅ **D3 文风**人审通过:`skill/trust-boundaries.md` + SKILL.md 两段(名失败模式→规则→CORRECT/WRONG,有声音、不泛泛),无需改。
+- ✅ **S6 follow-up**:`explain_rpc_error` 改为 staticmethod 并接到实时站点 `cdp.py`(新 `_rpc_error_fix`,-32601 时给具名"daemon 陈旧"fix);`test_version_coherence.py` 加 wiring 测试。
+- ✅ **version drift 根因=S5 bug**(doctor schema 检查只认 `1`,而当前 daemon 发 `2`):改为接受 `_SUPPORTED_DOCTOR_SCHEMAS=(1,2)`,并修了那条用 v1 掩盖问题的测试(加回归断言)。**非陈旧 CLI**——on-PATH `browser-skill` 指向 repo venv、`browser-daemon` 0.5.3。
 
 ---
 
@@ -35,7 +35,7 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 | | 条目 | 层 | 状态 | 备注 / 证据 |
 |---|---|---|---|---|
 | A1 | ws `max_size=None`,修截图响应超 1 MiB 被丢 → `extension disconnected` | L2 | ✅ | commit `2483b24`,`server/relay.py` |
-| A2 | daemon↔CLI 版本一致性:运行中 daemon 比安装代码旧时**自检并自动重启**;CLI 把自己发出的 `-32601 unknown method` 改写成"daemon 陈旧,请重启",不透传 raw JSON-RPC | L2 | ✅ | S6:版本经 pong→`status --json` 暴露;`ensure_version_coherent()` 接入 `auto_client`,不匹配/缺版本→stop+serve;`explain_rpc_error()` 改写 `-32601`(对任意 method 通用)。gate `test_version_coherence.py` 7(daemon)+12(skill)。**follow-up**:`explain_rpc_error` 尚未接到实时 ws 错误站点 `cdp.py:~168`(一行) |
+| A2 | daemon↔CLI 版本一致性:运行中 daemon 比安装代码旧时**自检并自动重启**;CLI 把自己发出的 `-32601 unknown method` 改写成"daemon 陈旧,请重启",不透传 raw JSON-RPC | L2 | ✅ | S6:版本经 pong→`status --json` 暴露;`ensure_version_coherent()` 接入 `auto_client`,不匹配/缺版本→stop+serve;`explain_rpc_error()` 改写 `-32601`(对任意 method 通用,已设 staticmethod 并接到实时站点 `cdp.py` `_rpc_error_fix`)。gate `test_version_coherence.py` 7(daemon)+13(skill) |
 | A3 | **错误 envelope 约定**:每个 error 带一个 `next`/`fix` 下一步串(对照已有的好例子 `NeedsUserConfirm` 的 `proposal`) | L1/L2 | ✅ | S5:`BrowserSkillError` 基类加 `fix`,各类设 `default_fix`,module 级 `serialize()` 把 `fix` 带进 agent 可见 JSON。覆盖 NoSession/CDPError/DaemonUnavailable/PageLoadFailed/AuthWall 等高频站点 |
 | A4 | `browser-skill doctor`:`{status,message,fix}` 检查表,含 relay/extension/daemon PID/helper 解析 | L2 | ✅ | S5:`doctor_checks()` 回 `{name,status,message,fix}`,**每个 fail 必带 fix**(`add()` 强制);`--json` + 人读;有 fail 则 exit≠0。gate `test_doctor_and_errors.py` 10。**注**:未做 live-launch 探针(doctor 不开 Chrome) |
 
@@ -91,7 +91,7 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 | S3 | ✅ | C3 `reload()` + C4 "你是司机"规则 | ✅ `test_reload.py` 5 + `cu-04` eval 绿(reload 重置断言 + 司机规则 forbidden 多变体) | 🧪🎯 | — |
 | S4 | ✅ | C2 一步式 verify(`userscript push --verify`) | ✅ `test_userscript_verify.py` 3(mock 编排:push→reload→截图;真实 e2e 需 live extension) | 🧪 | — |
 | S5 | ✅ | A3 错误带 `fix` 串 + A4 `doctor` | ✅ `test_doctor_and_errors.py` 10 + 全套 324 无回归;`serialize()` 带 fix 已独立复核 | 🧪 | — |
-| S6 | ✅ | A2 版本自重启 + 改写 `-32601` | ✅ `test_version_coherence.py` 7(daemon)+12(skill)。follow-up:`explain_rpc_error` 接 `cdp.py` 实时站点 | 🧪 | — |
+| S6 | ✅ | A2 版本自重启 + 改写 `-32601`(已接 `cdp.py` 实时站点) | ✅ `test_version_coherence.py` 7(daemon)+13(skill) | 🧪 | — |
 | S7 | ✅ | D1 文档由代码生成、版本锁死(`--print-skill`) | ✅ `test_print_skill.py` 5(44 callables 全覆盖 + 版本) | 🧪 | S1,S2 |
 | S8 | ✅ | D2 attach/session 恢复 + B3 标注截图 + D3 trust-boundaries(+文风) | ✅ `test_attach_recovery.py` 5 + `test_annotate_screenshot.py` 3 + evals `cu-05`/`cu-06`;文风待人审 | 🧪🎯👁 | S1 |
 

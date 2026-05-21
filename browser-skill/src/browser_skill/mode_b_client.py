@@ -545,7 +545,8 @@ class ModeBClient:
         Generic — keys only on the standard code, never on a method name."""
         return isinstance(error, dict) and error.get("code") == -32601
 
-    def explain_rpc_error(self, method: str, error: Any) -> str:
+    @staticmethod
+    def explain_rpc_error(method: str, error: Any) -> str:
         """Turn a JSON-RPC error object into a human-actionable message.
 
         For ``-32601`` (unknown method) — the signature of a daemon running
@@ -553,7 +554,7 @@ class ModeBClient:
         clear "the daemon is stale, restart it" message that names the offending
         method. Any other code is surfaced as its own message verbatim (those
         are real protocol errors, not staleness)."""
-        if self.is_stale_method_error(error):
+        if ModeBClient.is_stale_method_error(error):
             return (
                 f"the running daemon doesn't have method {method!r} — it is "
                 f"likely stale (older than the installed code). Restart it with "

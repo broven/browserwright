@@ -31,6 +31,10 @@ def _split_cmd(cmd: str) -> list[str]:
     return shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
 
 
+# Doctor-blob schema_versions this browser-skill build can read (daemon current = 2).
+_SUPPORTED_DOCTOR_SCHEMAS = (1, 2)
+
+
 class DaemonClient:
     """Mode A subprocess client.
 
@@ -209,14 +213,17 @@ class DaemonClient:
         # 2. schema version sanity (catches a daemon too old to speak the blob)
         sv = info.get("schema_version")
         if not info.get("skill_synthetic"):
-            if sv == 1:
+            # Schemas this browser-skill build knows how to read. The daemon's
+            # current contract is v2 (bumped in daemon v0.5.3); v1 is still
+            # parseable for the fields we use. Anything else = real version skew.
+            if sv in _SUPPORTED_DOCTOR_SCHEMAS:
                 add("daemon_schema", "pass", f"doctor schema_version={sv}", "")
             else:
                 add(
                     "daemon_schema",
                     "warn",
                     f"unexpected doctor schema_version={sv!r}",
-                    "update browser-daemon to match the installed browser-skill",
+                    "update browser-daemon and browser-skill to matching versions",
                 )
 
         # 3. at least one usable backend (relay/extension/rdp connection probe)

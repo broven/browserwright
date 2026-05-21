@@ -86,6 +86,17 @@ def _open_unix_websocket(ws_unix_url: str, *, connect_timeout: float):
     )
 
 
+def _rpc_error_fix(method: str, err: object) -> str:
+    """Recovery hint for a JSON-RPC error returned over the wire. A ``-32601``
+    ("method not found") almost always means the running daemon is older than
+    the installed code, so we surface the restart guidance (naming the method)
+    instead of leaking a bare envelope. Empty string for any other error."""
+    if isinstance(err, dict) and err.get("code") == -32601:
+        from .mode_b_client import ModeBClient  # lazy: avoid import cycle
+        return ModeBClient.explain_rpc_error(method, err)
+    return ""
+
+
 class CDPSession:
     """Reader-singleton CDP transport.
 
@@ -168,7 +179,8 @@ class CDPSession:
         if "error" in entry:
             err = entry["error"]
             raise CDPError(method=method, params=params,
-                           cdp_message=err.get("message", str(err)))
+                           cdp_message=err.get("message", str(err)),
+                           fix=_rpc_error_fix(method, err))
         return entry.get("result", {})
 
     def attach(self, target_id: str) -> str:

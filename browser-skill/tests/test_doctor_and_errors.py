@@ -108,11 +108,13 @@ def test_doctor_checks_shape_and_fail_carries_fix(monkeypatch):
 
 
 def test_doctor_checks_pass_when_backend_available(monkeypatch):
+    # schema_version=2 mirrors the CURRENT daemon contract (daemon v0.5.3). A
+    # prior version of this test used 1, which masked a false-positive warn.
     monkeypatch.setattr(
         DaemonClient,
         "doctor",
         lambda self: {
-            "schema_version": 1,
+            "schema_version": 2,
             "backends": [
                 {"name": "extension", "available": True, "ux_cost": "none",
                  "ws_url": "ws://127.0.0.1:1/x"},
@@ -125,6 +127,9 @@ def test_doctor_checks_pass_when_backend_available(monkeypatch):
     for c in checks:
         assert set(("status", "message", "fix")) <= set(c.keys())
     assert any(c["status"] == "pass" for c in checks)
+    # Regression guard: the current daemon schema must NOT trip a drift warn.
+    schema = next((c for c in checks if c["name"] == "daemon_schema"), None)
+    assert schema is not None and schema["status"] == "pass", schema
 
 
 def test_cmd_doctor_json_emits_checks_and_exits_nonzero_on_fail(monkeypatch, capsys):

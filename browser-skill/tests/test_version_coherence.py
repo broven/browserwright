@@ -166,3 +166,19 @@ def test_is_stale_method_error_predicate():
     assert c.is_stale_method_error({"code": -32000, "message": "x"}) is False
     assert c.is_stale_method_error({}) is False
     assert c.is_stale_method_error(None) is False
+
+
+# ---- S6 follow-up: -32601 rewrite wired at the live cdp.py error site -------
+
+def test_cdp_rpc_error_fix_rewrites_minus_32601():
+    """cdp.py raises CDPError with a stale-daemon `fix` on a -32601 reply,
+    naming the method; other RPC errors carry no stale-daemon fix."""
+    from browser_skill.cdp import _rpc_error_fix
+    method = "BrowserDaemon.userscript.install"
+    fix = _rpc_error_fix(method, {"code": -32601, "message": "Method not found"})
+    assert fix and method in fix
+    assert "stale" in fix.lower()
+    assert "serve" in fix.lower() or "restart" in fix.lower()
+    # Real protocol errors (not staleness) get no stale-daemon hint.
+    assert _rpc_error_fix("Page.navigate", {"code": -32000, "message": "boom"}) == ""
+    assert _rpc_error_fix("Page.navigate", {"message": "no code"}) == ""
