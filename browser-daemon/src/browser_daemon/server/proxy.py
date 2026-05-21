@@ -114,6 +114,8 @@ class Router:
         # session name. Signature: (bs_session | None, group_name) -> dict.
         self._recover_session: (
             Callable[[str | None, str], Awaitable[dict]] | None) = None
+        self._userscript_request: (
+            Callable[[str, dict], Awaitable[dict | None]] | None) = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -672,6 +674,35 @@ class Router:
     async def _handle_browserdaemon(self, client: ClientState, msg: dict) -> None:
         method = msg["method"]
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if isinstance(method, str) and method.startswith("BrowserDaemon.userscript."):
+            if False and method == "BrowserDaemon.userscript.install":
+                pass
+            verb = method.split(".", 2)[2]
+            if self._userscript_request is None:
+                if (self._ensure_upstream is not None
+                        and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                    try:
+                        await self._ensure_upstream()
+                    except Exception as e:
+                        await self._send_to_client(client.client_id, _error_response(
+                            req_id, -32603,
+                            f"userscript {verb} failed (upstream open): {e!r}"))
+                        return
+            if self._userscript_request is None:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32601,
+                    "BrowserDaemon.userscript.* requires the extension backend"))
+                return
+            try:
+                result = await self._userscript_request(verb, params)
+            except Exception as e:  # noqa: BLE001 - surface to client
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32000, f"userscript {verb} failed: {e}"))
+                return
+            await self._send_to_client(
+                client.client_id, _result_response(req_id, result or {}))
+            return
         if method == "BrowserDaemon.getActiveTab":
             tab = self.state.best_active_tab()
             payload = tab if tab is not None else {

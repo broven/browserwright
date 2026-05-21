@@ -232,6 +232,9 @@ class ExtensionUpstream:
         # We don't stop the relay here — the listener may want to keep it
         # alive across reconnects. The listener owns relay lifecycle.
 
+    async def userscript_request(self, verb: str, payload: dict, **kw):
+        return await self._relay.userscript_request(verb, payload, **kw)
+
     async def send_text(self, frame: str) -> None:
         """Client → 'upstream' CDP frame. We parse, intercept Target.* +
         Browser.*, and route session-scoped commands via the relay.

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -35,6 +36,7 @@ Usage:
   browser-skill session list [--json]
   browser-skill session prune [--idle=SECONDS]
   browser-skill whoami --session=ID
+  browser-skill userscript {push|list|remove|toggle|logs} ...
 
   browser-skill task <site>/<name> [--key=value ...] [--isolated]
   browser-skill list-tasks [--site SITE] [--query Q] [--json]
@@ -447,6 +449,11 @@ def _cmd_session(args: list[str]) -> int:
     return 1
 
 
+def _cmd_userscript(args: list[str]) -> int:
+    result = subprocess.run(["browser-daemon", "userscript", *args])
+    return result.returncode
+
+
 def _cmd_whoami(args: list[str]) -> int:
     """``browser-skill whoami --session=ID`` — the ledger view of a session.
 
@@ -512,6 +519,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_session(rest))
     if cmd == "whoami":
         sys.exit(_cmd_whoami(rest))
+    if cmd == "userscript":
+        sys.exit(_cmd_userscript(rest))
 
     # Catch heredoc usage: `cat foo.py | browser-skill`.
     print(f"unknown command: {cmd!r}", file=sys.stderr)

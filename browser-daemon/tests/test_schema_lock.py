@@ -76,6 +76,8 @@ V2_BROWSER_DAEMON_METHODS = frozenset({
     "BrowserDaemon.endSession",
     # Session-reconnect-recovery (extension backend only).
     "BrowserDaemon.recoverSession",
+    # Resident userscripts (extension backend only).
+    "BrowserDaemon.userscript.install",
 })
 
 
@@ -181,7 +183,7 @@ def test_schema_v2_browser_daemon_dispatch_matches_frozen_set():
         "src/browser_daemon/server/proxy.py").read_text()
     # All `method == "BrowserDaemon.XXX"` strings in the dispatch.
     found = set(re.findall(
-        r'method == "(BrowserDaemon\.[A-Za-z]+)"', proxy_src))
+        r'method == "(BrowserDaemon\.(?:[A-Za-z]+|userscript\.[A-Za-z]+))"', proxy_src))
     extra = found - V2_BROWSER_DAEMON_METHODS
     missing = V2_BROWSER_DAEMON_METHODS - found
     assert not extra and not missing, (

@@ -245,6 +245,25 @@ def _build_parser() -> argparse.ArgumentParser:
                            "the tabs in this group instead")
     # Output is always JSON (single-line discipline); no --json flag.
 
+    # userscript — resident extension userscripts
+    p_us = sub.add_parser("userscript", help="manage resident extension userscripts")
+    _add_name(p_us)
+    us_sub = p_us.add_subparsers(dest="userscript_cmd", metavar="<action>")
+    p_us_push = us_sub.add_parser("push", help="install or update a .user.js file")
+    p_us_push.add_argument("file", help=".user.js path, or - for stdin")
+    p_us_install = us_sub.add_parser("install", help="alias for push")
+    p_us_install.add_argument("file", help=".user.js path, or - for stdin")
+    p_us_list = us_sub.add_parser("list", help="list resident userscripts")
+    p_us_list.add_argument("--site", default=None, help="filter by matching site URL")
+    p_us_remove = us_sub.add_parser("remove", help="remove by identity or id")
+    p_us_remove.add_argument("key", help="identity or id")
+    p_us_toggle = us_sub.add_parser("toggle", help="enable or disable by identity or id")
+    p_us_toggle.add_argument("key", help="identity or id")
+    p_us_toggle.add_argument("--enabled", required=True, help="true or false")
+    p_us_logs = us_sub.add_parser("logs", help="print userscript injection logs")
+    p_us_logs.add_argument("--id", default=None, help="filter by userscript id")
+    p_us_logs.add_argument("--limit", type=int, default=50, help="max log rows")
+
     # install / uninstall / list — long-running service (macOS LaunchAgent).
     # The daemon was designed as a one-shot `serve` subprocess, but for the
     # "zero manual ops after install" extension flow it needs to be a
@@ -815,6 +834,101 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
     return result
 
 
+async def _userscript_call_ws(cfg: Config, method: str, params: dict,
+                                timeout: float = 5.0) -> dict:
+    return await _rpc_via_ws(
+        cfg, method, params, client_label="cli-userscript", timeout=timeout)
+
+
+def _cmd_userscript(args, cfg: Config | None = None) -> int:
+    if cfg is None:
+        cfg = load()
+    if isinstance(args, list):
+        parser = _build_parser()
+        ns = parser.parse_args(["userscript", *args])
+    else:
+        ns = args
+    action = getattr(ns, "userscript_cmd", None)
+    if not action:
+        print("usage: browser-daemon userscript {push,list,remove,toggle,logs} ...",
+              file=sys.stderr)
+        return 1
+
+    try:
+        if action in {"push", "install"}:
+            from .userscripts import parse_userscript
+            if ns.file == "-":
+                text = sys.stdin.read()
+            else:
+                with open(ns.file, encoding="utf-8") as f:
+                    text = f.read()
+            us = parse_userscript(text)
+            result = _run(_userscript_call_ws(
+                cfg, "BrowserDaemon.userscript.install", {"script": us.to_payload()}))
+            sync = result.get("sync", {}) or {}
+            print(json.dumps({
+                "id": result.get("id", us.id),
+                "identity": result.get("identity", us.identity),
+                "warnings": us.warnings,
+                "sync": sync,
+            }, sort_keys=True))
+            # Surface header warnings and (crucially) a failed sync to stderr so
+            # a stored-but-not-injected script doesn't read as plain success.
+            for w in us.warnings:
+                print(f"warning: {w}", file=sys.stderr)
+            if sync.get("ok") is False:
+                reason = sync.get("reason")
+                if reason:
+                    print(f"warning: stored but NOT active: {reason}", file=sys.stderr)
+                    if "userScripts API unavailable" in str(reason):
+                        print("hint: enable the extension's 'Allow user scripts' "
+                              "toggle at chrome://extensions (Chrome 138+), or "
+                              "developer mode on older Chrome.", file=sys.stderr)
+                for f in sync.get("failed") or []:
+                    print(f"warning: registration failed for "
+                          f"{f.get('identity') or f.get('id')}: {f.get('error')}",
+                          file=sys.stderr)
+                return 2
+            return 0
+
+        if action == "list":
+            params = {"site": ns.site} if ns.site else {}
+            result = _run(_userscript_call_ws(
+                cfg, "BrowserDaemon.userscript.list", params))
+        elif action == "remove":
+            result = _run(_userscript_call_ws(
+                cfg, "BrowserDaemon.userscript.remove", {"key": ns.key}))
+        elif action == "toggle":
+            enabled = str(ns.enabled).lower() in {"1", "true", "yes", "on"}
+            result = _run(_userscript_call_ws(
+                cfg, "BrowserDaemon.userscript.toggle",
+                {"key": ns.key, "enabled": enabled}))
+        elif action == "logs":
+            # NB: the relay envelope reserves the "id" key for the RPC
+            # request id (relay._request overwrites it), so the script-id
+            # filter must travel under a non-colliding key.
+            params = {"limit": ns.limit}
+            if ns.id:
+                params["scriptId"] = ns.id
+            result = _run(_userscript_call_ws(
+                cfg, "BrowserDaemon.userscript.logs", params))
+        else:
+            print(f"unknown userscript action: {action}", file=sys.stderr)
+            return 1
+    except UserError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def _cmd_open_background(args, cfg: Config) -> int:
     try:
         result = _run(_rpc_via_ws(
@@ -1158,6 +1272,7 @@ _DISPATCH = {
     "open-background": _cmd_open_background,
     "close-tab": _cmd_close_tab,
     "end-session": _cmd_end_session,
+    "userscript": _cmd_userscript,
     # v0.5.5 — LaunchAgent service (macOS) so the daemon is long-running.
     "install": _cmd_install,
     "uninstall": _cmd_uninstall,

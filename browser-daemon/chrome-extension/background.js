@@ -44,6 +44,7 @@ let ws = null;
 let reconnectIdx = 0;
 let installId = null;
 const attachedTabs = new Set();
+let userscriptMemoryLog = [];
 
 // ---- install id (stable across reloads) -----------------------------------
 
@@ -195,6 +196,225 @@ function safeSend(obj) {
   }
 }
 
+
+// ---- userscripts: store + chrome.userScripts registration ------------------
+
+const US_KEY = "userscripts";
+const US_MASTER = "userscriptsMasterEnabled";
+const US_LOG = "userscriptLog";
+const US_LOG_CAP = 500;
+
+async function usGetAll() {
+  const v = await chrome.storage.local.get([US_KEY, US_MASTER]);
+  return { scripts: v[US_KEY] || {}, master: v[US_MASTER] !== false };
+}
+
+async function usPutRecord(rec) {
+  const { scripts } = await usGetAll();
+  const now = Date.now();
+  scripts[rec.id] = {
+    ...rec,
+    enabled: rec.enabled !== false,
+    updatedAt: now,
+    createdAt: scripts[rec.id]?.createdAt || now,
+  };
+  await chrome.storage.local.set({ [US_KEY]: scripts });
+  return scripts[rec.id];
+}
+
+async function usDelete(key) {
+  const { scripts } = await usGetAll();
+  const id = scripts[key] ? key
+    : Object.values(scripts).find((script) => script.identity === key)?.id;
+  if (id) {
+    delete scripts[id];
+    await chrome.storage.local.set({ [US_KEY]: scripts });
+  }
+  return id || null;
+}
+
+async function usAppendLog(entry) {
+  const row = { ts: Date.now(), ...entry };
+  userscriptMemoryLog.push(row);
+  if (userscriptMemoryLog.length > US_LOG_CAP) {
+    userscriptMemoryLog.splice(0, userscriptMemoryLog.length - US_LOG_CAP);
+  }
+  const v = await chrome.storage.local.get([US_LOG]);
+  const log = v[US_LOG] || [];
+  log.push(row);
+  if (log.length > US_LOG_CAP) log.splice(0, log.length - US_LOG_CAP);
+  await chrome.storage.local.set({ [US_LOG]: log });
+}
+
+function usWrapCode(rec) {
+  return (
+    "try{chrome.runtime.sendMessage({type:'userscript.injected',id:" +
+    JSON.stringify(rec.id) + ",url:location.href});}catch(e){}\n" +
+    "(function(){\n" + rec.code + "\n})();"
+  );
+}
+
+
+function usToRegistration(rec) {
+  const registration = {
+    id: rec.id,
+    matches: rec.matches,
+    js: [{ code: usWrapCode(rec) }],
+    runAt: rec.runAt || "document_idle",
+    world: "USER_SCRIPT",
+    allFrames: false,
+  };
+  if (rec.excludeMatches && rec.excludeMatches.length) {
+    registration.excludeMatches = rec.excludeMatches;
+  }
+  return registration;
+}
+
+async function usSyncAll() {
+  if (!chrome.userScripts) {
+    console.warn("[bd-relay] chrome.userScripts unavailable (enable 'Allow user scripts')");
+    return { ok: false, registered: 0, failed: [], reason: "userScripts API unavailable" };
+  }
+  try { await chrome.userScripts.configureWorld({ messaging: true }); } catch (e) {}
+  const { scripts, master } = await usGetAll();
+  const existing = await chrome.userScripts.getScripts({});
+  if (existing.length) {
+    await chrome.userScripts.unregister({ ids: existing.map((script) => script.id) });
+  }
+  if (!master) return { ok: true, registered: 0, failed: [] };
+  const enabled = Object.values(scripts).filter((script) => script.enabled !== false);
+  let registered = 0;
+  const failed = [];
+  // Register one script at a time: chrome.userScripts.register rejects the
+  // entire batch if any single match pattern is invalid, which (after the
+  // unregister above) would leave every resident script disabled. Per-script
+  // registration contains the blast radius to the offending script.
+  for (const rec of enabled) {
+    try {
+      await chrome.userScripts.register([usToRegistration(rec)]);
+      registered += 1;
+      await usAppendLog({ event: "registered", id: rec.id, identity: rec.identity });
+    } catch (e) {
+      failed.push({ id: rec.id, identity: rec.identity, error: errMessage(e) });
+      await usAppendLog({ event: "register_failed", id: rec.id, identity: rec.identity, error: errMessage(e) });
+    }
+  }
+  return { ok: failed.length === 0, registered, failed, logCount: userscriptMemoryLog.length };
+}
+
+function usPatternMatchesUrl(pattern, url) {
+  if (!pattern || pattern === "<all_urls>") return true;
+  try {
+    const parsed = new URL(url);
+    const match = pattern.match(/^([^:]+):\/\/([^/]+)(\/.*)$/);
+    if (match) {
+      const scheme = match[1];
+      const host = match[2];
+      const path = match[3];
+      if (scheme !== "*" && scheme !== parsed.protocol.slice(0, -1)) return false;
+      // Chrome host semantics: "*" = any host; "*.example.com" = example.com
+      // OR any subdomain; otherwise an exact host match.
+      if (host !== "*") {
+        if (host.startsWith("*.")) {
+          const base = host.slice(2);
+          if (parsed.hostname !== base && !parsed.hostname.endsWith("." + base)) {
+            return false;
+          }
+        } else if (host !== parsed.hostname && host !== parsed.host) {
+          return false;
+        }
+      }
+      const pathRegex = new RegExp("^" + path
+        .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*/g, ".*") + "$");
+      return pathRegex.test(parsed.pathname + parsed.search + parsed.hash);
+    }
+  } catch (_e) {
+    // Fall through to the broad string matcher below.
+  }
+  const escaped = pattern
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  return new RegExp("^" + escaped + "$").test(url);
+}
+
+function usRecordMatchesSite(rec, site) {
+  if (!site) return true;
+  return (rec.matches || []).some((pattern) => usPatternMatchesUrl(pattern, site)) &&
+    !(rec.excludeMatches || []).some((pattern) => usPatternMatchesUrl(pattern, site));
+}
+
+async function doUserscriptInstall(id, script) {
+  try {
+    if (!script?.id || !Array.isArray(script.matches) || !script.code) {
+      throw new Error("userscript.install requires script {id,matches,code}");
+    }
+    const rec = await usPutRecord(script);
+    const sync = await usSyncAll();
+    safeSend({
+      type: "response",
+      id,
+      result: { ok: true, id: rec.id, identity: rec.identity, warnings: rec.warnings || [], sync },
+    });
+  } catch (e) {
+    safeSend({ type: "response", id, error: { code: -32000, message: errMessage(e) } });
+  }
+}
+
+async function doUserscriptList(id, site) {
+  try {
+    const { scripts, master } = await usGetAll();
+    const rows = Object.values(scripts)
+      .filter((script) => usRecordMatchesSite(script, site))
+      .map((script) => ({ ...script, enabled: script.enabled !== false }))
+      .sort((a, b) => (a.identity || a.id).localeCompare(b.identity || b.id));
+    safeSend({ type: "response", id, result: { scripts: rows, master } });
+  } catch (e) {
+    safeSend({ type: "response", id, error: { code: -32000, message: errMessage(e) } });
+  }
+}
+
+async function doUserscriptRemove(id, key) {
+  try {
+    const removed = await usDelete(key);
+    const sync = await usSyncAll();
+    safeSend({ type: "response", id, result: { ok: true, removed, sync } });
+  } catch (e) {
+    safeSend({ type: "response", id, error: { code: -32000, message: errMessage(e) } });
+  }
+}
+
+async function doUserscriptToggle(id, key, enabled) {
+  try {
+    const { scripts } = await usGetAll();
+    const scriptId = scripts[key] ? key
+      : Object.values(scripts).find((script) => script.identity === key)?.id;
+    if (!scriptId) throw new Error("userscript not found: " + key);
+    scripts[scriptId].enabled = !!enabled;
+    scripts[scriptId].updatedAt = Date.now();
+    await chrome.storage.local.set({ [US_KEY]: scripts });
+    const sync = await usSyncAll();
+    safeSend({ type: "response", id, result: { ok: true, id: scriptId, enabled: !!enabled, sync } });
+  } catch (e) {
+    safeSend({ type: "response", id, error: { code: -32000, message: errMessage(e) } });
+  }
+}
+
+async function doUserscriptLogs(id, msg) {
+  try {
+    const limit = Number.isFinite(msg?.limit) ? msg.limit : 50;
+    const v = await chrome.storage.local.get([US_LOG]);
+    const persisted = v[US_LOG] || [];
+    let log = persisted.concat(userscriptMemoryLog);
+    // The RPC envelope's own `id` is the request id, so the script-id filter
+    // arrives under `scriptId` (see daemon CLI logs construction).
+    if (msg?.scriptId) log = log.filter((entry) => entry.id === msg.scriptId);
+    safeSend({ type: "response", id, result: { logs: log.slice(-limit) } });
+  } catch (e) {
+    safeSend({ type: "response", id, error: { code: -32000, message: errMessage(e) } });
+  }
+}
+
 // ---- daemon command dispatch ----------------------------------------------
 
 async function handleDaemonMessage(msg) {
@@ -216,6 +436,16 @@ async function handleDaemonMessage(msg) {
       return await doCloseTab(id, msg.tabId);
     case "queryGroup":
       return await doQueryGroup(id, msg.groupName);
+    case "userscript.install":
+      return await doUserscriptInstall(id, msg.script);
+    case "userscript.list":
+      return await doUserscriptList(id, msg.site);
+    case "userscript.remove":
+      return await doUserscriptRemove(id, msg.key);
+    case "userscript.toggle":
+      return await doUserscriptToggle(id, msg.key, msg.enabled);
+    case "userscript.logs":
+      return await doUserscriptLogs(id, msg);
     case "pong":
       // App-level keepalive reply (see pingLoop). The mere fact that this
       // onmessage fired is enough to reset Chrome's SW idle reaper — no
@@ -666,6 +896,20 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // centralize the connection here). It sends `chrome.runtime.sendMessage`s
 // for "attach this tab" / "detach this tab" / "status".
 
+if (chrome.runtime.onUserScriptMessage) {
+  chrome.runtime.onUserScriptMessage.addListener((msg, _sender, sendResponse) => {
+    (async () => {
+      if (msg?.type === "userscript.injected") {
+        await usAppendLog({ id: msg.id, url: msg.url, event: "injected" });
+        sendResponse({ ok: true });
+        return;
+      }
+      sendResponse({ ok: false, error: "unknown user script message type" });
+    })();
+    return true;
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     if (msg?.type === "status") {
@@ -711,6 +955,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       return;
     }
+    if (msg?.type === "userscript.injected") {
+      await usAppendLog({ id: msg.id, url: msg.url, event: "injected" });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg?.type === "userscript.popupList") {
+      const { scripts, master } = await usGetAll();
+      sendResponse({
+        master,
+        scripts: Object.values(scripts)
+          .filter((script) => usRecordMatchesSite(script, msg.url))
+          .map((script) => ({ id: script.id, name: script.name, enabled: script.enabled !== false })),
+      });
+      return;
+    }
+    if (msg?.type === "userscript.popupToggle") {
+      const { scripts } = await usGetAll();
+      if (scripts[msg.id]) {
+        scripts[msg.id].enabled = !!msg.enabled;
+        scripts[msg.id].updatedAt = Date.now();
+        await chrome.storage.local.set({ [US_KEY]: scripts });
+      }
+      const sync = await usSyncAll();
+      sendResponse({ ok: true, sync });
+      return;
+    }
+    if (msg?.type === "userscript.popupMaster") {
+      await chrome.storage.local.set({ [US_MASTER]: !!msg.enabled });
+      const sync = await usSyncAll();
+      sendResponse({ ok: true, sync });
+      return;
+    }
     sendResponse({ ok: false, error: "unknown message type" });
   })();
   return true; // async response
@@ -739,6 +1015,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
+usSyncAll().catch((e) => console.warn("[bd-relay] usSyncAll on init failed:", e));
 connect();
 maintainLoop();
 pingLoop();

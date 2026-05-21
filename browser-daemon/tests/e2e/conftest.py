@@ -12,6 +12,7 @@ so it remains discoverable in the inner loop.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -252,6 +253,19 @@ def patched_ext_dir():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def _extension_id_from_path(ext_dir: Path) -> str:
+    digest = hashlib.sha256(str(ext_dir.resolve()).encode("utf-8")).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(ch, 16)) for ch in digest)
+
+
+# NOTE: Chrome 138+ gates chrome.userScripts behind a per-extension
+# "Allow user scripts" toggle whose state lives in the MAC-signed
+# `Secure Preferences` file. Writing a plain `Preferences` entry does NOT
+# enable it (Chrome ignores/rebuilds it). The toggle must be flipped through
+# the chrome://extensions UI so Chrome writes a valid HMAC itself — see
+# `_enable_user_scripts_toggle` in test_userscripts_e2e.py.
+
+
 @dataclass
 class ChromeHandle:
     ws_url: str
@@ -288,6 +302,7 @@ def _launch_cft_with_extension(
         "--no-default-browser-check",
         "--remote-allow-origins=*",
         "--no-proxy-server",
+        "--enable-features=UserScriptUserExtensionToggle",
         f"--load-extension={ext_dir}",
         "about:blank",
     ]

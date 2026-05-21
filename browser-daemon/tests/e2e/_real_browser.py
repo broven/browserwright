@@ -5,6 +5,7 @@ call the same functions without duplicating code.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -51,6 +52,17 @@ def find_cft_binary() -> Path | None:
             if matches:
                 return matches[-1]
     return None
+
+
+def extension_id_from_path(ext_dir: Path) -> str:
+    digest = hashlib.sha256(str(ext_dir.resolve()).encode("utf-8")).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(ch, 16)) for ch in digest)
+
+
+# NOTE: Chrome 138+ gates chrome.userScripts behind a per-extension
+# "Allow user scripts" toggle stored in the MAC-signed `Secure Preferences`.
+# A plain `Preferences` write does NOT enable it; the toggle must be flipped
+# via the chrome://extensions UI so Chrome writes a valid HMAC itself.
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +114,7 @@ def launch_cft_with_extension(
         "--no-default-browser-check",
         "--remote-allow-origins=*",
         "--no-proxy-server",
+        "--enable-features=UserScriptUserExtensionToggle",
         f"--load-extension={ext_dir}",
         "about:blank",
     ]

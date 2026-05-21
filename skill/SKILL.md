@@ -13,6 +13,8 @@ Two CLIs work together:
 
 Both ship from the same repo. If they're not on `$PATH`, see the repo's root `README.md` for the install steps.
 
+- **Userscripts (resident):** see [userscripts.md](./userscripts.md) — author Tampermonkey-style scripts the extension runs on matching sites.
+
 ## Before you do anything: read memory
 
 Open [memory.md](./memory.md) first. It carries the backend capability table and the user's `scenarios:` list — a per-scenario mapping from "kind of work" to "which backend + how to launch it." Each invocation, match the current task to a `when:` entry and use that scenario's backend. Fall back to `default_backend` if nothing matches.

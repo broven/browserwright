@@ -405,6 +405,20 @@ class RelayServer:
             "params": params,
         }, timeout=timeout) or {}
 
+    async def userscript_request(self, verb: str, payload: dict,
+                                 *, timeout: float = 5.0) -> dict | None:
+        """Forward a userscript control request to any ready extension.
+
+        Userscript operations are extension-global rather than tab-scoped, so
+        unlike ``send_cdp`` they only need a connected extension, not a tab
+        owner.
+        """
+        ext = self._pick_active_extension()
+        if ext is None:
+            raise RuntimeError("no extension connected")
+        return await self._request(
+            ext, {"type": f"userscript.{verb}", **payload}, timeout=timeout)
+
     # ---- internals -------------------------------------------------------
 
     def _pick_active_extension(self) -> _ExtensionConn | None:
