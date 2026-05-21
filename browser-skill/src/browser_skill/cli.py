@@ -18,7 +18,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -475,15 +474,19 @@ def _cmd_userscript(args: list[str]) -> int:
         return result.returncode
 
     if verify and fwd and fwd[0] in ("push", "install"):
-        # Reload the currently-active matching tab, let it settle, then grab a
-        # fresh screenshot. Self-contained: reload via raw CDP (no dependency
-        # on a reload() primitive another agent may be adding concurrently).
-        from .api import capture_screenshot, cdp
+        # Push succeeded; reload the live tab (reload() waits for load) and
+        # screenshot so the agent sees the effect in one step. This is a
+        # convenience: if there's no drivable session/tab (e.g. run outside a
+        # session), report that the push still SUCCEEDED rather than letting an
+        # opaque reload error look like a push failure.
+        try:
+            from .api import capture_screenshot, reload
 
-        cdp("Page.reload")
-        time.sleep(1.0)  # brief settle for the reloaded page to paint
-        shot = capture_screenshot()
-        print(shot)
+            reload()
+            print(capture_screenshot())
+        except Exception as e:
+            print(f"pushed OK — --verify skipped (no drivable tab): {e}",
+                  file=sys.stderr)
 
     return result.returncode
 

@@ -7,7 +7,9 @@ calls and assert the *flow*:
 
   (a) with ``--verify``  → after a successful push, reload the live tab then
       capture a screenshot, in that order, and surface the screenshot path;
-  (b) without ``--verify`` → only push runs; no reload, no screenshot.
+  (b) without ``--verify`` → only push runs; no reload, no screenshot;
+  (c) push fails → no reload/screenshot, push returncode surfaced;
+  (d) reload fails (no drivable tab) → push still reported as succeeded.
 
 A real end-to-end verify still needs the live extension backend; nothing here
 proves the script actually took effect on a page.
@@ -40,25 +42,26 @@ def _patch_push(monkeypatch, result):
     return calls
 
 
-def _patch_reload_and_shot(monkeypatch):
-    """Mock cdp() + capture_screenshot() and record the call order."""
-    order: list[str] = []
+def _patch_reload_and_shot(monkeypatch, reload_exc=None):
+    """Mock reload() + capture_screenshot() and record the call order. If
+    ``reload_exc`` is set, reload() raises it (simulating no drivable tab)."""
+    order: list = []
 
-    def fake_cdp(method, *a, **kw):
-        order.append(("cdp", method))
-        return {}
+    def fake_reload(*a, **kw):
+        order.append(("reload",))
+        if reload_exc is not None:
+            raise reload_exc
+        return {"url": "https://example.test/"}
 
     def fake_shot(path=None, **kw):
         order.append(("screenshot",))
         return "/tmp/verify-shot.png"
 
     # Patch the names as cli.py resolves them (imported inside the function
-    # from browser_skill.api / .primitives — patch on the module cli imports).
+    # from browser_skill.api — patch on that module).
     import browser_skill.api as api
-    monkeypatch.setattr(api, "cdp", fake_cdp, raising=False)
+    monkeypatch.setattr(api, "reload", fake_reload, raising=False)
     monkeypatch.setattr(api, "capture_screenshot", fake_shot, raising=False)
-    # Avoid a brief real sleep in the settle step.
-    monkeypatch.setattr(cli.time, "sleep", lambda *_: None, raising=False)
     return order
 
 
@@ -85,16 +88,12 @@ def test_with_verify_reloads_then_screenshots_after_push(monkeypatch, capsys):
     assert rc == 0
     # The --verify flag is a browser-skill concern; it must not be forwarded.
     assert "--verify" not in calls["push_argv"]
-    # Flow: reload (a Page.reload cdp call) must happen, then a screenshot,
-    # in that order.
+    # Flow: reload must happen, then a screenshot, in that order.
     kinds = [c[0] for c in order]
-    assert "cdp" in kinds, "expected a reload via cdp()"
+    assert "reload" in kinds, "expected a reload"
     assert "screenshot" in kinds, "expected a verification screenshot"
-    assert kinds.index("cdp") < kinds.index("screenshot"), \
+    assert kinds.index("reload") < kinds.index("screenshot"), \
         "reload must happen before the screenshot"
-    # The reload uses Page.reload (generic, no URL/script/selector baked in).
-    reload_methods = [c[1] for c in order if c[0] == "cdp"]
-    assert any("Page.reload" == m for m in reload_methods)
     # The screenshot path is surfaced to the agent on stdout.
     out = capsys.readouterr().out
     assert "/tmp/verify-shot.png" in out
@@ -110,3 +109,20 @@ def test_with_verify_skips_reload_when_push_fails(monkeypatch, capsys):
 
     assert rc == 1
     assert order == [], "no reload/screenshot should run after a failed push"
+
+
+def test_with_verify_degrades_gracefully_when_no_drivable_tab(monkeypatch, capsys):
+    """A successful push followed by a failed reload (no drivable tab) must NOT
+    look like a push failure: rc stays the push's 0, no screenshot is taken, and
+    the message makes clear the push succeeded and only --verify was skipped."""
+    _patch_push(monkeypatch, _Ok())
+    order = _patch_reload_and_shot(monkeypatch, reload_exc=RuntimeError("no tab"))
+
+    rc = cli._cmd_userscript(["push", "f.user.js", "--verify"])
+
+    assert rc == 0, "push succeeded; a verify-only failure must not flip the rc"
+    kinds = [c[0] for c in order]
+    assert "reload" in kinds and "screenshot" not in kinds, \
+        "reload was attempted; screenshot must be skipped on reload failure"
+    err = capsys.readouterr().err
+    assert "pushed OK" in err and "skipped" in err

@@ -69,8 +69,9 @@ def capture_screenshot(path: Optional[str] = None, *, full: bool = False,
         sid = sess.cdp.attach(sess.current_target_id)
 
     legend: Optional[list] = None
+    mark_error: Optional[str] = None
     if annotate:
-        legend = _draw_set_of_mark()
+        legend, mark_error = _draw_set_of_mark()
 
     try:
         params: dict[str, Any] = {"format": "png"}
@@ -96,7 +97,12 @@ def capture_screenshot(path: Optional[str] = None, *, full: bool = False,
     Path(path).write_bytes(raw)
     abs_path = str(Path(path).resolve())
     if annotate:
-        return {"path": abs_path, "legend": legend or []}
+        out: dict = {"path": abs_path, "legend": legend or []}
+        if mark_error:
+            # The overlay failed to paint; the legend coords are still valid but
+            # the agent must NOT assume numbered marks are visible on the image.
+            out["mark_error"] = mark_error
+        return out
     return abs_path
 
 
@@ -135,9 +141,10 @@ _CLEAR_MARK_JS = (
 )
 
 
-def _draw_set_of_mark() -> list:
+def _draw_set_of_mark() -> tuple:
     """Compute the legend from ``snapshot()``'s interactive nodes and draw a
-    numbered badge at each node's center. Returns the legend list.
+    numbered badge at each node's center. Returns ``(legend, error)`` where
+    ``error`` is ``None`` on success or a short string if the overlay draw failed.
 
     The legend is derived from the SAME snapshot the marks are drawn from, so
     each ``[n]``'s ``(x, y)`` is exactly the center ``snapshot()`` reports (and
@@ -158,13 +165,16 @@ def _draw_set_of_mark() -> list:
             "y": n.get("y"),
         })
     code = _DRAW_MARK_JS.replace("__NODES__", json.dumps(legend))
+    err: Optional[str] = None
     try:
         js(code)
-    except Exception:
+    except Exception as e:
         # Drawing is best-effort; the legend (coordinates) is the load-bearing
-        # output, so we still return it even if the overlay failed to paint.
-        pass
-    return legend
+        # output, so we still return it even if the overlay failed to paint —
+        # but report the failure so the caller can flag that the marks aren't
+        # actually on the image (see capture_screenshot's ``mark_error``).
+        err = f"{type(e).__name__}: {e}"
+    return legend, err
 
 
 def _clear_set_of_mark() -> None:
@@ -506,7 +516,12 @@ return (function(opts){
   // non-trivial background, blend/filter/backdrop, pseudo-elements.
   var cands = [];
   var all = document.querySelectorAll("body *");
-  for(var i=0;i<all.length;i++){
+  // Hard scan cap: never walk a pathologically large DOM node-by-node
+  // (getComputedStyle + getBoundingClientRect per element) — on an
+  // infinite-scroll/huge page that can blow the CDP eval timeout. 20k elements
+  // covers any real page's salient layer; salient nodes are then ranked + capped.
+  var scanN = Math.min(all.length, 20000);
+  for(var i=0;i<scanN;i++){
     var el = all[i];
     if(el.tagName==="SCRIPT"||el.tagName==="STYLE"||el.tagName==="NOSCRIPT") continue;
     var cs = getComputedStyle(el);
@@ -756,6 +771,13 @@ def diff_snapshot(before, after=None, *, max_items: int = 40, bucket: int = 32):
         click_at_xy(x, y)
         diff_snapshot(before)            # fresh snapshot() taken internally
         # or diff_snapshot(before, after) with an explicit second snapshot
+
+    **Compare like for like.** When ``after`` is omitted, the internal snapshot
+    uses *default* args (``interactive_only=True``, ``max_nodes=120``, no
+    ``scope``). If you captured ``before`` with non-default args (e.g.
+    ``snapshot(interactive_only=False)`` or a ``scope``), pass an explicit
+    ``after=snapshot(<same args>)`` — otherwise the two sides cover different
+    node sets and the diff reports spurious added/removed nodes.
 
     Node identity for matching across the two snapshots is
     ``role + accessible name + a coarse position bucket`` (default 32px). The
