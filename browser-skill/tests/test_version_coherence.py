@@ -21,15 +21,26 @@ from browser_skill.mode_b_client import ModeBClient
 # (A2-a) version coherence
 # ============================================================================
 
-def _client_with_versions(monkeypatch, running, installed):
+def _client_with_versions(monkeypatch, running, installed, *, backend="extension"):
     """Build a ModeBClient whose version-probe seams are stubbed. Records every
-    stop()/serve() the coherence path triggers so tests can assert restarts."""
+    stop()/serve() the coherence path triggers so tests can assert restarts.
+
+    A respawn must preserve the backend the stale daemon was serving — the
+    daemon now refuses to start under auto, so dropping the backend on restart
+    would leave the daemon dead. We stub ``get_backend_info`` to report
+    ``backend`` and record ``_spawn_daemon``'s backend argument as part of the
+    "serve" call so tests can assert it round-trips."""
     c = ModeBClient(name="default")
     monkeypatch.setattr(c, "running_daemon_version", lambda: running)
     monkeypatch.setattr(c, "installed_daemon_version", lambda: installed)
+    monkeypatch.setattr(
+        c, "get_backend_info",
+        lambda: {"running": True, "backend": backend} if backend else None)
     calls = []
     monkeypatch.setattr(c, "_stop_daemon", lambda: calls.append("stop"))
-    monkeypatch.setattr(c, "_spawn_daemon", lambda: calls.append("serve"))
+    monkeypatch.setattr(
+        c, "_spawn_daemon",
+        lambda backend=None: calls.append(("serve", backend)))
     return c, calls
 
 
@@ -44,8 +55,9 @@ def test_stale_running_version_triggers_stop_then_serve(monkeypatch):
     c, calls = _client_with_versions(monkeypatch, running="0.5.1", installed="0.5.3")
     restarted = c.ensure_version_coherent()
     assert restarted is True
-    # Must stop the stale daemon BEFORE spawning the fresh one.
-    assert calls == ["stop", "serve"]
+    # Must stop the stale daemon BEFORE spawning the fresh one, and the respawn
+    # must carry the backend the old daemon was serving (no auto fallback).
+    assert calls == ["stop", ("serve", "extension")]
 
 
 def test_missing_running_version_treated_as_stale(monkeypatch):
@@ -53,7 +65,27 @@ def test_missing_running_version_treated_as_stale(monkeypatch):
     c, calls = _client_with_versions(monkeypatch, running=None, installed="0.5.3")
     restarted = c.ensure_version_coherent()
     assert restarted is True
-    assert calls == ["stop", "serve"]
+    assert calls == ["stop", ("serve", "extension")]
+
+
+def test_restart_preserves_running_backend(monkeypatch):
+    """Whatever backend the stale daemon was serving (rdp here) must be the
+    backend the respawn pins — this is the regression that left `default`
+    silently downgraded to rdp."""
+    c, calls = _client_with_versions(
+        monkeypatch, running="0.5.1", installed="0.5.3", backend="rdp")
+    assert c.ensure_version_coherent() is True
+    assert calls == ["stop", ("serve", "rdp")]
+
+
+def test_restart_with_unknowable_backend_spawns_without_pin(monkeypatch):
+    """A daemon too old to answer backend-info → we can't learn its backend.
+    We respawn without --backend rather than invent one; the daemon's own guard
+    then decides (it refuses unless BD_BACKEND/default_backend is configured)."""
+    c, calls = _client_with_versions(
+        monkeypatch, running=None, installed="0.5.3", backend=None)
+    assert c.ensure_version_coherent() is True
+    assert calls == ["stop", ("serve", None)]
 
 
 def test_no_running_daemon_does_not_restart(monkeypatch):

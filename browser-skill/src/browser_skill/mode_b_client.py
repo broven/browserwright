@@ -497,12 +497,22 @@ class ModeBClient:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-    def _spawn_daemon(self) -> None:
+    def _spawn_daemon(self, backend: Optional[str] = None) -> None:
         """Spawn a fresh daemon. Detached so it outlives this process, mirroring
-        how cold-start launches ``serve``."""
+        how cold-start launches ``serve``.
+
+        ``backend`` pins ``--backend`` on the respawn. The daemon refuses to
+        start under auto (it would silently fall back to rdp and leave the
+        extension relay un-bound), so a restart that drops the backend would
+        kill the daemon. Callers that know the backend the old daemon was
+        serving (see ``ensure_version_coherent``) pass it through so the
+        replacement keeps serving the same backend."""
+        cmd = ["browser-daemon", "serve", "--name", self.name]
+        if backend:
+            cmd += ["--backend", backend]
         try:
             subprocess.Popen(
-                ["browser-daemon", "serve", "--name", self.name],
+                cmd,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL, start_new_session=True,
             )
@@ -532,8 +542,15 @@ class ModeBClient:
         elif running == installed:
             return False
         # running is None-but-alive (legacy) OR running != installed → stale.
+        # Capture the backend the stale daemon is serving BEFORE we stop it, so
+        # the respawn pins the same backend. The daemon refuses to start under
+        # auto, so dropping the backend here would leave it dead. A daemon too
+        # old to answer backend-info yields None → respawn without a pin and let
+        # the daemon's own guard decide (BD_BACKEND/default_backend).
+        prior = self.get_backend_info() or {}
+        backend = prior.get("backend") or None
         self._stop_daemon()
-        self._spawn_daemon()
+        self._spawn_daemon(backend=backend)
         self.invalidate()
         return True
 

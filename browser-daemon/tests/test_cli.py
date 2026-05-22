@@ -97,6 +97,58 @@ def test_unknown_backend_exit_code_1():
     assert "totally-fake" in (out + err)
 
 
+# ---- serve requires an explicit backend (no silent auto fallback) --------
+
+
+def test_serve_refuses_auto_backend():
+    """`serve` with no backend pinned anywhere (CLI/env/toml) must error out
+    rather than silently auto-resolve to rdp. The long-lived daemon picks its
+    backend for its whole lifetime, so an accidental auto→rdp fallback (e.g. a
+    version-coherence respawn that dropped --backend) leaves the extension
+    relay un-bound and the extension unable to connect. Fail loud instead.
+
+    `_run` strips BD_BACKEND/BD_CONFIG, so this subprocess sees no backend."""
+    code, out, err = _run(["serve", "--name", "test-serve-guard"])
+    assert code == 1, f"expected UserError exit 1, got {code}; stderr={err!r}"
+    assert "backend" in err.lower()
+    # The guard must fire BEFORE the daemon starts listening — no socket bound.
+    assert out == ""
+
+
+def test_serve_guard_unit_allows_explicit_backend(monkeypatch):
+    """The guard lives in `_cmd_serve` and only blocks when cfg.backend is
+    None. An explicit backend sails through to run_serve."""
+    import asyncio
+    from browser_daemon import cli as cli_mod
+    from browser_daemon.config import Config
+
+    seen = {}
+
+    async def _fake_run_serve(cfg):
+        seen["backend"] = cfg.backend
+        return 0
+
+    monkeypatch.setattr("browser_daemon.server.listener.run_serve",
+                        _fake_run_serve)
+    cfg = Config()
+    cfg.backend = "rdp"
+    rc = cli_mod._cmd_serve(object(), cfg)
+    assert rc == 0
+    assert seen["backend"] == "rdp"
+
+
+def test_serve_guard_unit_rejects_none_backend():
+    from browser_daemon import cli as cli_mod
+    from browser_daemon.config import Config
+    from browser_daemon.errors import UserError
+    import pytest
+
+    cfg = Config()
+    assert cfg.backend is None
+    with pytest.raises(UserError):
+        cli_mod._cmd_serve(object(), cfg)
+
+
 # ---- LaunchAgent install (v0.5.5) ----------------------------------------
 
 

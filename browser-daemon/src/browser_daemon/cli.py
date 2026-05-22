@@ -378,7 +378,22 @@ def _cmd_url(args, cfg: Config) -> int:
 
 
 def _cmd_serve(args, cfg: Config) -> int:
-    """Run the long-lived Mode B daemon (§5 v0.2)."""
+    """Run the long-lived Mode B daemon (§5 v0.2).
+
+    Unlike the Mode A probes (`url`, `doctor`), `serve` refuses to start under
+    auto. The daemon binds its backend for its whole lifetime — an accidental
+    auto→rdp fallback (e.g. a version-coherence respawn that dropped --backend)
+    silently leaves the extension relay un-bound and the extension unable to
+    connect. So require an explicit backend from CLI --backend, BD_BACKEND, or
+    config.toml `default_backend` (all three feed cfg.backend); fail loud
+    otherwise instead of guessing.
+    """
+    if cfg.backend is None:
+        raise UserError(
+            "serve requires an explicit backend (auto-selection is disabled "
+            "for the long-lived daemon to avoid a silent rdp fallback). Pass "
+            "--backend {env|rdp|extension|cloud}, or set BD_BACKEND, or "
+            "`default_backend` in config.toml.")
     from .server.listener import run_serve
     return _run(run_serve(cfg))
 
