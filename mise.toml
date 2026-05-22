@@ -1,0 +1,45 @@
+[tasks.reinstall]
+description = "Sync deps and entry points for browser-daemon and browser-skill after a merge"
+dir = "{{config_root}}"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="{{config_root}}"
+LOCAL_BIN="$HOME/.local/bin"
+mkdir -p "$LOCAL_BIN"
+
+for pkg in browser-daemon browser-skill; do
+  venv="$REPO/$pkg/.venv"
+
+  # Create venv if missing
+  if [[ ! -x "$venv/bin/python" ]]; then
+    echo "[$pkg] creating venv..."
+    python3.11 -m venv "$venv"
+  fi
+
+  echo "[$pkg] syncing editable install..."
+  uv pip install --python "$venv/bin/python" -e "$REPO/$pkg"
+
+  # Ensure ~/.local/bin symlink
+  bin_name="$pkg"
+  src="$venv/bin/$bin_name"
+  dst="$LOCAL_BIN/$bin_name"
+  if [[ ! -L "$dst" || "$(readlink "$dst")" != "$src" ]]; then
+    echo "[$pkg] linking $dst -> $src"
+    ln -sf "$src" "$dst"
+  fi
+done
+
+# Ensure skill dir symlinks
+skill_src="$REPO/skill"
+for skill_dst in "$HOME/.claude/skills/browser-skill" "$HOME/.pi/agent/skills/browser-skill"; do
+  if [[ ! -L "$skill_dst" || "$(readlink "$skill_dst")" != "$skill_src" ]]; then
+    echo "[browser-skill] linking $skill_dst -> $skill_src"
+    mkdir -p "$(dirname "$skill_dst")"
+    ln -sfn "$skill_src" "$skill_dst"
+  fi
+done
+
+echo "Done. Installed: browser-daemon, browser-skill, Claude skill"
+"""
