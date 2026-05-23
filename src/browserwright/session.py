@@ -109,10 +109,10 @@ class Session:
     def backend_name(self) -> str:
         """Lazy-resolved daemon backend name (``"rdp"``, ``"extension"``, …).
 
-        Primitives use this to branch on backend-specific quirks — most
-        notably extension's "you have to attach tabs explicitly" model —
-        without a round-trip on every call. Falls back to ``""`` when the
-        daemon doesn't surface backend info (older daemon that never wired it).
+        Diagnostics only — the downstream API is unified, so primitives no
+        longer branch on the backend (backend divergence is absorbed daemon-side;
+        see docs/refactor-single-daemon.md). Surfaced for doctor / debugging.
+        Falls back to ``""`` when the daemon doesn't surface backend info.
         """
         cached = getattr(self, "_backend_name_cache", None)
         if cached is not None:

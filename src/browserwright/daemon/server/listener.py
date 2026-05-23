@@ -924,6 +924,14 @@ async def _idle_watchdog(daemon: "Daemon", idle_after: float) -> None:
                         await ctx.holder.trigger_close("idle_close")
                     except Exception as e:
                         logger.warning("idle close failed: %r", e)
+                    # An idle-closed rdp context's Chrome is gone; drop the
+                    # context so the dict doesn't accumulate dead per-session
+                    # entries for the daemon's lifetime. (trigger_close flips
+                    # the phase itself, so _on_upstream_closed — the usual drop
+                    # path — never fires for the idle case.) A later client
+                    # frame for the session re-creates + relaunches cleanly.
+                    if ctx.backend == "rdp" and ctx.session_id is not None:
+                        daemon.drop_rdp_context(ctx.session_id)
     except asyncio.CancelledError:
         return
 

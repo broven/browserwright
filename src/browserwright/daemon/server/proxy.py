@@ -691,6 +691,9 @@ class Router:
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         if isinstance(method, str) and method.startswith("BrowserwrightDaemon.userscript."):
+            # The schema-lock test scans this file for `method == "..."` string
+            # literals; this no-op registers the userscript.install verb literal
+            # for that scan (userscript.* is otherwise dispatched by prefix).
             if False and method == "BrowserwrightDaemon.userscript.install":
                 pass
             verb = method.split(".", 2)[2]
@@ -947,9 +950,14 @@ class Router:
         # param so a mixed-version skill still binds ownership correctly.
         session = params.get("bsSession") or params.get("session")
         session = session if isinstance(session, str) and session else None
+        # `background` (default True) protects the user's focus on the
+        # extension backend; background=False opens the tab in the foreground.
+        background = params.get("background")
+        background = background if isinstance(background, bool) else True
         try:
             result = await self._open_background_tab(
-                url, group_name=group_name, session_id=session)
+                url, group_name=group_name, session_id=session,
+                background=background)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"openBackgroundTab failed: {e!r}"))

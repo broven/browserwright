@@ -716,7 +716,7 @@ async def test_open_background_with_callback_binds_session_and_attacher():
     ownership registered with the daemon-allocated LOCAL sessionId."""
     state, router, cap, (client,) = _setup(backend="extension")
 
-    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None, background: bool = True) -> dict:
         assert url == "https://example.com/"
         assert group_name == "Agent"
         return {
@@ -782,7 +782,7 @@ async def test_close_tab_with_callback_cleans_session_state():
     state, router, cap, (client,) = _setup(backend="extension")
     upstream_sid = "UPSTREAM-SID-99"
 
-    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None, background: bool = True) -> dict:
         return {
             "sessionId": upstream_sid,
             "targetId": "ext-tab-99",
@@ -844,7 +844,7 @@ async def test_close_tab_by_target_id_works_across_client_boundary():
     global state.attachers table, not just the local client's sessions."""
     state, router, cap, (alice, bob) = _setup("alice", "bob", backend="extension")
 
-    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None, background: bool = True) -> dict:
         return {
             "sessionId": "UPSTREAM-SID-77",
             "targetId": "ext-tab-77",
@@ -893,7 +893,7 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
     still has an entry)."""
     state, router, cap, (alice, bob) = _setup("alice", "bob", backend="extension")
 
-    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
+    async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None, background: bool = True) -> dict:
         return {
             "sessionId": "UPSTREAM-SID-88",
             "targetId": "ext-tab-88",

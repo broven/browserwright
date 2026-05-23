@@ -439,6 +439,7 @@ class ExtensionUpstream:
         *,
         group_name: str | None = "Agent",
         session_id: str | None = None,
+        background: bool = True,
     ) -> dict:
         """Open a background tab in the session's tab group via the relay,
         fabricate a sessionId, and return
@@ -451,7 +452,7 @@ class ExtensionUpstream:
         per-session state we keep; membership comes from the live group."""
         gid = self._groups.get(session_id) if session_id else None
         gt = await self._relay.create_background_tab(
-            url, group_name=group_name, group_id=gid)
+            url, group_name=group_name, group_id=gid, background=background)
         sid = _new_upstream_session_id(gt.tab_id)
         self._sessions[sid] = gt.tab_id
         group_id = getattr(gt, "group_id", -1)

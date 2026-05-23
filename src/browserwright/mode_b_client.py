@@ -263,10 +263,10 @@ class ModeBClient:
         currently-focused-window active tab — bypasses the popup click.
 
         Returns ``{sessionId, targetId, tabId, url, title}`` on success,
-        ``None`` if the daemon errored or isn't reachable. Only meaningful
-        when the running daemon was started with ``--backend extension``;
-        other backends will return -32601 ("requires the extension backend")
-        and that surfaces as ``None`` here.
+        ``None`` if the daemon errored or isn't reachable. The verb is unified:
+        on extension it adopts the focused tab into the session's group; on rdp
+        the daemon returns the session's current front tab. It never returns
+        -32601 to the agent.
         """
         try:
             proc = subprocess.run(

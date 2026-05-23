@@ -351,6 +351,7 @@ class RelayServer:
         *,
         group_name: str | None = "Agent",
         group_id: int | None = None,
+        background: bool = True,
         timeout: float = 10.0,
     ) -> GhostTarget:
         """Spec Phase B Feature 1: open a tab in the background (active=false)
@@ -377,6 +378,11 @@ class RelayServer:
             body["groupName"] = group_name
         if isinstance(group_id, int) and group_id >= 0:
             body["groupId"] = group_id
+        # background=False opens the tab in the foreground (active:true);
+        # default True keeps the user's focus tab. Only sent when foreground
+        # is requested so existing extensions default to background.
+        if not background:
+            body["background"] = False
         result = await self._request(ext, body, timeout=timeout) or {}
         tab_id = int(result.get("tabId", -1))
         if tab_id < 0:

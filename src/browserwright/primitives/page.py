@@ -485,7 +485,8 @@ def close_tab(
 
     Returns ``{"ok": True, "tabId": N}``.
 
-    Extension backend only — raises ``CDPError`` on other backends.
+    Unified across backends: extension closes the tab via the relay; rdp closes
+    it via ``Target.closeTarget`` (daemon-side). Never requires a specific backend.
     """
     sess = current_session()
     # Resolve target_id and session_id from local state when not passed,

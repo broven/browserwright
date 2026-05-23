@@ -441,7 +441,7 @@ async function handleDaemonMessage(msg) {
     case "attachActive":
       return await doAttachActive(id, msg.groupId, msg.groupName);
     case "createTab":
-      return await doCreateTab(id, msg.url, msg.groupName, msg.groupId);
+      return await doCreateTab(id, msg.url, msg.groupName, msg.groupId, msg.background);
     case "closeTab":
       return await doCloseTab(id, msg.tabId);
     case "queryGroup":
@@ -594,13 +594,16 @@ async function _resolveSessionGroup(groupId, groupName) {
   return -1;
 }
 
-async function doCreateTab(id, url, groupName, sessionGroupId) {
+async function doCreateTab(id, url, groupName, sessionGroupId, background) {
   try {
     if (typeof url !== "string" || !url) {
       throw new Error("createTab requires a url");
     }
-    // active:false is critical: we don't want to steal user focus.
-    const tab = await chrome.tabs.create({ url, active: false });
+    // active:false (the default) keeps the user's focus tab; the daemon sends
+    // background:false only when the caller explicitly asked for a foreground
+    // tab (open(url, background=False)).
+    const active = background === false;
+    const tab = await chrome.tabs.create({ url, active });
     let groupId = -1;
     // Bind the tab to the session's group. Prefer the daemon-remembered
     // numeric groupId; recover by title if it went invalid (empty-group
