@@ -108,47 +108,6 @@ class NoSession(BrowserwrightError):
         )
 
 
-class DaemonBackendMismatch(BrowserwrightError):
-    """Mode-B daemon is alive but serving a different backend than the
-    one the caller asked for / configured (REVIEW.md F-5d).
-
-    Surface case: a daemon was last started against ``extension`` under
-    ``BD_NAME=foo``; the operator now wants ``rdp`` for that same name.
-    Without an identity check, Skill would silently reuse the stale
-    daemon and target the wrong Chrome. This error makes the mismatch
-    loud + actionable.
-    """
-
-    exit_code = 2
-
-    def __init__(self, requested: str = "", actual: str = "",
-                 name: str = "default", fix: str = ""):
-        self.requested, self.actual, self.name = requested, actual, name
-        super().__init__(
-            f"daemon backend mismatch: BD_NAME={name!r} is serving "
-            f"backend={actual!r} but you requested {requested!r}. "
-            f"Either restart the daemon (`browserwright-daemon stop --name {name}` "
-            f"then `browserwright-daemon serve --backend {requested}`) or pick "
-            f"a different BD_NAME.",
-            fix=fix or (
-                f"`browserwright-daemon stop --name {name}` then "
-                f"`browserwright-daemon serve --backend {requested}` (or use a different BD_NAME)"
-            ),
-        )
-
-
-class SiteDrift(BrowserwrightError):
-    exit_code = 3
-    default_fix = (
-        "the site changed shape; re-derive the step with snapshot()/"
-        "capture_screenshot() and update the saved task"
-    )
-
-    def __init__(self, site: str = "", task: str = "", failed_check: str = "", fix: str = ""):
-        self.site, self.task, self.failed_check = site, task, failed_check
-        super().__init__(f"site drift in {site}/{task}: {failed_check}", fix=fix)
-
-
 class CDPError(BrowserwrightError):
     exit_code = 3
     default_fix = (
@@ -163,8 +122,8 @@ class CDPError(BrowserwrightError):
 
 
 class NeedsUserConfirm(BrowserwrightError):
-    """Raised by remember_preference / solidify when the agent must surface a
-    confirm prompt to the user before re-calling with confirm=False."""
+    """Raised by remember_preference (and similar) when the agent must surface
+    a confirm prompt to the user before re-calling with confirm=False."""
 
     exit_code = 1
 

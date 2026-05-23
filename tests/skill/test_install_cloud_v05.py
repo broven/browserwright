@@ -31,9 +31,8 @@ import pytest
 
 
 def _stub_doctor(monkeypatch, blob: dict) -> None:
-    from browserwright import daemon_client
-    monkeypatch.setattr(daemon_client.DaemonClient, "doctor",
-                        lambda self: blob)
+    from browserwright import health
+    monkeypatch.setattr(health, "daemon_doctor", lambda: blob)
 
 
 def test_cloud_available_true_when_doctor_lists_it(monkeypatch):
@@ -325,7 +324,7 @@ def test_wizard_choice_5_rejects_unknown_auth_kind(monkeypatch, tmp_bs_home,
 def test_doctor_probe_is_the_only_detection_channel(monkeypatch):
     """Spec H3 + HANDOFF detection contract: both ``_extension_backend_available``
     and ``_cloud_backend_available`` must derive their answer from
-    ``DaemonClient().doctor()`` alone. Any future helper that opens a ws
+    ``health.daemon_doctor()`` alone. Any future helper that opens a ws
     or curls a backend API is a contract break.
 
     We enforce this by replacing every other plausible network-touching
@@ -336,7 +335,7 @@ def test_doctor_probe_is_the_only_detection_channel(monkeypatch):
     def _trip(*a, **kw):
         raise AssertionError(
             "Detection helper opened a network connection — must consume "
-            "DaemonClient().doctor() output only (spec H3, HANDOFF)."
+            "health.daemon_doctor() output only (spec H3, HANDOFF)."
         )
 
     # Replace socket.socket so any ws / TCP attempt blows up loudly.
@@ -500,12 +499,10 @@ def test_live_daemon_doctor_surfaces_informative_unavailability(daemon_bin):
     assert extras.get("configured") is False
 
     # Skill-side helper agrees when fed the real-daemon JSON.
-    from browserwright import daemon_client, install
+    from browserwright import health, install
 
-    def _patched_doctor(self):
-        return blob
-
-    daemon_client.DaemonClient.doctor = _patched_doctor
+    _orig = health.daemon_doctor
+    health.daemon_doctor = lambda: blob
     try:
         assert install._cloud_backend_available() is False
         entry = install._cloud_backend_entry()
@@ -513,9 +510,7 @@ def test_live_daemon_doctor_surfaces_informative_unavailability(daemon_bin):
         assert entry.get("name") == "cloud"
         assert entry.get("available") is False
     finally:
-        from browserwright import daemon_client as _dc
-        import importlib
-        importlib.reload(_dc)
+        health.daemon_doctor = _orig
 
 
 # ---- option 5 — oauth2 deferred to v0.6 -----------------------------

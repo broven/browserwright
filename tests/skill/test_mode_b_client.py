@@ -158,49 +158,28 @@ def test_ws_url_tcp_format(monkeypatch):
     assert url == "ws://127.0.0.1:8541?token=abcd&client=skill-repl"
 
 
-def test_auto_falls_back_to_mode_a(monkeypatch):
-    """When the Mode B socket isn't reachable, ``auto_client`` returns a
-    Mode A ``DaemonClient``."""
-    from browserwright.daemon_client import DaemonClient as ModeAClient
-    from browserwright.mode_b_client import auto_client
+def test_client_is_lazy_when_socket_absent(monkeypatch):
+    """Mode A was removed (and so was ``auto_client``): constructing a
+    ``ModeBClient`` with no reachable daemon socket still stays offline — it
+    builds fine — and ``DaemonUnavailable`` surfaces only when the ws is
+    actually resolved."""
+    from browserwright.errors import DaemonUnavailable
+    from browserwright.mode_b_client import ModeBClient
 
     monkeypatch.setenv("BD_NAME", "absent")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent")
-    monkeypatch.delenv("BS_DAEMON_MODE", raising=False)
 
     class _FailProc:
         returncode = 1
         stdout = ""
 
     with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
-        client = auto_client()
-    assert isinstance(client, ModeAClient)
-
-
-def test_auto_force_b_raises_when_absent(monkeypatch):
-    from browserwright.errors import DaemonUnavailable
-    from browserwright.mode_b_client import auto_client
-
-    monkeypatch.setenv("BD_NAME", "absent2")
-    monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent")
-    monkeypatch.setenv("BS_DAEMON_MODE", "B")
-
-    class _FailProc:
-        returncode = 1
-        stdout = ""
-
-    with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
+        client = ModeBClient(name="absent")
+        assert isinstance(client, ModeBClient)
+        assert client.is_alive() is False
+        # Lazy: the error is deferred to first use, not construction.
         with pytest.raises(DaemonUnavailable):
-            auto_client()
-
-
-def test_force_a_env_picks_mode_a(monkeypatch):
-    from browserwright.daemon_client import DaemonClient as ModeAClient
-    from browserwright.mode_b_client import auto_client
-
-    monkeypatch.setenv("BS_DAEMON_MODE", "A")
-    client = auto_client()
-    assert isinstance(client, ModeAClient)
+            client.resolve_ws_url()
 
 
 def test_client_uses_session_daemon_endpoint(tmp_bs_home, monkeypatch):

@@ -16,7 +16,6 @@ from contextlib import redirect_stdout
 from typing import IO
 
 from ..errors import BrowserwrightError, serialize
-from ..session import current_session
 from . import _namespace
 
 
@@ -28,18 +27,20 @@ def run(stdin: IO[str]) -> int:
               file=sys.stderr)
         return 1
 
-    # P1: refuse loudly at the entrypoint when no session is in scope, rather
-    # than silently sharing a browser via the import-time default.
+    # P1: refuse loudly at the entrypoint when no session is in scope, then
+    # bind that explicit ledger record so primitives drive the session's
+    # daemon/backend — never an env-guessed default.
     from ..errors import NoSession
+    from ..session import Session, set_session
     from ..session_ctx import resolve_session
     try:
-        resolve_session()
+        rec = resolve_session()
     except NoSession as e:
         print(str(e), file=sys.stderr)
         return e.exit_code
+    set_session(Session(record=rec))
 
-    # Run in-process. Capture stdout so we can also record it in the session
-    # history (which propose_solidify reads).
+    # Run in-process. Capture stdout so we can replay it after the exec.
     globals_ = _namespace.build_globals()
     buf = io.StringIO()
     try:
@@ -48,18 +49,13 @@ def run(stdin: IO[str]) -> int:
     except BrowserwrightError as e:
         sys.stdout.write(buf.getvalue())
         sys.stderr.write(json.dumps(serialize(e)) + "\n")
-        current_session().record(code, ok=False, stdout=buf.getvalue(),
-                                 exception=type(e).__name__)
         return e.exit_code
     except SystemExit as e:
         sys.stdout.write(buf.getvalue())
         return int(e.code) if isinstance(e.code, int) else 0
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         sys.stdout.write(buf.getvalue())
         sys.stderr.write(traceback.format_exc())
-        current_session().record(code, ok=False, stdout=buf.getvalue(),
-                                 exception=type(e).__name__)
         return 3
     sys.stdout.write(buf.getvalue())
-    current_session().record(code, ok=True, stdout=buf.getvalue())
     return 0

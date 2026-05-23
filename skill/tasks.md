@@ -1,6 +1,6 @@
-# Solidifying a flow into a task
+# Saving a flow as a reusable task
 
-A "task" is a per-site Python file that bundles a reusable browser flow with metadata and a selftest. The runtime is filesystem-driven — drop the right files in the right place and `browserwright task <site>/<name>` works immediately. No registry, no `solidify()` CLI call needed.
+A "task" is a per-site Python file that bundles a reusable browser flow with metadata. The runtime is filesystem-driven — drop the right files in the right place and `browserwright task <site>/<name>` works immediately. No registry, no scaffolding command — **you author the file yourself with the `Write` tool**.
 
 ## Storage layout
 
@@ -33,17 +33,13 @@ REQUIRES_LOGIN = False
 ESTIMATED_DURATION_SEC = 5
 LAST_VERIFIED = "2026-05-19"
 
-def selftest():
-    new_tab("https://example.com")
-    return "Example" in page_info()["title"]
-
 def run(args, ctx=None):
     new_tab(f"https://example.com/search?q={args['query']}")
     wait_for_load()
     return {"title": page_info()["title"], "url": current_tab()}
 ```
 
-Module-level constants are all optional except `ARGS` and `run`. The runtime imports the file with `importlib`, validates args against `ARGS`, runs `selftest()` (cached 24h), then calls `run(args, ctx)`. `ctx.memory` is the parsed frontmatter of the site's `memory.md`.
+Module-level constants are all optional except `ARGS` and `run`. The runtime imports the file with `importlib`, validates args against `ARGS`, then calls `run(args, ctx)`. If you define `OUTPUT_SCHEMA`, the runtime validates `run()`'s return shape against it. `ctx.memory` is the parsed frontmatter of the site's `memory.md`.
 
 ## Site memory.md template
 
@@ -78,4 +74,4 @@ Anti-bot, rate limits, layouts that differ logged-in vs anonymous.
    - `~/.browserwright/site-skills/<site>/SKILL.md` if missing — one line per task is enough.
 3. Run `browserwright task <site>/<name>` once to verify it works end to end.
 
-The filesystem is the database. Don't use `browserwright save` / `propose_solidify()` / `solidify()` — direct file writes are cleaner and don't go through a JSON spec.
+The filesystem is the database — there is no save/scaffold command. Write the files directly with the `Write` tool, then run `browserwright task <site>/<name>` to confirm.

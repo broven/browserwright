@@ -11,20 +11,17 @@
   producthunt.
 - **Three-tier memory** — global preferences, per-site notes, in-process REPL state.
   Append-only by default; preference writes require explicit user confirm.
-- **Solidification** — `propose_solidify()` looks at REPL history, scores readiness,
-  and produces a ready-to-commit `tasks/<name>.py` scaffold.
 
 See `design.md` for the full specification.
 
 ## Install
 
 ```bash
-python3.11 -m venv .venv
-.venv/bin/pip install -e .
+uv sync --extra ux
 ```
 
-The console script `browserwright` is registered automatically. The daemon
-(`browserwright-daemon`) lives in `../browserwright-daemon/` and is a separate package.
+The console scripts `browserwright` and `browserwright-daemon` are both
+registered automatically — they ship from this single package.
 
 ## Usage
 
@@ -90,8 +87,8 @@ frontmatter tree.
 ## Tests
 
 ```bash
-.venv/bin/pip install pytest pytest-timeout
-.venv/bin/pytest tests/
+uv sync               # dev group brings in pytest + pytest-asyncio
+uv run pytest tests/
 ```
 
 30+ unit + integration tests; all green on macOS / Python 3.11. The default
@@ -114,9 +111,10 @@ user with that dialog. Two safe paths:
        --port 9333 \
        --profile bs-test-profile \
        --persistent &
-   # then point Skill at that endpoint:
-   export BS_CDP_WS="$(curl -s http://127.0.0.1:9333/json/version \
-       | python3 -c 'import sys,json;print(json.load(sys.stdin)["webSocketDebuggerUrl"])')"
+   # run a daemon against that isolated Chrome, then create an rdp session
+   # so the skill talks to it over the daemon socket (Mode B):
+   browserwright-daemon serve &
+   browserwright session new --backend=rdp
    pytest tests/
    ```
 
@@ -346,20 +344,12 @@ assertions previously lived in `_hardening.py` and gated `repl start`,
 Chrome 144+ popup-accumulation hazard. With autoconnect deleted, the
 gate no longer has a purpose; the module and its tests were dropped.
 
-**Mode-B identity check (F-5d)** — `auto_client()` invokes
-`assert_backend_matches()` on the resolved Mode-B daemon when the
-caller pinned a backend (`backend=` arg / `BD_BACKEND` env). Catches
-the "BD_NAME=foo daemon was last started against backend X,
-operator now wants Y" silent-reuse failure mode. Raises
-`DaemonBackendMismatch` with a daemon-restart command in the message.
-
 **Coverage & contract hygiene (F-7 / F-9 / F-12 / F-13 / F-16 / F-17)** —
 scaffold template now emits `OUTPUT_SCHEMA` (commented placeholder or
 inferred from `return {...}` / `return [...]`); 14 more `host_stem`
-multi-label TLD cases; args-schema rejects non-string keys; Mode-A
-`disconnect_upstream()` no-op stub for API parity; TOML emit rejects
-unsafe control characters; `browserwright solidify` aliases `save`;
-`warm_upstream` flagged for removal in v0.6.
+multi-label TLD cases; args-schema rejects non-string keys; TOML emit
+rejects unsafe control characters; `warm_upstream` flagged for removal
+in v0.6.
 
 **Two incidental bug fixes** surfaced during expanded coverage and
 were shipped alongside: `host_stem("github.com.")` now strips the FQDN

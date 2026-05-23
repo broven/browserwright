@@ -1,10 +1,9 @@
 """Per-process Skill session.
 
 Holds:
-  - one ``DaemonClient`` (Mode A subprocess or Mode B socket — duck-typed)
+  - one ``ModeBClient`` (long-lived daemon socket)
   - one ``CDPSession`` (lazy: opened on first primitive that touches the browser)
   - the currently-attached target id (the "current tab")
-  - a REPL history list (used by ``propose_solidify``)
 
 Concurrency model (v0.3 prep)
 -----------------------------
@@ -33,7 +32,6 @@ from __future__ import annotations
 import contextvars
 import os
 import threading
-import time
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -43,10 +41,9 @@ from .errors import DaemonUnavailable
 
 class Session:
     def __init__(self, daemon=None, *, record=None):
-        # ``daemon`` is duck-typed: either a ``ModeAClient`` (subprocess-based)
-        # or a ``ModeBClient`` (long-lived socket). Both expose
-        # ``resolve_ws_url`` / ``ws_url`` semantics through the matching
-        # methods we use below.
+        # ``daemon`` is a ``ModeBClient`` (long-lived socket), exposing
+        # ``resolve_ws_url`` / ``ws_url`` semantics through the methods we use
+        # below. (Mode A — the subprocess resolver — was removed.)
         #
         # ``record`` is a resolved session ledger record (P1). When given, the
         # daemon endpoint comes from ``record["daemon_endpoint"]`` rather than
@@ -54,17 +51,19 @@ class Session:
         # Stored as ``session_record`` to avoid shadowing the ``record()`` method.
         self.session_record = record
         if daemon is None:
-            if record is not None:
-                from .mode_b_client import client_for_session
-                daemon = client_for_session(record)
-            else:
-                from .mode_b_client import auto_client
-                daemon = auto_client()
+            if record is None:
+                from .errors import NoSession
+                raise NoSession(
+                    "no session bound: a Session needs an explicit ledger "
+                    "record (its backend/daemon comes from `session new`). "
+                    "Set BD_SESSION, or pass record=/daemon= explicitly."
+                )
+            from .mode_b_client import client_for_session
+            daemon = client_for_session(record)
         self.daemon = daemon
         self._cdp: Optional[CDPSession] = None
         self._cdp_lock = threading.Lock()
         self.current_target_id: Optional[str] = None
-        self.history: list[dict] = []  # {"code", "ok", "stdout", "result", "exception", "ts"}
         # Last-seen accuracy from getActiveTab for warn-on-stale UX.
         self.last_active_tab: Optional[dict] = None
         # Caches keyed by host name → memory dict for performance.
@@ -91,26 +90,14 @@ class Session:
     def _resolve_ws_url(self) -> str:
         """Ask the underlying daemon client for a CDP ws URL.
 
-        Both Mode A (``ModeAClient.resolve_ws_url``) and Mode B
-        (``ModeBClient.resolve_ws_url`` aliasing ``ws_url()``) implement the
-        same one-method protocol. On failure, retry once after dropping the
-        cached URL — spec §D.7.
+        ``ModeBClient.resolve_ws_url`` aliases ``ws_url()``. On failure, retry
+        once after dropping the cached URL — spec §D.7.
         """
         try:
             return self.daemon.resolve_ws_url()
         except DaemonUnavailable:
             self.daemon.invalidate()
             return self.daemon.resolve_ws_url()
-
-    def record(self, code: str, *, ok: bool, stdout: str = "", result=None, exception=None) -> None:
-        self.history.append({
-            "code": code,
-            "ok": ok,
-            "stdout": stdout,
-            "result": result,
-            "exception": exception,
-            "ts": time.time(),
-        })
 
     def close(self) -> None:
         if self._cdp is not None and self._owns_cdp:
@@ -124,8 +111,7 @@ class Session:
         Primitives use this to branch on backend-specific quirks — most
         notably extension's "you have to attach tabs explicitly" model —
         without a round-trip on every call. Falls back to ``""`` when the
-        daemon doesn't surface backend info (older daemon / Mode A path
-        that never wired it).
+        daemon doesn't surface backend info (older daemon that never wired it).
         """
         cached = getattr(self, "_backend_name_cache", None)
         if cached is not None:
@@ -136,10 +122,9 @@ class Session:
             # Narrow the catch to the failure modes the underlying clients
             # actually surface: ModeBClient.get_backend_info wraps subprocess
             # plumbing (FileNotFoundError, TimeoutExpired) and JSON parsing.
-            # OSError covers low-level I/O. AttributeError is here to absorb
-            # the "Mode A client missing some inner shim" edge case rather
-            # than letting an internal bug crash backend-name resolution.
-            # Truly unexpected exceptions propagate.
+            # OSError covers low-level I/O. AttributeError absorbs a missing
+            # inner shim rather than letting an internal bug crash backend-name
+            # resolution. Truly unexpected exceptions propagate.
             import json as _json
             import subprocess as _subprocess
             try:
@@ -174,10 +159,12 @@ def current_session() -> Session:
 
     Resolution order:
       1. The ``ContextVar`` push (most recent ``with_session(...)`` block).
-      2. The process-wide default singleton (lazily created).
+      2. The process-wide default singleton, bound by ``set_session()``.
 
-    Calling code never has to plumb a session argument through every
-    primitive — the same way ``logging`` keeps a default logger.
+    There is no env-guessed default: a Session's backend/daemon comes from an
+    explicit ledger record. Entry points (the heredoc runner) bind one via
+    ``set_session(Session(record=...))`` before primitives run. Calling this
+    with nothing bound raises ``NoSession`` from ``Session.__init__``.
     """
     override = _active.get()
     if override is not None:
@@ -191,11 +178,25 @@ def current_session() -> Session:
 
 
 def set_session(sess: Optional[Session]) -> None:
-    """Replace the default singleton outright. Used by tests to install a
-    mock session. Pushing via ``with_session()`` is preferred in production
-    code because it scopes the override."""
+    """Bind the process-wide default Session. The heredoc entry point calls
+    this with a record-bound Session; tests use it to install a mock. Pushing
+    via ``with_session()`` is preferred when the override should be scoped."""
     global _singleton
     _singleton = sess
+
+
+def isolated_session() -> Session:
+    """A fresh Session for fan-out / isolated task runs.
+
+    Inherits the current session's daemon binding (so it drives the *same*
+    browser) but isolates target tracking (its own ``current_target_id``), so
+    concurrent tasks don't yank each other's attached tab. Prefers the ledger
+    record (own client connection) and falls back to sharing the parent's
+    daemon when the parent was constructed without a record (tests)."""
+    parent = current_session()
+    if parent.session_record is not None:
+        return Session(record=parent.session_record)
+    return Session(daemon=parent.daemon)
 
 
 @contextmanager
@@ -204,8 +205,8 @@ def with_session(sess: Session) -> Iterator[Session]:
 
     Pattern (per-task isolation)::
 
-        from browserwright.session import Session, with_session
-        with with_session(Session()) as sess:
+        from browserwright.session import isolated_session, with_session
+        with with_session(isolated_session()) as sess:
             goto_url("https://example.com")
             # this block's primitives operate on `sess`, not the default
         # outside the `with`, primitives revert to the default singleton.

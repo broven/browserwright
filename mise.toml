@@ -11,14 +11,10 @@ mkdir -p "$LOCAL_BIN"
 
 venv="$REPO/.venv"
 
-# Create the single repo venv if missing.
-if [[ ! -x "$venv/bin/python" ]]; then
-  echo "creating venv..."
-  python3.11 -m venv "$venv"
-fi
-
-echo "syncing editable install..."
-uv pip install --python "$venv/bin/python" -e "$REPO[test,ux]"
+# Resolve deps from uv.lock into .venv (editable project + dev group + ux extra).
+# uv creates/updates .venv and the lockfile as needed; no manual `python -m venv`.
+echo "syncing deps with uv..."
+(cd "$REPO" && uv sync --extra ux)
 
 # Ensure ~/.local/bin symlinks for BOTH console scripts the package ships.
 for bin_name in browserwright browserwright-daemon; do

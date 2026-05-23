@@ -66,8 +66,8 @@ def run_task(site: str, name: Optional[str] = None, **kwargs) -> Any:
       - ``run_task("github.com", "list_issues", state="open")`` (split)
 
     Re-exports ``browserwright.task_runner.run_task`` so agents calling
-    this through the REPL namespace get the same isolation /
-    propose-solidify-history semantics as the CLI ``task`` subcommand.
+    this through the REPL namespace get the same isolation semantics as
+    the CLI ``task`` subcommand.
     """
     if name is None and "/" in site:
         site, name = site.split("/", 1)

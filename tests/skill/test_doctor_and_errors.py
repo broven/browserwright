@@ -16,8 +16,7 @@ import json
 
 import pytest
 
-from browserwright import cli
-from browserwright.daemon_client import DaemonClient
+from browserwright import cli, health
 from browserwright.errors import (
     BrowserwrightError,
     CDPError,
@@ -86,16 +85,16 @@ def test_doctor_checks_shape_and_fail_carries_fix(monkeypatch):
     EVERY fail check's fix must be non-empty (the discipline)."""
     # Known-broken: synthetic doctor blob like a missing daemon binary.
     monkeypatch.setattr(
-        DaemonClient,
-        "doctor",
-        lambda self: {
+        health,
+        "daemon_doctor",
+        lambda: {
             "schema_version": 1,
             "backends": [],
             "error": "browserwright-daemon: not found on PATH",
             "skill_synthetic": True,
         },
     )
-    info = DaemonClient().doctor_checks()
+    info = health.doctor_checks()
     checks = _checks(info)
     assert checks, "expected at least one check"
     for c in checks:
@@ -111,9 +110,9 @@ def test_doctor_checks_pass_when_backend_available(monkeypatch):
     # schema_version=2 mirrors the CURRENT daemon contract (daemon v0.5.3). A
     # prior version of this test used 1, which masked a false-positive warn.
     monkeypatch.setattr(
-        DaemonClient,
-        "doctor",
-        lambda self: {
+        health,
+        "daemon_doctor",
+        lambda: {
             "schema_version": 2,
             "backends": [
                 {"name": "extension", "available": True, "ux_cost": "none",
@@ -121,7 +120,7 @@ def test_doctor_checks_pass_when_backend_available(monkeypatch):
             ],
         },
     )
-    info = DaemonClient().doctor_checks()
+    info = health.doctor_checks()
     checks = _checks(info)
     # All checks still shaped correctly even on the happy path.
     for c in checks:
@@ -134,9 +133,9 @@ def test_doctor_checks_pass_when_backend_available(monkeypatch):
 
 def test_cmd_doctor_json_emits_checks_and_exits_nonzero_on_fail(monkeypatch, capsys):
     monkeypatch.setattr(
-        DaemonClient,
-        "doctor",
-        lambda self: {
+        health,
+        "daemon_doctor",
+        lambda: {
             "schema_version": 1,
             "backends": [],
             "error": "browserwright-daemon: not found on PATH",
@@ -155,9 +154,9 @@ def test_cmd_doctor_json_emits_checks_and_exits_nonzero_on_fail(monkeypatch, cap
 
 def test_cmd_doctor_human_prints_fix_for_fail(monkeypatch, capsys):
     monkeypatch.setattr(
-        DaemonClient,
-        "doctor",
-        lambda self: {
+        health,
+        "daemon_doctor",
+        lambda: {
             "schema_version": 1,
             "backends": [],
             "error": "browserwright-daemon: not found on PATH",
@@ -174,9 +173,9 @@ def test_cmd_doctor_human_prints_fix_for_fail(monkeypatch, capsys):
 
 def test_cmd_doctor_exits_zero_when_all_pass(monkeypatch, capsys):
     monkeypatch.setattr(
-        DaemonClient,
-        "doctor",
-        lambda self: {
+        health,
+        "daemon_doctor",
+        lambda: {
             "schema_version": 1,
             "backends": [
                 {"name": "extension", "available": True, "ux_cost": "none",

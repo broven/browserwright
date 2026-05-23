@@ -8,7 +8,13 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .conftest import TEST_EXT_PORT, TEST_NAME, TEST_RDP_PORT, scrubbed_env
+from .conftest import (
+    TEST_EXT_PORT,
+    TEST_NAME,
+    TEST_RDP_NAME,
+    TEST_RDP_PORT,
+    scrubbed_env,
+)
 
 
 @dataclass
@@ -22,12 +28,12 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
               timeout: float = 30.0) -> SkillResult:
     """Invoke `browserwright` with the given heredoc-style Python script.
 
-    Sets env vars so the skill resolves the *test* daemon, not the user's
-    production daemon:
+    Sets env vars so the skill talks to the *test* Mode B daemon, not the
+    user's production daemon:
 
-        - `BS_DAEMON_URL_CMD`  -> invokes the test daemon's URL resolution
-        - `BS_DAEMON_BACKEND`  -> pins the backend
-        - `BD_NAME`            -> pins the daemon name
+        - `BD_NAME`            -> picks the scenario's daemon socket
+        - `BD_EXTENSION_PORT` / `BD_RDP_PORT` -> the scenario's upstream
+        - a ledger record (below) -> the session's backend + daemon_endpoint
 
     Args:
         script: Python source the skill REPL will execute (heredoc body).
@@ -47,38 +53,34 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
             "`pip install -e browserwright[test]`"
         )
 
+    # Both scenarios drive the browser *through* a Mode B daemon (Mode A — the
+    # direct-ws resolver — was removed). `extension` talks to the daemon at
+    # TEST_NAME (the `e2e_daemon` fixture, serving extension); `rdp` talks to a
+    # separate daemon at TEST_RDP_NAME (the `e2e_rdp_daemon` fixture, serving
+    # rdp). The skill routes by the ledger record's daemon_endpoint (set below
+    # to BD_NAME); each daemon serves exactly its backend.
+    daemon_name = TEST_NAME if backend == "extension" else TEST_RDP_NAME
     env = scrubbed_env()
-    env["BD_NAME"] = TEST_NAME
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / TEST_NAME)
-    env["BS_DAEMON_BACKEND"] = backend
+    env["BD_NAME"] = daemon_name
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / daemon_name)
     # Bypass proxy for localhost
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
     if backend == "extension":
-        # BD_EXTENSION_PORT drives the relay port in `browserwright-daemon url`.
-        # Without it, the url command falls through to DEFAULT_RELAY_PORT
-        # (19989) — the user's production daemon. This is the isolation wall.
+        # Pin the relay port so the daemon (and any doctor probe) targets the
+        # test relay, not DEFAULT_RELAY_PORT (19989) — the isolation wall.
         env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
-        env["BS_DAEMON_URL_CMD"] = (
-            f"browserwright-daemon url --backend extension --name {TEST_NAME}"
-        )
     else:  # rdp
-        # Force Mode A for RDP: the session-scoped daemon serves 'extension',
-        # so Mode B's backend-match check would reject 'rdp'. Mode A uses
-        # BS_DAEMON_URL_CMD (or BS_CDP_WS if set by caller) to resolve directly.
-        env["BS_DAEMON_MODE"] = "A"
-        env["BS_DAEMON_URL_CMD"] = (
-            f"browserwright-daemon url --backend rdp --port {TEST_RDP_PORT}"
-        )
+        # The rdp daemon resolves its upstream against this port.
+        env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
     if extra_env:
         env.update(extra_env)
 
     # P1 session model: inline `browserwright <<PY` refuses to run unless a
     # ledger session is explicitly in scope. E2E helpers create a lightweight
     # ledger record directly in the isolated BS_HOME so tests don't depend on
-    # the developer's session state. Avoid `browserwright session new` here:
-    # for RDP it would spawn a detached per-session daemon, while these tests
-    # intentionally force Mode A via BS_DAEMON_URL_CMD / BS_CDP_WS.
+    # the developer's session state, with the record's daemon_endpoint pointing
+    # at the scenario's Mode B daemon.
     created_session_id = None
     if "BD_SESSION" not in env:
         import json
@@ -92,7 +94,7 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
         record = {
             "id": created_session_id,
             "backend": backend,
-            "daemon_endpoint": TEST_NAME if backend == "extension" else f"e2e-rdp-{created_session_id}",
+            "daemon_endpoint": daemon_name,
             "workspace": None,
             "owner": "attach",
             "name": "e2e-run-skill",

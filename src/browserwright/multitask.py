@@ -15,7 +15,7 @@ Concurrency model
 Primitives are sync. The CDP transport is thread-safe (single ``send`` lock).
 So we use a ``ThreadPoolExecutor`` rather than asyncio:
 
-  - Each worker thread enters ``with_session(Session())`` and runs the task.
+  - Each worker thread enters ``with_session(isolated_session())`` and runs the task.
   - Sessions are independent ``ContextVar`` slots (#55 covers thread isolation).
   - Daemon assigns each ws its own client id, so per-thread sessionIds don't
     collide on the wire either.
@@ -35,7 +35,7 @@ import concurrent.futures
 from typing import Any, Callable, Iterable, Optional
 
 from .errors import BrowserwrightError
-from .session import Session, with_session
+from .session import isolated_session, with_session
 from .task_runner import run_task
 
 
@@ -64,7 +64,7 @@ def _run_one(spec: TaskSpec) -> TaskResult:
     import time
     site, name, kwargs = spec
     t0 = time.monotonic()
-    sess = Session()
+    sess = isolated_session()
     try:
         with with_session(sess):
             value = run_task(site, name, **kwargs)

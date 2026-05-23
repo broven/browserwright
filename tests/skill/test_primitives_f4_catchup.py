@@ -45,7 +45,14 @@ def patched_session(monkeypatch, fresh_modules):
     is set + session.cdp is the recording fake."""
     from browserwright.session import Session, with_session
 
-    sess = Session()
+    class _StubDaemon:
+        def resolve_ws_url(self):
+            raise AssertionError("daemon should not be touched")
+
+        def invalidate(self):
+            pass
+
+    sess = Session(daemon=_StubDaemon())
     sess.current_target_id = "target-test"
     fake = _FakeCDP(responses={
         "Runtime.evaluate": {"result": {"value": True}},

@@ -490,7 +490,7 @@ async def _run_backend_info(args, cfg: Config) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 3
     # Surface as `backend` (alias of `name`) for callers like
-    # ModeBClient.assert_backend_matches that read either key.
+    # ModeBClient.get_backend_info that read either key.
     payload = {
         "running": True,
         "name": info.get("name"),

@@ -32,13 +32,18 @@ import pytest
 TEST_EXT_PORT = 29989
 TEST_RDP_PORT = 29990
 TEST_NAME = "bd-e2e"
+# Distinct daemon instance (socket name) for the rdp scenario: the extension
+# daemon (TEST_NAME) serves `extension`, so rdp must run its own Mode B serve
+# under a separate BD_NAME — both scenarios drive the browser *through* the
+# daemon, never via a direct ws (Mode A was removed).
+TEST_RDP_NAME = "bd-e2e-rdp"
 
 
 def scrubbed_env() -> dict[str, str]:
     """Return os.environ with BD_*/BS_*/BU_* vars stripped.
 
     Prevents the user's shell environment from leaking into test
-    subprocesses (e.g. BD_RDP_PORT, BD_BACKEND, BS_DAEMON_URL_CMD).
+    subprocesses (e.g. BD_RDP_PORT, BD_BACKEND, BD_NAME).
     Callers re-add only the vars they need for isolation.
     """
     return {k: v for k, v in os.environ.items()
@@ -450,3 +455,82 @@ def e2e_chrome_rdp(tmp_path_factory):
     yield handle
     _kill_chrome(handle.pid)
     shutil.rmtree(handle.profile_path, ignore_errors=True)
+
+
+@pytest.fixture
+def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
+    """Spawn `browserwright-daemon serve --backend rdp --name bd-e2e-rdp` against
+    the rdp Chrome, for the rdp scenario.
+
+    Mirrors `e2e_daemon` (the extension scenario) but for rdp: the skill drives
+    the browser *through* this Mode B daemon (no direct-ws / Mode A). The rdp
+    upstream is resolved lazily on the first client frame via `BD_RDP_PORT`.
+    Yields the daemon's BD_NAME.
+    """
+    log_path = e2e_artifacts_dir / "daemon-rdp.log"
+    log_fh = open(log_path, "wb")  # noqa: SIM115 — closed in teardown
+
+    env = os.environ.copy()
+    env["BD_NAME"] = TEST_RDP_NAME
+    env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+    # Don't inherit the user's toml (relay_url / ports / default_backend).
+    env["BD_CONFIG"] = ""
+
+    # Clear any stale daemon under this name (leftover socket from a crash).
+    subprocess.run(["browserwright-daemon", "stop", "--name", TEST_RDP_NAME],
+                   capture_output=True, env=env)
+
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "browserwright.daemon.cli",
+            "serve",
+            "--backend", "rdp",
+            "--name", TEST_RDP_NAME,
+            "-v",
+        ],
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+
+    # Wait until the daemon's socket answers `status` (alive).
+    deadline = time.monotonic() + 10.0
+    last = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log_fh.flush()
+            pytest.fail(
+                f"rdp daemon exited early with code {proc.returncode}; "
+                f"see {log_path}"
+            )
+        status = subprocess.run(
+            ["browserwright-daemon", "status", "--name", TEST_RDP_NAME, "--json"],
+            capture_output=True, text=True, env=env,
+        )
+        if status.returncode == 0 and status.stdout.strip():
+            try:
+                if json.loads(status.stdout).get("alive") is True:
+                    break
+            except json.JSONDecodeError:
+                pass
+        last = status.stdout or status.stderr
+        time.sleep(0.2)
+    else:
+        log_fh.flush()
+        pytest.fail(
+            f"rdp daemon never came up within 10s; last status={last!r}; "
+            f"see {log_path}"
+        )
+
+    yield TEST_RDP_NAME
+
+    # Teardown.
+    subprocess.run(["browserwright-daemon", "stop", "--name", TEST_RDP_NAME],
+                   capture_output=True, env=env)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+    log_fh.close()

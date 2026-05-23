@@ -68,8 +68,8 @@ Run:
 
 ```bash
 cd browserwright-daemon
-python -m pip install -e ".[test]"
-python -m pytest tests -q
+uv sync                 # installs the project + dev group (pytest, pytest-asyncio)
+uv run pytest tests -q
 ```
 
 Note: real Chrome E2E tests under `tests/e2e/` are opt-in and are skipped unless explicitly selected.
@@ -133,8 +133,6 @@ Covers:
 - primitives with fake CDP sessions
 - memory and site memory
 - install wizard logic
-- solidify/propose/scaffold
-- selftest runner
 - subscriptions
 - historical regression cases
 - skill markdown guidance checks
@@ -143,13 +141,11 @@ Representative files:
 
 ```text
 browserwright/tests/test_cli.py
-browserwright/tests/test_daemon_client.py
 browserwright/tests/test_mode_b_client.py
 browserwright/tests/test_memory.py
 browserwright/tests/test_primitives_f4_catchup.py
 browserwright/tests/test_primitives_offline.py
 browserwright/tests/test_session_*.py
-browserwright/tests/test_solidify.py
 browserwright/tests/test_subscriptions.py
 browserwright/tests/test_v02_features.py
 ```
@@ -158,8 +154,8 @@ Run:
 
 ```bash
 cd browserwright
-python -m pip install -e ".[test]"
-python -m pytest tests -q
+uv sync                 # installs the project + dev group (pytest, pytest-asyncio)
+uv run pytest tests -q
 ```
 
 Some tests under `browserwright/tests/agent-e2e/` need additional agent-e2e dependencies; run those separately if collection fails in a minimal environment.
@@ -188,7 +184,7 @@ Cases:
 |---|---|
 | A | Connect, open `example.com`, summarize page |
 | B | Save a user preference to memory |
-| C | Solidify a recurring task |
+| C | Author + run a reusable task |
 | D | Write site memory |
 | E | Check skill auto-triggering without daemon |
 

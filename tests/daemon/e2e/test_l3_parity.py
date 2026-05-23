@@ -18,13 +18,12 @@ def _extract_payload(stdout: str) -> dict:
 
 @pytest.mark.parametrize("backend,fixture_name,nav_fn", [
     ("extension", "ext_ready", "open_background"),
-    ("rdp", "e2e_chrome_rdp", "goto_url"),
+    ("rdp", "e2e_rdp_daemon", "goto_url"),
 ])
 def test_dom_query_parity(backend, fixture_name, nav_fn, request):
-    fixture_val = request.getfixturevalue(fixture_name)
-    extra_env = {}
-    if backend == "rdp":
-        extra_env["BS_CDP_WS"] = fixture_val.ws_url
+    # Both scenarios drive the browser through their Mode B daemon (the fixture
+    # ensures daemon + Chrome are up); no direct-ws injection.
+    request.getfixturevalue(fixture_name)
     script = (
         "import json\n"
         f"{nav_fn}({PAGE!r})\n"
@@ -33,7 +32,7 @@ def test_dom_query_parity(backend, fixture_name, nav_fn, request):
         "title = js(\"document.title\")\n"
         "print(json.dumps({'txt': txt, 'title': title}))\n"
     )
-    result = run_skill(script=script, backend=backend, extra_env=extra_env or None)
+    result = run_skill(script=script, backend=backend)
     assert result.returncode == 0, result.stderr
     payload = _extract_payload(result.stdout)
     assert payload["txt"] == "P"

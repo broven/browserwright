@@ -25,5 +25,4 @@ from .errors import (  # noqa: F401
     NeedsUserConfirm,
     NetworkError,
     PageLoadFailed,
-    SiteDrift,
 )

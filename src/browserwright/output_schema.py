@@ -1,8 +1,8 @@
 """Minimal JSON-Schema-subset validator for task ``OUTPUT_SCHEMA`` (v0.2).
 
 We don't pull in ``jsonschema`` — task schemas in practice cover one of
-five shapes (see ``propose_solidify`` output): list-of-dicts, dict, scalar,
-optional/nullable, and unions. The validator handles those plus enough
+five shapes: list-of-dicts, dict, scalar, optional/nullable, and unions.
+The validator handles those plus enough
 plumbing for nested ``items`` / ``properties``. If a task needs a richer
 schema it can ``pip install jsonschema`` and write its own ``validate()``;
 we don't paint into a corner.

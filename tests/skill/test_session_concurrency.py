@@ -29,37 +29,49 @@ def _make_session():
 
 
 def test_default_singleton_returned_with_no_override():
-    from browserwright.session import current_session
+    from browserwright.session import current_session, set_session
 
-    a = current_session()
-    b = current_session()
-    assert a is b
+    set_session(_make_session())
+    try:
+        a = current_session()
+        b = current_session()
+        assert a is b
+    finally:
+        set_session(None)
 
 
 def test_with_session_overrides_inside_block():
-    from browserwright.session import current_session, with_session
+    from browserwright.session import current_session, set_session, with_session
 
-    default = current_session()
-    fresh = _make_session()
-    assert fresh is not default
-    with with_session(fresh):
-        assert current_session() is fresh
-    # Reverts.
-    assert current_session() is default
+    set_session(_make_session())
+    try:
+        default = current_session()
+        fresh = _make_session()
+        assert fresh is not default
+        with with_session(fresh):
+            assert current_session() is fresh
+        # Reverts.
+        assert current_session() is default
+    finally:
+        set_session(None)
 
 
 def test_with_session_nested_lifo():
-    from browserwright.session import current_session, with_session
+    from browserwright.session import current_session, set_session, with_session
 
-    outer = _make_session()
-    inner = _make_session()
-    default = current_session()
-    with with_session(outer):
-        assert current_session() is outer
-        with with_session(inner):
-            assert current_session() is inner
-        assert current_session() is outer
-    assert current_session() is default
+    set_session(_make_session())
+    try:
+        outer = _make_session()
+        inner = _make_session()
+        default = current_session()
+        with with_session(outer):
+            assert current_session() is outer
+            with with_session(inner):
+                assert current_session() is inner
+            assert current_session() is outer
+        assert current_session() is default
+    finally:
+        set_session(None)
 
 
 def test_threads_have_independent_overrides():
@@ -121,14 +133,18 @@ def test_asyncio_tasks_have_independent_overrides():
 
 def test_session_close_does_not_break_default():
     """Closing a pushed session must not affect the default singleton."""
-    from browserwright.session import current_session, with_session
+    from browserwright.session import current_session, set_session, with_session
 
-    default = current_session()
-    fresh = _make_session()
-    with with_session(fresh):
-        fresh.close()
-    # Default still usable afterwards.
-    assert current_session() is default
+    set_session(_make_session())
+    try:
+        default = current_session()
+        fresh = _make_session()
+        with with_session(fresh):
+            fresh.close()
+        # Default still usable afterwards.
+        assert current_session() is default
+    finally:
+        set_session(None)
 
 
 def test_run_task_isolated_uses_pushed_session(tmp_bs_home, monkeypatch):
@@ -144,9 +160,10 @@ def test_run_task_isolated_uses_pushed_session(tmp_bs_home, monkeypatch):
             del sys.modules[k]
 
     from browserwright.memory.site_mem import site_skills_root
-    from browserwright.session import current_session, Session
+    from browserwright.session import current_session, set_session, Session
 
-    # Stub the auto_client picker so Session() never tries to spawn a daemon.
+    # Bind a default stub session so isolated_session() can inherit its
+    # daemon — no real daemon/network is ever touched.
     class _StubDaemon:
         def resolve_ws_url(self):
             return "ws://stub/never-used"
@@ -154,10 +171,7 @@ def test_run_task_isolated_uses_pushed_session(tmp_bs_home, monkeypatch):
         def invalidate(self):
             pass
 
-    monkeypatch.setattr(
-        "browserwright.mode_b_client.auto_client",
-        lambda *_a, **_k: _StubDaemon(),
-    )
+    set_session(Session(daemon=_StubDaemon()))
 
     # Plant a task that records which session is active when it runs.
     site_dir = site_skills_root() / "isotest"
@@ -175,11 +189,14 @@ def test_run_task_isolated_uses_pushed_session(tmp_bs_home, monkeypatch):
 
     from browserwright.task_runner import run_task
 
-    # Capture default session id from outside.
-    default_id = id(current_session())
-    # Non-isolated: should match the default.
-    same_id = run_task("isotest", "checksess")
-    assert same_id == default_id
-    # Isolated: should differ.
-    iso_id = run_task("isotest", "checksess", isolated=True)
-    assert iso_id != default_id
+    try:
+        # Capture default session id from outside.
+        default_id = id(current_session())
+        # Non-isolated: should match the default.
+        same_id = run_task("isotest", "checksess")
+        assert same_id == default_id
+        # Isolated: should differ.
+        iso_id = run_task("isotest", "checksess", isolated=True)
+        assert iso_id != default_id
+    finally:
+        set_session(None)

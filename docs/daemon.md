@@ -196,8 +196,8 @@ header_prefix = "Bearer "            # 可选，默认就是 "Bearer "
 
 ### Mode B vs Mode A 取舍
 
-- **Mode B（`browserwright-daemon serve --backend cloud`）**：daemon 自己连上游 ws，AuthProvider 在握手时注入 header / SSLContext。**Skill 端无需感知 auth**——只连 daemon socket，daemon 帮它完成认证
-- **Mode A（`browserwright-daemon url --backend cloud`）**：daemon 把 ws URL 透传给 Skill，Skill 自己开 ws。**只对 URL-embedded auth 形态有意义**（basic / URL-token）。header / mTLS 在 Mode A 下不能用——Skill 没有 header 注入点
+- **Mode B（`browserwright-daemon serve --backend cloud`）**：daemon 自己连上游 ws，AuthProvider 在握手时注入 header / SSLContext。**Skill 端无需感知 auth**——只连 daemon socket，daemon 帮它完成认证。**Skill（Layer 2）一律走 Mode B**——通过 daemon socket 操作，永不自己开 upstream ws
+- **Mode A（`browserwright-daemon url --backend cloud`）**：daemon 把 ws URL 透传给调用方，调用方自己开 ws。**仅供自带 ws 客户端的外部脚本使用，不是 Skill 的连接路径**；**只对 URL-embedded auth 形态有意义**（basic / URL-token）。header / mTLS 在 Mode A 下不能用——调用方没有 header 注入点
 
 ### `OAuth2Auth` 状态
 

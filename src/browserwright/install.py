@@ -115,7 +115,7 @@ def chrome_extension_path() -> Optional[str]:
 
 
 def _wizard_doctor_backends() -> list[dict]:
-    """One ``DaemonClient().doctor()`` call shared by every wizard
+    """One ``health.daemon_doctor()`` call shared by every wizard
     option-availability detector.
 
     spec H3 / §D.2.3: ``doctor`` is contract-bound to **zero ws side
@@ -129,8 +129,8 @@ def _wizard_doctor_backends() -> list[dict]:
     doctor schema first.
     """
     try:
-        from .daemon_client import DaemonClient
-        info = DaemonClient().doctor()
+        from .health import daemon_doctor
+        info = daemon_doctor()
     except Exception:  # noqa: BLE001
         return []
     if info.get("skill_synthetic"):

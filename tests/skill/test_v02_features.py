@@ -1,49 +1,6 @@
-"""v0.2 feature unit tests: selftest cache, OUTPUT_SCHEMA, memory forget,
-project-level site-skills, solidify by analogy."""
-import os
-import shutil
-import time
-from pathlib import Path
-
+"""v0.2 feature unit tests: OUTPUT_SCHEMA, memory forget,
+project-level site-skills."""
 import pytest
-
-
-# ---- selftest cache ---------------------------------------------------
-
-
-def test_selftest_cache_pass_then_skip(tmp_bs_home, fresh_modules):
-    from browserwright import selftest_cache
-
-    tdir = tmp_bs_home / "fake-task"
-    tdir.mkdir()
-    task_path = tdir / "demo.py"
-    task_path.write_text("# v1")
-    assert selftest_cache.is_fresh("siteA", "demo", task_path) is False
-    selftest_cache.remember_pass("siteA", "demo", task_path)
-    assert selftest_cache.is_fresh("siteA", "demo", task_path) is True
-    # editing the file invalidates.
-    task_path.write_text("# v2")
-    assert selftest_cache.is_fresh("siteA", "demo", task_path) is False
-
-
-def test_selftest_cache_env_bypass(tmp_bs_home, monkeypatch, fresh_modules):
-    from browserwright import selftest_cache
-
-    task_path = tmp_bs_home / "t.py"
-    task_path.write_text("# x")
-    selftest_cache.remember_pass("siteA", "demo", task_path)
-    monkeypatch.setenv("BS_SELFTEST_NOCACHE", "1")
-    assert selftest_cache.is_fresh("siteA", "demo", task_path) is False
-
-
-def test_selftest_fail_not_cached_as_skip(tmp_bs_home, fresh_modules):
-    from browserwright import selftest_cache
-
-    task_path = tmp_bs_home / "t.py"
-    task_path.write_text("# x")
-    selftest_cache.remember_fail("siteA", "demo", task_path, "drifted")
-    # Failures do not short-circuit the next call; only successes do.
-    assert selftest_cache.is_fresh("siteA", "demo", task_path) is False
 
 
 # ---- OUTPUT_SCHEMA ---------------------------------------------------
@@ -178,47 +135,3 @@ def test_project_level_overrides_bundled(tmp_path, monkeypatch):
     rebuild_index()
     path = find_task_path("google", "search")
     assert "proj" in str(path)
-
-
-# ---- solidify by analogy ----------------------------------------------
-
-
-def test_propose_like_seeds_from_donor(tmp_bs_home, fresh_modules):
-    from browserwright.session import Session
-    from browserwright.solidify import propose
-    # Build a fake donor task in BS_HOME.
-    donor_dir = tmp_bs_home / "site-skills" / "example" / "tasks"
-    donor_dir.mkdir(parents=True)
-    (donor_dir / "search.py").write_text(
-        '"""donor."""\nARGS = {"q": {"type": "str", "required": True}}\n'
-        'OUTPUT = "list"\nTAGS = []\n'
-        'def selftest(): return True\n'
-        'def run(args, ctx=None):\n'
-        '    new_tab(f"https://example.com/?q={args[\'q\']}")\n'
-        '    return js("return 1")\n',
-        encoding="utf-8",
-    )
-    # Force re-import so site_skills_roots() picks up our temp dir.
-    import sys
-    for k in list(sys.modules):
-        if k.startswith("browserwright"):
-            del sys.modules[k]
-    from browserwright.solidify import propose
-    from browserwright.session import Session
-    sess = Session()
-    # Inject a small history so propose passes its readiness threshold.
-    sess.history = [
-        {"code": "q = 'foo'", "ok": True, "stdout": "", "result": None, "exception": None, "ts": 0},
-        {"code": "new_tab('https://demo.org/?q=' + q)", "ok": True, "stdout": "",
-         "result": None, "exception": None, "ts": 0},
-        {"code": "results = js('return Array.from(document.querySelectorAll(\"a\")).map(a => a.href)')",
-         "ok": True, "stdout": "", "result": None, "exception": None, "ts": 0},
-    ]
-    out = propose.propose(sess, name_hint="search_demo", like="example/search")
-    assert out is not None
-    assert "donor" in out
-    assert out["donor"] == "example/search"
-    # URL host should have been swapped from example.com to demo.org (the
-    # current session's host hint from history).
-    assert "demo.org" in out["draft_run_body"]
-    assert "example.com" not in out["draft_run_body"]

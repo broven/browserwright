@@ -60,9 +60,7 @@ from .page import (  # noqa: F401
 from .site import (  # noqa: F401
     bootstrap_site,
     memory_read,
-    propose_solidify,
     remember,
     remember_global,
     remember_preference,
-    solidify,
 )

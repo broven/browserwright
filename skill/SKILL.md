@@ -10,7 +10,7 @@ allowed-tools: Bash(browserwright:*), Bash(browserwright-daemon:*)
 Two CLIs work together:
 
 - **`browserwright-daemon`** (Layer 1) — resolves a Chrome CDP WebSocket URL. Backends: `env / rdp / extension / cloud`. Also has `launch-chrome` to spawn an isolated Chrome.
-- **`browserwright`** (Layer 2) — the agent-facing surface. Invocation forms, primitives, site skills, memory, solidify.
+- **`browserwright`** (Layer 2) — the agent-facing surface. Invocation forms, primitives, site skills, memory, reusable tasks.
 
 Both ship from the same repo. If they're not on `$PATH`, see the repo's root `README.md` for the install steps.
 
@@ -99,7 +99,7 @@ browserwright list-tasks --query="search the web"
 browserwright task wikipedia.org/lookup --title="Wikipedia"
 ```
 
-Tasks live as plain Python files under `~/.browserwright/site-skills/<host>/tasks/`. To create one, see [the solidify section below](#when-to-suggest-saving-as-a-task).
+Tasks live as plain Python files under `~/.browserwright/site-skills/<host>/tasks/`. To create one, see [Saving a flow as a reusable task](#saving-a-flow-as-a-reusable-task).
 
 ## First call: which attach should you reach for?
 
@@ -268,18 +268,17 @@ The `targetId` is stable for the life of the tab and the daemon — it's encoded
 
 `attach_active()` steals the user's focus — only use when the task is literally "drive my current tab". For everything else default to `open_background(url)` (new tab, no focus steal) or `switch_tab(<saved targetId>)` (heredoc continuity). See "First call: which attach should you reach for?" above.
 
-## When to suggest saving as a task
+## Saving a flow as a reusable task
 
-After completing a working flow, **you MUST ask the user for confirmation before saving** — never save a task without explicit user approval. Ask something like "Want me to save this as a reusable task?" if **any** of these hold:
+There's no save/scaffold command and no readiness scoring — **you decide, from context, when a flow is worth keeping**, then author the file yourself. Good signals: the user mentioned a recurring need ("每天"/"每小时"/"monitor"/"watch"/"notify me when X"), the flow is 3+ non-trivial steps they'd otherwise re-type, or the output is a feed / dashboard / scheduled scrape.
 
-- The user mentioned a recurring need ("每天", "每小时", "monitor", "watch", "notify me when X").
-- The flow has 3+ non-trivial steps the user would otherwise re-type.
-- The user just ran two heredocs with small variations.
-- The output looks like a feed, dashboard, or scheduled scrape.
+Ask the user before saving — they may want to rename it, adjust the flow, or skip. On a yes, read [tasks.md](./tasks.md) for the file format and use the `Write` tool to create:
 
-**Important: always ask first, then wait for the user's answer.** Do not save the task proactively — the user may want to adjust the flow, rename it, or skip saving entirely. Only after the user confirms ("yes", "go ahead", etc.) should you proceed.
+```
+~/.browserwright/site-skills/<host>/tasks/<name>.py
+```
 
-If they say yes, read [tasks.md](./tasks.md) for the storage layout and template, then use the `Write` tool to drop the files into `~/.browserwright/site-skills/<host>/`. No CLI scaffolding call needed — the filesystem is the database.
+That directory **is** the database — there is no CLI to register it. To find and run saved tasks later: `browserwright list-tasks [--query …]` and `browserwright task <host>/<name> [--key=val]`.
 
 ## Diagnostics
 
@@ -293,7 +292,7 @@ browserwright-daemon stats --name default # observability counters when serve is
 ## Memory files
 
 - **[memory.md](./memory.md)** — ships with this skill. Holds the backend capability table and the user's saved preference. The agent reads this on every invocation and writes to `## User preference` when the user expresses a choice. **No `browserwright install` step exists or is needed** — `memory.md` is already in place when the skill is installed.
-- **[tasks.md](./tasks.md)** — ships with this skill. Read on demand, only when about to solidify a flow into a task.
+- **[tasks.md](./tasks.md)** — ships with this skill. Read on demand, only when about to save a flow as a task.
 - `~/.browserwright/global.md` — daemon-level persistent config (port, default backend). Optional. Set via `remember_preference("daemon.preferred_backend", "rdp")`.
 - `~/.browserwright/site-skills/<eTLD+1>/memory.md` — per-site facts. Append-only.
 - `~/.browserwright/agent_helpers.py` — agent-authored helpers, hot-loaded into every heredoc namespace after the core primitives. See "Extending the primitive surface" above. Edit with the `Write` / `Edit` tools.

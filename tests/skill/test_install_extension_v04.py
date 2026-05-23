@@ -22,9 +22,8 @@ import pytest
 
 
 def _stub_doctor(monkeypatch, blob: dict) -> None:
-    from browserwright import daemon_client
-    monkeypatch.setattr(daemon_client.DaemonClient, "doctor",
-                        lambda self: blob)
+    from browserwright import health
+    monkeypatch.setattr(health, "daemon_doctor", lambda: blob)
 
 
 def test_extension_available_true_when_doctor_reports_available(monkeypatch):

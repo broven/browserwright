@@ -33,8 +33,8 @@ def test_extension_backend_page_info(ext_ready):
     assert "url" in info and "title" in info
 
 
-def test_rdp_backend_page_info(e2e_chrome_rdp):
-    """RDP backend: bypass daemon, point skill directly at Chrome's ws URL."""
+def test_rdp_backend_page_info(e2e_rdp_daemon):
+    """RDP backend: the skill drives Chrome *through* the rdp Mode B daemon."""
     result = run_skill(
         script=(
             "import json\n"
@@ -42,7 +42,6 @@ def test_rdp_backend_page_info(e2e_chrome_rdp):
             "print(json.dumps(info))\n"
         ),
         backend="rdp",
-        extra_env={"BS_CDP_WS": e2e_chrome_rdp.ws_url},
     )
     assert result.returncode == 0, (
         f"skill exited {result.returncode}; "

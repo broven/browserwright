@@ -6,7 +6,6 @@ Subcommands:
   task <site>/<name> [--arg=val ...]    NOT IN v0.1 ENTRY: minimal stub
   install
   doctor
-  save <site>/<name>                    proxy to solidify with a spec dict
   list-tasks [--site SITE]
   index rebuild
   memory show [--site SITE | --global]
@@ -40,9 +39,6 @@ Usage:
 
   browserwright task <site>/<name> [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
-  browserwright save <site>/<name> --json-spec='{...}'      (alias: solidify)
-
-  browserwright selftest run [--site SITE] [--isolated] [--json]
 
   browserwright sub add <git-url> [--name NAME]
   browserwright sub list [--json]
@@ -132,10 +128,9 @@ def _cmd_doctor(args: list[str]) -> int:
     Every ``fail`` check carries a non-empty ``fix`` (enforced in
     ``doctor_checks``). Exits nonzero (CI-style) if any check fails.
     """
-    from .daemon_client import DaemonClient
+    from .health import doctor_checks
 
-    cli = DaemonClient()
-    info = cli.doctor_checks()
+    info = doctor_checks()
     info["skill_version"] = __version__
     checks = info.get("checks", [])
     any_fail = any(c.get("status") == "fail" for c in checks)
@@ -181,38 +176,6 @@ def _cmd_list_tasks(args: list[str]) -> int:
         return 0
     for t in tasks:
         print(f"  {t['site']}/{t['name']}  — {t.get('desc','')}")
-    return 0
-
-
-def _cmd_save(args: list[str]) -> int:
-    """``save <site>/<name> --json-spec='{...}'``: persist a solidify spec."""
-    if not args:
-        print("usage: browserwright save <site>/<name> --json-spec='{...}'",
-              file=sys.stderr)
-        return 1
-    spec_arg = args[0]
-    kwargs = _parse_kv_args(args[1:])
-    if "/" not in spec_arg:
-        print("save target must be <site>/<name>", file=sys.stderr)
-        return 1
-    site, name = spec_arg.split("/", 1)
-    spec_text = kwargs.get("json-spec")
-    if not spec_text:
-        # read from stdin
-        spec_text = sys.stdin.read().strip()
-    if not spec_text:
-        print("missing --json-spec=... or stdin", file=sys.stderr)
-        return 1
-    if isinstance(spec_text, str):
-        spec = json.loads(spec_text)
-    else:
-        spec = spec_text
-    spec.setdefault("site", site)
-    spec.setdefault("suggested_name", name)
-    from .session import current_session
-    from .solidify import scaffold
-    result = scaffold.commit(current_session(), spec)
-    sys.stdout.write(json.dumps(result, default=str) + "\n")
     return 0
 
 
@@ -294,40 +257,6 @@ def _cmd_sub(args: list[str]) -> int:
 
     print(f"unknown sub subcommand: {sub}", file=sys.stderr)
     return 1
-
-
-def _cmd_selftest(args: list[str]) -> int:
-    """``browserwright selftest run [--site SITE] [--isolated] [--json]``.
-
-    Refreshes ``$BS_HOME/selftest_cache.json`` for every (or filtered) task.
-    Exit code is 0 if all tasks pass, 1 if any failure/error, 2 if no tasks
-    were discovered.
-    """
-    if not args or args[0] != "run":
-        print("usage: browserwright selftest run [--site SITE] [--isolated] [--json]",
-              file=sys.stderr)
-        return 1
-    kwargs = _parse_kv_args(args[1:])
-    from .selftest_runner import run_all
-    summary = run_all(
-        site=kwargs.get("site"),
-        isolated=bool(kwargs.get("isolated", False)),
-    )
-    if kwargs.get("json"):
-        sys.stdout.write(json.dumps(summary, indent=2, default=str) + "\n")
-    else:
-        totals = summary["totals"]
-        print(f"selftest done in {summary['duration_sec']}s — "
-              f"ok={totals['ok']} fail={totals['fail']} "
-              f"skip={totals['skip']} error={totals['error']}")
-        for r in summary["results"]:
-            mark = {"ok": "✓", "fail": "✗", "error": "!", "skip": "·"}.get(r["verdict"], "?")
-            print(f"  {mark} {r['site']}/{r['name']:20s} — {r.get('reason','')}")
-    if not summary["results"]:
-        return 2
-    if summary["totals"]["fail"] or summary["totals"]["error"]:
-        return 1
-    return 0
 
 
 def _cmd_memory(args: list[str]) -> int:
@@ -569,19 +498,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_install(rest))
     if cmd == "list-tasks":
         sys.exit(_cmd_list_tasks(rest))
-    if cmd == "save":
-        sys.exit(_cmd_save(rest))
-    if cmd == "solidify":
-        # REVIEW.md F-16: design / README narrative uses "solidify";
-        # the verb is the same as `save`. Alias keeps both spellings
-        # working — agent muscle memory is forgiving.
-        sys.exit(_cmd_save(rest))
     if cmd == "index":
         sys.exit(_cmd_index(rest))
     if cmd == "memory":
         sys.exit(_cmd_memory(rest))
-    if cmd == "selftest":
-        sys.exit(_cmd_selftest(rest))
     if cmd == "sub":
         sys.exit(_cmd_sub(rest))
     if cmd == "session":

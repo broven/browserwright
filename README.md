@@ -25,7 +25,7 @@ One installable package, two CLIs that work together:
 - Python 3.11 (`brew install python@3.11` / `pyenv install 3.11`)
 - Chrome / Chromium (any flavor)
 - `~/.local/bin` on `$PATH`
-- [`uv`](https://docs.astral.sh/uv/) (used by the install task; or substitute `pip`)
+- [`uv`](https://docs.astral.sh/uv/) — manages the venv, lockfile, and Python toolchain (`uv` can fetch Python 3.11 itself)
 
 ## Install
 
@@ -38,9 +38,9 @@ mise run reinstall
 Manual equivalent:
 
 ```bash
-# 1. One venv, editable install (the package ships both CLIs)
-python3.11 -m venv .venv
-.venv/bin/pip install -e ".[ux]"
+# 1. Resolve deps from uv.lock into .venv (editable project + dev group + ux extra).
+#    uv creates the venv and pins Python from .python-version (3.11).
+uv sync --extra ux
 
 # 2. Put both console scripts on $PATH (no system-Python pollution)
 mkdir -p ~/.local/bin

@@ -1,8 +1,8 @@
 """Site + memory primitives (spec §A.2 second half).
 
-These are the calls agents reach for to record knowledge and propose / commit
-solidification. The heavy lifting lives in ``memory/`` and ``solidify/`` —
-this module is mostly a thin shim that picks the right host.
+These are the calls agents reach for to record per-site knowledge. The heavy
+lifting lives in ``memory/`` — this module is mostly a thin shim that picks the
+right host.
 """
 from __future__ import annotations
 
@@ -141,31 +141,3 @@ def memory_read(site: Optional[str] = None) -> dict:
     if site:
         out["current_site"] = {"site": host_stem(site), "data": site_memory(site).read()}
     return out
-
-
-# ---- solidify pass-through ----------------------------------------------
-
-def propose_solidify(*, name_hint: Optional[str] = None,
-                     like: Optional[str] = None) -> dict:
-    """See ``solidify/propose.py``. US3.
-
-    **Always returns a dict** (v0.3.1 — Bug 3). The dict carries a
-    ``ready: bool`` flag plus diagnostics (``readiness_score``,
-    ``threshold``, ``reasons``, ``warnings``). When ``ready=True`` it also
-    carries ``draft_run_body`` + ``draft_args_schema`` for the agent to
-    review and pass to ``solidify()``.
-
-    v0.2: ``like="<site>/<task>"`` lets the agent ask "make this look like
-    that existing task" — useful when the user says "do this for X like the
-    search task on google.com". The donor task's run() body becomes the
-    scaffold seed (with URL/selector hints swapped for the current host),
-    and history is only used to fill in observed parameter values.
-    """
-    from ..solidify import propose
-    return propose.propose(current_session(), name_hint=name_hint, like=like)
-
-
-def solidify(spec: dict) -> dict:
-    """See ``solidify/scaffold.py``. US3."""
-    from ..solidify import scaffold
-    return scaffold.commit(current_session(), spec)

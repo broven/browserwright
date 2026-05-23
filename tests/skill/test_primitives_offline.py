@@ -9,11 +9,22 @@ import pytest
 
 
 def test_session_lazy(tmp_bs_home, fresh_modules):
-    from browserwright.session import current_session
+    from browserwright.session import Session, current_session, set_session
 
-    s = current_session()
-    assert s is not None
-    assert s.current_target_id is None
+    class _StubDaemon:
+        def resolve_ws_url(self):
+            raise AssertionError("daemon should not be touched")
+
+        def invalidate(self):
+            pass
+
+    set_session(Session(daemon=_StubDaemon()))
+    try:
+        s = current_session()
+        assert s is not None
+        assert s.current_target_id is None
+    finally:
+        set_session(None)
 
 
 def test_bootstrap_site_via_api(tmp_bs_home, fresh_modules):
@@ -25,21 +36,21 @@ def test_bootstrap_site_via_api(tmp_bs_home, fresh_modules):
 
 def test_memory_read_no_current_tab(tmp_bs_home, fresh_modules):
     import browserwright
+    from browserwright.session import Session, set_session
 
-    m = browserwright.memory_read()
-    assert "global" in m
+    class _StubDaemon:
+        def resolve_ws_url(self):
+            raise AssertionError("daemon should not be touched")
 
+        def invalidate(self):
+            pass
 
-def test_propose_solidify_through_api(tmp_bs_home, fresh_modules):
-    import browserwright
-
-    # Bug 3 (v0.3.1): no history → returns a dict with ready=False +
-    # diagnostic warnings, not None.
-    out = browserwright.propose_solidify()
-    assert isinstance(out, dict)
-    assert out["ready"] is False
-    assert out["readiness_score"] == 0.0
-    assert any("history" in w.lower() for w in out["warnings"])
+    set_session(Session(daemon=_StubDaemon()))
+    try:
+        m = browserwright.memory_read()
+        assert "global" in m
+    finally:
+        set_session(None)
 
 
 def test_redaction_blocks_remember(tmp_bs_home, fresh_modules, capsys):

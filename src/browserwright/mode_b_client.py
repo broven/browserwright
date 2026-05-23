@@ -10,18 +10,19 @@ Mode B is the v0.2 happy path:
   - Events fan out to the client: ``upstreamClosed``, ``activeTabChanged``,
     ``upstreamReady`` etc.
 
-The Skill side here is a single-threaded sync wrapper, mirroring the
-``ModeAClient`` shape so ``Session`` can hold either via a duck-typed
-``DaemonClient`` protocol.
+The Skill side here is a single-threaded sync wrapper that ``Session`` holds
+as its sole daemon client (Mode A — the one-shot subprocess resolver — was
+removed; the skill always talks to a running daemon over its socket).
 
 Discovery:
   - Endpoint path comes from ``browserwright-daemon status --json`` (or directly
     ``${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon-${BD_NAME}.sock``).
   - On connect, the client appends ``?client=skill-repl`` to the URL.
 
-Auto mode (``DaemonClient`` factory): try Mode B socket → fall back to
-Mode A subprocess. The CDPSession transport accepts either a real ws URL
-(Mode A) or our Mode B unix endpoint (translated to ``ws+unix://``).
+The CDPSession transport connects to our Mode B unix endpoint (translated to
+``ws+unix://``). :func:`client_for_session` builds the client from a resolved
+ledger record; ``DaemonUnavailable`` surfaces lazily when no daemon socket is
+reachable.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from .errors import DaemonBackendMismatch, DaemonUnavailable
+from .errors import DaemonUnavailable
 
 
 def _default_name() -> str:
@@ -208,19 +209,17 @@ class ModeBClient:
     def resolve_ws_url(self) -> str:
         return self.ws_url()
 
-    # ---- backend identity (F-5d) ---------------------------------------
+    # ---- backend identity ----------------------------------------------
 
     def get_backend_info(self) -> Optional[dict]:
-        """Return the running daemon's reported backend, or ``None`` if
-        the daemon doesn't support the ``BrowserwrightDaemon.getBackendInfo``
-        RPC. Used by ``assert_backend_matches()`` to refuse silently
-        reusing a daemon configured for a different backend.
+        """Return the running daemon's reported backend, or ``None`` if the
+        daemon doesn't support the ``BrowserwrightDaemon.getBackendInfo`` RPC.
+        Surfaced via ``Session.backend_name`` so primitives can branch on
+        backend quirks (e.g. extension's explicit-attach model).
 
-        Mode B's daemon supports this RPC over the same socket. We use
-        the CLI shim ``browserwright-daemon backend-info --name <X> --json``
-        when available (zero-side-effect, mirrors doctor's contract)
-        because that's the easiest path that doesn't require us to open
-        a ws first.
+        We use the CLI shim ``browserwright-daemon backend-info --name <X>
+        --json`` (zero-side-effect, mirrors doctor's contract) because that's
+        the easiest path that doesn't require us to open a ws first.
         """
         try:
             proc = subprocess.run(
@@ -237,42 +236,16 @@ class ModeBClient:
         except json.JSONDecodeError:
             return None
 
-    def assert_backend_matches(self, expected: str) -> None:
-        """Refuse to proceed if the running daemon's backend differs from
-        ``expected``. Skipped silently when:
-          - ``expected`` is empty / None (caller didn't pin a backend)
-          - The daemon doesn't expose ``backend-info`` (older daemon —
-            we can't verify; fall through to the original behaviour)
-          - ``BS_SKIP_BACKEND_IDENTITY_CHECK=1`` is set (escape hatch
-            for explicit re-use, e.g. mid-test cross-backend probing)
-
-        Raises ``DaemonBackendMismatch`` otherwise.
-        """
-        if not expected:
-            return
-        if os.environ.get(
-                "BS_SKIP_BACKEND_IDENTITY_CHECK", "").lower() in {
-                    "1", "true", "yes"}:
-            return
-        info = self.get_backend_info()
-        if info is None:
-            return
-        actual = info.get("backend") or info.get("name")
-        if not actual or actual == expected:
-            return
-        raise DaemonBackendMismatch(requested=expected, actual=actual,
-                                    name=self.name)
-
-    # ---- minimal one-shot RPC (subprocess CLI fallback) ----------------
-    # These exist so callers that already have a CDPSession via Mode A can
-    # still ask the *same* daemon for BrowserwrightDaemon.* answers via its CLI
-    # subcommands. The interesting ones (subscribeFocus, uiState) require a
-    # live ws and are handled inside CDPSession instead.
+    # ---- minimal one-shot RPC (subprocess CLI) -------------------------
+    # These let a caller ask the *same* daemon for BrowserwrightDaemon.* answers
+    # via its CLI subcommands without opening a ws. The interesting ones
+    # (subscribeFocus, uiState) require a live ws and are handled inside
+    # CDPSession instead.
 
     def active_tab(self) -> Optional[dict]:
-        """Same shape as ``ModeAClient.active_tab`` — Mode B uses the same CLI
-        subcommand here for now; the ws-based ``BrowserwrightDaemon.getActiveTab``
-        RPC is wired into ``Session`` when a Mode B CDP connection is up."""
+        """Best-guess user-active tab via the ``browserwright-daemon active-tab``
+        CLI subcommand; the ws-based ``BrowserwrightDaemon.getActiveTab`` RPC is
+        wired into ``Session`` when a CDP connection is up."""
         try:
             proc = subprocess.run(
                 ["browserwright-daemon", "active-tab", "--name", self.name, "--json"],
@@ -417,7 +390,7 @@ class ModeBClient:
             return None
 
     def doctor(self) -> dict:
-        """For parity with ``ModeAClient.doctor``."""
+        """Forward ``browserwright-daemon doctor --json`` over a subprocess."""
         try:
             proc = subprocess.run(
                 ["browserwright-daemon", "doctor", "--json"],
@@ -591,52 +564,17 @@ def client_for_session(record: dict) -> ModeBClient:
 
     The connection carries the session identity as its client label
     (``skill-s<id>``) for daemon-side observability; falls back to the default
-    ``skill-repl`` when the record has no id."""
+    ``skill-repl`` when the record has no id.
+
+    Construction is lazy — ``DaemonUnavailable`` surfaces only when a primitive
+    first resolves the ws — but when the daemon *is* already up we restart it if
+    it's running stale code (S6 / A2-a), so we don't lean on newer RPCs against
+    an old protocol. There is no backend guessing: the backend is whatever the
+    session's daemon was started to serve."""
     client = ModeBClient(name=record["daemon_endpoint"])
     sid = record.get("id")
     if sid:
         client._client_label = f"skill-s{sid}"
+    if client.is_alive() and client.ensure_version_coherent():
+        client.wait_until_alive()
     return client
-
-
-# ---- factory: auto-pick Mode B → Mode A ------------------------------
-
-def auto_client(mode: Optional[str] = None, *, backend: Optional[str] = None):
-    """Return whichever client matches ``mode`` (or the resolved default).
-
-    ``mode`` values:
-      - ``"A"`` — force ``ModeAClient``
-      - ``"B"`` — force ``ModeBClient`` (raises DaemonUnavailable if no socket)
-      - ``"auto"`` / None — try Mode B; fall back to Mode A on miss.
-
-    Env override ``BS_DAEMON_MODE`` takes precedence over the argument.
-    """
-    from .daemon_client import DaemonClient as ModeAClient
-
-    mode = (os.environ.get("BS_DAEMON_MODE") or mode or "auto").upper()
-    requested_backend = backend or os.environ.get("BS_DAEMON_BACKEND") \
-        or os.environ.get("BD_BACKEND")
-    if mode == "A":
-        return ModeAClient(backend=backend)
-    if mode == "B":
-        mb = ModeBClient()
-        # S6 (A2-a): a daemon running older code than what's installed speaks
-        # the old protocol — restart it before we lean on newer RPCs.
-        if mb.ensure_version_coherent():
-            mb.wait_until_alive()
-        if not mb.is_alive():
-            raise DaemonUnavailable(
-                f"Mode B socket not reachable (BD_NAME={mb.name!r}); "
-                f"start it with `browserwright-daemon serve` or use --mode=auto.")
-        # F-5d: refuse silent reuse of a daemon serving a different backend.
-        mb.assert_backend_matches(requested_backend or "")
-        return mb
-    # auto
-    mb = ModeBClient()
-    if mb.is_alive():
-        # S6: restart a stale daemon (running an older build) before reuse.
-        if mb.ensure_version_coherent():
-            mb.wait_until_alive()
-        mb.assert_backend_matches(requested_backend or "")
-        return mb
-    return ModeAClient(backend=backend)

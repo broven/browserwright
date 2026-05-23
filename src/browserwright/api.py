@@ -20,7 +20,6 @@ from .errors import (
     NeedsUserConfirm,
     NetworkError,
     PageLoadFailed,
-    SiteDrift,
 )
 from .multitask import run_tasks_concurrent
 from .primitives import (
@@ -52,14 +51,12 @@ from .primitives import (
     page_info,
     reload,
     press_key,
-    propose_solidify,
     remember,
     remember_global,
     remember_preference,
     run_task,
     scroll,
     snapshot,
-    solidify,
     switch_tab,
     type_text,
     upload_file,
@@ -92,13 +89,12 @@ EXPORTS = [
     # memory + site
     "bootstrap_site", "remember", "remember_global", "remember_preference",
     "memory_read",
-    # solidify / task / fan-out
-    "propose_solidify", "solidify",
+    # task / fan-out
     "list_site_skills", "load_site_skill", "run_task",
     "run_tasks_concurrent",
     # errors
     "BrowserwrightError", "PageLoadFailed", "ElementNotFound", "AuthWall",
-    "Captcha", "NetworkError", "DaemonUnavailable", "SiteDrift", "CDPError",
+    "Captcha", "NetworkError", "DaemonUnavailable", "CDPError",
     "NeedsUserConfirm",
 ]
 

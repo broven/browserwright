@@ -179,7 +179,7 @@ def list_tabs(include_chrome: bool = True) -> list[dict]:
 def current_tab() -> dict | None:
     """The tab Skill is currently attached to (may be stale / chrome:// page).
 
-    Mode A backends: returns ``None`` when no tab has been attached yet —
+    rdp / env backends: returns ``None`` when no tab has been attached yet —
     a legitimate "Chrome has tabs but Skill hasn't picked one" state.
 
     Extension backend: ``None`` is never legitimate here because the
@@ -374,20 +374,15 @@ def reload(*, hard: bool = False) -> dict:
 def current_page() -> dict:
     """User's visually-foreground tab (US1). Auto-attaches.
 
-    Mode A backends use ``browserwright-daemon active-tab --json`` to find the
-    most-recently-activated target and switch to it.
+    rdp / env backends use ``browserwright-daemon active-tab --json`` to find
+    the most-recently-activated target and switch to it.
 
     Extension backend has no notion of "active tab" outside of attached
     ghosts, so we route through ``attach_active()`` instead — the daemon
     asks the extension to attach Chrome's focused-window active tab right
     now. The first call in a session triggers Chrome's yellow banner;
     subsequent calls in the same session reuse the cached target.
-
-    When ``BS_CDP_WS`` / ``BU_CDP_WS`` is set the daemon CLI may be
-    querying a different Chrome than the one we're attached to. Trust
-    ``list_tabs`` over the daemon's hint in that case.
     """
-    import os as _os
     sess = current_session()
     if sess.backend_name == "extension":
         if sess.current_target_id:
@@ -411,17 +406,15 @@ def current_page() -> dict:
             return {"targetId": recovered, "accuracy": "exact"}
         info = attach_active()
         return {**info, "accuracy": "exact"}
-    explicit_ws = bool(_os.environ.get("BS_CDP_WS") or _os.environ.get("BU_CDP_WS"))
-    if not explicit_ws:
-        info = sess.daemon.active_tab()
-        if info and info.get("targetId"):
-            sess.last_active_tab = info
-            # Confirm the targetId is actually reachable on our ws before
-            # blindly switching to it (cross-Chrome confusion guard).
-            if any(t["targetId"] == info["targetId"]
-                   for t in list_tabs(include_chrome=False)):
-                switch_tab(info["targetId"])
-                return {**info, "accuracy": info.get("accuracy", "unknown")}
+    info = sess.daemon.active_tab()
+    if info and info.get("targetId"):
+        sess.last_active_tab = info
+        # Confirm the targetId is actually reachable on our ws before
+        # blindly switching to it (cross-Chrome confusion guard).
+        if any(t["targetId"] == info["targetId"]
+               for t in list_tabs(include_chrome=False)):
+            switch_tab(info["targetId"])
+            return {**info, "accuracy": info.get("accuracy", "unknown")}
     # Degrade: pick first real tab, or open a fresh one.
     tabs = [t for t in list_tabs(include_chrome=False)]
     if tabs:
@@ -460,7 +453,7 @@ def ensure_real_tab() -> dict | None:
     attachment is already a real page.
 
     Use this when ``current_page()``'s active-tab heuristic isn't
-    available (e.g. ``BS_CDP_WS`` set, daemon Mode A unreachable) and
+    available (e.g. the daemon's active-tab probe is unreachable) and
     you just want "some real page" to operate on.
     """
     tabs = list_tabs(include_chrome=False)

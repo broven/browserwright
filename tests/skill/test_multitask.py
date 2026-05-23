@@ -29,8 +29,9 @@ def _isolated_modules(monkeypatch, tmp_path):
     empty.mkdir()
     from browserwright import discovery
     monkeypatch.setattr(discovery, "_bundled_root", lambda: empty)
-    # Stub daemon so Session() never hits the network.
-    from browserwright import session as _sess_mod
+    # Bind a default stub session so workers' isolated_session() inherits
+    # parent.daemon and never hits the network.
+    from browserwright.session import Session, set_session
 
     class _StubDaemon:
         def resolve_ws_url(self):
@@ -39,11 +40,9 @@ def _isolated_modules(monkeypatch, tmp_path):
         def invalidate(self):
             pass
 
-    monkeypatch.setattr(
-        "browserwright.mode_b_client.auto_client",
-        lambda *_a, **_k: _StubDaemon(),
-    )
+    set_session(Session(daemon=_StubDaemon()))
     yield
+    set_session(None)
 
 
 def _plant_task(root: Path, site: str, name: str, body: str = 'return "ok"'):

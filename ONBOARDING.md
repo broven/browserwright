@@ -52,8 +52,7 @@ src/browserwright/
 ├── cli.py                ← argv dispatch — start here when wiring a new subcommand
 ├── api.py                ← `from browserwright import *` surface
 ├── install.py            ← the wizard (~550 LOC; doctor-driven option detection)
-├── daemon_client.py      ← Mode A subprocess client
-├── mode_b_client.py      ← Mode B socket client + auto_client() factory
+├── mode_b_client.py      ← Mode B socket client + client_for_session() resolver
 ├── repl/
 │   ├── inline.py         ← P0 #75 popup-cost abort gate; reads doctor JSON
 │   └── server.py         ← long-lived REPL daemon
@@ -61,7 +60,6 @@ src/browserwright/
 ├── memory/
 │   ├── global_mem.py     ← `~/.browserwright/global.md` + dotted-key set_preference
 │   └── site_mem.py       ← per-host memory; eTLD+1 stems (with legacy fallback)
-├── solidify/             ← propose_solidify + scaffold + extract
 ├── multitask.py          ← run_tasks_concurrent fan-out
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
@@ -69,7 +67,7 @@ tests/
 ├── test_install_extension_v04.py        v0.4 wizard wire (12 tests)
 ├── test_install_cloud_v05.py            v0.5 cloud wizard + config writer (17 tests)
 ├── test_e2e_bugs_v031.py                4 AI-E2E bug regressions (22 tests)
-├── test_solidify.py / test_memory.py / test_multitask.py / ...
+├── test_memory.py / test_multitask.py / ...
 └── conftest.py                          ← shared fixtures (tmp_bs_home, fresh_modules)
 ```
 
@@ -144,8 +142,7 @@ follow.
 |---|---|---|
 | `inline heredoc fails with `Target.createTarget requires sessionId in extension backend`` | `new_tab()` doesn't support the extension backend | use `open_background(url)` or `attach_active()` to bind to an existing tab; or run against `BD_BACKEND=rdp` with an isolated profile |
 | `memory show --site=news.ycombinator.com` returns empty but bundled dir exists | pre-v0.3.1 user-written `~/.browserwright/site-skills/news/` shadowing the eTLD+1 stem | The `_read_candidates()` fallback should pick it up automatically; if not, run `browserwright index rebuild` |
-| `solidify(...)` raises `AttributeError: 'str' has no attribute 'items'` | args-schema is flat (`{"q": "str"}`) | Use the dict shape: `{"q": {"type": "str", "required": True}}` — `_validate_args_schema` rejects the flat form with a clear `ValueError` in v0.3.1+ |
-| `propose_solidify()` returns a dict with `ready: False` but agent expected None | v0.3.1 changed the contract — `propose_solidify` always returns a dict now, check `out["ready"]` and surface `out["reasons"]` / `out["warnings"]` to the user | this is correct behaviour, not a bug |
+| `run_task` rejects a task whose args-schema is flat (`{"q": "str"}`) | flat shape not supported | Use the dict shape: `{"q": {"type": "str", "required": True}}` — `_validate_args_schema` rejects the flat form with a clear `ValueError` |
 | Tests pollute `~/.config/browserwright-daemon/` | new code path writes outside tmp_path without an env override | follow the `BS_DAEMON_CONFIG_PATH` pattern; add a `*_PATH` env override to the production code |
 | Wizard option 4 / 5 still says "coming vX.Y" after the daemon was upgraded | stale doctor probe cache, or daemon binary not on `PATH` | rerun the wizard; `browserwright-daemon doctor --json` must report `available=true` for the option |
 
