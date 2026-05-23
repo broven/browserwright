@@ -1,7 +1,7 @@
 """Skill exception hierarchy (spec §A.4)."""
 
 
-class BrowserSkillError(Exception):
+class BrowserwrightError(Exception):
     """Root of every exception Skill itself raises.
 
     Every error can carry a ``fix`` — a short, concrete next-action string
@@ -26,7 +26,7 @@ class BrowserSkillError(Exception):
             self.args = (f"{args[0]}  [fix: {self.fix}]",) + tuple(args[1:])
 
 
-class PageLoadFailed(BrowserSkillError):
+class PageLoadFailed(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "retry with new_tab(url) then wait_for_load(); if it persists, "
@@ -38,7 +38,7 @@ class PageLoadFailed(BrowserSkillError):
         super().__init__(f"page load failed: {url} ({reason})", fix=fix)
 
 
-class ElementNotFound(BrowserSkillError):
+class ElementNotFound(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "capture_screenshot() to confirm the element is visible, then "
@@ -50,7 +50,7 @@ class ElementNotFound(BrowserSkillError):
         super().__init__(f"element not found: {selector!r} after {timeout}s", fix=fix)
 
 
-class AuthWall(BrowserSkillError):
+class AuthWall(BrowserwrightError):
     exit_code = 4
     default_fix = "stop and ask the user to log in; do not type credentials from a screenshot"
 
@@ -59,7 +59,7 @@ class AuthWall(BrowserSkillError):
         super().__init__(f"auth wall at {url}: {self.signals}", fix=fix)
 
 
-class Captcha(BrowserSkillError):
+class Captcha(BrowserwrightError):
     exit_code = 5
     default_fix = "stop and ask the user to solve the captcha; do not attempt to bypass it"
 
@@ -68,7 +68,7 @@ class Captcha(BrowserSkillError):
         super().__init__(f"captcha ({kind}) at {url}", fix=fix)
 
 
-class NetworkError(BrowserSkillError):
+class NetworkError(BrowserwrightError):
     exit_code = 3
     default_fix = "verify the URL and connectivity, then retry; check http_get(url) for static pages"
 
@@ -77,7 +77,7 @@ class NetworkError(BrowserSkillError):
         super().__init__(f"network error: {url} (status={status})", fix=fix)
 
 
-class DaemonUnavailable(BrowserSkillError):
+class DaemonUnavailable(BrowserwrightError):
     exit_code = 2
     default_fix = (
         "start the daemon: `browserwright-daemon serve --backend <extension|rdp>` "
@@ -89,7 +89,7 @@ class DaemonUnavailable(BrowserSkillError):
         super().__init__(f"daemon unavailable: {detail}", fix=fix)
 
 
-class NoSession(BrowserSkillError):
+class NoSession(BrowserwrightError):
     """No BD_SESSION provided. Refuse rather than silently sharing a browser (P1)."""
 
     exit_code = 2
@@ -108,7 +108,7 @@ class NoSession(BrowserSkillError):
         )
 
 
-class DaemonBackendMismatch(BrowserSkillError):
+class DaemonBackendMismatch(BrowserwrightError):
     """Mode-B daemon is alive but serving a different backend than the
     one the caller asked for / configured (REVIEW.md F-5d).
 
@@ -137,7 +137,7 @@ class DaemonBackendMismatch(BrowserSkillError):
         )
 
 
-class SiteDrift(BrowserSkillError):
+class SiteDrift(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "the site changed shape; re-derive the step with snapshot()/"
@@ -149,7 +149,7 @@ class SiteDrift(BrowserSkillError):
         super().__init__(f"site drift in {site}/{task}: {failed_check}", fix=fix)
 
 
-class CDPError(BrowserSkillError):
+class CDPError(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "if the message mentions an unknown method (-32601) the daemon is "
@@ -162,7 +162,7 @@ class CDPError(BrowserSkillError):
         super().__init__(f"CDP {method} failed: {cdp_message}", fix=fix)
 
 
-class NeedsUserConfirm(BrowserSkillError):
+class NeedsUserConfirm(BrowserwrightError):
     """Raised by remember_preference / solidify when the agent must surface a
     confirm prompt to the user before re-calling with confirm=False."""
 

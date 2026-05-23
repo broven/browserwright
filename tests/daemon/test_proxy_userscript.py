@@ -27,7 +27,7 @@ async def test_browserdaemon_userscript_dispatch_invokes_callback():
     router._userscript_request = userscript_request
     await router.route_from_client(client, json.dumps({
         "id": 7,
-        "method": "BrowserDaemon.userscript.install",
+        "method": "BrowserwrightDaemon.userscript.install",
         "params": {"script": {"id": "abc"}},
     }))
 

@@ -12,7 +12,7 @@ for v0.6.
 """
 from .errors import (
     AuthWall,
-    BrowserSkillError,
+    BrowserwrightError,
     Captcha,
     CDPError,
     DaemonUnavailable,
@@ -97,7 +97,7 @@ EXPORTS = [
     "list_site_skills", "load_site_skill", "run_task",
     "run_tasks_concurrent",
     # errors
-    "BrowserSkillError", "PageLoadFailed", "ElementNotFound", "AuthWall",
+    "BrowserwrightError", "PageLoadFailed", "ElementNotFound", "AuthWall",
     "Captcha", "NetworkError", "DaemonUnavailable", "SiteDrift", "CDPError",
     "NeedsUserConfirm",
 ]

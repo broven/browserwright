@@ -15,7 +15,7 @@ import traceback
 from contextlib import redirect_stdout
 from typing import IO
 
-from ..errors import BrowserSkillError, serialize
+from ..errors import BrowserwrightError, serialize
 from ..session import current_session
 from . import _namespace
 
@@ -45,7 +45,7 @@ def run(stdin: IO[str]) -> int:
     try:
         with redirect_stdout(buf):
             exec(compile(code, "<inline>", "exec"), globals_)
-    except BrowserSkillError as e:
+    except BrowserwrightError as e:
         sys.stdout.write(buf.getvalue())
         sys.stderr.write(json.dumps(serialize(e)) + "\n")
         current_session().record(code, ok=False, stdout=buf.getvalue(),

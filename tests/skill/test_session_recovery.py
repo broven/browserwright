@@ -36,7 +36,7 @@ class _StubCDP:
 
     def send(self, method: str, *, session: str | None = None, **params) -> dict:
         self.calls.append((method, {"session": session, **params}))
-        if method == "BrowserDaemon.recoverSession":
+        if method == "BrowserwrightDaemon.recoverSession":
             if self._recover_raises:
                 raise _cdp_error(method=method, params=params,
                                  cdp_message="no matching group")
@@ -79,7 +79,7 @@ def test_fast_path_uses_runtime_cache_no_recover(tmp_bs_home):
     assert sess.current_target_id == "ext-tab-7"
     # Fast path: attached the cached tab, never queried the group.
     assert ("attach", {"targetId": "ext-tab-7"}) in cdp.calls
-    assert not any(m == "BrowserDaemon.recoverSession" for m, _ in cdp.calls)
+    assert not any(m == "BrowserwrightDaemon.recoverSession" for m, _ in cdp.calls)
 
 
 def test_fallback_recovers_by_group_and_writes_runtime(tmp_bs_home):
@@ -99,7 +99,7 @@ def test_fallback_recovers_by_group_and_writes_runtime(tmp_bs_home):
     assert tid == "ext-tab-9"
     assert sess.current_target_id == "ext-tab-9"
 
-    recover = [(m, p) for m, p in cdp.calls if m == "BrowserDaemon.recoverSession"]
+    recover = [(m, p) for m, p in cdp.calls if m == "BrowserwrightDaemon.recoverSession"]
     assert len(recover) == 1
     assert recover[0][1]["groupName"] == "cf-bots"
     assert recover[0][1]["bsSession"] == sid
@@ -120,7 +120,7 @@ def test_fallback_after_stale_runtime_attach_failure(tmp_bs_home):
 
     tid = ensure_session_target(sess)
     assert tid == "ext-tab-2"
-    assert any(m == "BrowserDaemon.recoverSession" for m, _ in cdp.calls)
+    assert any(m == "BrowserwrightDaemon.recoverSession" for m, _ in cdp.calls)
 
 
 def test_empty_group_returns_none(tmp_bs_home):
@@ -166,7 +166,7 @@ def test_persist_target_writes_runtime_on_open_background(tmp_bs_home, monkeypat
 
     def _send(method, *, session=None, **params):
         cdp.calls.append((method, {"session": session, **params}))
-        if method == "BrowserDaemon.openBackgroundTab":
+        if method == "BrowserwrightDaemon.openBackgroundTab":
             return {"sessionId": "ws-sid-ob", "targetId": "ext-tab-ob",
                     "tabId": 1, "url": params.get("url"), "title": "",
                     "groupId": 5}

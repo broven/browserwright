@@ -31,7 +31,7 @@ class _FakeCDP:
 
     def send(self, method, *args, **kwargs):
         self.calls.append(method)
-        if method == "BrowserDaemon.attachActiveTab":
+        if method == "BrowserwrightDaemon.attachActiveTab":
             raise CDPError(method=method, cdp_message=self._attach_error_msg)
         return {}
 
@@ -90,7 +90,7 @@ def test_attach_active_falls_back_to_open_background_on_internal_url(patched, er
     # And the result is the open_background tab handle (so callers chain on it).
     assert result.get("targetId") == "bg-tab-1"
     # It really did try attach first (we recovered, not skipped).
-    assert "BrowserDaemon.attachActiveTab" in cdp.calls
+    assert "BrowserwrightDaemon.attachActiveTab" in cdp.calls
 
 
 def test_attach_active_reraises_on_unrelated_cdp_error(patched):

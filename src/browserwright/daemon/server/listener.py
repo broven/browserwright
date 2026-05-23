@@ -385,10 +385,10 @@ class _UpstreamHolder:
             UpstreamConnection
 
         v0.5.3 F-3: emits two lifecycle events to subscribed clients:
-          - `BrowserDaemon.upstreamConnecting {backend}` at the start of
+          - `BrowserwrightDaemon.upstreamConnecting {backend}` at the start of
             the open attempt (after we've taken the lock and bumped state
             to CONNECTING)
-          - `BrowserDaemon.upstreamReady {backend, ws_url}` on successful
+          - `BrowserwrightDaemon.upstreamReady {backend, ws_url}` on successful
             open (after `state.set_connected`)
         Failed-open paths emit `upstreamClosed {reason}` via the
         `trigger_close` path the resolver/connect call site already runs.
@@ -401,9 +401,9 @@ class _UpstreamHolder:
             cfg = self._cfg
             await self.state.begin_connecting(cfg.backend or "auto")
             metrics().upstream_open_attempts_total += 1
-            # F-3: emit BrowserDaemon.upstreamConnecting to all clients.
+            # F-3: emit BrowserwrightDaemon.upstreamConnecting to all clients.
             await self._broadcast_event(
-                "BrowserDaemon.upstreamConnecting",
+                "BrowserwrightDaemon.upstreamConnecting",
                 {"backend": cfg.backend or "auto"},
             )
 
@@ -417,10 +417,10 @@ class _UpstreamHolder:
                 raise
             else:
                 metrics().upstream_open_succeeded_total += 1
-                # F-3: emit BrowserDaemon.upstreamReady. `state.upstream_ws_url`
+                # F-3: emit BrowserwrightDaemon.upstreamReady. `state.upstream_ws_url`
                 # is set by both open paths via `state.set_connected(...)`.
                 await self._broadcast_event(
-                    "BrowserDaemon.upstreamReady",
+                    "BrowserwrightDaemon.upstreamReady",
                     {
                         "backend": cfg.backend or "auto",
                         "ws_url": self.state.upstream_ws_url,
@@ -552,7 +552,7 @@ class _UpstreamHolder:
         self.upstream = ext
         self.router.update_upstream_send(ext.send_text)
         # IMPORTANT: wire all extension-only verb callbacks BEFORE
-        # state.set_connected — concurrent BrowserDaemon.* handlers in the
+        # state.set_connected — concurrent BrowserwrightDaemon.* handlers in the
         # proxy gate on state.upstream_phase == CONNECTED to skip the lazy-
         # open call, so if we flip the phase first they'd see callback=None
         # and respond -32601 incorrectly. Tear-down in trigger_close runs
@@ -579,7 +579,7 @@ class _UpstreamHolder:
 
         Sequence per spec §6.5:
           1. send Target.detachedFromTarget for each owned sessionId
-          2. send BrowserDaemon.upstreamClosed
+          2. send BrowserwrightDaemon.upstreamClosed
           3. close client ws with 1011
         We do (1)+(2) here. The actual ws close (3) is the client handler's
         job; we set state so the handler's outer `async for` returns.
@@ -608,11 +608,11 @@ class _UpstreamHolder:
             # We don't clear client.sessions here — set_disconnected() below
             # wipes everyone's sessions atomically.
 
-        # Spec §6.5 step 2: BrowserDaemon.upstreamClosed event broadcast.
+        # Spec §6.5 step 2: BrowserwrightDaemon.upstreamClosed event broadcast.
         for cid in list(self.state.clients.keys()):
             try:
                 await self.router._send_to_client(cid, json.dumps({
-                    "method": "BrowserDaemon.upstreamClosed",
+                    "method": "BrowserwrightDaemon.upstreamClosed",
                     "params": {"reason": reason},
                 }))
             except Exception:
@@ -623,7 +623,7 @@ class _UpstreamHolder:
         self.upstream = None
         self.router.update_upstream_send(None)
         # v0.5.4: drop the extension-backend attach-active callback so
-        # post-close BrowserDaemon.attachActiveTab returns -32601 instead
+        # post-close BrowserwrightDaemon.attachActiveTab returns -32601 instead
         # of racing against a torn-down upstream.
         self.router._attach_active_tab = None
         self.router._open_background_tab = None

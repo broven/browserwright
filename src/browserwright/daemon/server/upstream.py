@@ -45,7 +45,7 @@ class UpstreamConnection:
       open(ws_url) → forward() pumps frames → close() ends it cleanly.
 
     `on_frame(text)` is called for every frame *from* upstream. It is the
-    caller's job to forward it downstream (modulo BrowserDaemon.* answers
+    caller's job to forward it downstream (modulo BrowserwrightDaemon.* answers
     which never enter here).
     """
 

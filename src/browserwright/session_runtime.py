@@ -3,7 +3,7 @@
 A session's durable anchor is its **name == Chrome tab-group title**. The
 ledger record carries a ``runtime`` cache (``current_target_id``, ``group_id``,
 ``owned_tab_ids``, ``updated_at``) as a *fast path* only — the source of truth
-is the tab group, recoverable via the daemon verb ``BrowserDaemon.recoverSession``.
+is the tab group, recoverable via the daemon verb ``BrowserwrightDaemon.recoverSession``.
 
 These helpers let primitives re-attach to a session's tab across daemon
 restarts / extension reconnects / new ``bs run`` processes without the caller
@@ -89,7 +89,7 @@ def ensure_session_target(sess) -> Optional[str]:
     2. ledger ``runtime.current_target_id`` → try ``cdp.attach(tid)`` (FAST
        PATH, no group query). The daemon auto-reattaches the debugger; a
        stale/closed tab raises → fall through.
-    3. group anchor: ``BrowserDaemon.recoverSession`` by name → register +
+    3. group anchor: ``BrowserwrightDaemon.recoverSession`` by name → register +
        persist the new binding. On CDPError / empty group return None.
 
     Returns the targetId, or None when nothing could be recovered (brand-new
@@ -118,7 +118,7 @@ def ensure_session_target(sess) -> Optional[str]:
         return None
     try:
         payload = sess.cdp.send(
-            "BrowserDaemon.recoverSession", groupName=name, bsSession=sid,
+            "BrowserwrightDaemon.recoverSession", groupName=name, bsSession=sid,
         )
     except CDPError:
         return None

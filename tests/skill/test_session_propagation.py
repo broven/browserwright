@@ -50,7 +50,7 @@ def _stub_session_for_ws(monkeypatch, *, backend: str = "extension",
 
 
 def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
-    """open_background() must dispatch BrowserDaemon.openBackgroundTab over
+    """open_background() must dispatch BrowserwrightDaemon.openBackgroundTab over
     sess.cdp.send (the long-lived ws), NOT via daemon.open_background()
     (CLI subprocess that loses the sessionId binding on exit)."""
     from browserwright.primitives.page import open_background
@@ -65,11 +65,11 @@ def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
     })
     result = open_background("https://example.com", group="Agent-Test")
 
-    # Wire shape: exactly one BrowserDaemon.openBackgroundTab over sess.cdp.
+    # Wire shape: exactly one BrowserwrightDaemon.openBackgroundTab over sess.cdp.
     # The session id threads through as the plain CDP param ``bsSession``
     # (None here — the stub session is not bound to a ledger record).
     assert sess.cdp.calls == [
-        ("BrowserDaemon.openBackgroundTab",
+        ("BrowserwrightDaemon.openBackgroundTab",
          {"session": None, "url": "https://example.com",
           "groupName": "Agent-Test", "bsSession": None}),
     ], f"unexpected wire calls: {sess.cdp.calls!r}"
@@ -109,13 +109,13 @@ def test_open_background_derives_group_and_bssession_from_ledger(
     open_background("https://x.test")
 
     method, params = sess.cdp.calls[0]
-    assert method == "BrowserDaemon.openBackgroundTab"
+    assert method == "BrowserwrightDaemon.openBackgroundTab"
     assert params["groupName"] == "cf-bots"
     assert params["bsSession"] == sid
 
 
 def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):
-    """close_tab() must dispatch BrowserDaemon.closeTab over sess.cdp.send."""
+    """close_tab() must dispatch BrowserwrightDaemon.closeTab over sess.cdp.send."""
     from browserwright.primitives.page import close_tab
 
     sess = _stub_session_for_ws(monkeypatch, response={
@@ -130,7 +130,7 @@ def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):
     # The session_id forwarded to the daemon comes from the local cache
     # (since we have one). Both params are sent.
     assert sess.cdp.calls == [
-        ("BrowserDaemon.closeTab",
+        ("BrowserwrightDaemon.closeTab",
          {"session": None, "sessionId": "ws-sid-99",
           "targetId": "ext-tab-99"}),
     ], f"unexpected wire calls: {sess.cdp.calls!r}"

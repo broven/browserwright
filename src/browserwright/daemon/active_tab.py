@@ -41,7 +41,7 @@ async def active_tab(cfg: Config) -> dict[str, Any] | None:
     """
     # The extension backend is a LOCAL_RELAY — there's no externally-resolvable
     # browser ws (resolve() raises Unavailable). Route through the running
-    # daemon's BrowserDaemon.getActiveTab RPC instead (P4b).
+    # daemon's BrowserwrightDaemon.getActiveTab RPC instead (P4b).
     if cfg.backend == "extension":
         return await _active_tab_via_relay(cfg)
 
@@ -87,7 +87,7 @@ async def active_tab(cfg: Config) -> dict[str, Any] | None:
 async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
     """Ask the running daemon for the active tab over its Mode B socket.
 
-    The extension backend answers ``BrowserDaemon.getActiveTab`` from relay
+    The extension backend answers ``BrowserwrightDaemon.getActiveTab`` from relay
     state (no upstream browser ws to open). Returns the same dict shape as the
     Mode A path, or ``None`` when the daemon reports no eligible tab.
     """
@@ -112,7 +112,7 @@ async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
             raise Unavailable("active-tab: no daemon running (extension relay)")
         url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-active-tab"
         async with websockets.connect(url, compression=None) as ws:
-            await ws.send(json.dumps({"id": 1, "method": "BrowserDaemon.getActiveTab"}))
+            await ws.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.getActiveTab"}))
             msg = await _drain(ws)
     else:
         path = _ipc.sock_path(cfg.name)
@@ -121,7 +121,7 @@ async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
         async with websockets.unix_connect(
                 str(path), uri="ws://localhost/?client=cli-active-tab",
                 compression=None) as ws:
-            await ws.send(json.dumps({"id": 1, "method": "BrowserDaemon.getActiveTab"}))
+            await ws.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.getActiveTab"}))
             msg = await _drain(ws)
 
     result = msg.get("result") or {}

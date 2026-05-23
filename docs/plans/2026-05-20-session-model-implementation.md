@@ -189,7 +189,7 @@ def test_nosession_message_is_actionable():
 ```
 **Implement** in `errors.py` (mirror `DaemonUnavailable` style):
 ```python
-class NoSession(BrowserSkillError):
+class NoSession(BrowserwrightError):
     """No BD_SESSION provided. Refuse rather than silently sharing a browser (P1)."""
     exit_code = 2
     def __init__(self, detail: str = ""):
@@ -339,7 +339,7 @@ Run: `( cd browserwright-daemon && .venv/bin/python -m pytest tests/test_extensi
 1. **Bucket `_sessions` by session_id.** Change `ExtensionUpstream._sessions: dict[str,int]` → `dict[session_id, dict[sid,int]]` (or a `(session_id, sid)` keyspace). Test: session A's fabricated sid is not resolvable from session B; detach from B can't reach A's tab.
 2. **Group ownership.** `create_background_tab(group_name=...)` (relay.py:310) → key the created group by session_id; persist `group_id` back into the ledger via the daemon→skill response (skill calls `reg.update(sid, workspace={"group_id":...})`). Test: two sessions get distinct group ids; tabs land in the right group.
 3. **`attach_active` into session group + borrow flag.** `attach_active_tab` (relay.py:214) pulls the focused tab into the caller session's group and marks it **borrowed**. Test: borrowed tab recorded as borrowed, not owned.
-4. **End cleanup.** New daemon verb `BrowserDaemon.endSession(session_id)`: close session-owned tabs, **ungroup** (not close) borrowed tabs, drop the group. Test: owned tabs closed, borrowed tabs survive + ungrouped.
+4. **End cleanup.** New daemon verb `BrowserwrightDaemon.endSession(session_id)`: close session-owned tabs, **ungroup** (not close) borrowed tabs, drop the group. Test: owned tabs closed, borrowed tabs survive + ungrouped.
 5. **whoami live fields.** Daemon answers group id, owned-tab count, a sample URL for a session; `whoami` (Phase 2.4) now fills these. Test: round-trip shape.
 
 Tests live in `tests/test_extension_upstream.py`, `tests/test_multiclient.py`, new `tests/test_session_isolation.py`. Use the existing fake-extension fixtures (`ai-e2e-tests/fake_extension.py` / daemon `tests/conftest.py`).

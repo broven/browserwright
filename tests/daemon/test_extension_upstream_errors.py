@@ -3,15 +3,15 @@
 
 def test_requires_sessionid_error_mentions_recovery_methods():
     """The 'requires a sessionId' error must name both
-    BrowserDaemon.attachActiveTab AND BrowserDaemon.openBackgroundTab so
+    BrowserwrightDaemon.attachActiveTab AND BrowserwrightDaemon.openBackgroundTab so
     the client knows what to call next, NOT just what is missing."""
     from browserwright.daemon.server.extension_upstream import (
         _build_requires_session_error,
     )
     msg = _build_requires_session_error("Input.insertText")
     assert "Input.insertText" in msg
-    assert "BrowserDaemon.attachActiveTab" in msg
-    assert "BrowserDaemon.openBackgroundTab" in msg
+    assert "BrowserwrightDaemon.attachActiveTab" in msg
+    assert "BrowserwrightDaemon.openBackgroundTab" in msg
 
 
 def test_create_target_error_names_real_verbs():

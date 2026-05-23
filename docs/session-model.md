@@ -37,7 +37,7 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 ### 1.3 P3 抽象泄漏
 
 - backend 名在 server 层被**字符串比较 6+ 次**:`server/listener.py:106/411/461/564-568`、`server/proxy.py:714-789/837-853/931-935`。
-- `BrowserDaemon.getBackendInfo` 硬编码 `"kind":"UPSTREAM_WS"`,extension 下是错的:`server/proxy.py:676-681`。
+- `BrowserwrightDaemon.getBackendInfo` 硬编码 `"kind":"UPSTREAM_WS"`,extension 下是错的:`server/proxy.py:676-681`。
 - `backends/extension.py` 的 `resolve()` 永远抛 `Unavailable`,而 `active_tab.py` 直接调 `resolve()` → extension 下 `active-tab` 必失败(真 bug)。
 
 ### 1.4 缺自省 + 误导报错

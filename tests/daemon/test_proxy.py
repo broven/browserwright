@@ -1,4 +1,4 @@
-"""CDP proxy + BrowserDaemon.* namespace (v0.3 multi-client).
+"""CDP proxy + BrowserwrightDaemon.* namespace (v0.3 multi-client).
 
 The Router uses async callables for upstream + per-client sends; we capture
 them in test scaffolding and assert on what the router would have done
@@ -145,14 +145,14 @@ async def test_lazy_upstream_open_when_disconnected_calls_ensure():
     assert cap.ensure_calls == 1
 
 
-# ---- BrowserDaemon.* self-answer (per-client) ----------------------------
+# ---- BrowserwrightDaemon.* self-answer (per-client) ----------------------------
 
 
 @pytest.mark.asyncio
 async def test_browserdaemon_get_active_tab_no_tabs_returns_unknown():
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.getActiveTab",
+        "id": 1, "method": "BrowserwrightDaemon.getActiveTab",
     }))
     assert cap.upstream == []
     resp = cap.per_client[client.client_id][-1]
@@ -167,7 +167,7 @@ async def test_browserdaemon_get_active_tab_picks_recent():
                             "url": "https://x/", "title": "X"})
     state.last_activated_at["T"] = time.time() - 1
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.getActiveTab",
+        "id": 1, "method": "BrowserwrightDaemon.getActiveTab",
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["result"]["targetId"] == "T"
@@ -178,7 +178,7 @@ async def test_browserdaemon_get_backend_info_self_answered():
     state, router, cap, (client,) = _setup()
     state.backend_name = "rdp"
     await router.route_from_client(client, json.dumps({
-        "id": 2, "method": "BrowserDaemon.getBackendInfo",
+        "id": 2, "method": "BrowserwrightDaemon.getBackendInfo",
     }))
     assert cap.upstream == []
     result = cap.per_client[client.client_id][-1]["result"]
@@ -193,7 +193,7 @@ async def test_browserdaemon_get_backend_info_reports_extension_kind():
     state, router, cap, (client,) = _setup()
     state.backend_name = "extension"
     await router.route_from_client(client, json.dumps({
-        "id": 2, "method": "BrowserDaemon.getBackendInfo",
+        "id": 2, "method": "BrowserwrightDaemon.getBackendInfo",
     }))
     result = cap.per_client[client.client_id][-1]["result"]
     assert result["name"] == "extension"
@@ -205,7 +205,7 @@ async def test_browserdaemon_ui_state_reports_client_count():
     """v0.3 added `client_count` to uiState — checks both fields shape."""
     state, router, cap, clients = _setup("a", "b")
     await router.route_from_client(clients[0], json.dumps({
-        "id": 3, "method": "BrowserDaemon.uiState",
+        "id": 3, "method": "BrowserwrightDaemon.uiState",
     }))
     result = cap.per_client[clients[0].client_id][-1]["result"]
     assert result["ws_count"] == 1
@@ -217,7 +217,7 @@ async def test_browserdaemon_ui_state_reports_client_count():
 async def test_browserdaemon_disconnect_triggers_close():
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 6, "method": "BrowserDaemon.disconnect",
+        "id": 6, "method": "BrowserwrightDaemon.disconnect",
     }))
     assert cap.per_client[client.client_id][0]["result"] == {"ok": True}
     assert cap.disconnect_calls == ["skill_disconnect"]
@@ -227,7 +227,7 @@ async def test_browserdaemon_disconnect_triggers_close():
 async def test_unknown_browserdaemon_method_returns_method_not_found():
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 99, "method": "BrowserDaemon.totallyMadeUp",
+        "id": 99, "method": "BrowserwrightDaemon.totallyMadeUp",
     }))
     err = cap.per_client[client.client_id][-1]["error"]
     assert err["code"] == -32601
@@ -238,11 +238,11 @@ async def test_unknown_browserdaemon_method_returns_method_not_found():
 
 @pytest.mark.asyncio
 async def test_attach_active_without_callback_returns_method_not_found():
-    """Without an extension backend wired, BrowserDaemon.attachActiveTab
+    """Without an extension backend wired, BrowserwrightDaemon.attachActiveTab
     must surface -32601 instead of silently doing nothing."""
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 33, "method": "BrowserDaemon.attachActiveTab",
+        "id": 33, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
     err = cap.per_client[client.client_id][-1]["error"]
     assert err["code"] == -32601
@@ -267,7 +267,7 @@ async def test_attach_active_with_callback_binds_session_and_attacher():
 
     router._attach_active_tab = fake_attach_active
     await router.route_from_client(client, json.dumps({
-        "id": 10, "method": "BrowserDaemon.attachActiveTab",
+        "id": 10, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["id"] == 10
@@ -297,7 +297,7 @@ async def test_attach_active_callback_failure_returns_error():
 
     router._attach_active_tab = boom
     await router.route_from_client(client, json.dumps({
-        "id": 11, "method": "BrowserDaemon.attachActiveTab",
+        "id": 11, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
     err = cap.per_client[client.client_id][-1]["error"]
     assert err["code"] == -32000
@@ -624,7 +624,7 @@ async def test_pre_open_buffer_per_client_isolation():
     assert methods == {"Browser.getVersion"}
 
 
-# ---- Phase B: BrowserDaemon.openBackgroundTab / closeTab ------------------
+# ---- Phase B: BrowserwrightDaemon.openBackgroundTab / closeTab ------------------
 
 
 @pytest.mark.asyncio
@@ -634,7 +634,7 @@ async def test_open_background_without_callback_returns_method_not_found():
     missing-params)."""
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "id": 1, "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://x/"},
     }))
     resp = cap.per_client[client.client_id][-1]
@@ -663,7 +663,7 @@ async def test_open_background_with_callback_binds_session_and_attacher():
 
     router._open_background_tab = _fake_open
     await router.route_from_client(client, json.dumps({
-        "id": 5, "method": "BrowserDaemon.openBackgroundTab",
+        "id": 5, "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://example.com/", "groupName": "Agent"},
     }))
     resp = cap.per_client[client.client_id][-1]
@@ -689,7 +689,7 @@ async def test_open_background_missing_url_returns_invalid_params():
     """params.url is required; absence → -32602."""
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 9, "method": "BrowserDaemon.openBackgroundTab",
+        "id": 9, "method": "BrowserwrightDaemon.openBackgroundTab",
     }))
     err = cap.per_client[client.client_id][-1]["error"]
     assert err["code"] == -32602
@@ -700,7 +700,7 @@ async def test_open_background_missing_url_returns_invalid_params():
 async def test_close_tab_without_callback_returns_method_not_found():
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.closeTab",
+        "id": 1, "method": "BrowserwrightDaemon.closeTab",
         "params": {"sessionId": "anything"},
     }))
     resp = cap.per_client[client.client_id][-1]
@@ -735,7 +735,7 @@ async def test_close_tab_with_callback_cleans_session_state():
     router._close_tab = _fake_close
 
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "id": 1, "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://x/"},
     }))
     local_sid = cap.per_client[client.client_id][-1]["result"]["sessionId"]
@@ -743,7 +743,7 @@ async def test_close_tab_with_callback_cleans_session_state():
     assert "ext-tab-99" in state.attachers
 
     await router.route_from_client(client, json.dumps({
-        "id": 2, "method": "BrowserDaemon.closeTab",
+        "id": 2, "method": "BrowserwrightDaemon.closeTab",
         "params": {"sessionId": local_sid},
     }))
     resp = cap.per_client[client.client_id][-1]
@@ -763,7 +763,7 @@ async def test_close_tab_unknown_local_session_returns_invalid_params():
         return {"ok": True, "tabId": 0}
     router._close_tab = _fake_close
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.closeTab",
+        "id": 1, "method": "BrowserwrightDaemon.closeTab",
         "params": {"sessionId": "no-such-local-sid"},
     }))
     err = cap.per_client[client.client_id][-1]["error"]
@@ -793,7 +793,7 @@ async def test_close_tab_by_target_id_works_across_client_boundary():
 
     # Alice opens; binding lands on alice.sessions only.
     await router.route_from_client(alice, json.dumps({
-        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "id": 1, "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://x/"},
     }))
     alice_local_sid = cap.per_client[alice.client_id][-1]["result"]["sessionId"]
@@ -802,7 +802,7 @@ async def test_close_tab_by_target_id_works_across_client_boundary():
 
     # Bob (different client, no shared session state) closes by targetId.
     await router.route_from_client(bob, json.dumps({
-        "id": 2, "method": "BrowserDaemon.closeTab",
+        "id": 2, "method": "BrowserwrightDaemon.closeTab",
         "params": {"targetId": "ext-tab-77"},
     }))
     resp = cap.per_client[bob.client_id][-1]
@@ -850,7 +850,7 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
 
     # Alice opens the tab.
     await router.route_from_client(alice, json.dumps({
-        "id": 1, "method": "BrowserDaemon.openBackgroundTab",
+        "id": 1, "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://y/"},
     }))
     assert "ext-tab-88" in state.attachers
@@ -863,7 +863,7 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
 
     # Bob closes by targetId. No attacher → fallback path runs.
     await router.route_from_client(bob, json.dumps({
-        "id": 2, "method": "BrowserDaemon.closeTab",
+        "id": 2, "method": "BrowserwrightDaemon.closeTab",
         "params": {"targetId": "ext-tab-88"},
     }))
     resp = cap.per_client[bob.client_id][-1]
@@ -883,7 +883,7 @@ async def test_close_tab_without_session_or_target_id_returns_invalid_params():
         return {"ok": True, "tabId": 0}
     router._close_tab = _fake_close
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.closeTab",
+        "id": 1, "method": "BrowserwrightDaemon.closeTab",
         "params": {},
     }))
     err = cap.per_client[client.client_id][-1]["error"]
@@ -893,13 +893,13 @@ async def test_close_tab_without_session_or_target_id_returns_invalid_params():
 
 @pytest.mark.asyncio
 async def test_pre_open_buffer_browserdaemon_namespace_bypasses_gate():
-    """BrowserDaemon.* commands self-answer without touching upstream — they
+    """BrowserwrightDaemon.* commands self-answer without touching upstream — they
     must NOT get buffered when upstream is closed.
     """
     state, router, cap, (client,) = _setup(
         phase=UpstreamPhase.DISCONNECTED, wire_upstream=False)
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.getBackendInfo",
+        "id": 1, "method": "BrowserwrightDaemon.getBackendInfo",
     }))
     assert client.pre_open_buffer == deque()
     resp = cap.per_client[client.client_id][-1]
@@ -909,12 +909,12 @@ async def test_pre_open_buffer_browserdaemon_namespace_bypasses_gate():
 
 
 
-# ---- P5: BrowserDaemon.endSession dispatch --------------------------------
+# ---- P5: BrowserwrightDaemon.endSession dispatch --------------------------------
 
 
 @pytest.mark.asyncio
 async def test_end_session_dispatch_invokes_callback():
-    """P5: BrowserDaemon.endSession routes to the wired callback with the
+    """P5: BrowserwrightDaemon.endSession routes to the wired callback with the
     session id and returns its {closed, kept} result."""
     state, router, cap, (client,) = _setup()
     seen: list[str] = []
@@ -925,7 +925,7 @@ async def test_end_session_dispatch_invokes_callback():
 
     router._end_session = _fake_end
     await router.route_from_client(client, json.dumps({
-        "id": 9, "method": "BrowserDaemon.endSession",
+        "id": 9, "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "A"},
     }))
     assert seen == ["A"]
@@ -940,7 +940,7 @@ async def test_recover_session_missing_group_name_returns_invalid_params():
     sees code != -32601 'unknown method')."""
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 1, "method": "BrowserDaemon.recoverSession",
+        "id": 1, "method": "BrowserwrightDaemon.recoverSession",
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["id"] == 1
@@ -952,7 +952,7 @@ async def test_recover_session_missing_group_name_returns_invalid_params():
 async def test_recover_session_without_callback_returns_method_not_found():
     state, router, cap, (client,) = _setup()
     await router.route_from_client(client, json.dumps({
-        "id": 2, "method": "BrowserDaemon.recoverSession",
+        "id": 2, "method": "BrowserwrightDaemon.recoverSession",
         "params": {"groupName": "sess"},
     }))
     resp = cap.per_client[client.client_id][-1]
@@ -981,7 +981,7 @@ async def test_recover_session_with_callback_binds_and_returns_payload():
 
     router._recover_session = _fake_recover
     await router.route_from_client(client, json.dumps({
-        "id": 3, "method": "BrowserDaemon.recoverSession",
+        "id": 3, "method": "BrowserwrightDaemon.recoverSession",
         "params": {"groupName": "my-session", "bsSession": "bs-42"},
     }))
     assert seen == [("bs-42", "my-session")]
@@ -1012,7 +1012,7 @@ async def test_recover_session_callback_failure_returns_error():
 
     router._recover_session = _fake_recover
     await router.route_from_client(client, json.dumps({
-        "id": 4, "method": "BrowserDaemon.recoverSession",
+        "id": 4, "method": "BrowserwrightDaemon.recoverSession",
         "params": {"groupName": "empty"},
     }))
     resp = cap.per_client[client.client_id][-1]
@@ -1024,7 +1024,7 @@ async def test_end_session_requires_session_param():
     state, router, cap, (client,) = _setup()
     router._end_session = None
     await router.route_from_client(client, json.dumps({
-        "id": 9, "method": "BrowserDaemon.endSession",
+        "id": 9, "method": "BrowserwrightDaemon.endSession",
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["error"]["code"] == -32602

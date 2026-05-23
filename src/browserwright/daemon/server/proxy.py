@@ -1,4 +1,4 @@
-"""CDP proxy + BrowserDaemon.* namespace router (v0.3 multi-client).
+"""CDP proxy + BrowserwrightDaemon.* namespace router (v0.3 multi-client).
 
 Three translation tables make v0.3 work:
 
@@ -20,7 +20,7 @@ Three translation tables make v0.3 work:
    attach with the flag becomes a read-only reader sharing the existing
    upstream session.
 
-`BrowserDaemon.*` self-answer + heuristic active-tab table behave the same
+`BrowserwrightDaemon.*` self-answer + heuristic active-tab table behave the same
 as v0.2.
 """
 from __future__ import annotations
@@ -161,9 +161,9 @@ class Router:
         params = msg.get("params") or {}
         local_sid = msg.get("sessionId") if isinstance(msg.get("sessionId"), str) else None
 
-        # --- BrowserDaemon.* namespace ---
+        # --- BrowserwrightDaemon.* namespace ---
         # Self-answered: doesn't need upstream, so no gate.
-        if isinstance(method, str) and method.startswith("BrowserDaemon."):
+        if isinstance(method, str) and method.startswith("BrowserwrightDaemon."):
             await self._handle_browserdaemon(client, msg)
             return
 
@@ -669,14 +669,14 @@ class Router:
         for cid in list(self._client_sends.keys()):
             await self._send_to_client(cid, text)
 
-    # ---- BrowserDaemon.* (per-client RPC) -------------------------------
+    # ---- BrowserwrightDaemon.* (per-client RPC) -------------------------------
 
     async def _handle_browserdaemon(self, client: ClientState, msg: dict) -> None:
         method = msg["method"]
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        if isinstance(method, str) and method.startswith("BrowserDaemon.userscript."):
-            if False and method == "BrowserDaemon.userscript.install":
+        if isinstance(method, str) and method.startswith("BrowserwrightDaemon.userscript."):
+            if False and method == "BrowserwrightDaemon.userscript.install":
                 pass
             verb = method.split(".", 2)[2]
             if self._userscript_request is None:
@@ -692,7 +692,7 @@ class Router:
             if self._userscript_request is None:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32601,
-                    "BrowserDaemon.userscript.* requires the extension backend"))
+                    "BrowserwrightDaemon.userscript.* requires the extension backend"))
                 return
             try:
                 result = await self._userscript_request(verb, params)
@@ -703,7 +703,7 @@ class Router:
             await self._send_to_client(
                 client.client_id, _result_response(req_id, result or {}))
             return
-        if method == "BrowserDaemon.getActiveTab":
+        if method == "BrowserwrightDaemon.getActiveTab":
             tab = self.state.best_active_tab()
             payload = tab if tab is not None else {
                 "targetId": None, "url": None, "title": None,
@@ -711,7 +711,7 @@ class Router:
             }
             await self._send_to_client(client.client_id, _result_response(req_id, payload))
             return
-        if method == "BrowserDaemon.getBackendInfo":
+        if method == "BrowserwrightDaemon.getBackendInfo":
             from ..backends import kind_for
             # Report the live backend's real kind (extension is LOCAL_RELAY),
             # not a hardcoded UPSTREAM_WS. Unknown/unresolved names ("auto")
@@ -724,7 +724,7 @@ class Router:
                 "schema_version": 1,
             }))
             return
-        if method == "BrowserDaemon.uiState":
+        if method == "BrowserwrightDaemon.uiState":
             await self._send_to_client(client.client_id, _result_response(req_id, {
                 "ws_count": 1 if self.state.upstream_phase == UpstreamPhase.CONNECTED else 0,
                 "last_popup_resolved_at": self.state.last_popup_resolved_at,
@@ -733,29 +733,29 @@ class Router:
                 "client_count": len(self.state.clients),  # v0.3 addition
             }))
             return
-        if method == "BrowserDaemon.subscribeFocus":
+        if method == "BrowserwrightDaemon.subscribeFocus":
             client.subscribed_focus = True
             await self._send_to_client(client.client_id,
                                        _result_response(req_id, {"ok": True}))
             return
-        if method == "BrowserDaemon.unsubscribeFocus":
+        if method == "BrowserwrightDaemon.unsubscribeFocus":
             client.subscribed_focus = False
             await self._send_to_client(client.client_id,
                                        _result_response(req_id, {"ok": True}))
             return
-        if method == "BrowserDaemon.disconnect":
+        if method == "BrowserwrightDaemon.disconnect":
             await self._send_to_client(client.client_id,
                                        _result_response(req_id, {"ok": True}))
             if self._trigger_disconnect is not None:
                 await self._trigger_disconnect("skill_disconnect")
             return
-        if method == "BrowserDaemon.version":
+        if method == "BrowserwrightDaemon.version":
             await self._send_to_client(client.client_id, _result_response(req_id, {
                 "browserwright_daemon_version": __version__,
                 "schema_version": 1,
             }))
             return
-        if method == "BrowserDaemon.attachActiveTab":
+        if method == "BrowserwrightDaemon.attachActiveTab":
             # v0.5.4: extension-backend-only. Bypasses the standard
             # Target.attachToTarget flow because the targetId isn't known
             # until the extension picks the focused-window active tab. We
@@ -779,7 +779,7 @@ class Router:
             if self._attach_active_tab is None:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32601,
-                    "BrowserDaemon.attachActiveTab requires the extension backend"))
+                    "BrowserwrightDaemon.attachActiveTab requires the extension backend"))
                 return
             attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
             attach_session = attach_params.get("session")
@@ -834,29 +834,29 @@ class Router:
                     "title": info.get("title", ""),
                 }))
             return
-        if method == "BrowserDaemon.stats":
+        if method == "BrowserwrightDaemon.stats":
             # v0.5: expose in-process metrics counters. Schema is the
             # observability.Metrics dataclass keys + uptime_seconds.
             await self._send_to_client(
                 client.client_id,
                 _result_response(req_id, metrics().snapshot()))
             return
-        if method == "BrowserDaemon.openBackgroundTab":
+        if method == "BrowserwrightDaemon.openBackgroundTab":
             await self._handle_open_background_tab(client, msg, req_id)
             return
-        if method == "BrowserDaemon.closeTab":
+        if method == "BrowserwrightDaemon.closeTab":
             await self._handle_close_tab(client, msg, req_id)
             return
-        if method == "BrowserDaemon.endSession":
+        if method == "BrowserwrightDaemon.endSession":
             await self._handle_end_session(client, msg, req_id)
             return
-        if method == "BrowserDaemon.recoverSession":
+        if method == "BrowserwrightDaemon.recoverSession":
             await self._handle_recover_session(client, msg, req_id)
             return
         await self._send_to_client(client.client_id, _error_response(
-            req_id, -32601, f"unknown BrowserDaemon method: {method}"))
+            req_id, -32601, f"unknown BrowserwrightDaemon method: {method}"))
 
-    # ---- Phase B: BrowserDaemon.openBackgroundTab / closeTab ----------
+    # ---- Phase B: BrowserwrightDaemon.openBackgroundTab / closeTab ----------
 
     async def _handle_open_background_tab(
         self, client: ClientState, msg: dict, req_id: int | None,
@@ -870,7 +870,7 @@ class Router:
         translation path as Target.attachToTarget.
         """
         # Param validation runs FIRST: the schema-lock smoke test calls
-        # every BrowserDaemon.* method with no params and asserts the
+        # every BrowserwrightDaemon.* method with no params and asserts the
         # response code is NOT -32601 ("unknown method"). Returning -32602
         # here for the missing required param keeps the lock satisfied
         # without us wiring a real extension upstream in unit tests.
@@ -879,13 +879,13 @@ class Router:
         if not isinstance(url, str) or not url:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserDaemon.openBackgroundTab requires params.url"))
+                "BrowserwrightDaemon.openBackgroundTab requires params.url"))
             return
         group_name = params.get("groupName")
         if group_name is not None and not isinstance(group_name, str):
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserDaemon.openBackgroundTab params.groupName must be a string"))
+                "BrowserwrightDaemon.openBackgroundTab params.groupName must be a string"))
             return
         if self._open_background_tab is None:
             # Lazy-open: a cold daemon + already-connected extension becomes
@@ -903,7 +903,7 @@ class Router:
         if self._open_background_tab is None:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32601,
-                "BrowserDaemon.openBackgroundTab requires the extension backend"))
+                "BrowserwrightDaemon.openBackgroundTab requires the extension backend"))
             return
         # The browserwright session id now arrives as `bsSession` (the skill
         # stopped using a reserved kwarg). Keep accepting the legacy `session`
@@ -970,7 +970,7 @@ class Router:
         if not isinstance(group_name, str) or not group_name:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserDaemon.recoverSession requires params.groupName"))
+                "BrowserwrightDaemon.recoverSession requires params.groupName"))
             return
         if self._recover_session is None:
             # Lazy-open mirror of openBackgroundTab.
@@ -986,7 +986,7 @@ class Router:
         if self._recover_session is None:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32601,
-                "BrowserDaemon.recoverSession requires the extension backend"))
+                "BrowserwrightDaemon.recoverSession requires the extension backend"))
             return
         bs_session = params.get("bsSession")
         bs_session = bs_session if isinstance(bs_session, str) and bs_session else None
@@ -1039,7 +1039,7 @@ class Router:
         if not isinstance(session, str) or not session:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserDaemon.endSession requires params.session"))
+                "BrowserwrightDaemon.endSession requires params.session"))
             return
         group_name = params.get("groupName")
         group_name = group_name if isinstance(group_name, str) and group_name else None
@@ -1056,7 +1056,7 @@ class Router:
         if self._end_session is None:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32601,
-                "BrowserDaemon.endSession requires the extension backend"))
+                "BrowserwrightDaemon.endSession requires the extension backend"))
             return
         try:
             # Pass group_name only when provided so callbacks with the legacy
@@ -1094,7 +1094,7 @@ class Router:
         if not has_sid and not has_tid:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserDaemon.closeTab requires params.sessionId or params.targetId"))
+                "BrowserwrightDaemon.closeTab requires params.sessionId or params.targetId"))
             return
         if self._close_tab is None:
             # Lazy-open mirror of openBackgroundTab + attachActiveTab.
@@ -1110,7 +1110,7 @@ class Router:
         if self._close_tab is None:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32601,
-                "BrowserDaemon.closeTab requires the extension backend"))
+                "BrowserwrightDaemon.closeTab requires the extension backend"))
             return
         # Resolve to (target_id, upstream_sid, owner_client_id, owner_local_sid).
         # sessionId path = per-client lookup; targetId path = state.attachers
@@ -1141,7 +1141,7 @@ class Router:
             if self._close_tab_by_target_id is None:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32601,
-                    "BrowserDaemon.closeTab (by targetId) requires the extension backend"))
+                    "BrowserwrightDaemon.closeTab (by targetId) requires the extension backend"))
                 return
             try:
                 result = await self._close_tab_by_target_id(target_id)
@@ -1203,4 +1203,4 @@ class Router:
             if client.subscribed_focus:
                 await self._send_to_client(
                     client.client_id,
-                    _event("BrowserDaemon.activeTabChanged", params))
+                    _event("BrowserwrightDaemon.activeTabChanged", params))

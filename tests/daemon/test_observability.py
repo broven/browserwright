@@ -185,7 +185,7 @@ async def test_browserwright_daemon_stats_method_returns_snapshot(
     short_runtime, monkeypatch,
 ):
     """End-to-end: a real daemon listener accepts a client + answers
-    BrowserDaemon.stats with the metrics snapshot."""
+    BrowserwrightDaemon.stats with the metrics snapshot."""
     reset_metrics_for_test()
     # Patch resolver so the daemon doesn't try to reach a real Chrome.
     from browserwright.daemon.backends.base import ResolveResult
@@ -227,14 +227,14 @@ async def test_browserwright_daemon_stats_method_returns_snapshot(
             break
 
     try:
-        # Connect a client + invoke BrowserDaemon.stats.
+        # Connect a client + invoke BrowserwrightDaemon.stats.
         ws = await websockets.unix_connect(
             str(_ipc.sock_path(cfg.name)),
             uri="ws://localhost/?client=stats-test",
             compression=None,
         )
         try:
-            await ws.send(json.dumps({"id": 1, "method": "BrowserDaemon.stats"}))
+            await ws.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.stats"}))
             resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
             assert resp["id"] == 1
             snap = resp["result"]

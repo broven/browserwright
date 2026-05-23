@@ -262,14 +262,14 @@ async def test_v03_second_client_accepted(daemon):
 
 @pytest.mark.asyncio
 async def test_explicit_disconnect_emits_upstream_closed_event(daemon):
-    """Spec §6.5: client invokes BrowserDaemon.disconnect, daemon emits
-    BrowserDaemon.upstreamClosed before closing."""
+    """Spec §6.5: client invokes BrowserwrightDaemon.disconnect, daemon emits
+    BrowserwrightDaemon.upstreamClosed before closing."""
     async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
         # Open upstream.
         await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
         await _recv_response(ws, 1)
 
-        await ws.send(json.dumps({"id": 2, "method": "BrowserDaemon.disconnect"}))
+        await ws.send(json.dumps({"id": 2, "method": "BrowserwrightDaemon.disconnect"}))
         # Expect: result for id=2, then an upstreamClosed event.
         got_ack = False
         got_event = False
@@ -281,11 +281,11 @@ async def test_explicit_disconnect_emits_upstream_closed_event(daemon):
             msg = json.loads(raw)
             if msg.get("id") == 2 and "result" in msg:
                 got_ack = True
-            if msg.get("method") == "BrowserDaemon.upstreamClosed":
+            if msg.get("method") == "BrowserwrightDaemon.upstreamClosed":
                 got_event = True
                 assert msg["params"]["reason"] == "skill_disconnect"
                 break
-        assert got_ack, "BrowserDaemon.disconnect didn't get an ack"
+        assert got_ack, "BrowserwrightDaemon.disconnect didn't get an ack"
         assert got_event, "no upstreamClosed event after disconnect"
 
 
@@ -317,7 +317,7 @@ async def test_daemon_does_not_auto_reconnect_after_disconnect(daemon):
 @pytest.mark.asyncio
 async def test_reconnect_after_client_close_warm_upstream(daemon):
     """Regression for #58: skill-implementer hit AttributeError when a client
-    reconnected while upstream was still warm (no BrowserDaemon.disconnect
+    reconnected while upstream was still warm (no BrowserwrightDaemon.disconnect
     between sessions). Repro: client A connects + sends a normal CDP command
     (lazy-opens upstream), closes; client B connects and sends *anything*.
 
@@ -335,11 +335,11 @@ async def test_reconnect_after_client_close_warm_upstream(daemon):
     # Tiny pause so the daemon registers session-1 release.
     await asyncio.sleep(0.05)
 
-    # Session 2: connect again. Either standard CDP OR BrowserDaemon.* must
+    # Session 2: connect again. Either standard CDP OR BrowserwrightDaemon.* must
     # work — the bug crashed the daemon on the warm-reconnect path before any
     # command was even processed.
     async with await _client_connect(sock, label="client-b") as ws:
-        await ws.send(json.dumps({"id": 2, "method": "BrowserDaemon.getBackendInfo"}))
+        await ws.send(json.dumps({"id": 2, "method": "BrowserwrightDaemon.getBackendInfo"}))
         resp = await _recv_response(ws, 2)
         assert "result" in resp
         assert resp["result"]["schema_version"] == 1
@@ -349,12 +349,12 @@ async def test_reconnect_after_client_close_warm_upstream(daemon):
         assert resp["result"]["product"] == "FakeChrome/1.0"
 
 
-# ---- BrowserDaemon.* roundtrip over the wire ------------------------------
+# ---- BrowserwrightDaemon.* roundtrip over the wire ------------------------------
 
 
 @pytest.mark.asyncio
 async def test_browserwright_daemon_get_active_tab_over_wire(daemon, fake_upstream):
-    """End-to-end: client calls BrowserDaemon.getActiveTab; daemon answers
+    """End-to-end: client calls BrowserwrightDaemon.getActiveTab; daemon answers
     using its target table (populated from fake upstream's Target.targetCreated)."""
     async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
         # Open upstream so setDiscoverTargets fires + table populates.
@@ -369,7 +369,7 @@ async def test_browserwright_daemon_get_active_tab_over_wire(daemon, fake_upstre
         }))
         await _recv_response(ws, 2)
 
-        await ws.send(json.dumps({"id": 3, "method": "BrowserDaemon.getActiveTab"}))
+        await ws.send(json.dumps({"id": 3, "method": "BrowserwrightDaemon.getActiveTab"}))
         resp = await _recv_response(ws, 3)
         result = resp["result"]
         assert result["targetId"] == "FAKE-T"
@@ -528,7 +528,7 @@ async def test_run_stats_against_live_daemon_does_not_misreport_not_running(
 
 @pytest.mark.asyncio
 async def test_upstream_lifecycle_events_emitted_in_order(daemon):
-    """REVIEW.md F-3: design-v2.md:550-551 documents BrowserDaemon.upstreamConnecting
+    """REVIEW.md F-3: design-v2.md:550-551 documents BrowserwrightDaemon.upstreamConnecting
     + .upstreamReady but they were never wired. Verify a connected client sees
     both events in order around the lazy upstream open.
     """
@@ -546,11 +546,11 @@ async def test_upstream_lifecycle_events_emitted_in_order(daemon):
             except asyncio.TimeoutError:
                 break
             msg = json.loads(raw)
-            if msg.get("method") == "BrowserDaemon.upstreamConnecting":
+            if msg.get("method") == "BrowserwrightDaemon.upstreamConnecting":
                 seen_connecting = True
                 # F-3 contract: backend name in params.
                 assert "backend" in msg["params"]
-            elif msg.get("method") == "BrowserDaemon.upstreamReady":
+            elif msg.get("method") == "BrowserwrightDaemon.upstreamReady":
                 seen_ready = True
                 # F-3 contract: backend + ws_url in params.
                 assert "backend" in msg["params"]
@@ -561,8 +561,8 @@ async def test_upstream_lifecycle_events_emitted_in_order(daemon):
             if seen_connecting and seen_ready and seen_response:
                 break
 
-        assert seen_connecting, "BrowserDaemon.upstreamConnecting never emitted"
-        assert seen_ready, "BrowserDaemon.upstreamReady never emitted"
+        assert seen_connecting, "BrowserwrightDaemon.upstreamConnecting never emitted"
+        assert seen_ready, "BrowserwrightDaemon.upstreamReady never emitted"
         assert seen_response, "the actual CDP response never arrived"
 
 
@@ -593,7 +593,7 @@ async def test_upstream_lifecycle_events_reach_all_connected_clients(daemon):
                     seen.add(m)
             return seen
 
-        want = {"BrowserDaemon.upstreamConnecting", "BrowserDaemon.upstreamReady"}
+        want = {"BrowserwrightDaemon.upstreamConnecting", "BrowserwrightDaemon.upstreamReady"}
         a_seen, b_seen = await asyncio.gather(
             collect_events(a, want, timeout=5.0),
             collect_events(b, want, timeout=5.0),

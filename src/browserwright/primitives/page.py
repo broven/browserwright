@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..errors import BrowserSkillError, CDPError, NeedsUserConfirm, PageLoadFailed
+from ..errors import BrowserwrightError, CDPError, NeedsUserConfirm, PageLoadFailed
 from ..session import current_session
 
 
@@ -63,7 +63,7 @@ def attach_active() -> dict:
     # disconnect, so by the time the caller hands the sid to a primitive on
     # its own connection the proxy answers "unknown sessionId".
     try:
-        result = sess.cdp.send("BrowserDaemon.attachActiveTab")
+        result = sess.cdp.send("BrowserwrightDaemon.attachActiveTab")
     except CDPError as e:
         # D2 recovery: the user's *focused* tab may be an internal page Chrome's
         # debugger refuses to attach to (chrome://, chrome-extension://,
@@ -76,7 +76,7 @@ def attach_active() -> dict:
         if _is_nonattachable_internal_url_error(e.cdp_message):
             return open_background("about:blank", group="Agent")
         raise CDPError(
-            method="BrowserDaemon.attachActiveTab",
+            method="BrowserwrightDaemon.attachActiveTab",
             params={},
             cdp_message=(e.cdp_message or
                          "attach_active() requires the extension backend; "
@@ -85,7 +85,7 @@ def attach_active() -> dict:
         ) from e
     if not result:
         raise CDPError(
-            method="BrowserDaemon.attachActiveTab",
+            method="BrowserwrightDaemon.attachActiveTab",
             params={},
             cdp_message="empty response from daemon",
         )
@@ -93,7 +93,7 @@ def attach_active() -> dict:
     sid = result.get("sessionId")
     if not isinstance(target_id, str) or not isinstance(sid, str):
         raise CDPError(
-            method="BrowserDaemon.attachActiveTab",
+            method="BrowserwrightDaemon.attachActiveTab",
             params={},
             cdp_message=f"malformed daemon response: {result!r}",
         )
@@ -271,7 +271,7 @@ def new_tab(url: str = "about:blank") -> dict:
         # cannot issue — it would fail deep in the daemon with a confusing
         # "requires a sessionId" / createTarget error. Fail fast here with the
         # real verb so the agent (or a solidified task calling new_tab) recovers.
-        raise BrowserSkillError(
+        raise BrowserwrightError(
             "new_tab() uses Target.createTarget, which the extension backend "
             "cannot issue. Open a tab with open_background(url, group=\"Agent\") "
             "(background tab, no focus steal), or attach_active() to drive the "
@@ -509,12 +509,12 @@ def open_background(url: str, *, group: Optional[str] = None) -> dict:
         group = name  # may stay None if no session/name resolvable
     try:
         payload = sess.cdp.send(
-            "BrowserDaemon.openBackgroundTab",
+            "BrowserwrightDaemon.openBackgroundTab",
             url=url, groupName=group, bsSession=sid,
         )
     except CDPError as e:
         raise CDPError(
-            method="BrowserDaemon.openBackgroundTab",
+            method="BrowserwrightDaemon.openBackgroundTab",
             params={"url": url, "groupName": group},
             cdp_message=(
                 f"open_background failed: {e.cdp_message}. "
@@ -523,7 +523,7 @@ def open_background(url: str, *, group: Optional[str] = None) -> dict:
         ) from e
     if not payload:
         raise CDPError(
-            method="BrowserDaemon.openBackgroundTab",
+            method="BrowserwrightDaemon.openBackgroundTab",
             params={"url": url, "groupName": group},
             cdp_message="daemon returned an empty payload",
         )
@@ -531,7 +531,7 @@ def open_background(url: str, *, group: Optional[str] = None) -> dict:
     session_id = payload.get("sessionId")
     if not target_id or not session_id:
         raise CDPError(
-            method="BrowserDaemon.openBackgroundTab",
+            method="BrowserwrightDaemon.openBackgroundTab",
             params={"url": url, "groupName": group},
             cdp_message=f"daemon returned incomplete payload: {payload!r}",
         )
@@ -578,7 +578,7 @@ def close_tab(
         resolved_target_id = sess.current_target_id
         if not resolved_target_id:
             raise CDPError(
-                method="BrowserDaemon.closeTab",
+                method="BrowserwrightDaemon.closeTab",
                 params={"sessionId": None, "targetId": None},
                 cdp_message="close_tab: no current attached tab to close",
             )
@@ -588,13 +588,13 @@ def close_tab(
         resolved_session_id = sess.cdp._sessions.get(resolved_target_id)
     try:
         payload = sess.cdp.send(
-            "BrowserDaemon.closeTab",
+            "BrowserwrightDaemon.closeTab",
             sessionId=resolved_session_id,
             targetId=resolved_target_id,
         )
     except CDPError as e:
         raise CDPError(
-            method="BrowserDaemon.closeTab",
+            method="BrowserwrightDaemon.closeTab",
             params={"sessionId": resolved_session_id,
                     "targetId": resolved_target_id},
             cdp_message=(
@@ -606,7 +606,7 @@ def close_tab(
     session_id = resolved_session_id
     if not payload:
         raise CDPError(
-            method="BrowserDaemon.closeTab",
+            method="BrowserwrightDaemon.closeTab",
             params={"sessionId": session_id},
             cdp_message="daemon returned an empty close-tab payload",
         )

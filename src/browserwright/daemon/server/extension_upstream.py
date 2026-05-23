@@ -55,8 +55,8 @@ def _build_requires_session_error(method: str) -> str:
     return (
         f"{method!r} requires a sessionId in extension backend — "
         "no tab attached. Attach one first via "
-        "BrowserDaemon.attachActiveTab (focused tab) or "
-        "BrowserDaemon.openBackgroundTab (background tab), then retry."
+        "BrowserwrightDaemon.attachActiveTab (focused tab) or "
+        "BrowserwrightDaemon.openBackgroundTab (background tab), then retry."
     )
 
 
@@ -68,7 +68,7 @@ def _build_create_target_error() -> str:
         "Target.createTarget is not supported by the extension backend — "
         "it cannot open browser-level targets. Open a tab via the skill "
         "primitive open_background(url, group=\"Agent\") (or "
-        "BrowserDaemon.openBackgroundTab for a background tab) instead. "
+        "BrowserwrightDaemon.openBackgroundTab for a background tab) instead. "
         "new_tab() works only on the rdp/env backend."
     )
 

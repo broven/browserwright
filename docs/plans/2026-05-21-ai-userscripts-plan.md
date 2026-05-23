@@ -10,7 +10,7 @@ daemon↔extension relay.
 **Architecture:** Source of truth = local `.user.js` files the agent edits.
 Flow on `push`: `browserwright userscript` (thin shim) → `browserwright-daemon
 userscript` CLI (reads file, parses `==UserScript==` header) → daemon control
-verb `BrowserDaemon.userscript.*` in `proxy.py` → `RelayServer._request` →
+verb `BrowserwrightDaemon.userscript.*` in `proxy.py` → `RelayServer._request` →
 extension `userscript.*` message → `chrome.storage.local` + `chrome.userScripts`
 registration in the `USER_SCRIPT` world. Full-auto activation, `<all_urls>` host
 permission, plain page JS only (no `GM_*`). Existing CDP session-driven control
@@ -51,11 +51,11 @@ existing Chrome-for-Testing e2e harness on port 29989.
   `safeSend({ type:"response", id, result })` or `{ ..., error:{ code, message }}`.
 - **Daemon control dispatch:** `_handle_browserdaemon()` at
   `browserwright-daemon/src/browserwright/daemon/server/proxy.py:672`, verbs named
-  `BrowserDaemon.*`, results sent with `_send_to_client(client_id, _result_response(req_id, {...}))`.
+  `BrowserwrightDaemon.*`, results sent with `_send_to_client(client_id, _result_response(req_id, {...}))`.
 - **Daemon CLI ws shim pattern:** `_disconnect_via_ws()` at
   `browserwright-daemon/src/browserwright/daemon/cli.py:555` shows how to open a transient ws
   to the daemon control socket (`_ipc.sock_path(cfg.name)` on POSIX) and send a
-  `BrowserDaemon.*` method.
+  `BrowserwrightDaemon.*` method.
 - **browserwright CLI dispatch:** `main()` at
   `browserwright/src/browserwright/cli.py:470`; subcommand groups like
   `_cmd_session` at `:388`; kv-arg parser `_parse_kv_args` at `:61`.
@@ -438,7 +438,7 @@ git add browserwright-daemon/src/browserwright/daemon/server/extension_upstream.
 git commit -m "feat(daemon): ExtensionUpstream delegates userscript_request to relay"
 ```
 
-### Task 4: Add `BrowserDaemon.userscript.*` control verbs in proxy.py
+### Task 4: Add `BrowserwrightDaemon.userscript.*` control verbs in proxy.py
 
 **Files:**
 - Modify: `browserwright-daemon/src/browserwright/daemon/server/proxy.py` (`_handle_browserdaemon`, ~line 672)
@@ -446,7 +446,7 @@ git commit -m "feat(daemon): ExtensionUpstream delegates userscript_request to r
 
 **Step 1: Write the failing test** — inspect `tests/` for how the Router is
 constructed with a fake upstream/client in existing proxy tests, and assert that
-a client message `{"method":"BrowserDaemon.userscript.install","params":{...}}`
+a client message `{"method":"BrowserwrightDaemon.userscript.install","params":{...}}`
 results in `upstream.userscript_request("install", {...})` being awaited and the
 result sent back via `_result_response`.
 
@@ -458,7 +458,7 @@ result sent back via `_result_response`.
 
 **Step 3: Implement** — add to `_handle_browserdaemon()` before the fallthrough:
 ```python
-if method.startswith("BrowserDaemon.userscript."):
+if method.startswith("BrowserwrightDaemon.userscript."):
     verb = method.split(".", 2)[2]            # install|push|list|remove|logs|toggle
     if self._ensure_upstream is not None:
         await self._ensure_upstream()         # lazy-open extension upstream
@@ -480,7 +480,7 @@ obtained in this method (read the surrounding code at line 672+).
 **Step 4: Run → pass. Step 5: Commit**
 ```bash
 git add browserwright-daemon/src/browserwright/daemon/server/proxy.py browserwright-daemon/tests/test_proxy_userscript.py
-git commit -m "feat(daemon): BrowserDaemon.userscript.* control verbs"
+git commit -m "feat(daemon): BrowserwrightDaemon.userscript.* control verbs"
 ```
 
 ---
@@ -494,14 +494,14 @@ git commit -m "feat(daemon): BrowserDaemon.userscript.* control verbs"
 - Test: `browserwright-daemon/tests/test_cli_userscript.py`
 
 **Subcommands:**
-- `push <file>` — read file → `parse_userscript` → send `BrowserDaemon.userscript.install` with `{"script": us.to_payload()}`. Print `{id, identity, warnings}` as JSON. (`install` is an alias of `push` that also accepts `-`/stdin.)
-- `list [--site=<url>]` — send `BrowserDaemon.userscript.list` with `{"site": url}`; print rows.
-- `remove <identity-or-id>` — send `BrowserDaemon.userscript.remove` with `{"key": ...}`.
-- `toggle <identity-or-id> --enabled=<true|false>` — send `BrowserDaemon.userscript.toggle`.
-- `logs [--id=<id>] [--limit=N]` — send `BrowserDaemon.userscript.logs`.
+- `push <file>` — read file → `parse_userscript` → send `BrowserwrightDaemon.userscript.install` with `{"script": us.to_payload()}`. Print `{id, identity, warnings}` as JSON. (`install` is an alias of `push` that also accepts `-`/stdin.)
+- `list [--site=<url>]` — send `BrowserwrightDaemon.userscript.list` with `{"site": url}`; print rows.
+- `remove <identity-or-id>` — send `BrowserwrightDaemon.userscript.remove` with `{"key": ...}`.
+- `toggle <identity-or-id> --enabled=<true|false>` — send `BrowserwrightDaemon.userscript.toggle`.
+- `logs [--id=<id>] [--limit=N]` — send `BrowserwrightDaemon.userscript.logs`.
 
 **Step 1: Write a failing test** for the pure parts: that `push` of a temp
-`.user.js` file calls the ws shim with method `BrowserDaemon.userscript.install`
+`.user.js` file calls the ws shim with method `BrowserwrightDaemon.userscript.install`
 and a payload whose `script.id` equals the parsed id. Monkeypatch the ws-send
 helper so no real daemon is needed:
 
@@ -523,7 +523,7 @@ def test_push_parses_and_sends_install(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_userscript_call_ws", fake_call, raising=False)
     rc = cli._cmd_userscript(["push", str(f)])  # adapt to real signature
     assert rc == 0
-    assert captured["method"] == "BrowserDaemon.userscript.install"
+    assert captured["method"] == "BrowserwrightDaemon.userscript.install"
     assert captured["params"]["script"]["name"] == "X"
 ```
 

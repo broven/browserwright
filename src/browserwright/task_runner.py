@@ -45,7 +45,7 @@ def run_task(site: str, name: str, *, isolated: bool = False, **kwargs) -> Any:
       - selftest result is cached for 24h keyed on the task file hash; pass
         ``BS_SELFTEST_NOCACHE=1`` to force a re-run.
       - ``OUTPUT_SCHEMA`` (if defined on the module) validates ``run()``
-        return shape; mismatch raises ``BrowserSkillError`` with details.
+        return shape; mismatch raises ``BrowserwrightError`` with details.
 
     v0.3 added:
       - ``isolated=True`` runs the task in its own ``Session`` pushed onto the

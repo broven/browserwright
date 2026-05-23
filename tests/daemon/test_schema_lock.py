@@ -54,30 +54,30 @@ V2_BACKEND_ENTRY_KEYS = frozenset({
 V2_TOP_LEVEL_KEYS = frozenset({"schema_version", "recommended", "backends"})
 
 
-# v0.5.3 F-6: BrowserDaemon.* namespace lock. Every method below must be
+# v0.5.3 F-6: BrowserwrightDaemon.* namespace lock. Every method below must be
 # documented in design-v2.md §6.4 AND dispatched in proxy.py's
 # `_handle_browserdaemon`. Adding a new method = update this set, update
 # the spec, write a test for the dispatch.
 V2_BROWSER_DAEMON_METHODS = frozenset({
-    "BrowserDaemon.getActiveTab",
-    "BrowserDaemon.getBackendInfo",
-    "BrowserDaemon.uiState",
-    "BrowserDaemon.subscribeFocus",
-    "BrowserDaemon.unsubscribeFocus",
-    "BrowserDaemon.disconnect",
-    "BrowserDaemon.version",
-    "BrowserDaemon.stats",
+    "BrowserwrightDaemon.getActiveTab",
+    "BrowserwrightDaemon.getBackendInfo",
+    "BrowserwrightDaemon.uiState",
+    "BrowserwrightDaemon.subscribeFocus",
+    "BrowserwrightDaemon.unsubscribeFocus",
+    "BrowserwrightDaemon.disconnect",
+    "BrowserwrightDaemon.version",
+    "BrowserwrightDaemon.stats",
     # v0.5.4 — extension backend only; -32601 on other backends.
-    "BrowserDaemon.attachActiveTab",
+    "BrowserwrightDaemon.attachActiveTab",
     # Phase B: extension-backend-only verbs.
-    "BrowserDaemon.openBackgroundTab",
-    "BrowserDaemon.closeTab",
+    "BrowserwrightDaemon.openBackgroundTab",
+    "BrowserwrightDaemon.closeTab",
     # P5: per-session teardown (extension backend only).
-    "BrowserDaemon.endSession",
+    "BrowserwrightDaemon.endSession",
     # Session-reconnect-recovery (extension backend only).
-    "BrowserDaemon.recoverSession",
+    "BrowserwrightDaemon.recoverSession",
     # Resident userscripts (extension backend only).
-    "BrowserDaemon.userscript.install",
+    "BrowserwrightDaemon.userscript.install",
 })
 
 
@@ -161,7 +161,7 @@ async def test_doctor_every_ux_cost_value_is_in_v2_enum():
             f"not in v2 enum {V2_UX_COST_ENUM}.")
 
 
-# ---- v0.5.3 F-6: BrowserDaemon.* namespace lock --------------------------
+# ---- v0.5.3 F-6: BrowserwrightDaemon.* namespace lock --------------------------
 
 
 def test_schema_v2_browserwright_daemon_dispatch_matches_frozen_set():
@@ -181,13 +181,13 @@ def test_schema_v2_browserwright_daemon_dispatch_matches_frozen_set():
 
     proxy_src = Path(
         "src/browserwright/daemon/server/proxy.py").read_text()
-    # All `method == "BrowserDaemon.XXX"` strings in the dispatch.
+    # All `method == "BrowserwrightDaemon.XXX"` strings in the dispatch.
     found = set(re.findall(
-        r'method == "(BrowserDaemon\.(?:[A-Za-z]+|userscript\.[A-Za-z]+))"', proxy_src))
+        r'method == "(BrowserwrightDaemon\.(?:[A-Za-z]+|userscript\.[A-Za-z]+))"', proxy_src))
     extra = found - V2_BROWSER_DAEMON_METHODS
     missing = V2_BROWSER_DAEMON_METHODS - found
     assert not extra and not missing, (
-        f"BrowserDaemon.* dispatch drift — extra={extra}, missing={missing}. "
+        f"BrowserwrightDaemon.* dispatch drift — extra={extra}, missing={missing}. "
         f"Update tests/test_schema_lock.py V2_BROWSER_DAEMON_METHODS AND "
         f"design-v2.md §6.4 to match production.")
 
@@ -219,7 +219,7 @@ async def test_browserwright_daemon_dispatch_uses_v2_lockable_methods_only(monke
     router.register_client(client.client_id, _send)
     router.bind_lifecycle(_ensure, _disc)
 
-    # v0.5.4: BrowserDaemon.attachActiveTab is backend-conditional — when no
+    # v0.5.4: BrowserwrightDaemon.attachActiveTab is backend-conditional — when no
     # extension callback is wired (this test uses rdp), it deliberately
     # returns -32601 with a "requires the extension backend" message. The
     # smoke check below distinguishes that legitimate gating from the

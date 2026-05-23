@@ -18,14 +18,14 @@ Supported keywords:
   - ``enum``: list of allowed scalar values
   - ``nullable``: bool — convenience, equivalent to ``type: [..., "null"]``
 
-Failures raise ``BrowserSkillError`` with a path-qualified message so the
+Failures raise ``BrowserwrightError`` with a path-qualified message so the
 agent can tell the user *which* field failed.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .errors import BrowserSkillError
+from .errors import BrowserwrightError
 
 
 _TYPE_MAP = {
@@ -39,7 +39,7 @@ _TYPE_MAP = {
 }
 
 
-class OutputSchemaError(BrowserSkillError):
+class OutputSchemaError(BrowserwrightError):
     exit_code = 3
 
     def __init__(self, site: str, task: str, path: str, msg: str):

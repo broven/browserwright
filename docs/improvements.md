@@ -36,7 +36,7 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 |---|---|---|---|---|
 | A1 | ws `max_size=None`,修截图响应超 1 MiB 被丢 → `extension disconnected` | L2 | ✅ | commit `2483b24`,`server/relay.py` |
 | A2 | daemon↔CLI 版本一致性:运行中 daemon 比安装代码旧时**自检并自动重启**;CLI 把自己发出的 `-32601 unknown method` 改写成"daemon 陈旧,请重启",不透传 raw JSON-RPC | L2 | ✅ | S6:版本经 pong→`status --json` 暴露;`ensure_version_coherent()` 接入 `auto_client`,不匹配/缺版本→stop+serve;`explain_rpc_error()` 改写 `-32601`(对任意 method 通用,已设 staticmethod 并接到实时站点 `cdp.py` `_rpc_error_fix`)。gate `test_version_coherence.py` 7(daemon)+13(skill) |
-| A3 | **错误 envelope 约定**:每个 error 带一个 `next`/`fix` 下一步串(对照已有的好例子 `NeedsUserConfirm` 的 `proposal`) | L1/L2 | ✅ | S5:`BrowserSkillError` 基类加 `fix`,各类设 `default_fix`,module 级 `serialize()` 把 `fix` 带进 agent 可见 JSON。覆盖 NoSession/CDPError/DaemonUnavailable/PageLoadFailed/AuthWall 等高频站点 |
+| A3 | **错误 envelope 约定**:每个 error 带一个 `next`/`fix` 下一步串(对照已有的好例子 `NeedsUserConfirm` 的 `proposal`) | L1/L2 | ✅ | S5:`BrowserwrightError` 基类加 `fix`,各类设 `default_fix`,module 级 `serialize()` 把 `fix` 带进 agent 可见 JSON。覆盖 NoSession/CDPError/DaemonUnavailable/PageLoadFailed/AuthWall 等高频站点 |
 | A4 | `browserwright doctor`:`{status,message,fix}` 检查表,含 relay/extension/daemon PID/helper 解析 | L2 | ✅ | S5:`doctor_checks()` 回 `{name,status,message,fix}`,**每个 fail 必带 fix**(`add()` 强制);`--json` + 人读;有 fail 则 exit≠0。gate `test_doctor_and_errors.py` 10。**注**:未做 live-launch 探针(doctor 不开 Chrome) |
 
 ## B. 感知(降低"理解页面"成本)

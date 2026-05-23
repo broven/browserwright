@@ -200,7 +200,7 @@ class RelayServer:
         return out
 
     async def query_active_tab(self, *, timeout: float = 5.0) -> dict | None:
-        """Spec §8.4: `BrowserDaemon.getActiveTab` accuracy=`exact` path.
+        """Spec §8.4: `BrowserwrightDaemon.getActiveTab` accuracy=`exact` path.
 
         Asks the first ready extension `chrome.tabs.query({active:true})`. If
         no extension is connected, returns None — caller falls back to the

@@ -16,5 +16,5 @@ def test_push_parses_and_sends_install(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_userscript_call_ws", fake_call, raising=False)
     rc = cli._cmd_userscript(["push", str(path)])
     assert rc == 0
-    assert captured["method"] == "BrowserDaemon.userscript.install"
+    assert captured["method"] == "BrowserwrightDaemon.userscript.install"
     assert captured["params"]["script"]["name"] == "X"

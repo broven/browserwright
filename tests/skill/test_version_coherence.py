@@ -163,10 +163,10 @@ def test_installed_version_reads_version_subcommand(monkeypatch):
 
 def test_rewrite_unknown_method_mentions_method_and_restart():
     c = ModeBClient(name="default")
-    err = {"code": -32601, "message": "unknown BrowserDaemon method: BrowserDaemon.fooBar"}
-    msg = c.explain_rpc_error("BrowserDaemon.fooBar", err)
+    err = {"code": -32601, "message": "unknown BrowserwrightDaemon method: BrowserwrightDaemon.fooBar"}
+    msg = c.explain_rpc_error("BrowserwrightDaemon.fooBar", err)
     low = msg.lower()
-    assert "BrowserDaemon.fooBar" in msg          # names the offending method
+    assert "BrowserwrightDaemon.fooBar" in msg          # names the offending method
     assert "stale" in low                          # diagnoses staleness
     assert "browserwright-daemon stop" in low            # actionable restart hint
     assert "browserwright-daemon serve" in low
@@ -177,8 +177,8 @@ def test_rewrite_unknown_method_mentions_method_and_restart():
 def test_rewrite_is_generic_across_methods():
     """No hardcoded method name in the logic — works for any RPC."""
     c = ModeBClient(name="default")
-    for method in ("BrowserDaemon.userscript.install",
-                   "BrowserDaemon.totallyNewMethod",
+    for method in ("BrowserwrightDaemon.userscript.install",
+                   "BrowserwrightDaemon.totallyNewMethod",
                    "Page.navigate"):
         err = {"code": -32601, "message": f"unknown method: {method}"}
         msg = c.explain_rpc_error(method, err)
@@ -191,7 +191,7 @@ def test_non_32601_error_passed_through_untouched():
     rewrite them into a misleading 'restart the daemon' message."""
     c = ModeBClient(name="default")
     err = {"code": -32602, "message": "invalid params: missing url"}
-    msg = c.explain_rpc_error("BrowserDaemon.openBackgroundTab", err)
+    msg = c.explain_rpc_error("BrowserwrightDaemon.openBackgroundTab", err)
     assert "invalid params: missing url" in msg
     assert "stale" not in msg.lower()
 
@@ -210,7 +210,7 @@ def test_cdp_rpc_error_fix_rewrites_minus_32601():
     """cdp.py raises CDPError with a stale-daemon `fix` on a -32601 reply,
     naming the method; other RPC errors carry no stale-daemon fix."""
     from browserwright.cdp import _rpc_error_fix
-    method = "BrowserDaemon.userscript.install"
+    method = "BrowserwrightDaemon.userscript.install"
     fix = _rpc_error_fix(method, {"code": -32601, "message": "Method not found"})
     assert fix and method in fix
     assert "stale" in fix.lower()

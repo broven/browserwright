@@ -98,7 +98,7 @@ def test_recovery_fast_path_across_processes(ext_ready):
 def test_recovery_via_group_when_runtime_stale(ext_ready):
     """When the ledger.runtime fast path points at a dead target (simulating a
     browser restart that changed tab ids), process B must fall back to
-    BrowserDaemon.recoverSession, which finds the tab by the group whose title
+    BrowserwrightDaemon.recoverSession, which finds the tab by the group whose title
     == the session name. Transitively proves name->tab-group titling."""
     sid = "rec-group"
     ledger = _seed_session(sid, "cf-bots2")

@@ -4,7 +4,7 @@ Mode B is the v0.2 happy path:
 
   - Skill connects to a running ``browserwright-daemon serve`` instance via its
     unix-socket (POSIX) or TCP+token (Windows) endpoint.
-  - Standard CDP commands are tunnelled through. ``BrowserDaemon.*`` RPCs
+  - Standard CDP commands are tunnelled through. ``BrowserwrightDaemon.*`` RPCs
     (``getActiveTab``, ``disconnect``, ``subscribeFocus``, ``uiState``) are
     answered by the daemon itself, not forwarded upstream.
   - Events fan out to the client: ``upstreamClosed``, ``activeTabChanged``,
@@ -212,7 +212,7 @@ class ModeBClient:
 
     def get_backend_info(self) -> Optional[dict]:
         """Return the running daemon's reported backend, or ``None`` if
-        the daemon doesn't support the ``BrowserDaemon.getBackendInfo``
+        the daemon doesn't support the ``BrowserwrightDaemon.getBackendInfo``
         RPC. Used by ``assert_backend_matches()`` to refuse silently
         reusing a daemon configured for a different backend.
 
@@ -265,13 +265,13 @@ class ModeBClient:
 
     # ---- minimal one-shot RPC (subprocess CLI fallback) ----------------
     # These exist so callers that already have a CDPSession via Mode A can
-    # still ask the *same* daemon for BrowserDaemon.* answers via its CLI
+    # still ask the *same* daemon for BrowserwrightDaemon.* answers via its CLI
     # subcommands. The interesting ones (subscribeFocus, uiState) require a
     # live ws and are handled inside CDPSession instead.
 
     def active_tab(self) -> Optional[dict]:
         """Same shape as ``ModeAClient.active_tab`` — Mode B uses the same CLI
-        subcommand here for now; the ws-based ``BrowserDaemon.getActiveTab``
+        subcommand here for now; the ws-based ``BrowserwrightDaemon.getActiveTab``
         RPC is wired into ``Session`` when a Mode B CDP connection is up."""
         try:
             proc = subprocess.run(

@@ -44,7 +44,7 @@ async def test_picks_most_recent_eligible_page(monkeypatch):
 @pytest.mark.asyncio
 async def test_extension_routes_through_relay_not_resolve(monkeypatch):
     """4b: under the extension backend, active-tab must route through the relay
-    (BrowserDaemon.getActiveTab), never resolve() — which always raises
+    (BrowserwrightDaemon.getActiveTab), never resolve() — which always raises
     Unavailable for a LOCAL_RELAY backend."""
     calls = {"resolve": 0, "relay": 0}
 

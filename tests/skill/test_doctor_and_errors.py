@@ -19,7 +19,7 @@ import pytest
 from browserwright import cli
 from browserwright.daemon_client import DaemonClient
 from browserwright.errors import (
-    BrowserSkillError,
+    BrowserwrightError,
     CDPError,
     DaemonUnavailable,
     NeedsUserConfirm,
@@ -32,8 +32,8 @@ from browserwright.errors import (
 
 
 def test_base_error_accepts_fix():
-    """The convention is generic: ANY BrowserSkillError can carry a fix."""
-    e = BrowserSkillError("something broke", fix="run `browserwright doctor`")
+    """The convention is generic: ANY BrowserwrightError can carry a fix."""
+    e = BrowserwrightError("something broke", fix="run `browserwright doctor`")
     assert e.fix
     assert e.fix in str(e)  # surfaced in __str__
 

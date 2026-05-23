@@ -17,7 +17,7 @@ from .api import EXPORTS  # noqa: F401
 from .api import *  # noqa: F401,F403
 from .errors import (  # noqa: F401
     AuthWall,
-    BrowserSkillError,
+    BrowserwrightError,
     Captcha,
     CDPError,
     DaemonUnavailable,

@@ -34,7 +34,7 @@ from __future__ import annotations
 import concurrent.futures
 from typing import Any, Callable, Iterable, Optional
 
-from .errors import BrowserSkillError
+from .errors import BrowserwrightError
 from .session import Session, with_session
 from .task_runner import run_task
 
@@ -68,7 +68,7 @@ def _run_one(spec: TaskSpec) -> TaskResult:
     try:
         with with_session(sess):
             value = run_task(site, name, **kwargs)
-    except BrowserSkillError as e:
+    except BrowserwrightError as e:
         return TaskResult(
             site=site, name=name, ok=False,
             error_type=type(e).__name__, error_msg=str(e),

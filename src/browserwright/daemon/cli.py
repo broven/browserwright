@@ -464,7 +464,7 @@ def _cmd_stop(args, cfg: Config) -> int:
 
 def _cmd_backend_info(args, cfg: Config) -> int:
     """Probe the running daemon for its backend identity. Same shape as
-    `BrowserDaemon.getBackendInfo`'s ws response so the mode_b_client
+    `BrowserwrightDaemon.getBackendInfo`'s ws response so the mode_b_client
     subprocess shim can parse it directly."""
     import asyncio
     _validate_daemon_name(cfg.name)
@@ -483,7 +483,7 @@ async def _run_backend_info(args, cfg: Config) -> int:
         return 2
     try:
         info = await _rpc_via_ws(
-            cfg, "BrowserDaemon.getBackendInfo", {},
+            cfg, "BrowserwrightDaemon.getBackendInfo", {},
             client_label="cli-backend-info", timeout=5.0,
         )
     except (Unavailable, DaemonError) as e:
@@ -504,7 +504,7 @@ async def _run_backend_info(args, cfg: Config) -> int:
 
 def _cmd_stats(args, cfg: Config) -> int:
     """v0.5: query the running daemon's in-process metrics via the
-    `BrowserDaemon.stats` CDP-namespace method, print to stdout.
+    `BrowserwrightDaemon.stats` CDP-namespace method, print to stdout.
 
     Connects to the daemon's unix socket as a normal client. Exits with
     code 2 if the daemon isn't running (matching `status`).
@@ -537,7 +537,7 @@ async def _run_stats(args, cfg: Config) -> int:
             compression=None,
         )
     try:
-        await conn.send(json.dumps({"id": 1, "method": "BrowserDaemon.stats"}))
+        await conn.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.stats"}))
         # Drain until we see id=1.
         for _ in range(20):
             raw = await asyncio.wait_for(conn.recv(), timeout=3.0)
@@ -551,7 +551,7 @@ async def _run_stats(args, cfg: Config) -> int:
                     for k in sorted(snap.keys()):
                         print(f"{k}\t{snap[k]}")
                 return 0
-        print("daemon did not respond to BrowserDaemon.stats", file=sys.stderr)
+        print("daemon did not respond to BrowserwrightDaemon.stats", file=sys.stderr)
         return 3
     finally:
         try:
@@ -588,7 +588,7 @@ def _cmd_status(args, cfg: Config) -> int:
 
 
 def _cmd_disconnect(args, cfg: Config) -> int:
-    """Open a transient ws to the daemon, fire BrowserDaemon.disconnect, exit.
+    """Open a transient ws to the daemon, fire BrowserwrightDaemon.disconnect, exit.
 
     Equivalent to the RPC over an established connection — Skill can use either.
     """
@@ -597,7 +597,7 @@ def _cmd_disconnect(args, cfg: Config) -> int:
 
 
 async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
-    """Lightweight ws client that says BrowserDaemon.disconnect and reads the
+    """Lightweight ws client that says BrowserwrightDaemon.disconnect and reads the
     ack. We bypass cdp-use intentionally — we don't need framing, just one
     request + one response."""
     import websockets
@@ -612,7 +612,7 @@ async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
         try:
             async with websockets.connect(url, compression=None) as ws:
                 await ws.send(json.dumps({
-                    "id": 1, "method": "BrowserDaemon.disconnect",
+                    "id": 1, "method": "BrowserwrightDaemon.disconnect",
                     "params": {"reason": reason},
                 }))
                 await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -629,7 +629,7 @@ async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
             async with websockets.unix_connect(str(path), uri="ws://localhost/?client=cli-disconnect",
                                                compression=None) as ws:
                 await ws.send(json.dumps({
-                    "id": 1, "method": "BrowserDaemon.disconnect",
+                    "id": 1, "method": "BrowserwrightDaemon.disconnect",
                     "params": {"reason": reason},
                 }))
                 await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -679,7 +679,7 @@ async def _attach_active_via_ws(cfg: Config, args) -> int:
 
 async def _attach_active_roundtrip(ws, args) -> int:
     await ws.send(json.dumps({
-        "id": 1, "method": "BrowserDaemon.attachActiveTab",
+        "id": 1, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
     # Drain until we see id=1 — lifecycle events (upstreamConnecting,
     # upstreamReady) can arrive ahead of the response.
@@ -700,7 +700,7 @@ async def _attach_active_roundtrip(ws, args) -> int:
             print(f"{result.get('targetId')}\t{result.get('url', '')}\t"
                   f"{result.get('title', '')}")
         return 0
-    print("daemon did not respond to BrowserDaemon.attachActiveTab",
+    print("daemon did not respond to BrowserwrightDaemon.attachActiveTab",
           file=sys.stderr)
     return 1
 
@@ -796,7 +796,7 @@ def _cmd_version(args, cfg: Config) -> int:
 
 async def _rpc_via_ws(cfg: Config, method: str, params: dict,
                       *, client_label: str, timeout: float = 10.0) -> dict:
-    """Open a transient ws to the running daemon, send one BrowserDaemon.*
+    """Open a transient ws to the running daemon, send one BrowserwrightDaemon.*
     RPC, read the response, close. Mirrors `_disconnect_via_ws` but returns
     the parsed result (or raises with the daemon's error message).
 
@@ -880,7 +880,7 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
                     text = f.read()
             us = parse_userscript(text)
             result = _run(_userscript_call_ws(
-                cfg, "BrowserDaemon.userscript.install", {"script": us.to_payload()}))
+                cfg, "BrowserwrightDaemon.userscript.install", {"script": us.to_payload()}))
             sync = result.get("sync", {}) or {}
             print(json.dumps({
                 "id": result.get("id", us.id),
@@ -910,14 +910,14 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
         if action == "list":
             params = {"site": ns.site} if ns.site else {}
             result = _run(_userscript_call_ws(
-                cfg, "BrowserDaemon.userscript.list", params))
+                cfg, "BrowserwrightDaemon.userscript.list", params))
         elif action == "remove":
             result = _run(_userscript_call_ws(
-                cfg, "BrowserDaemon.userscript.remove", {"key": ns.key}))
+                cfg, "BrowserwrightDaemon.userscript.remove", {"key": ns.key}))
         elif action == "toggle":
             enabled = str(ns.enabled).lower() in {"1", "true", "yes", "on"}
             result = _run(_userscript_call_ws(
-                cfg, "BrowserDaemon.userscript.toggle",
+                cfg, "BrowserwrightDaemon.userscript.toggle",
                 {"key": ns.key, "enabled": enabled}))
         elif action == "logs":
             # NB: the relay envelope reserves the "id" key for the RPC
@@ -927,7 +927,7 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
             if ns.id:
                 params["scriptId"] = ns.id
             result = _run(_userscript_call_ws(
-                cfg, "BrowserDaemon.userscript.logs", params))
+                cfg, "BrowserwrightDaemon.userscript.logs", params))
         else:
             print(f"unknown userscript action: {action}", file=sys.stderr)
             return 1
@@ -949,7 +949,7 @@ def _cmd_open_background(args, cfg: Config) -> int:
     try:
         result = _run(_rpc_via_ws(
             cfg,
-            "BrowserDaemon.openBackgroundTab",
+            "BrowserwrightDaemon.openBackgroundTab",
             {"url": args.url, "groupName": args.group},
             client_label="cli-open-background",
             timeout=15.0,
@@ -978,7 +978,7 @@ def _cmd_close_tab(args, cfg: Config) -> int:
     try:
         result = _run(_rpc_via_ws(
             cfg,
-            "BrowserDaemon.closeTab",
+            "BrowserwrightDaemon.closeTab",
             params,
             client_label="cli-close-tab",
             timeout=10.0,
@@ -1002,7 +1002,7 @@ def _cmd_end_session(args, cfg: Config) -> int:
     try:
         result = _run(_rpc_via_ws(
             cfg,
-            "BrowserDaemon.endSession",
+            "BrowserwrightDaemon.endSession",
             es_params,
             client_label="cli-end-session",
             timeout=10.0,

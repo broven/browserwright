@@ -108,10 +108,10 @@ def test_new_tab_raises_on_extension_backend(tmp_bs_home, monkeypatch):
     issue — fail fast with the real verb (open_background) instead of letting
     it blow up deep in the daemon. Regression from evals/feedback (~18 sessions
     hit this; the daemon error even suggested a non-existent new_page())."""
-    from browserwright.errors import BrowserSkillError
+    from browserwright.errors import BrowserwrightError
     from browserwright.primitives import new_tab
     _stub_session(monkeypatch, backend="extension", targets=[])
-    with pytest.raises(BrowserSkillError) as exc_info:
+    with pytest.raises(BrowserwrightError) as exc_info:
         new_tab("https://example.com")
     msg = str(exc_info.value)
     assert "open_background" in msg
@@ -121,14 +121,14 @@ def test_new_tab_raises_on_extension_backend(tmp_bs_home, monkeypatch):
 def test_new_tab_guard_does_not_fire_on_rdp_backend(tmp_bs_home, monkeypatch):
     """The guard is extension-only: on rdp/env new_tab must get PAST the
     backend check (it then fails later in the stub CDP, not with our
-    BrowserSkillError guard)."""
-    from browserwright.errors import BrowserSkillError
+    BrowserwrightError guard)."""
+    from browserwright.errors import BrowserwrightError
     from browserwright.primitives import new_tab
     _stub_session(monkeypatch, backend="rdp", targets=[])
     with pytest.raises(Exception) as exc_info:
         new_tab("https://example.com")
-    # Past the guard → not our extension BrowserSkillError about open_background.
-    assert not (isinstance(exc_info.value, BrowserSkillError)
+    # Past the guard → not our extension BrowserwrightError about open_background.
+    assert not (isinstance(exc_info.value, BrowserwrightError)
                 and "open_background" in str(exc_info.value))
 
 
