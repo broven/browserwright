@@ -121,6 +121,16 @@ class Router:
             Callable[[str | None, str], Awaitable[dict]] | None) = None
         self._userscript_request: (
             Callable[[str, dict], Awaitable[dict | None]] | None) = None
+        # Phase 3 (docs/refactor-single-daemon.md): rdp raw-CDP command channel.
+        # Set by listener._open_chrome_upstream to the UpstreamConnection's
+        # daemon-internal `send_command` when this is an rdp (or env/cloud)
+        # context. The unified session verbs (openBackgroundTab / closeTab /
+        # userscript) dispatch to a CDP implementation through this when the
+        # context's backend is rdp, instead of the extension callbacks (which
+        # stay None on an rdp context). Signature mirrors
+        # UpstreamConnection.send_command: (method, params?, session_id?) -> result.
+        self._upstream_command: (
+            Callable[..., Awaitable[dict]] | None) = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -684,6 +694,13 @@ class Router:
             if False and method == "BrowserwrightDaemon.userscript.install":
                 pass
             verb = method.split(".", 2)[2]
+            # rdp dispatch: the extension's userScripts API doesn't exist on a
+            # daemon-owned Chrome. Provide an honest shim via
+            # Page.addScriptToEvaluateOnNewDocument (see _rdp_userscript). Never
+            # -32601 on rdp.
+            if self.state.backend_name == "rdp":
+                await self._rdp_userscript(client, req_id, verb, params)
+                return
             if self._userscript_request is None:
                 if (self._ensure_upstream is not None
                         and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
@@ -895,6 +912,13 @@ class Router:
                 req_id, -32602,
                 "BrowserwrightDaemon.openBackgroundTab params.groupName must be a string"))
             return
+        # rdp dispatch: on an rdp context there is no extension callback —
+        # implement the verb with raw CDP (Target.createTarget + attach). Every
+        # rdp tab is "background" (no human focus to protect), so `background`
+        # is a no-op and `groupId` is -1 (tab groups are an extension concept).
+        if self.state.backend_name == "rdp":
+            await self._rdp_open_tab(client, req_id, url)
+            return
         if self._open_background_tab is None:
             # Lazy-open: a cold daemon + already-connected extension becomes
             # ready after ensure_upstream runs (listener wires the callbacks
@@ -1081,10 +1105,9 @@ class Router:
         extension: close the session's extension workspace (owned tabs closed,
         borrowed kept) via the wired `_end_session` callback.
 
-        rdp: the per-session context owns a dedicated Chrome. Phase 3 will close
-        that Chrome + drop the context here; for now we return a uniform,
-        non-`-32601` success after dropping the context registration so the
-        wire contract holds (docs §RPCs: same-shape, never -32601)."""
+        rdp: the per-session context owns a dedicated Chrome. Close that Chrome
+        (SIGTERM the launched pid), close the upstream, and drop the context —
+        the uniform, non-`-32601` success shape (docs §RPCs)."""
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = params.get("session")
         if not isinstance(session, str) or not session:
@@ -1093,19 +1116,21 @@ class Router:
                 "BrowserwrightDaemon.endSession requires params.session"))
             return
 
-        # rdp branch: if this Router is an rdp per-session context (or the
-        # session resolves to one), drop the context. Phase-3 TODO: also kill
-        # the owned Chrome process + remove the bs-s{id} profile dir.
+        # rdp branch: if this session has a live per-session context, tear it
+        # down — close the upstream + SIGTERM the daemon-owned Chrome + drop the
+        # context. A later ensureSession recreates a fresh context + relaunches.
         daemon = self.daemon
-        if daemon is not None and getattr(daemon, "contexts", None):
+        if daemon is not None and getattr(daemon, "contexts", None) is not None:
             if session in daemon.contexts:  # type: ignore[attr-defined]
-                # TODO(Phase 3): close the per-session Chrome + upstream before
-                # dropping. For now drop the registration so a later
-                # ensureSession recreates a fresh context.
-                daemon.drop_rdp_context(session)  # type: ignore[attr-defined]
+                try:
+                    await daemon.teardown_rdp_context(session)  # type: ignore[attr-defined]
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603, f"endSession failed (rdp teardown): {e!r}"))
+                    return
                 await self._send_to_client(client.client_id, _result_response(
                     req_id, {"ok": True, "closed": [], "kept": [],
-                             "backend": "rdp", "deferred": "phase3-chrome-teardown"}))
+                             "backend": "rdp"}))
                 return
         group_name = params.get("groupName")
         group_name = group_name if isinstance(group_name, str) and group_name else None
@@ -1161,6 +1186,14 @@ class Router:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
                 "BrowserwrightDaemon.closeTab requires params.sessionId or params.targetId"))
+            return
+        # rdp dispatch: close via Target.closeTarget. Resolve the targetId from
+        # the local sessionId binding when only a sessionId was given.
+        if self.state.backend_name == "rdp":
+            await self._rdp_close_tab(
+                client, req_id,
+                local_sid=local_sid if has_sid else None,
+                target_id_param=target_id_param if has_tid else None)
             return
         if self._close_tab is None:
             # Lazy-open mirror of openBackgroundTab + attachActiveTab.
@@ -1253,6 +1286,233 @@ class Router:
             "ok": True,
             "tabId": result.get("tabId"),
         }))
+
+    # ---- rdp unified-verb implementations -------------------------------
+    #
+    # On an rdp context (state.backend_name == "rdp") the extension callbacks
+    # (`_open_background_tab` etc.) are never wired — instead we drive the
+    # daemon-owned Chrome with raw CDP through `self._upstream_command`
+    # (UpstreamConnection.send_command, a distinct id space from client
+    # traffic). These keep the wire-facing method names + result shapes
+    # identical to the extension impls so the downstream never branches on
+    # backend (docs §"Unified downstream interface"); divergences are honest,
+    # not -32601.
+
+    async def _rdp_open_tab(
+        self, client: ClientState, req_id: int | None, url: str,
+    ) -> None:
+        """rdp `openBackgroundTab`: Target.createTarget(url) then attach, and
+        register the same client-side binding openBackgroundTab's extension
+        path produces so subsequent CDP commands route through sessionId
+        translation. `groupId` is -1 (tab groups are extension-only); `tabId`
+        is null (Chrome tab ids are an extension concept — the targetId is the
+        rdp-native handle)."""
+        if self._upstream_command is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "openBackgroundTab: rdp upstream not connected"))
+            return
+        try:
+            created = await self._upstream_command(
+                "Target.createTarget", {"url": url})
+            target_id = created.get("targetId") if isinstance(created, dict) else None
+            if not isinstance(target_id, str):
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"openBackgroundTab: Target.createTarget returned {created!r}"))
+                return
+            # Attach (flatten) so the daemon owns a session for this target.
+            attached = await self._upstream_command(
+                "Target.attachToTarget", {"targetId": target_id, "flatten": True})
+            upstream_sid = attached.get("sessionId") if isinstance(attached, dict) else None
+            if not isinstance(upstream_sid, str):
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"openBackgroundTab: attach returned {attached!r}"))
+                return
+        except Exception as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"openBackgroundTab failed: {e!r}"))
+            return
+        # Register the binding (mirror the extension path).
+        local_sid = _new_local_session_id(client.client_id)
+        self.state.bind_session(
+            client.client_id, local_sid, upstream_sid, target_id, readonly=False)
+        self.state.claim_attacher(
+            target_id, client.client_id, local_sid, upstream_sid)
+        meta = self.state.targets.get(target_id) or {}
+        self.state.note_target_info({
+            "targetId": target_id, "type": "page",
+            "url": meta.get("url", url), "title": meta.get("title", ""),
+        })
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "sessionId": local_sid,
+            "targetId": target_id,
+            "tabId": None,           # rdp has no Chrome tab id; targetId is native
+            "url": meta.get("url", url),
+            "title": meta.get("title", ""),
+            "groupId": -1,           # tab groups are extension-only
+        }))
+
+    async def _rdp_close_tab(
+        self, client: ClientState, req_id: int | None,
+        *, local_sid: str | None, target_id_param: str | None,
+    ) -> None:
+        """rdp `closeTab`: Target.closeTarget(targetId). Resolve the targetId
+        from the client's local sessionId binding when only a sessionId was
+        given (mirrors the extension path's sessionId→target resolution), then
+        tear down local bookkeeping whether or not the close succeeded — the
+        tab is gone either way."""
+        target_id: str | None = None
+        owner_client_id: int | None = None
+        owner_local_sid: str | None = None
+        if local_sid is not None:
+            binding = client.sessions.get(local_sid)
+            if binding is not None:
+                target_id = binding.target_id
+                owner_client_id = client.client_id
+                owner_local_sid = local_sid
+        if target_id is None and target_id_param is not None:
+            target_id = target_id_param
+            attacher = self.state.attachers.get(target_id)
+            if attacher is not None:
+                owner_client_id = attacher.primary_client_id
+                owner_local_sid = attacher.primary_local_session
+        if target_id is None:
+            ident = local_sid or target_id_param
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602, f"unknown sessionId/targetId {ident}"))
+            return
+        if self._upstream_command is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "closeTab: rdp upstream not connected"))
+            return
+        try:
+            await self._upstream_command(
+                "Target.closeTarget", {"targetId": target_id})
+        except Exception as e:
+            # Tear down bookkeeping even on error so the caller can't reuse a
+            # stale id.
+            if owner_client_id is not None and owner_local_sid is not None:
+                self.state.unbind_session_by_local(owner_client_id, owner_local_sid)
+            self.state.note_target_destroyed(target_id)
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"closeTab failed: {e!r}"))
+            return
+        if owner_client_id is not None and owner_local_sid is not None:
+            self.state.unbind_session_by_local(owner_client_id, owner_local_sid)
+        self.state.note_target_destroyed(target_id)
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "ok": True, "tabId": None,
+        }))
+
+    async def _rdp_userscript(
+        self, client: ClientState, req_id: int | None, verb: str, params: dict,
+    ) -> None:
+        """rdp `userscript.*` shim via Page.addScriptToEvaluateOnNewDocument.
+
+        Caveats (documented per docs §C3 — these are honest divergences from
+        the extension's userScripts API, NOT lies):
+          - The script runs in the page's MAIN world, not the extension's
+            ISOLATED world. There is no privileged `GM_*` API surface.
+          - There is NO match-pattern filtering: CDP injects the script into
+            EVERY new document on the attached target(s). The extension's
+            per-URL `@match` semantics are not reproduced — callers that need
+            URL scoping must guard inside the script body.
+          - `install` registers on the currently-attached rdp sessions; `list`
+            reports what we've registered this process; `remove`/`toggle` are
+            best-effort (CDP's removeScriptToEvaluateOnNewDocument by id).
+          - This persists only for the life of the (ephemeral, C2) Chrome.
+
+        We keep the result shape uniform with the extension impl and never
+        return -32601.
+        """
+        if self._upstream_command is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "userscript: rdp upstream not connected"))
+            return
+        # Registry of scripts we've installed this process, keyed by identity.
+        # Lives on the Router (per-context) so list/remove can see it.
+        registry: dict = getattr(self, "_rdp_userscripts", None)
+        if registry is None:
+            registry = {}
+            self._rdp_userscripts = registry  # type: ignore[attr-defined]
+
+        try:
+            if verb == "install":
+                script = params.get("script") if isinstance(params.get("script"), dict) else {}
+                source = script.get("source") or script.get("body") or ""
+                identity = script.get("identity") or script.get("id") or f"rdp-us-{len(registry) + 1}"
+                if not isinstance(source, str) or not source:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32602, "userscript install requires script.source"))
+                    return
+                # Register on every attached rdp session (each its own target).
+                ids: list[str] = []
+                seen: set[str] = set()
+                for binding in list(client.sessions.values()):
+                    usid = binding.upstream_session_id
+                    if usid in seen:
+                        continue
+                    seen.add(usid)
+                    res = await self._upstream_command(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": source}, usid)
+                    sid_id = res.get("identifier") if isinstance(res, dict) else None
+                    if isinstance(sid_id, str):
+                        ids.append(sid_id)
+                registry[identity] = {"identity": identity, "ids": ids,
+                                      "enabled": True}
+                await self._send_to_client(client.client_id, _result_response(req_id, {
+                    "id": identity, "identity": identity,
+                    "sync": {"ok": True, "backend": "rdp",
+                             "note": "MAIN-world, no @match filtering (rdp shim)"},
+                }))
+                return
+            if verb == "list":
+                await self._send_to_client(client.client_id, _result_response(req_id, {
+                    "scripts": [
+                        {"identity": k, "enabled": v.get("enabled", True),
+                         "backend": "rdp"}
+                        for k, v in registry.items()
+                    ],
+                }))
+                return
+            if verb in ("remove", "toggle"):
+                key = params.get("key")
+                entry = registry.get(key) if isinstance(key, str) else None
+                if entry is None:
+                    await self._send_to_client(client.client_id, _result_response(
+                        req_id, {"ok": False, "reason": f"no such userscript {key!r}"}))
+                    return
+                # CDP can only un-register future injections (removeScript...);
+                # already-injected MAIN-world code can't be retracted.
+                for binding in list(client.sessions.values()):
+                    for ident in entry.get("ids", []):
+                        try:
+                            await self._upstream_command(
+                                "Page.removeScriptToEvaluateOnNewDocument",
+                                {"identifier": ident},
+                                binding.upstream_session_id)
+                        except Exception:
+                            pass
+                if verb == "remove":
+                    registry.pop(key, None)
+                else:
+                    enabled = bool(params.get("enabled"))
+                    entry["enabled"] = enabled
+                await self._send_to_client(client.client_id, _result_response(
+                    req_id, {"ok": True, "backend": "rdp"}))
+                return
+            if verb == "logs":
+                # No injection-log facility on rdp; honest empty list.
+                await self._send_to_client(client.client_id, _result_response(
+                    req_id, {"logs": [], "backend": "rdp"}))
+                return
+            await self._send_to_client(client.client_id, _result_response(
+                req_id, {"ok": False, "reason": f"unsupported userscript verb {verb!r} on rdp"}))
+        except Exception as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32000, f"userscript {verb} failed (rdp): {e!r}"))
 
     # ---- focus push -----------------------------------------------------
 

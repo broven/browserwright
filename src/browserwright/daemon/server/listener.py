@@ -62,7 +62,7 @@ def make_context(*, backend: str, cfg: Config,
     """
     state = DaemonState(backend_name=backend)
     router = Router(state)
-    holder = _UpstreamHolder(state, router, cfg)
+    holder = _UpstreamHolder(state, router, cfg, session_id=session_id)
     return UpstreamContext(
         backend=backend, state=state, router=router, holder=holder,
         session_id=session_id,
@@ -90,6 +90,13 @@ async def run_serve(cfg: Config) -> int:
         )
         return 1
     _ipc.cleanup_endpoint()
+
+    # Phase 3 (C2 ephemeral): rdp Chrome processes are daemon children and die
+    # with us — but a hard crash / SIGKILL can leave orphan Chrome processes
+    # holding their `bs-s{id}` profile dirs. Sweep them before serving so
+    # ephemeral rdp sessions start clean (and so a relaunch on the same profile
+    # isn't blocked by a stale SingletonLock).
+    _cleanup_orphan_rdp_chrome()
 
     # Log file is best-effort — we route Python logging to it but never crash
     # the daemon over a write failure.
@@ -188,6 +195,60 @@ async def run_serve(cfg: Config) -> int:
             pass
         _ipc.cleanup_endpoint()
     return 0
+
+
+# ---- rdp orphan cleanup (Phase 3 / C2 ephemeral) ---------------------------
+
+
+def _cleanup_orphan_rdp_chrome() -> None:
+    """Best-effort: on daemon startup, kill stray Chrome processes + remove
+    leftover `bs-s{id}` profile dirs from a prior daemon crash (C2 ephemeral —
+    docs/refactor-single-daemon.md §Notes "rdp orphan cleanup").
+
+    Conservative by design:
+      - We ONLY touch profile dirs we own: `<cache>/profiles/bs-s*`. We never
+        scan the system process table for "chrome" (would catch the user's real
+        Chrome) — we only signal a pid we can prove belongs to one of our
+        profiles via that profile's own `SingletonLock`.
+      - Chrome writes `SingletonLock` as a symlink whose target is
+        `<hostname>-<pid>`. We parse the pid, SIGTERM it (if it still exists),
+        then remove the whole profile dir. A profile with no SingletonLock is
+        already-dead — we just remove the dir.
+      - Every step is wrapped so a permission error / race never crashes serve.
+    """
+    import os as _os
+    import shutil as _shutil
+    import signal as _signal
+    from ..platforms import cache_dir
+
+    profiles_root = cache_dir() / "profiles"
+    if not profiles_root.is_dir():
+        return
+    for entry in profiles_root.iterdir():
+        if not entry.name.startswith("bs-s") or not entry.is_dir():
+            continue
+        # Try to identify + kill the Chrome that owns this profile via its
+        # SingletonLock symlink (target == "<hostname>-<pid>").
+        lock = entry / "SingletonLock"
+        try:
+            target = _os.readlink(lock)
+            pid = int(target.rsplit("-", 1)[-1])
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None:
+            try:
+                _os.kill(pid, _signal.SIGTERM)
+                logger.info("orphan-cleanup: SIGTERM stray rdp Chrome pid %d "
+                            "(profile %s)", pid, entry.name)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        # Remove the leftover profile dir so the next launch of this session id
+        # starts from a clean, lock-free profile.
+        try:
+            _shutil.rmtree(entry, ignore_errors=True)
+            logger.info("orphan-cleanup: removed stale profile dir %s", entry.name)
+        except OSError as e:
+            logger.debug("orphan-cleanup: could not remove %s: %r", entry, e)
 
 
 # ---- log wiring ------------------------------------------------------------
@@ -391,7 +452,8 @@ class _UpstreamHolder:
     extension has connected.
     """
 
-    def __init__(self, state: DaemonState, router: Router, cfg: Config):
+    def __init__(self, state: DaemonState, router: Router, cfg: Config,
+                 *, session_id: str | None = None):
         self.state = state
         self.router = router
         self.upstream: UpstreamConnection | ExtensionUpstream | None = None
@@ -401,6 +463,16 @@ class _UpstreamHolder:
         # for the daemon's full lifetime; we don't tear down on idle-close
         # so the extension's persistent ws to us stays warm.
         self.relay: RelayServer | None = None
+        # Phase 3 (docs/refactor-single-daemon.md §P3 + C2): for an rdp context
+        # the daemon itself launches and owns a dedicated Chrome (own port +
+        # profile `bs-s{id}`). We record the launched process's pid + profile
+        # dir here so teardown can SIGTERM it and so orphan-cleanup can spot
+        # leftover `bs-s*` profiles after a crash. None on every other backend
+        # (the extension/env/cloud holders never own a Chrome process).
+        self.session_id: str | None = session_id
+        self.rdp_pid: int | None = None
+        self.rdp_profile_dir: str | None = None
+        self.rdp_port: int | None = None
 
     @property
     def is_open(self) -> bool:
@@ -468,6 +540,14 @@ class _UpstreamHolder:
                 if cfg.backend == "extension":
                     await self._open_extension_upstream(cfg)
                 else:
+                    # Phase 3: an rdp context owns its Chrome. Launch it (once)
+                    # BEFORE the resolve/connect path runs, so the cfg's pinned
+                    # rdp port is actually listening when `_open_chrome_upstream`
+                    # → resolve() probes it. Other rdp callers (env/cloud share
+                    # `_open_chrome_upstream` too) skip this — only a holder with
+                    # a session_id + rdp backend owns a Chrome.
+                    if cfg.backend == "rdp" and self.session_id is not None:
+                        await self._launch_rdp_chrome(cfg)
                     await self._open_chrome_upstream(cfg)
             except Exception:
                 metrics().upstream_open_failed_total += 1
@@ -535,6 +615,13 @@ class _UpstreamHolder:
             raise
         self.upstream = conn
         self.router.update_upstream_send(conn.send_text)
+        # Phase 3: expose the upstream's daemon-internal command channel to the
+        # Router so the unified session verbs (openBackgroundTab / closeTab /
+        # userscript) have an rdp implementation via raw CDP — Target.create/
+        # closeTarget, Page.addScriptToEvaluateOnNewDocument. Distinct id space
+        # from client traffic (UpstreamConnection.send_command). Cleared on
+        # close (symmetric with the extension callbacks).
+        self.router._upstream_command = conn.send_command
         # Tell Chrome to gossip about all targets so we can maintain the
         # last_activated table without needing the client to enable it.
         # `waitForDebuggerOnStart=False` keeps target creation immediate.
@@ -544,6 +631,79 @@ class _UpstreamHolder:
         except Exception as e:
             logger.warning("setDiscoverTargets failed: %r", e)
         await self.state.set_connected(rr.ws_url, was_popup=False)
+
+    async def _launch_rdp_chrome(self, cfg: Config) -> None:
+        """Phase 3 (C2 ephemeral): the daemon launches + owns this rdp session's
+        Chrome — a dedicated process on its own port with profile `bs-s{id}`.
+
+        Idempotent: if we already launched (rdp_pid set) we no-op so a
+        reconnect after idle-close doesn't spawn a second Chrome.
+
+        Port selection mirrors the old `session_create._launch_daemon`: reuse
+        `cfg.backends.rdp.port` when the ledger pinned one (Daemon._rdp_cfg_for
+        copies the session's `workspace["port"]` into the cfg), else allocate a
+        free port and pin it onto `self._cfg` so the subsequent resolve probes
+        the right port.
+
+        We call `launch_chrome.launch_chrome` in-process (NOT the CLI) so the
+        spawned Chrome's pid is visible to us for teardown. The function spawns
+        a detached Chrome and waits for `DevToolsActivePort`; on failure it
+        raises Unavailable, which propagates out of `ensure_open` and surfaces
+        to the client as a normal upstream-open failure.
+        """
+        if self.rdp_pid is not None:
+            return  # already launched (warm reconnect)
+        from ..launch_chrome import launch_chrome as _launch_chrome
+
+        port = cfg.backends.rdp.port
+        if not port:
+            # No port pinned by the ledger — pick a free one and pin it onto
+            # the holder's cfg so `_open_chrome_upstream`'s resolve hits it.
+            import socket as _socket
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            try:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            finally:
+                s.close()
+            import dataclasses as _dc
+            self._cfg = _dc.replace(
+                cfg,
+                backends=_dc.replace(
+                    cfg.backends,
+                    rdp=_dc.replace(cfg.backends.rdp, port=port),
+                ),
+            )
+            cfg = self._cfg
+
+        profile = f"bs-s{self.session_id}"
+        logger.info("launching rdp Chrome for session %s on port %d (profile %s)",
+                    self.session_id, port, profile)
+        out = await _launch_chrome(cfg, profile=profile, persistent=True,
+                                   port=port, timeout=max(cfg.timeout, 30.0))
+        extras = out.get("extras") or {}
+        self.rdp_pid = extras.get("pid")
+        self.rdp_profile_dir = extras.get("profile_path")
+        self.rdp_port = port
+
+    def _kill_rdp_chrome(self) -> None:
+        """Phase 3 teardown: SIGTERM the daemon-owned Chrome for this rdp
+        session (best-effort; the process may already be gone). Clears the pid
+        so a later relaunch starts fresh. Leaves the profile dir on disk — it's
+        a persistent `bs-s{id}` dir that orphan-cleanup sweeps on next startup;
+        removing it inline races Chrome's shutdown writeback."""
+        pid = self.rdp_pid
+        self.rdp_pid = None
+        if pid is None:
+            return
+        import os as _os
+        import signal as _signal
+        try:
+            _os.kill(pid, _signal.SIGTERM)
+            logger.info("killed rdp Chrome pid %d for session %s",
+                        pid, self.session_id)
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            logger.debug("rdp Chrome pid %s already gone: %r", pid, e)
 
     async def _build_cloud_auth(self, cfg: Config) -> tuple[dict[str, str], Any]:
         """Build (headers, ssl_context) for the cloud backend's upstream
@@ -689,11 +849,22 @@ class _UpstreamHolder:
         self.router._end_session = None
         self.router._recover_session = None
         self.router._userscript_request = None
+        # Phase 3: drop the rdp raw-CDP command channel (symmetric with the
+        # extension callbacks above) so a post-close verb returns a clean error
+        # instead of racing a torn-down upstream.
+        self.router._upstream_command = None
         if up is not None:
             try:
                 await up.close(code=1000, reason=reason)
             except Exception:
                 pass
+
+        # Phase 3 (C2 ephemeral): an rdp context's Chrome is a daemon child —
+        # it must die with the upstream. Kill it on every close path
+        # (endSession, idle_close, daemon_shutdown, chrome_exit). Harmless on
+        # non-rdp holders (rdp_pid is None there).
+        if self.rdp_pid is not None:
+            self._kill_rdp_chrome()
 
         # Spec §6.5 step 3: close client ws. The handler's `async for` will
         # exit naturally on the next read once we set state DISCONNECTED;
@@ -704,11 +875,24 @@ class _UpstreamHolder:
     async def _on_upstream_closed(self, reason: str) -> None:
         """Called by UpstreamConnection's reader when upstream drops on its
         own (Chrome exited, etc.). We translate to a CloseReason and run
-        the close-etiquette path."""
+        the close-etiquette path.
+
+        Phase 3 (docs/refactor-single-daemon.md §Notes): for an rdp context the
+        Chrome IS the upstream — once it's gone the context is dead, so we drop
+        it from the daemon's registry (not just mark disconnected). A later
+        ensureSession then recreates a fresh context + relaunches Chrome."""
         metrics().upstream_closed_total += 1
         if self.state.upstream_phase in (UpstreamPhase.DISCONNECTED, UpstreamPhase.CLOSING):
             return
         await self.trigger_close("chrome_exit")
+        if self.session_id is not None:
+            daemon = getattr(self.router, "daemon", None)
+            if daemon is not None:
+                try:
+                    daemon.drop_rdp_context(self.session_id)
+                except Exception as e:
+                    logger.warning("drop rdp context %s failed: %r",
+                                   self.session_id, e)
 
 
 # ---- graceful shutdown -----------------------------------------------------

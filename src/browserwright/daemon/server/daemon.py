@@ -174,6 +174,33 @@ class Daemon:
         return cfg
 
     def drop_rdp_context(self, session_id: str) -> UpstreamContext | None:
-        """Remove an rdp context from the registry (Phase 3 also tears down
-        its Chrome). Returns the dropped context, or None if absent."""
+        """Remove an rdp context from the registry. Returns the dropped
+        context, or None if absent.
+
+        This only de-registers the context (sync, callable from `_on_upstream_
+        closed` after teardown already ran). To also close the upstream + kill
+        the owned Chrome, use the async `teardown_rdp_context` instead — it runs
+        the holder's `trigger_close` (which SIGTERMs the Chrome) before
+        dropping."""
         return self.contexts.pop(session_id, None)
+
+    async def teardown_rdp_context(self, session_id: str) -> bool:
+        """Phase 3 endSession teardown: close the per-session upstream, kill the
+        daemon-owned Chrome (the holder's `trigger_close` SIGTERMs `rdp_pid`),
+        and drop the context. Returns True if a context was found + torn down.
+
+        Idempotent-ish: a missing context returns False so the caller can still
+        answer the wire RPC with a uniform success shape."""
+        ctx = self.contexts.get(session_id)
+        if ctx is None:
+            return False
+        try:
+            # "skill_disconnect" is the closest honest CloseReason — the client
+            # explicitly asked to end this session (vs chrome_exit / idle).
+            await ctx.holder.trigger_close("skill_disconnect")  # type: ignore[attr-defined]
+        except Exception as e:
+            logger.warning("teardown rdp context %s close failed: %r",
+                           session_id, e)
+        self.contexts.pop(session_id, None)
+        logger.info("tore down rdp context for session %s", session_id)
+        return True
