@@ -44,12 +44,14 @@ Full rules and more paired examples: [trust-boundaries.md](./trust-boundaries.md
 
 A **session** is the isolation key that lets multiple agents drive browsers without interfering. Creation is **explicit**, usage is **transparent**.
 
+**A session is a logical browser.** One global daemon serves every session. On `rdp` the session's browser is a dedicated, isolated Chrome the daemon launches and owns (its own profile — separate cookies/storage; it dies when the session ends). On `extension` the session's browser is a **Chrome tab group** (named after the session) inside the user's real Chrome — `session end` closes the whole group. **Isolation caveat (extension):** a tab group isolates only the *tab set*, NOT cookies/storage — every extension session shares the user's one profile, so two extension sessions on the same origin share that origin's cookies/login. (That sharing is the point of the extension backend: reuse the user's logged-in state.) rdp sessions do not share storage. The backend is fixed at `session new` and never changes.
+
 **Your FIRST command of any browser task is `session new` — never a bare heredoc.** A bare `browserwright <<'PY'` with no `BD_SESSION` exits 2 (no session). Create one session, reuse its id for every later call. Pick the backend from [memory.md](./memory.md) (`default_backend`); for "use my browser" / logged-in / personal work that's `extension`:
 
 ```bash
-sid=$(browserwright session new --backend=extension --name=<task-slug>)   # --name= needs the '='
+sid=$(browserwright session new --backend=extension)
 BD_SESSION=$sid browserwright <<'PY'
-open_background("https://example.com", group="Agent")
+open("https://example.com")
 print(page_info())
 PY
 ```
@@ -58,14 +60,15 @@ Full form below:
 
 ```bash
 # Create a session (pick the backend/mode — see the decision rule below). Prints a short id.
-# --name is required and must be globally unique; it becomes the Chrome tab group title and the reconnect-recovery anchor for the session.
-sid=$(browserwright session new --backend=extension --name=research)
-# OR: browserwright session new --backend=rdp --create --name=build      # owns a fresh isolated Chrome
-# OR: browserwright session new --backend=rdp --attach=9222 --name=cf-bots # attaches to a running browser
+# The backend is fixed at creation and immutable for the session's life. No --name:
+# one global daemon serves every session, and the session's id is its only handle.
+sid=$(browserwright session new --backend=extension)
+# OR: browserwright session new --backend=rdp --create      # daemon launches+owns a fresh isolated Chrome
+# OR: browserwright session new --backend=rdp --attach=9222  # attaches to a running browser
 
 # Then every call carries the id — via --session or BD_SESSION.
 BD_SESSION=$sid browserwright <<'PY'
-open_background("https://news.ycombinator.com", group="Agent")
+open("https://news.ycombinator.com")
 print(page_info())
 PY
 
@@ -83,13 +86,13 @@ browserwright session end --session=$sid   # who created, closes; attach only re
 
 ```bash
 BD_SESSION=$sid browserwright <<'PY'
-new_page("https://news.ycombinator.com")
+open("https://news.ycombinator.com")
 wait_for_load()
 print(page_info())
 PY
 ```
 
-All primitives are pre-imported. The endpoint comes from the session record — no import-time `BD_NAME` default.
+All primitives are pre-imported. The endpoint comes from the session record (its backend, fixed at creation) — the client connects to the one global daemon with `?session=<id>` and is unaware of which backend serves it.
 
 ### 2. Task — pre-solidified reusable flow
 
@@ -106,20 +109,20 @@ Tasks live as plain Python files under `~/.browserwright/site-skills/<host>/task
 | Goal | Use | Why |
 | --- | --- | --- |
 | Reuse a tab opened in an earlier heredoc | `switch_tab("<saved targetId>")` | Deterministic, no popups, no focus steal |
-| Spawn a new tab for automation **(default)** | `open_background(url, group="Agent")` | Does **not** steal user focus; isolated; safe for long flows |
-| Drive the user's currently-focused tab ("read my email", "what's on my screen now") | `attach_active()` | Extension backend only. **Steals focus** — only when the user literally said "use my current tab" |
-| Fresh isolated Chrome (rdp / env backend **only**) | `new_tab(url)` | Standard `Target.createTarget`. **Hard-errors on the extension backend** — use `open_background()` there |
+| Open a new working tab for automation **(default)** | `open(url)` | The unified tab-opener — works the same on **every** backend. `background=True` (default) does not steal user focus on extension; on rdp it's a no-op (no human to interrupt) |
+| Get the session's current tab, opening one if none | `current_page()` | Auto-opens a fresh working tab when the session has none |
+| Drive the user's currently-focused tab ("read my email", "what's on my screen now") | `attach_active()` | Extension: **adopts** the focused tab into this session's group (steals focus) — only when the user literally said "use my current tab". rdp: returns the daemon-owned Chrome's front tab |
 
-**Rule of thumb:** Unless the user said "use my current tab" or "what I'm looking at", default to `open_background()`. **`new_tab()` works only on the rdp/env backend** — on the extension backend (the default for "use my browser") it raises, because `Target.createTarget` can't run there; reach for `open_background(url, group="Agent")` instead. Multiple agents (or this agent + the user) can share one Chrome that way without colliding on a single focus.
+**Rule of thumb:** Unless the user said "use my current tab" or "what I'm looking at", default to `open(url)`. It is **backend-neutral** — there is no longer a backend on which a tab-opener "hard-errors"; the daemon dispatches `open` to the right implementation (extension tab group vs. rdp `Target.createTarget`). `new_tab` and `open_background` survive as deprecated aliases for one release; prefer `open`. Multiple agents (or this agent + the user) can share one Chrome that way without colliding on a single focus.
 
-⚠️ **Always read the return value of an attach call before chaining.** If `attach_active()` / `open_background()` failed (a hook blocked the command, daemon refused, etc.), the next `type_text` / `click_at_xy` will surface as "requires sessionId" or "unknown sessionId" — that's the symptom, not the cause. The cause is the silent failure two lines up.
+⚠️ **Always read the return value of an attach call before chaining.** If `attach_active()` / `open()` failed (a hook blocked the command, daemon refused, etc.), the next `type_text` / `click_at_xy` will surface as "requires sessionId" or "unknown sessionId" — that's the symptom, not the cause. The cause is the silent failure two lines up.
 
-⚠️ **`sessionId` is daemon-internal plumbing — agents don't pass it.** If you see "unknown sessionId" or "requires a sessionId", the prior attach failed. Don't try to "look up" the sessionId; re-call `attach_active()` / `open_background()` / `switch_tab()` and verify the return value before the next primitive.
+⚠️ **`sessionId` is daemon-internal plumbing — agents don't pass it.** If you see "unknown sessionId" or "requires a sessionId", the prior attach failed. Don't try to "look up" the sessionId; re-call `attach_active()` / `open()` / `switch_tab()` and verify the return value before the next primitive.
 
-⚠️ **Attach failed? Recover the tab — do NOT open a new session.** Failure mode: `attach_active()` bounces off the user's focused tab because it's an internal page (`chrome-extension://`, `chrome://`, `devtools://`, the New Tab Page) the debugger can't bind to — and the reflex is to "start clean" by creating a *new session* (or worse, a second isolated Chrome). That stacks orphan sessions and contradicts the one-Chrome model. The rule: **stay in the current session; get a drivable tab instead.** `attach_active()` already auto-falls back to `open_background()` for you on a non-attachable internal tab; if you need to recover by hand, reach for `open_background(url, group="Agent")` (fresh background tab) or `ensure_real_tab()` (switch to an existing non-internal tab).
+⚠️ **Attach failed? Recover the tab — do NOT open a new session.** Failure mode: `attach_active()` bounces off the user's focused tab because it's an internal page (`chrome-extension://`, `chrome://`, `devtools://`, the New Tab Page) the debugger can't bind to — and the reflex is to "start clean" by creating a *new session* (or worse, a second isolated Chrome). That stacks orphan sessions and contradicts the one-browser-per-session model. The rule: **stay in the current session; get a drivable tab instead.** `attach_active()` already auto-falls back to `open()` for you on a non-attachable internal tab; if you need to recover by hand, reach for `open(url)` (fresh working tab) or `ensure_real_tab()` (switch to an existing non-internal tab).
 
-- **WRONG** — `attach_active()` raised → `browserwright session new --name=retry-2` (now you have two sessions and still no working tab).
-- **CORRECT** — `attach_active()` raised on a `chrome-extension://` tab → `open_background("about:blank", group="Agent")` and keep working in the *same* session.
+- **WRONG** — `attach_active()` raised → `browserwright session new` again (now you have two sessions and still no working tab).
+- **CORRECT** — `attach_active()` raised on a `chrome-extension://` tab → `open("about:blank")` and keep working in the *same* session.
 
 ## Primitives surface (pre-imported in the heredoc namespace)
 
@@ -127,15 +130,15 @@ Tasks live as plain Python files under `~/.browserwright/site-skills/<host>/task
 
 | You reach for | Use instead |
 | --- | --- |
-| `navigate(url)`, `goto(url)` | `goto_url(url)` (or `open_background(url)` for a new tab) |
-| `open_background_tab(url)` | `open_background(url, group="Agent")` |
-| `new_page(url)` | `open_background(url)` (extension) / `new_tab(url)` (rdp) |
+| `navigate(url)`, `goto(url)` | `goto_url(url)` (or `open(url)` for a new tab) |
+| `open_background_tab(url)`, `new_tab(url)` | `open(url)` (unified; old names are deprecated aliases) |
+| `new_page(url)` | `open(url)` (same verb on every backend) |
 | `get_text()`, `page.content()` | `js("return document.body.innerText")` |
 | `page.locator(...).click()` | `snapshot()` to get coordinates, then `click_at_xy(x, y)` |
 
 **Don't trust `dir()` to discover the API** — the REPL is persistent, so `dir()` leaks variables from earlier `exec`s and you may call a leftover string as if it were a primitive. The lists below are authoritative.
 
-**Navigation:** `goto_url`, `new_tab`, `reload(hard=False)`, `switch_tab`, `list_tabs`, `current_tab`, `current_page`, `ensure_real_tab`, `iframe_target`
+**Navigation:** `goto_url`, `open(url, *, background=True)` (unified tab-opener; `new_tab`/`open_background` remain as deprecated aliases), `attach_active`, `reload(hard=False)`, `switch_tab`, `list_tabs`, `current_tab`, `current_page`, `ensure_real_tab`, `iframe_target`
 
 **Interaction:** `click_at_xy(x, y)`, `type_text`, `press_key`, `fill_input`, `scroll`, `dispatch_key`, `upload_file`
 
@@ -178,7 +181,7 @@ Next heredoc, `upload_via_hidden_input` is already in scope — no import:
 
 ```bash
 BD_SESSION=$sid browserwright <<'PY'
-open_background("https://example.com/upload")
+open("https://example.com/upload")
 upload_via_hidden_input("#file", "/tmp/x.png")
 PY
 ```
@@ -196,7 +199,7 @@ PY
 ```bash
 browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent &
 BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
-new_tab("https://example.com")
+open("https://example.com")
 wait_for_load()
 path = capture_screenshot()         # returns the absolute PNG path (str)
 print(f"screenshot saved: {path}")
@@ -209,7 +212,7 @@ PY
 
 ```bash
 BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
-new_tab("https://news.ycombinator.com")
+open("https://news.ycombinator.com")
 wait_for_load()
 capture_screenshot()             # look at pixel coords
 click_at_xy(450, 300)            # click target by xy
@@ -234,12 +237,12 @@ PY
 
 ### Persisting a tab handle across heredocs
 
-Every heredoc runs in a fresh Python process — `current_target_id` is lost when the heredoc exits. To stay on the same tab across multiple `browserwright <<'PY' ... PY` calls, capture the `targetId` from `attach_active()` / `new_tab()` / `open_background()` and pass it back via `switch_tab()`:
+Every heredoc runs in a fresh Python process — `current_target_id` is lost when the heredoc exits. To stay on the same tab across multiple `browserwright <<'PY' ... PY` calls, capture the `targetId` from `attach_active()` / `open()` and pass it back via `switch_tab()`:
 
 ```bash
 # Heredoc 1 — open the tab, print its handle so the agent captures it.
 browserwright <<'PY'
-r = new_tab("https://example.com")
+r = open("https://example.com")
 print("TAB:", r["targetId"])         # agent stores this string
 wait_for_load()
 PY
@@ -264,9 +267,9 @@ print(page_info())
 PY
 ```
 
-The `targetId` is stable for the life of the tab and the daemon — it's encoded from Chrome's `tabId`, not an opaque daemon-side token. If the tab is closed before heredoc N, `switch_tab` raises `CDPError` with a "call `attach_active()` / `new_tab()` to get a fresh handle" hint.
+The `targetId` is stable for the life of the tab and the daemon — it's encoded from Chrome's `tabId`, not an opaque daemon-side token. If the tab is closed before heredoc N, `switch_tab` raises `CDPError` with a "call `attach_active()` / `open()` to get a fresh handle" hint.
 
-`attach_active()` steals the user's focus — only use when the task is literally "drive my current tab". For everything else default to `open_background(url)` (new tab, no focus steal) or `switch_tab(<saved targetId>)` (heredoc continuity). See "First call: which attach should you reach for?" above.
+`attach_active()` steals the user's focus — only use when the task is literally "drive my current tab". For everything else default to `open(url)` (new tab, no focus steal) or `switch_tab(<saved targetId>)` (heredoc continuity). See "First call: which attach should you reach for?" above.
 
 ## Saving a flow as a reusable task
 
@@ -286,7 +289,7 @@ That directory **is** the database — there is no CLI to register it. To find a
 browserwright-daemon doctor               # which backends are live, why each is/isn't usable
 browserwright-daemon list-backends
 browserwright doctor                # skill-side health (venv, daemon reachability, memory dir)
-browserwright-daemon stats --name default # observability counters when serve is running
+browserwright-daemon stats          # observability counters when serve is running
 ```
 
 ## Memory files

@@ -136,7 +136,7 @@ through the extension's `chrome.debugger` permission. It bypasses both the
 "Allow remote debugging?" popup and the persistent CDP banner because the
 extension itself holds the debugger handle. The Skill side is wired through
 `browserwright install` option 3; the daemon side requires Mode B
-(`browserwright-daemon serve --backend extension`).
+(`browserwright-daemon serve` — one global daemon, no `--backend`/`--name`).
 
 End-to-end setup (run once, then forget it):
 
@@ -148,8 +148,8 @@ browserwright-daemon extension-path --json
 # Then in Chrome: chrome://extensions → Developer mode → Load unpacked
 # → pick that directory.
 
-# 2. Start the daemon as a Mode B relay.
-browserwright-daemon serve --backend extension --name default
+# 2. Start the daemon as a Mode B relay (one global daemon, fixed socket).
+browserwright-daemon serve
 
 # 3. Click the extension icon → "Attach this tab".
 
@@ -206,7 +206,7 @@ browserwright install
 #   wrote [backends.cloud] + [backends.cloud.auth.*] sections to ~/.config/browserwright-daemon/config.toml
 
 # 3. Start the daemon in cloud-relay mode.
-browserwright-daemon serve --backend cloud --provider browser-use --name default
+browserwright-daemon serve --provider browser-use
 
 # 4. Verify the connection.
 browserwright-daemon doctor --json
@@ -233,7 +233,7 @@ browserwright install   # → 5 → browser-use → bearer
 
 # Then export the token before serving:
 export BROWSER_USE_API_KEY=<your-token>
-browserwright-daemon serve --backend cloud --provider browser-use
+browserwright-daemon serve --provider browser-use
 ```
 
 #### Basic (Browserless, generic with HTTP basic auth)
@@ -250,7 +250,7 @@ browserwright install   # → 5 → browserless → basic
 # upstream — credentials never enter the URL or Skill memory.
 export BROWSERLESS_USER=<your-username>
 export BROWSERLESS_PASS=<your-password>
-browserwright-daemon serve --backend cloud --provider browserless
+browserwright-daemon serve --provider browserless
 ```
 
 > The wizard refuses `wss://user:pass@host/...` style URLs even though
@@ -268,7 +268,7 @@ browserwright install   # → 5 → generic → mtls
 #                 key  path → /opt/certs/client.key
 #                 endpoint  → wss://api.example/cdp   (optional)
 
-browserwright-daemon serve --backend cloud --provider generic
+browserwright-daemon serve --provider generic
 # daemon loads both PEMs at startup; secrets never enter Skill memory.
 ```
 

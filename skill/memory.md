@@ -10,8 +10,8 @@ The agent reads this file on every browserwright invocation. It carries two thin
 | Backend | Connects to | How to use |
 |---|---|---|
 | `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent` then prefix the call: `BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY' ... PY` |
-| `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve --backend extension` then load the bundled `chrome-extension/` directory |
-| `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --backend cloud --provider <name>` + provider auth env vars |
+| `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve` (one global daemon) then load the bundled `chrome-extension/` directory |
+| `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --provider <name>` + provider auth env vars |
 | `env` | An externally-supplied CDP URL | Set `BROWSER_DAEMON_CDP_URL=ws://...` before calling |
 
 ## User preference
@@ -25,7 +25,7 @@ scenarios:
   - name: personal
     when: 用户个人任务、需要已登录账号或 cookie ("我的 X" / 私信 / 消息 / 个人 dashboard / 已登录的网盘 / 邮件)
     backend: extension
-    launch_command: browserwright-daemon serve --backend extension
+    launch_command: browserwright-daemon serve
     env: {}
     notes: |
       User has the unpacked extension loaded into their daily Chrome

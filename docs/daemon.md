@@ -30,7 +30,9 @@ $ browserwright-daemon extension-path --json    # prints the absolute path
 # In Chrome: chrome://extensions → toggle Developer mode → Load unpacked → pick that path.
 
 # 2. Start the relay (typically as a LaunchAgent / systemd unit).
-$ browserwright-daemon serve --backend extension --name default
+#    One global daemon, fixed socket — `serve` needs no --backend (it serves
+#    the shared extension upstream plus per-session rdp) and no --name.
+$ browserwright-daemon serve
 ```
 
 Zero popups, zero banner. For scripted work without touching the user's browser, prefer an isolated Chrome instead:
@@ -111,11 +113,11 @@ ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
    写入 `~/Library/LaunchAgents/com.browserwright-daemon.default.plist` 并 `launchctl load`。daemon 会：
    - 每次登录自动启动（`RunAtLoad`）
    - 崩了 launchd 自动重启（`KeepAlive`，`Crashed=true`）
-   - 本地 unix socket 永远在 `/tmp/browserwright-daemon-default.sock`
+   - 本地 unix socket 永远在 `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`（全局唯一、无 name 后缀；第二个 daemon 起不来——stale-detect 拒绝）
    - relay ws server 永远在 `ws://127.0.0.1:19989`（扩展通过此连）
 
-   想换 name / 端口：`browserwright-daemon install --name X --extension-port N`。  
-   想卸：`browserwright-daemon uninstall --name X`。  
+   想换端口：`browserwright-daemon install --extension-port N`。  
+   想卸：`browserwright-daemon uninstall`。  
    想查：`browserwright-daemon list`。
 
 2. 把 `browserwright-daemon/chrome-extension/` 整个目录作为 **unpacked extension** 装到 Chrome：
@@ -131,11 +133,11 @@ ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 
 正确用法：**Agent / Skill 在需要操作 tab 时主动 attach**。三个入口：
 
-- `attach_active()` — 抓 Chrome focused window 的 active tab（黄条出现，因为这正是你想看到 Agent 操作的 tab）
-- `open_background(url, group="Agent")` — 后台开新 tab + 加进名为 "Agent" 的 tab group，`active:false` 不抢焦点。黄条出现在那个 tab 上但你看不见
+- `attach_active()` — 把 Chrome focused window 的 active tab **adopt 进本 session 的 tab group**（黄条出现，因为这正是你想看到 Agent 操作的 tab）；该 tab 已属于另一个 session 的 group 时拒绝、不抢
+- `open(url, background=True)` — 统一开页动词，开新 tab 进本 session 的 group（`background=True` 在 extension 下 `active:false` 不抢焦点，rdp 下无人争焦点故为 no-op）。黄条出现在那个 tab 上但你看不见。`open_background`/`new_tab` 仍作为 deprecated 别名保留
 - `close_tab(target_id=...)` — Agent 操作完后显式关闭
 
-对应 CLI：`browserwright-daemon attach-active` / `open-background --url X --group Agent` / `close-tab --target-id ext-tab-N`。
+对应 CLI：`browserwright-daemon attach-active` / `open --url X` / `close-tab --target-id ext-tab-N`。
 
 用户还可以走 popup 手动 attach（点扩展图标），跟 Agent 路径并存。
 
@@ -145,7 +147,7 @@ ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 
 | `available` | `detail` | 含义 |
 |---|---|---|
-| `false` | "no extension relay listening on 127.0.0.1:19989…" | daemon 没启动 — 跑 `browserwright-daemon install` 一次性注册成 LaunchAgent，或临时 `browserwright-daemon serve --backend extension` |
+| `false` | "no extension relay listening on 127.0.0.1:19989…" | daemon 没启动 — 跑 `browserwright-daemon install` 一次性注册成 LaunchAgent，或临时 `browserwright-daemon serve` |
 | `false` | "extension relay is running but no Chrome extension has connected yet" | daemon 起来了，但 Chrome 扩展还没装/还没启动 |
 | `true` | `"<N> extension(s) connected (install_ids=[…], attached tabs=N)"` | 健康 |
 
@@ -196,7 +198,7 @@ header_prefix = "Bearer "            # 可选，默认就是 "Bearer "
 
 ### Mode B vs Mode A 取舍
 
-- **Mode B（`browserwright-daemon serve --backend cloud`）**：daemon 自己连上游 ws，AuthProvider 在握手时注入 header / SSLContext。**Skill 端无需感知 auth**——只连 daemon socket，daemon 帮它完成认证。**Skill（Layer 2）一律走 Mode B**——通过 daemon socket 操作，永不自己开 upstream ws
+- **Mode B（`browserwright-daemon serve --provider <cloud>`）**：daemon 自己连上游 ws，AuthProvider 在握手时注入 header / SSLContext。**Skill 端无需感知 auth**——只连 daemon socket，daemon 帮它完成认证。**Skill（Layer 2）一律走 Mode B**——通过 daemon socket 操作，永不自己开 upstream ws
 - **Mode A（`browserwright-daemon url --backend cloud`）**：daemon 把 ws URL 透传给调用方，调用方自己开 ws。**仅供自带 ws 客户端的外部脚本使用，不是 Skill 的连接路径**；**只对 URL-embedded auth 形态有意义**（basic / URL-token）。header / mTLS 在 Mode A 下不能用——调用方没有 header 注入点
 
 ### `OAuth2Auth` 状态
@@ -217,7 +219,7 @@ header_prefix = "Bearer "            # 可选，默认就是 "Bearer "
 
 ```bash
 # 默认 tab-separated key\tvalue
-$ browserwright-daemon stats --name myrepl
+$ browserwright-daemon stats
 client_connected_total       3
 proxy_pre_open_buffered_total 0
 upstream_open_succeeded_total 1
@@ -226,7 +228,7 @@ uptime_seconds                127.451
 ...
 
 # JSON
-$ browserwright-daemon stats --name myrepl --json | jq '.proxy_pre_open_overflow_total'
+$ browserwright-daemon stats --json | jq '.proxy_pre_open_overflow_total'
 0
 ```
 
@@ -282,12 +284,11 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_BACKEND` | 等同于 `--backend`，命令行参数优先 |
 | `BD_RDP_PORT` | `rdp` backend 的端口（v0.4.1 起）。优先级：CLI `--port` > `BD_RDP_PORT` > toml > 9222 默认。**配合 `BD_BACKEND=rdp` 锁定到隔离 Chrome 时务必同时设这个**——否则 daemon 用 9222 默认值撞上用户日常 Chrome，Allow 弹窗连发 |
 | `BD_TIMEOUT` | 单 backend resolve 超时秒数 |
-| `BD_NAME` | daemon 实例名（多实例区分用），影响 socket / pid 文件路径 |
 | `BD_CHROME_BINARY` | 指定 Chrome 可执行文件路径（`launch-chrome` 用） |
 | `BD_IDLE_CLOSE_AFTER` | Mode B serve idle 关 upstream 的秒数；不设/≤0 = 永不 |
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
 | `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
-| `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988，但需要进一步避冲突（多 daemon 实例等）时用这个 |
+| `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988；e2e 测试用它隔离（29989）|
 | `BD_CLOUD_ENDPOINT` / `BD_CLOUD_AUTH_KIND` / `BD_CLOUD_PROVIDER_HINT` | cloud backend 配置 env shortcut（v0.5 起），等价 `[backends.cloud].*` toml key |
 | `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE` | EXPERT ESCAPE：绕过 launch-chrome 拒绝用户 default profile 的 guard。truthy 值 `1`/`true`/`yes`/`on`/`y`（case-insensitive）unlock。**仅当你完全理解会永久暴露日常 Chrome 给 CDP popup hazard 时** |
 | `BD_LOG_JSON` | `1` / `true` / `yes` → daemon log 输出 JSON 行（`{ts, level, logger, msg, extra?, exc_info?}`），方便日志聚合器消费。默认 plaintext |

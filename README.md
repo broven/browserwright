@@ -67,7 +67,7 @@ browserwright-daemon launch-chrome --port 9333 --profile bs-smoke --persistent -
 
 # Drive it
 BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
-new_tab("https://example.com")
+open("https://example.com")
 wait_for_load()
 info = page_info()
 print(f"URL:   {info.get('url')}")
@@ -87,9 +87,9 @@ Clean up: `kill <pid>` (the `launch-chrome --json` output includes the pid).
 A **session** is the isolation key that lets multiple agents drive browsers without colliding. Create one, then every later call carries its id (via `--session` or `BD_SESSION`):
 
 ```bash
-sid=$(browserwright session new --backend=extension --name=research)
+sid=$(browserwright session new --backend=extension)
 BD_SESSION=$sid browserwright <<'PY'
-open_background("https://news.ycombinator.com", group="Agent")
+open("https://news.ycombinator.com")
 print(page_info())
 PY
 browserwright whoami --session=$sid
@@ -97,6 +97,8 @@ browserwright session end --session=$sid
 ```
 
 A bare heredoc with no session/`BD_PORT` context exits 2 with guidance — the daemon is never silently shared.
+
+One global daemon serves every session (fixed socket `browserwright-daemon.sock`; no per-instance name). The session's backend is fixed at `session new` and never changes. On `extension` the session's "browser" is a Chrome **tab group** (named after the session) inside the user's real Chrome; `session end` closes the whole group. On `rdp` the daemon launches and owns a dedicated, isolated Chrome (profile `bs-s<id>`) that dies with the session. **Isolation caveat:** rdp sessions get isolated profiles (separate cookies/storage), but extension tab groups isolate only the *tab set* — all extension sessions share the user's one profile, so they share cookies/login/origin storage with each other and with the user.
 
 ### Two invocation forms
 
@@ -121,7 +123,7 @@ browserwright task wikipedia.org/lookup --title="Wikipedia"
 | Your daily Chrome (logged-in / personal) *(default for "use my browser")* | `extension` | `browserwright session new --backend=extension …` — load `chrome-extension/` once, connect via the daemon's relay; zero popups |
 | Scripts / iterative work in throwaway profiles | `rdp` + isolated Chrome | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=rdp` |
 | Fingerprint browser (AdsPower / MultiLogin / 比特浏览器) | `rdp` | point `BD_PORT` at the tool's exposed port |
-| Remote Chrome (Browser Use / Browserless / Hyperbrowser) | `cloud` | `browserwright-daemon serve --backend cloud --provider <name>` + auth env vars |
+| Remote Chrome (Browser Use / Browserless / Hyperbrowser) | `cloud` | `browserwright-daemon serve --provider <name>` + auth env vars |
 
 Interactive wizard: `browserwright install` — walks the decision tree and writes your pick.
 
@@ -139,7 +141,7 @@ browserwright userscript remove <id>
 
 ### Primitives (pre-imported in every heredoc)
 
-- **Navigation:** `goto_url`, `new_tab`, `open_background`, `switch_tab`, `list_tabs`, `current_tab`, `ensure_real_tab`
+- **Navigation:** `goto_url`, `open` (unified tab-opener; `new_tab`/`open_background` remain as deprecated aliases), `current_page`, `attach_active`, `switch_tab`, `list_tabs`, `current_tab`, `ensure_real_tab`
 - **Interaction:** `click_at_xy(x, y)`, `type_text`, `press_key`, `fill_input`, `scroll`, `upload_file`
 - **Inspection:** `js(code)`, `cdp(method, params)`, `page_info()`, `capture_screenshot()`, `snapshot()`, `describe_page()`, `diff_snapshot(before)`
 - **Waiting:** `wait`, `wait_for_load`, `wait_for_element`, `wait_for_network_idle`
@@ -154,7 +156,7 @@ Full catalogue and guidance in `skill/SKILL.md`.
 browserwright-daemon doctor                  # which backends are live, why each is/isn't usable
 browserwright-daemon list-backends
 browserwright doctor                         # skill-side health
-browserwright-daemon stats --name default    # observability counters when `serve` is running
+browserwright-daemon stats                   # observability counters when `serve` is running
 ```
 
 ## Claude Code integration

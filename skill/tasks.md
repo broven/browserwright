@@ -34,7 +34,7 @@ ESTIMATED_DURATION_SEC = 5
 LAST_VERIFIED = "2026-05-19"
 
 def run(args, ctx=None):
-    new_tab(f"https://example.com/search?q={args['query']}")
+    open(f"https://example.com/search?q={args['query']}")
     wait_for_load()
     return {"title": page_info()["title"], "url": current_tab()}
 ```

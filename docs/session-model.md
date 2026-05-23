@@ -1,6 +1,14 @@
 # Multi-Agent Session Model — 问题说明与目标设计
 
-> **状态**:设计已与 owner 对齐,待实现(由后续 Claude Code 会话执行)。
+> **状态**:本设计**已实现**,并被后续的 single-global-daemon 重构取代/超越。
+> 当前权威模型见 [`refactor-single-daemon.md`](./refactor-single-daemon.md)。本文 §1 仍是
+> 准确的动机记录(描述旧的 `BD_NAME`/per-session-daemon 问题),但 §2–§3 的若干决策已被
+> 那次重构改写——**关键差异**:`BD_NAME`/`--name`/`daemon_endpoint` **已彻底删除**(不再是
+> "物理选择",见下文 §2.3 更正);现在是**一个全局 daemon**(固定 socket
+> `browserwright-daemon.sock`,无 name),同时服务 extension(共享 relay 上游)与 rdp
+> (daemon 自己 launch+own 每会话的独立 Chrome,profile `bs-s{id}`,ephemeral);
+> session↔backend 在创建时定死、不可变;下游统一动词 `open(url, *, background=True)`
+> 取代 `new_tab`/`open_background`(后者降级为 deprecated 别名)。
 > **原则**:代码是唯一事实来源。本文所有引用均为 `path:line`。其余 `design*.md` 已删除(见 §4),不要再参考。
 
 ## 0. 范围与基线准则
@@ -64,16 +72,26 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 - **attach 模式(仅当 owner 明确要求"操作我当前页面")**:`attach_active()` 驱动 owner 当前聚焦标签,**并把该当前标签拉进本 session 的 group**。
   - **注意**:attach 拉进来的是 owner 的标签,`session end` 时应**移出 group(ungroup)而非关闭**,区别于 agent 自己开的页面(end 时关闭)。
 
-### 2.3 隔离主键 = `session_id`;`BD_NAME` 退为物理选择 〔决策 4〕
+### 2.3 隔离主键 = `session_id`(`BD_NAME` 已删除)〔决策 4,已被 single-daemon 重构更新〕
 
-- `session_id` 成为 **skill↔daemon 协议的隔离主键**。`open_background` 现有的 `group=` 参数(`mode_b_client.py:315`)绑定为 `session_id`,daemon 侧**按 session 跟踪标签归属**。
+> **更正(single-daemon 重构后)**:本节原写"`BD_NAME` 退为物理选择"。重构后 `BD_NAME` /
+> `--name` / `daemon_endpoint` **已彻底删除**——不再有"哪个物理浏览器/daemon"的选择维度,
+> 因为**全局只有一个 daemon**。物理浏览器由 session 的 backend(创建时定死)决定:extension =
+> 用户真实 Chrome 内的一个 tab group(以 session 名命名,绑 `groupId`),rdp = daemon 自己
+> launch+own 的独立 Chrome。下面两条仍准确,第三条按上文更正阅读。
+
+- `session_id` 成为 **skill↔daemon 协议的隔离主键**。客户端只带 `?session=<id>`,daemon 查 ledger 的 backend 路由到对应上游;daemon 侧**按 session 跟踪标签归属**。统一动词 `open(url, *, background=True)` 把页面开进本 session 的 group(`new_tab`/`open_background` 降级为别名)。
 - `ExtensionUpstream._sessions`(`extension_upstream.py:119`)改为**按 session_id 分桶**,跨 session 不可见/不可互相 detach。
-- `BD_NAME` 仅表示"哪个物理浏览器/daemon"。**extension 场景:单 daemon 多 session**——一个装了扩展的 Chrome、一个 daemon、N 个 group/session 复用之。
+- **extension 场景:一个 daemon、一个装了扩展的 Chrome、N 个 group/session 复用之**(不再有 `BD_NAME` 区分多 daemon)。**隔离边界仅限标签集合,不含 cookie/storage**:所有 extension session 共用用户的同一个 profile/登录态(C4);rdp session 才有独立 profile。
 
-### 2.4 backend 差异 〔决策 5〕
+### 2.4 backend 差异 〔决策 5,已被 single-daemon 重构更新〕
 
-- **extension**:单 daemon 多 session(如上)。
-- **rdp / env(含指纹浏览器)**:一个浏览器只服务一个 code agent → **session 与 daemon 1:1**。session 层仍存在(API 统一),但隔离退化为 daemon 本身;无需 tab group 多路复用。
+> **更正(single-daemon 重构后)**:rdp 不再各起一个 daemon。仍是**那一个全局 daemon**,但它
+> 为每个 rdp session 自己 launch 并 own 一个独立 Chrome(独立端口 + profile `bs-s{id}`),
+> session 结束时连同 Chrome 一起拆掉(rdp 为 ephemeral,随 daemon 消亡)。
+
+- **extension**:单 daemon、多 session、共享用户真实 Chrome 的 relay 上游(如上)。
+- **rdp / env(含指纹浏览器)**:同一个全局 daemon 为每个 rdp session 持有一个独立 Chrome(独立 profile)。隔离落在那个 per-session Chrome 上;无需 tab group 多路复用。
 
 ### 2.5 砍掉全局 REPL daemon
 
