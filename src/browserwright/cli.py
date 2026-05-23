@@ -1,4 +1,4 @@
-"""Top-level ``browser-skill`` CLI dispatch.
+"""Top-level ``browserwright`` CLI dispatch.
 
 Subcommands:
   session new | end | list | prune        (P2: explicit session creation)
@@ -24,63 +24,76 @@ from typing import Optional
 from . import __version__
 
 
-HELP = """browser-skill — Layer 2 of the browser stack.
+HELP = """browserwright — Layer 2 of the browser stack.
 
 Usage:
-  browser-skill <<'PY'
+  browserwright <<'PY'
   print(page_info())
   PY
 
-  browser-skill session new --backend=<extension|rdp> --name=NAME [--create | --attach=PORT]
-  browser-skill session end --session=ID
-  browser-skill session list [--json]
-  browser-skill session prune [--idle=SECONDS]
-  browser-skill whoami --session=ID
-  browser-skill userscript {push|list|remove|toggle|logs} ...
+  browserwright session new --backend=<extension|rdp> --name=NAME [--create | --attach=PORT]
+  browserwright session end --session=ID
+  browserwright session list [--json]
+  browserwright session prune [--idle=SECONDS]
+  browserwright whoami --session=ID
+  browserwright userscript {push|list|remove|toggle|logs} ...
 
-  browser-skill task <site>/<name> [--key=value ...] [--isolated]
-  browser-skill list-tasks [--site SITE] [--query Q] [--json]
-  browser-skill save <site>/<name> --json-spec='{...}'      (alias: solidify)
+  browserwright task <site>/<name> [--key=value ...] [--isolated]
+  browserwright list-tasks [--site SITE] [--query Q] [--json]
+  browserwright save <site>/<name> --json-spec='{...}'      (alias: solidify)
 
-  browser-skill selftest run [--site SITE] [--isolated] [--json]
+  browserwright selftest run [--site SITE] [--isolated] [--json]
 
-  browser-skill sub add <git-url> [--name NAME]
-  browser-skill sub list [--json]
-  browser-skill sub update [--name NAME]
-  browser-skill sub remove --name NAME
+  browserwright sub add <git-url> [--name NAME]
+  browserwright sub list [--json]
+  browserwright sub update [--name NAME]
+  browserwright sub remove --name NAME
 
-  browser-skill install
-  browser-skill doctor [--json]
-  browser-skill index rebuild
-  browser-skill memory show [--site SITE | --global]
-  browser-skill memory forget --pattern PAT (--site SITE | --global) [--yes]
-  browser-skill memory replace --pattern PAT --with 'TEXT' (--site SITE | --global) [--yes]
+  browserwright install
+  browserwright doctor [--json]
+  browserwright index rebuild
+  browserwright memory show [--site SITE | --global]
+  browserwright memory forget --pattern PAT (--site SITE | --global) [--yes]
+  browserwright memory replace --pattern PAT --with 'TEXT' (--site SITE | --global) [--yes]
 
-  browser-skill version
-  browser-skill --print-skill            (alias: print-skill)
+  browserwright version
+  browserwright --print-skill            (alias: print-skill)
 """
+
+
+def _coerce(value: str) -> object:
+    # try JSON first so callers can pass numbers/lists/etc.
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
 
 
 def _parse_kv_args(args: list[str]) -> dict:
     out: dict[str, object] = {}
-    for a in args:
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
         if not a.startswith("--"):
+            i += 1
             continue
-        key, _, value = a[2:].partition("=")
-        if not _:
-            out[key] = True
+        key, eq, value = a[2:].partition("=")
+        if eq:
+            out[key] = _coerce(value)
+        elif i + 1 < n and not args[i + 1].startswith("--"):
+            # space form: `--query "hacker news"` (the form --help advertises).
+            # Consume the next token as the value unless it's another flag.
+            out[key] = _coerce(args[i + 1])
+            i += 1
         else:
-            # try JSON first so callers can pass numbers/lists/etc.
-            try:
-                out[key] = json.loads(value)
-            except (TypeError, ValueError):
-                out[key] = value
+            out[key] = True
+        i += 1
     return out
 
 
 def _cmd_task(args: list[str]) -> int:
     if not args:
-        print("usage: browser-skill task <site>/<name> [--key=val ...]", file=sys.stderr)
+        print("usage: browserwright task <site>/<name> [--key=val ...]", file=sys.stderr)
         return 1
     spec = args[0]
     if "/" not in spec:
@@ -131,7 +144,7 @@ def _cmd_doctor(args: list[str]) -> int:
         sys.stdout.write(json.dumps(info, indent=2, default=str) + "\n")
         return 1 if any_fail else 0
 
-    print(f"browser-skill {__version__}")
+    print(f"browserwright {__version__}")
     print()
     glyph = {"pass": "✓", "warn": "!", "fail": "✗"}
     for c in checks:
@@ -174,7 +187,7 @@ def _cmd_list_tasks(args: list[str]) -> int:
 def _cmd_save(args: list[str]) -> int:
     """``save <site>/<name> --json-spec='{...}'``: persist a solidify spec."""
     if not args:
-        print("usage: browser-skill save <site>/<name> --json-spec='{...}'",
+        print("usage: browserwright save <site>/<name> --json-spec='{...}'",
               file=sys.stderr)
         return 1
     spec_arg = args[0]
@@ -209,14 +222,14 @@ def _cmd_index(args: list[str]) -> int:
         out = rebuild_index()
         sys.stdout.write(json.dumps({"sites": len(out.get("sites", []))}, default=str) + "\n")
         return 0
-    print("usage: browser-skill index rebuild", file=sys.stderr)
+    print("usage: browserwright index rebuild", file=sys.stderr)
     return 1
 
 
 def _cmd_sub(args: list[str]) -> int:
-    """``browser-skill sub {add|list|update|remove} ...``."""
+    """``browserwright sub {add|list|update|remove} ...``."""
     if not args:
-        print("usage: browser-skill sub {add|list|update|remove} ...", file=sys.stderr)
+        print("usage: browserwright sub {add|list|update|remove} ...", file=sys.stderr)
         return 1
     sub = args[0]
     rest = args[1:]
@@ -224,7 +237,7 @@ def _cmd_sub(args: list[str]) -> int:
 
     if sub == "add":
         if not rest or rest[0].startswith("--"):
-            print("usage: browser-skill sub add <git-url> [--name NAME]", file=sys.stderr)
+            print("usage: browserwright sub add <git-url> [--name NAME]", file=sys.stderr)
             return 1
         url = rest[0]
         kw = _parse_kv_args(rest[1:])
@@ -269,7 +282,7 @@ def _cmd_sub(args: list[str]) -> int:
         kw = _parse_kv_args(rest)
         name = kw.get("name")
         if not name:
-            print("usage: browser-skill sub remove --name NAME", file=sys.stderr)
+            print("usage: browserwright sub remove --name NAME", file=sys.stderr)
             return 1
         try:
             subscriptions.remove(name)
@@ -284,14 +297,14 @@ def _cmd_sub(args: list[str]) -> int:
 
 
 def _cmd_selftest(args: list[str]) -> int:
-    """``browser-skill selftest run [--site SITE] [--isolated] [--json]``.
+    """``browserwright selftest run [--site SITE] [--isolated] [--json]``.
 
     Refreshes ``$BS_HOME/selftest_cache.json`` for every (or filtered) task.
     Exit code is 0 if all tasks pass, 1 if any failure/error, 2 if no tasks
     were discovered.
     """
     if not args or args[0] != "run":
-        print("usage: browser-skill selftest run [--site SITE] [--isolated] [--json]",
+        print("usage: browserwright selftest run [--site SITE] [--isolated] [--json]",
               file=sys.stderr)
         return 1
     kwargs = _parse_kv_args(args[1:])
@@ -319,7 +332,7 @@ def _cmd_selftest(args: list[str]) -> int:
 
 def _cmd_memory(args: list[str]) -> int:
     if not args:
-        print("usage: browser-skill memory {show|forget|replace} ...", file=sys.stderr)
+        print("usage: browserwright memory {show|forget|replace} ...", file=sys.stderr)
         return 1
     sub = args[0]
     rest = args[1:]
@@ -398,12 +411,12 @@ def _cmd_memory(args: list[str]) -> int:
 
 
 def _cmd_session(args: list[str]) -> int:
-    """``browser-skill session {new|end|list|prune} ...`` (P2)."""
+    """``browserwright session {new|end|list|prune} ...`` (P2)."""
     from . import session_create
     from . import session_registry as reg
 
     if not args:
-        print("usage: browser-skill session {new|end|list|prune} ...", file=sys.stderr)
+        print("usage: browserwright session {new|end|list|prune} ...", file=sys.stderr)
         return 1
     sub = args[0]
     kw = _parse_kv_args(args[1:])
@@ -411,7 +424,7 @@ def _cmd_session(args: list[str]) -> int:
     if sub == "new":
         backend = kw.get("backend")
         if backend not in ("extension", "rdp"):
-            print("usage: browser-skill session new --backend=<extension|rdp> "
+            print("usage: browserwright session new --backend=<extension|rdp> "
                   "--name=NAME [--create | --attach=PORT]", file=sys.stderr)
             return 1
         try:
@@ -460,14 +473,14 @@ def _cmd_session(args: list[str]) -> int:
 
 
 def _cmd_userscript(args: list[str]) -> int:
-    # ``--verify`` is a browser-skill-level convenience on ``push``: after a
+    # ``--verify`` is a browserwright-level convenience on ``push``: after a
     # successful push, reload the live tab and screenshot it so the agent sees
     # the effect in one step instead of the manual push→reload→screenshot
     # ritual. It is NOT a daemon flag, so strip it before delegating.
     verify = "--verify" in args
     fwd = [a for a in args if a != "--verify"]
 
-    result = subprocess.run(["browser-daemon", "userscript", *fwd])
+    result = subprocess.run(["browserwright-daemon", "userscript", *fwd])
     if result.returncode != 0:
         # Push failed — don't reload/screenshot a stale state. Surface the
         # push failure so the agent fixes the script first.
@@ -492,7 +505,7 @@ def _cmd_userscript(args: list[str]) -> int:
 
 
 def _cmd_whoami(args: list[str]) -> int:
-    """``browser-skill whoami --session=ID`` — the ledger view of a session.
+    """``browserwright whoami --session=ID`` — the ledger view of a session.
 
     Live-browser fields (group/tab count/sample URL) are filled by a daemon
     round-trip in Phase 5/6; for now we print only ledger-known fields.
@@ -515,7 +528,7 @@ def _cmd_print_skill(_: list[str]) -> int:
     """D1: emit the agent-facing skill doc assembled from the running code.
 
     The version stamp and primitive surface are generated at runtime from
-    ``browser_skill.__version__`` and ``browser_skill.EXPORTS`` respectively,
+    ``browserwright.__version__`` and ``browserwright.EXPORTS`` respectively,
     so the printed instructions can never silently drift from the installed
     binary.
     """
@@ -528,7 +541,7 @@ def _cmd_print_skill(_: list[str]) -> int:
 def main(argv: Optional[list[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # `browser-skill` with stdin (heredoc) → inline.
+    # `browserwright` with stdin (heredoc) → inline.
     if not argv and not sys.stdin.isatty():
         from .repl import inline
         sys.exit(inline.run(sys.stdin))
@@ -578,7 +591,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if cmd == "userscript":
         sys.exit(_cmd_userscript(rest))
 
-    # Catch heredoc usage: `cat foo.py | browser-skill`.
+    # Catch heredoc usage: `cat foo.py | browserwright`.
     print(f"unknown command: {cmd!r}", file=sys.stderr)
     print(HELP, file=sys.stderr)
     sys.exit(1)

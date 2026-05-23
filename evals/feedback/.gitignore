@@ -1,0 +1,6 @@
+# Harvested real-world transcripts + state are private (contain arbitrary
+# project content from ~/.claude/projects). Never commit them.
+inbox/
+.state.json
+__pycache__/
+*.pyc

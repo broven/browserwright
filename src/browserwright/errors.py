@@ -80,8 +80,8 @@ class NetworkError(BrowserSkillError):
 class DaemonUnavailable(BrowserSkillError):
     exit_code = 2
     default_fix = (
-        "start the daemon: `browser-daemon serve --backend <extension|rdp>` "
-        "(or run `browser-skill doctor` to see what is missing)"
+        "start the daemon: `browserwright-daemon serve --backend <extension|rdp>` "
+        "(or run `browserwright doctor` to see what is missing)"
     )
 
     def __init__(self, detail: str = "", fix: str = ""):
@@ -94,15 +94,16 @@ class NoSession(BrowserSkillError):
 
     exit_code = 2
     default_fix = (
-        "run `browser-skill session new --backend <extension|rdp> --name NAME` "
-        "then pass --session <id> (or set BD_SESSION=<id>)"
+        "run `browserwright session new --backend=<extension|rdp> --name=NAME` "
+        "then pass --session=<id> (or set BD_SESSION=<id>)"
     )
 
     def __init__(self, detail: str = "", fix: str = ""):
         self.detail = detail
         super().__init__(
-            "no session: run `browser-skill session new --backend <extension|rdp> ...` "
-            "first, then pass --session <id> (or BD_SESSION=<id>) on every call. " + detail,
+            "no session: run `browserwright session new --backend=<extension|rdp> "
+            "--name=NAME` first (use the `=` form), then pass --session=<id> "
+            "(or BD_SESSION=<id>) on every call. " + detail,
             fix=fix,
         )
 
@@ -126,12 +127,12 @@ class DaemonBackendMismatch(BrowserSkillError):
         super().__init__(
             f"daemon backend mismatch: BD_NAME={name!r} is serving "
             f"backend={actual!r} but you requested {requested!r}. "
-            f"Either restart the daemon (`browser-daemon stop --name {name}` "
-            f"then `browser-daemon serve --backend {requested}`) or pick "
+            f"Either restart the daemon (`browserwright-daemon stop --name {name}` "
+            f"then `browserwright-daemon serve --backend {requested}`) or pick "
             f"a different BD_NAME.",
             fix=fix or (
-                f"`browser-daemon stop --name {name}` then "
-                f"`browser-daemon serve --backend {requested}` (or use a different BD_NAME)"
+                f"`browserwright-daemon stop --name {name}` then "
+                f"`browserwright-daemon serve --backend {requested}` (or use a different BD_NAME)"
             ),
         )
 
@@ -152,7 +153,7 @@ class CDPError(BrowserSkillError):
     exit_code = 3
     default_fix = (
         "if the message mentions an unknown method (-32601) the daemon is "
-        "likely stale — `browser-daemon stop` then re-run; otherwise check "
+        "likely stale — `browserwright-daemon stop` then re-run; otherwise check "
         "the method name and params"
     )
 

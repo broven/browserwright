@@ -5,7 +5,7 @@ def test_requires_sessionid_error_mentions_recovery_methods():
     """The 'requires a sessionId' error must name both
     BrowserDaemon.attachActiveTab AND BrowserDaemon.openBackgroundTab so
     the client knows what to call next, NOT just what is missing."""
-    from browser_daemon.server.extension_upstream import (
+    from browserwright.daemon.server.extension_upstream import (
         _build_requires_session_error,
     )
     msg = _build_requires_session_error("Input.insertText")
@@ -16,12 +16,14 @@ def test_requires_sessionid_error_mentions_recovery_methods():
 
 def test_create_target_error_names_real_verbs():
     """4c: Target.createTarget must fast-fail with a message naming the real
-    tab-opening verbs (new_page / openBackgroundTab), not the misleading
-    'requires a sessionId'."""
-    from browser_daemon.server.extension_upstream import _build_create_target_error
+    tab-opening verbs — the skill primitive open_background() and the daemon
+    verb openBackgroundTab — not the misleading 'requires a sessionId' and not
+    the non-existent new_page()."""
+    from browserwright.daemon.server.extension_upstream import _build_create_target_error
     msg = _build_create_target_error()
-    assert "new_page" in msg
+    assert "open_background" in msg
     assert "openBackgroundTab" in msg
+    assert "new_page" not in msg          # not a real browserwright primitive
     assert "sessionId" not in msg
 
 
@@ -29,7 +31,7 @@ def test_unknown_sessionid_error_mentions_subprocess_cause():
     """'unknown sessionId' must hint that the binding was likely released
     by a transient ws (CLI subprocess) so the client knows to re-attach
     from the same ws."""
-    from browser_daemon.server.extension_upstream import (
+    from browserwright.daemon.server.extension_upstream import (
         _build_unknown_session_error,
     )
     msg = _build_unknown_session_error("c110-DEADBEEF")

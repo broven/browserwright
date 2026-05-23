@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..errors import CDPError, NeedsUserConfirm, PageLoadFailed
+from ..errors import BrowserSkillError, CDPError, NeedsUserConfirm, PageLoadFailed
 from ..session import current_session
 
 
@@ -80,7 +80,7 @@ def attach_active() -> dict:
             params={},
             cdp_message=(e.cdp_message or
                          "attach_active() requires the extension backend; "
-                         "start the daemon with `browser-daemon serve "
+                         "start the daemon with `browserwright-daemon serve "
                          "--backend extension` and load the chrome-extension/."),
         ) from e
     if not result:
@@ -266,6 +266,18 @@ def new_tab(url: str = "about:blank") -> dict:
     "Persisting a tab handle across heredocs".
     """
     sess = current_session()
+    if sess.backend_name == "extension":
+        # Target.createTarget is a browser-level command the extension backend
+        # cannot issue — it would fail deep in the daemon with a confusing
+        # "requires a sessionId" / createTarget error. Fail fast here with the
+        # real verb so the agent (or a solidified task calling new_tab) recovers.
+        raise BrowserSkillError(
+            "new_tab() uses Target.createTarget, which the extension backend "
+            "cannot issue. Open a tab with open_background(url, group=\"Agent\") "
+            "(background tab, no focus steal), or attach_active() to drive the "
+            "user's focused tab. new_tab() works only on the rdp/env backend.",
+            fix="use open_background(url, group=\"Agent\") on the extension backend",
+        )
     res = sess.cdp.send("Target.createTarget", url=url)
     target_id = res["targetId"]
     sess.cdp.attach(target_id)
@@ -362,7 +374,7 @@ def reload(*, hard: bool = False) -> dict:
 def current_page() -> dict:
     """User's visually-foreground tab (US1). Auto-attaches.
 
-    Mode A backends use ``browser-daemon active-tab --json`` to find the
+    Mode A backends use ``browserwright-daemon active-tab --json`` to find the
     most-recently-activated target and switch to it.
 
     Extension backend has no notion of "active tab" outside of attached

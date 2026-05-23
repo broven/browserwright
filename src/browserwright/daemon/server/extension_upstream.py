@@ -67,8 +67,9 @@ def _build_create_target_error() -> str:
     return (
         "Target.createTarget is not supported by the extension backend — "
         "it cannot open browser-level targets. Open a tab via the skill "
-        "primitive new_page() (or BrowserDaemon.openBackgroundTab for a "
-        "background tab) instead."
+        "primitive open_background(url, group=\"Agent\") (or "
+        "BrowserDaemon.openBackgroundTab for a background tab) instead. "
+        "new_tab() works only on the rdp/env backend."
     )
 
 
@@ -130,7 +131,7 @@ class ExtensionUpstream:
         # specify sessionId without our naming convention).
         self._sessions: dict[str, int] = {}
         # P5 per-(skill)session tab ownership. ``owner`` keys are the
-        # browser-skill session ids the caller threads through openBackgroundTab
+        # browserwright session ids the caller threads through openBackgroundTab
         # / attachActiveTab. Owned tabs are closed on end_session; borrowed
         # (attached) tabs are kept (the user already had them open).
         self._owned: dict[str, set[int]] = {}
@@ -314,7 +315,7 @@ class ExtensionUpstream:
             # proxy doesn't choke on the heartbeat loop in UpstreamConnection
             # land (not used in extension backend, but symmetric).
             await self._respond(req_id, {
-                "product": f"browser-daemon-extension/{__version__}",
+                "product": f"browserwright-daemon-extension/{__version__}",
                 "userAgent": "extension-relay",
                 "protocolVersion": "1.3",
                 "revision": "0",
@@ -516,7 +517,7 @@ class ExtensionUpstream:
             return {}
         if method == "Browser.getVersion":
             return {
-                "product": f"browser-daemon-extension/{__version__}",
+                "product": f"browserwright-daemon-extension/{__version__}",
                 "userAgent": "extension-relay",
                 "protocolVersion": "1.3",
                 "revision": "0",
