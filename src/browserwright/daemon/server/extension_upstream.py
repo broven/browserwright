@@ -130,67 +130,73 @@ class ExtensionUpstream:
         # Map: upstream sessionId → tabId (for the rare path where commands
         # specify sessionId without our naming convention).
         self._sessions: dict[str, int] = {}
-        # P5 per-(skill)session tab ownership. ``owner`` keys are the
-        # browserwright session ids the caller threads through openBackgroundTab
-        # / attachActiveTab. Owned tabs are closed on end_session; borrowed
-        # (attached) tabs are kept (the user already had them open).
-        self._owned: dict[str, set[int]] = {}
-        self._borrowed: dict[str, set[int]] = {}
-        self._groups: dict[str, int] = {}        # session → tab-group id
+        # The session IS a tab group (docs "extension browser = tab group").
+        # We bind to the durable numeric Chrome groupId and key all ops on it;
+        # the group's live membership (chrome.tabs.query({groupId})) is the
+        # SINGLE source of truth for what's in the session — there is no
+        # owned/borrowed bookkeeping. ``group_name`` (= session name) is only a
+        # recovery anchor used to re-find the group after the groupId is lost.
+        self._groups: dict[str, int] = {}        # bs session → tab-group id
         self._tab_url: dict[int, str] = {}        # tab_id → last-known url
 
-    # ---- P5 per-session ownership helpers --------------------------------
+    # ---- per-session group binding helpers -------------------------------
 
-    def _record_owned(self, session_id: str, tab_id: int, *, group_id: int = -1,
-                      url: str = "") -> None:
-        self._owned.setdefault(session_id, set()).add(tab_id)
+    def _bind_group(self, session_id: str, group_id: int) -> None:
+        """Record the session's durable groupId (the session's browser id).
+        A negative/invalid id is ignored — the group may have been auto-deleted
+        (empty) and will be recreated on the next open."""
         if isinstance(group_id, int) and group_id >= 0:
             self._groups[session_id] = group_id
-        if url:
-            self._tab_url[tab_id] = url
 
-    def _record_borrowed(self, session_id: str, tab_id: int, *, url: str = "") -> None:
-        self._borrowed.setdefault(session_id, set()).add(tab_id)
-        if url:
-            self._tab_url[tab_id] = url
+    async def _group_member_tabs(self, session_id: str | None,
+                                 group_name: str | None) -> tuple[int, list[int]]:
+        """Resolve the session's live group membership = the source of truth.
+        Returns ``(group_id, [tab_id, ...])``. Keys on the bound groupId first,
+        falls back to the title (recovery anchor). Empty list when the session
+        has no live group (e.g. its last tab closed and Chrome auto-deleted the
+        group)."""
+        gid = self._groups.get(session_id) if session_id else None
+        info = await self._relay.query_group_tabs(group_name, group_id=gid)
+        if not info:
+            return (-1, [])
+        live_gid = int(info.get("groupId", -1))
+        if session_id and live_gid >= 0:
+            self._groups[session_id] = live_gid
+        tabs = sorted({
+            t.get("tabId") for t in (info.get("tabs") or [])
+            if isinstance(t.get("tabId"), int)
+        })
+        return (live_gid, list(tabs))
 
     def session_info(self, session_id: str) -> dict:
-        """Live view of a session's tabs (P5.5): group id, owned/borrowed tab
-        counts, and a sample url. Used to fill `whoami`'s live fields."""
-        owned = sorted(self._owned.get(session_id, set()))
-        borrowed = sorted(self._borrowed.get(session_id, set()))
-        sample = next((self._tab_url.get(t, "") for t in owned + borrowed
-                       if self._tab_url.get(t)), "")
+        """Live view of a session's browser: its bound group id, the number of
+        tabs we currently track for it (best-effort, in-memory), and a sample
+        url. Used to fill `whoami`'s live fields. Membership-as-truth means the
+        authoritative count comes from the live group query (``list_tabs``);
+        this synchronous view reports the in-memory tabs bound to the group's
+        recorded sessions."""
+        gid = self._groups.get(session_id, -1)
+        sample = next((u for u in (self._tab_url.get(t) for t in self._sessions.values())
+                       if u), "")
         return {
             "session_id": session_id,
-            "group_id": self._groups.get(session_id, -1),
-            "owned_tabs": len(owned),
-            "borrowed_tabs": len(borrowed),
+            "group_id": gid,
+            "tab_count": sum(1 for _ in self._sessions),
             "sample_url": sample,
         }
 
     async def end_session(self, session_id: str,
                           group_name: str | None = None) -> dict:
-        """Tear down a session's workspace (P5.4): close owned tabs, keep
-        borrowed ones (the user opened them), and drop the session's tracking.
-        Returns ``{closed: [...], kept: [...]}``.
-
-        Session-reconnect-recovery fallback: when ``_owned`` for this session is
-        empty/missing (lost across a reconnect / daemon restart) AND
-        ``group_name`` is given, recover the tabs from the durable tab group
-        and close those instead."""
-        owned = sorted(self._owned.pop(session_id, set()))
-        borrowed = sorted(self._borrowed.pop(session_id, set()))
+        """Tear down a session's browser (DECIDED): close the WHOLE tab group —
+        every member tab — then the group disappears. Membership is resolved
+        from the live group (groupId first, title fallback), NOT from any
+        owned/borrowed set. Returns ``{closed: [...], kept: []}`` (``kept`` is
+        always empty now — there is no borrowed distinction; drag a tab out of
+        the group first to spare it)."""
+        group_id, members = await self._group_member_tabs(session_id, group_name)
         self._groups.pop(session_id, None)
-        if not owned and group_name:
-            info = await self._relay.query_group_tabs(group_name)
-            if info and info.get("tabs"):
-                owned = sorted({
-                    t.get("tabId") for t in info["tabs"]
-                    if isinstance(t.get("tabId"), int)
-                })
         closed: list[int] = []
-        for tab_id in owned:
+        for tab_id in members:
             try:
                 await self._relay.close_tab(tab_id)
                 closed.append(tab_id)
@@ -200,7 +206,32 @@ class ExtensionUpstream:
             for sid in [s for s, t in self._sessions.items() if t == tab_id]:
                 self._sessions.pop(sid, None)
             self._tab_url.pop(tab_id, None)
-        return {"closed": closed, "kept": borrowed}
+        return {"closed": closed, "kept": []}
+
+    async def list_tabs(self, session_id: str | None = None,
+                        group_name: str | None = None) -> dict:
+        """The session's tabs, resolved from LIVE group membership (the source
+        of truth) — never from an in-memory set. Returns
+        ``{groupId, tabs:[{tabId, url, title, attached}, ...]}``."""
+        gid = self._groups.get(session_id) if session_id else None
+        info = await self._relay.query_group_tabs(group_name, group_id=gid)
+        if not info:
+            return {"groupId": -1, "tabs": []}
+        live_gid = int(info.get("groupId", -1))
+        if session_id and live_gid >= 0:
+            self._groups[session_id] = live_gid
+        attached_tabs = {t for t in self._sessions.values()}
+        tabs = [
+            {
+                "tabId": t.get("tabId"),
+                "url": t.get("url", ""),
+                "title": t.get("title", ""),
+                "attached": t.get("tabId") in attached_tabs,
+            }
+            for t in (info.get("tabs") or [])
+            if isinstance(t.get("tabId"), int)
+        ]
+        return {"groupId": live_gid, "tabs": tabs}
 
     @property
     def ws_url(self) -> str | None:
@@ -369,26 +400,37 @@ class ExtensionUpstream:
         except Exception as e:
             await self._error(req_id, -32603, f"relay send failed: {e!r}")
 
-    async def attach_active_tab(self, *, session_id: str | None = None) -> dict:
-        """Daemon-driven attach: relay asks the extension for its focused-
-        window active tab, attaches it, and we fabricate a sessionId the
-        same shape `Target.attachToTarget` would. Returned dict is what the
-        Skill client should see: `{sessionId, targetId, tabId, url, title}`.
+    async def attach_active_tab(self, *, session_id: str | None = None,
+                                group_name: str | None = None) -> dict:
+        """Daemon-driven ADOPT (docs C1): the relay asks the extension to move
+        the focused-window active tab INTO this session's tab group and attach
+        it. We fabricate a sessionId the same shape `Target.attachToTarget`
+        would. Returned dict: `{sessionId, targetId, tabId, url, title,
+        groupId}`.
 
-        When ``session_id`` is given (P5), the tab is recorded as **borrowed**
-        by that session — end_session keeps it (the user already had it open).
+        The adopted tab becomes a regular group member — it closes with the
+        group on `end_session` (no separate borrowed flag). The extension
+        REFUSES (raises) if the focused tab already belongs to another
+        session's group; that error propagates to the caller.
         """
-        ghost = await self._relay.attach_active_tab(timeout=10.0)
+        gid = self._groups.get(session_id) if session_id else None
+        ghost = await self._relay.attach_active_tab(
+            group_name=group_name, group_id=gid, timeout=10.0)
         sid = _new_upstream_session_id(ghost.tab_id)
         self._sessions[sid] = ghost.tab_id
+        group_id = getattr(ghost, "group_id", -1)
+        group_id = int(group_id) if isinstance(group_id, int) else -1
         if session_id is not None:
-            self._record_borrowed(session_id, ghost.tab_id, url=ghost.url)
+            self._bind_group(session_id, group_id)
+            if ghost.url:
+                self._tab_url[ghost.tab_id] = ghost.url
         return {
             "sessionId": sid,
             "targetId": ghost.target_id,
             "tabId": ghost.tab_id,
             "url": ghost.url,
             "title": ghost.title,
+            "groupId": group_id,
         }
 
     async def open_background_tab(
@@ -398,26 +440,33 @@ class ExtensionUpstream:
         group_name: str | None = "Agent",
         session_id: str | None = None,
     ) -> dict:
-        """Open a background tab via the relay, fabricate a sessionId, and
-        return ``{sessionId, targetId, tabId, url, title, groupId}``.
+        """Open a background tab in the session's tab group via the relay,
+        fabricate a sessionId, and return
+        ``{sessionId, targetId, tabId, url, title, groupId}``.
 
-        When ``session_id`` is given (P5), the tab is recorded as **owned** by
-        that session and its group is tracked — end_session closes it."""
-        gt = await self._relay.create_background_tab(url, group_name=group_name)
+        The session's group is keyed on the bound groupId (durable); the group
+        NAME is passed as the recovery anchor so the extension can recreate the
+        group when its last tab had closed and Chrome auto-deleted it. The
+        returned groupId is (re)bound to the session — that's the only
+        per-session state we keep; membership comes from the live group."""
+        gid = self._groups.get(session_id) if session_id else None
+        gt = await self._relay.create_background_tab(
+            url, group_name=group_name, group_id=gid)
         sid = _new_upstream_session_id(gt.tab_id)
         self._sessions[sid] = gt.tab_id
         group_id = getattr(gt, "group_id", -1)
+        group_id = int(group_id) if isinstance(group_id, int) else -1
         if session_id is not None:
-            self._record_owned(session_id, gt.tab_id,
-                               group_id=int(group_id) if isinstance(group_id, int) else -1,
-                               url=gt.url)
+            self._bind_group(session_id, group_id)
+            if gt.url:
+                self._tab_url[gt.tab_id] = gt.url
         return {
             "sessionId": sid,
             "targetId": gt.target_id,
             "tabId": gt.tab_id,
             "url": gt.url,
             "title": gt.title,
-            "groupId": int(group_id) if isinstance(group_id, int) else -1,
+            "groupId": group_id,
         }
 
     async def recover_session(self, session_id: str | None,
@@ -426,11 +475,16 @@ class ExtensionUpstream:
         daemon restart, the in-memory session→tab bindings are gone but the
         Chrome tab group (title == session name) survives. Query that group,
         re-attach the debugger to each of its tabs, rebuild ``_sessions`` /
-        ``_owned`` / ``_groups``, and return a representative target with the
-        same shape as ``open_background_tab``.
+        ``_groups`` (the session→groupId binding), and return a representative
+        target with the same shape as ``open_background_tab``.
+
+        Title→groupId is the recovery path: across a restart the bound groupId
+        is gone, so we look the group up by its title (= session name), which
+        Chrome preserves on the surviving group.
 
         Raises (proxy maps to a CDP error) when no group matches or it has no
         tabs."""
+        # Recovery anchor is the title; the bound id is gone after a restart.
         info = await self._relay.query_group_tabs(group_name)
         if not info or not info.get("tabs"):
             raise RuntimeError(
@@ -452,8 +506,9 @@ class ExtensionUpstream:
             self._sessions[sid] = tab_id
             url = str(tab.get("url", ""))
             if session_id:
-                self._record_owned(session_id, tab_id,
-                                   group_id=group_id, url=url)
+                self._bind_group(session_id, group_id)
+                if url:
+                    self._tab_url[tab_id] = url
             recovered.append(tab_id)
             meta[tab_id] = {
                 "sid": sid,

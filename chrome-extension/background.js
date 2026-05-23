@@ -8,9 +8,19 @@
 //     {"type":"detach","id":N,"tabId":42}
 //     {"type":"command","id":N,"tabId":42,"method":"Page.navigate","params":{...}}
 //     {"type":"queryActiveTab","id":N}
-//     {"type":"attachActive","id":N}
-//     {"type":"createTab","id":N,"url":"...","groupName":"Agent"}
+//     {"type":"attachActive","id":N,"groupId":7,"groupName":"sess-1"}
+//     {"type":"createTab","id":N,"url":"...","groupId":7,"groupName":"sess-1"}
 //     {"type":"closeTab","id":N,"tabId":42}
+//     {"type":"queryGroup","id":N,"groupId":7,"groupName":"sess-1"}
+//
+// Tab-group = session's browser (see docs/refactor-single-daemon.md): a
+// session's durable identity is a Chrome tab GROUP. The daemon binds to the
+// numeric `groupId` (passed back on every op); `groupName` (= session name) is
+// ONLY a recovery anchor used to re-find the group after the groupId is lost
+// (daemon/SW restart, or Chrome auto-deleted an emptied group). Live group
+// membership (`chrome.tabs.query({groupId})`) is the single source of truth
+// for what is "in" the session; a tab dragged out of the group leaves the
+// session (we detach it and emit `detached`).
 //
 //   us → daemon:
 //     {"type":"hello","installId":"...","browser":"chrome","version":"..."}
@@ -429,13 +439,13 @@ async function handleDaemonMessage(msg) {
     case "queryActiveTab":
       return await doQueryActiveTab(id);
     case "attachActive":
-      return await doAttachActive(id);
+      return await doAttachActive(id, msg.groupId, msg.groupName);
     case "createTab":
-      return await doCreateTab(id, msg.url, msg.groupName);
+      return await doCreateTab(id, msg.url, msg.groupName, msg.groupId);
     case "closeTab":
       return await doCloseTab(id, msg.tabId);
     case "queryGroup":
-      return await doQueryGroup(id, msg.groupName);
+      return await doQueryGroup(id, msg.groupName, msg.groupId);
     case "userscript.install":
       return await doUserscriptInstall(id, msg.script);
     case "userscript.list":
@@ -482,11 +492,16 @@ async function doAttach(id, tabId) {
   }
 }
 
-async function doAttachActive(id) {
-  // Daemon-driven equivalent of the popup's "Attach this tab" click — picks
-  // the currently-focused-window active tab, attaches the debugger, and
-  // announces so the daemon's ghost-target table is populated identically
-  // to the popup path.
+async function doAttachActive(id, groupId, groupName) {
+  // Adopt the user's focused-window active tab INTO this session's tab group
+  // (docs C1: adopt, not borrow). The tab becomes a regular group member and
+  // closes with the group on endSession like any other member — there is no
+  // separate "borrowed" flag.
+  //
+  // Refuse-on-conflict: if the focused tab already lives in ANOTHER session's
+  // group (a real group whose id differs from ours), we refuse and do NOT
+  // steal it out of that group. Ungrouped tabs (groupId == -1) and tabs
+  // already in our group are fine to adopt.
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) {
@@ -496,6 +511,34 @@ async function doAttachActive(id) {
         error: { code: -32000, message: "no active tab in focused window" },
       });
       return;
+    }
+    // Resolve this session's destination group (existing groupId if still
+    // live, else recover by title, else create a fresh one on the tab).
+    const ourGroupId = await _resolveSessionGroup(groupId, groupName);
+    const tabGroup = typeof tab.groupId === "number" ? tab.groupId : -1;
+    const inAGroup = tabGroup >= 0;  // -1 == chrome.tabGroups.TAB_GROUP_ID_NONE
+    if (inAGroup && ourGroupId >= 0 && tabGroup !== ourGroupId) {
+      safeSend({
+        type: "response",
+        id,
+        error: {
+          code: -32000,
+          message: "focused tab belongs to another session's tab group " +
+            "(groupId=" + tabGroup + "); refusing to steal it. Drag it out " +
+            "of that group first, or adopt it from its owning session.",
+        },
+      });
+      return;
+    }
+    // Move the tab into our group (idempotent if already a member). When we
+    // had no live group, chrome.tabs.group({tabIds}) creates one and we name
+    // it with the session name as the recovery anchor.
+    let finalGroupId = ourGroupId;
+    try {
+      finalGroupId = await _ensureTabInGroup(tab.id, groupName, ourGroupId);
+    } catch (ge) {
+      console.warn("[bd-relay] adopt grouping failed:", ge);
+      finalGroupId = ourGroupId;
     }
     if (!attachedTabs.has(tab.id)) {
       await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
@@ -509,6 +552,7 @@ async function doAttachActive(id) {
         tabId: tab.id,
         url: tab.url || "",
         title: stripMarker(tab.title),
+        groupId: finalGroupId,
       },
     });
     markTabAttached(tab.id);  // fire-and-forget; cosmetic
@@ -522,7 +566,35 @@ async function doAttachActive(id) {
   }
 }
 
-async function doCreateTab(id, url, groupName) {
+async function _resolveSessionGroup(groupId, groupName) {
+  // Return the live groupId for this session, or -1 if none exists yet.
+  // Primary key = the numeric groupId the daemon remembers; if that group
+  // still exists, use it. Otherwise fall back to the title (recovery anchor)
+  // — a daemon/SW restart or a Chrome-auto-deleted empty group loses the id
+  // but the surviving group keeps its title. Never creates a group here.
+  if (typeof groupId === "number" && groupId >= 0) {
+    try {
+      await chrome.tabGroups.get(groupId);
+      return groupId;  // still live
+    } catch (_e) {
+      // groupId went invalid (empty group auto-deleted, etc.) — recover below.
+    }
+  }
+  if (typeof groupName === "string" && groupName) {
+    try {
+      const matching = await chrome.tabGroups.query({ title: groupName });
+      if (Array.isArray(matching) && matching.length > 0) {
+        matching.sort((a, b) => a.id - b.id);
+        return matching[0].id;
+      }
+    } catch (_e) {
+      // fall through to "no group"
+    }
+  }
+  return -1;
+}
+
+async function doCreateTab(id, url, groupName, sessionGroupId) {
   try {
     if (typeof url !== "string" || !url) {
       throw new Error("createTab requires a url");
@@ -530,9 +602,15 @@ async function doCreateTab(id, url, groupName) {
     // active:false is critical: we don't want to steal user focus.
     const tab = await chrome.tabs.create({ url, active: false });
     let groupId = -1;
-    if (typeof groupName === "string" && groupName) {
+    // Bind the tab to the session's group. Prefer the daemon-remembered
+    // numeric groupId; recover by title if it went invalid (empty-group
+    // auto-delete / restart); create a fresh group named with the session
+    // name when neither is available.
+    if ((typeof sessionGroupId === "number" && sessionGroupId >= 0) ||
+        (typeof groupName === "string" && groupName)) {
       try {
-        groupId = await _ensureTabInGroup(tab.id, groupName);
+        const resolved = await _resolveSessionGroup(sessionGroupId, groupName);
+        groupId = await _ensureTabInGroup(tab.id, groupName, resolved);
       } catch (ge) {
         console.warn("[bd-relay] grouping failed:", ge);
         groupId = -1;
@@ -566,31 +644,27 @@ async function doCreateTab(id, url, groupName) {
   }
 }
 
-async function _ensureTabInGroup(tabId, groupName) {
-  // Reuse a deterministic existing group with matching title; otherwise
-  // create a fresh group (chrome.tabs.group both creates and assigns).
-  let groupId = -1;
-  try {
-    const matching = await chrome.tabGroups.query({ title: groupName });
-    if (Array.isArray(matching) && matching.length > 0) {
-      matching.sort((a, b) => a.id - b.id);
-      groupId = matching[0].id;
-    }
-  } catch (_e) {
-    groupId = -1;
-  }
-  if (groupId >= 0) {
-    await chrome.tabs.group({ groupId, tabIds: [tabId] });
-    return groupId;
+async function _ensureTabInGroup(tabId, groupName, resolvedGroupId) {
+  // Move `tabId` into the session's group and return the live groupId.
+  //
+  // groupId-first (the durable binding): if the caller already resolved a
+  // live groupId (via _resolveSessionGroup), join it directly. Otherwise
+  // create a fresh group (chrome.tabs.group both creates and assigns) and
+  // name it with the session name as the recovery anchor.
+  if (typeof resolvedGroupId === "number" && resolvedGroupId >= 0) {
+    await chrome.tabs.group({ groupId: resolvedGroupId, tabIds: [tabId] });
+    return resolvedGroupId;
   }
   const newGroupId = await chrome.tabs.group({ tabIds: [tabId] });
-  try {
-    await chrome.tabGroups.update(newGroupId, {
-      title: groupName,
-      collapsed: false,
-    });
-  } catch (_e) {
-    // Title race; group still exists.
+  if (typeof groupName === "string" && groupName) {
+    try {
+      await chrome.tabGroups.update(newGroupId, {
+        title: groupName,
+        collapsed: false,
+      });
+    } catch (_e) {
+      // Title race; group still exists.
+    }
   }
   return newGroupId;
 }
@@ -681,23 +755,19 @@ async function doQueryActiveTab(id) {
   }
 }
 
-async function doQueryGroup(id, groupName) {
-  // Session-reconnect-recovery anchor: a session's durable identity is its
-  // tab-group title (groups survive SW respawn / daemon restart). The daemon
-  // asks us for the tabs of the group whose title == the session name so it
-  // can re-attach the debugger and rebuild its in-memory session→tab map.
+async function doQueryGroup(id, groupName, sessionGroupId) {
+  // Live group membership = the single source of truth for "what's in this
+  // session's browser" (docs invariant 2). The daemon asks for the tabs of
+  // the session's group; we resolve by the durable numeric groupId first and
+  // fall back to the title (recovery anchor) only when the id is gone
+  // (daemon/SW restart, empty-group auto-delete). Returns groupId -1 / [] when
+  // no group matches — the session's browser currently has no tabs.
   try {
-    if (typeof groupName !== "string" || !groupName) {
-      throw new Error("queryGroup requires a groupName");
-    }
-    const matching = await chrome.tabGroups.query({ title: groupName });
-    if (!Array.isArray(matching) || matching.length === 0) {
+    const groupId = await _resolveSessionGroup(sessionGroupId, groupName);
+    if (groupId < 0) {
       safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
       return;
     }
-    // Mirror the dedup in _ensureTabInGroup: pick the smallest group id.
-    matching.sort((a, b) => a.id - b.id);
-    const groupId = matching[0].id;
     const tabs = await chrome.tabs.query({ groupId });
     const out = (Array.isArray(tabs) ? tabs : []).map((tab) => ({
       tabId: tab.id,
@@ -888,6 +958,67 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     markedTabs.delete(source.tabId);
     safeSend({ type: "detached", tabId: source.tabId, reason });
   }
+});
+
+// ---- group-membership = session membership --------------------------------
+//
+// docs invariant 3: entering/leaving the session's tab group == entering/
+// leaving the session's browser. A tab the agent drives that the user drags
+// OUT of the group (or that gets removed/ungrouped) must leave the session:
+// we detach chrome.debugger and emit `detached` so the daemon drops it from
+// its ghost-target table. We only act on tabs WE attached (`attachedTabs`),
+// so unrelated user tab/group activity is ignored.
+//
+// Membership truth is always re-derived from chrome.tabs.query({groupId});
+// these events are just the trigger to re-check an attached tab's group.
+
+async function _detachAttachedTab(tabId, reason) {
+  if (!attachedTabs.has(tabId)) return;
+  attachedTabs.delete(tabId);
+  await unmarkTabBeforeDetach(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch (_e) {
+    // Already detached / tab gone — onDetach (if any) handles the rest.
+  }
+  safeSend({ type: "detached", tabId, reason });
+}
+
+// onUpdated fires with changeInfo.groupId when a tab is dragged into/out of a
+// group. groupId === -1 (TAB_GROUP_ID_NONE) means it left its group entirely;
+// any other value means it moved to a different group. Either way the tab is
+// no longer in the session's group, so it leaves the session.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!("groupId" in changeInfo)) return;
+  if (!attachedTabs.has(tabId)) return;
+  // The tab moved out of (or between) groups. We can't cheaply know which
+  // session's group it should still be in here, but an attached agent tab
+  // that the user pulls out of its group is, by the locked model, leaving the
+  // session — detach it. (Re-adopting requires an explicit attach_active.)
+  _detachAttachedTab(tabId, "dragged_out_of_group").catch((e) =>
+    console.warn("[bd-relay] drag-out detach failed:", e));
+});
+
+// A whole group being removed (last tab dragged out / group dissolved) — drop
+// any attached tabs that belonged to it. Chrome auto-deletes a group when its
+// last tab leaves, so this also covers "session group emptied".
+if (chrome.tabGroups && chrome.tabGroups.onRemoved) {
+  chrome.tabGroups.onRemoved.addListener((group) => {
+    // The tabs are already out of the group by the time this fires; the
+    // per-tab onUpdated above handles the detach. This listener exists so a
+    // future daemon-side "group gone" notification has a hook — kept minimal.
+    console.debug("[bd-relay] tab group removed:", group?.id);
+  });
+}
+
+// onRemoved fires when a tab is closed outright. If we were driving it, tell
+// the daemon so its ghost-target table stays in sync even when chrome.debugger
+// onDetach didn't fire first (rare close-ordering races).
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (!attachedTabs.has(tabId)) return;
+  attachedTabs.delete(tabId);
+  markedTabs.delete(tabId);
+  safeSend({ type: "detached", tabId, reason: "tab_closed" });
 });
 
 // ---- popup → background message bridge ------------------------------------

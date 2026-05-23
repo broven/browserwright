@@ -363,10 +363,10 @@ async def test_close_tab_unknown_session_raises_value_error():
             await upstream.close_tab("not-a-real-session-id")
 
 
-# ---- P5: per-session ownership + end_session cleanup ----------------------
+# ---- tab-group = browser: groupId binding + close-whole-group -------------
 
 
-async def _open_owned(upstream, ext, url, tab_id, group_id, session_id):
+async def _open_in_group(upstream, ext, url, tab_id, group_id, session_id):
     async def respond():
         cmd = await ext.next_command()
         await ext.respond(cmd["id"], result={
@@ -380,61 +380,110 @@ async def _open_owned(upstream, ext, url, tab_id, group_id, session_id):
 
 
 @pytest.mark.asyncio
-async def test_sessions_own_distinct_groups_and_tabs():
-    """P5.1/5.2: two sessions get distinct groups; each owns its own tab."""
+async def test_sessions_bind_distinct_groups():
+    """Each session binds to its own durable groupId (the session = group);
+    there is no _owned/_borrowed bookkeeping anymore."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
-        await _open_owned(upstream, ext, "https://a/", 10, 100, "A")
-        await _open_owned(upstream, ext, "https://b/", 20, 200, "B")
-        assert upstream._owned["A"] == {10}
-        assert upstream._owned["B"] == {20}
+        await _open_in_group(upstream, ext, "https://a/", 10, 100, "A")
+        await _open_in_group(upstream, ext, "https://b/", 20, 200, "B")
         assert upstream._groups["A"] == 100
         assert upstream._groups["B"] == 200
-        # session B can't see session A's tab
-        assert 10 not in upstream._owned["B"]
+        # owned/borrowed sets are gone entirely.
+        assert not hasattr(upstream, "_owned")
+        assert not hasattr(upstream, "_borrowed")
 
 
 @pytest.mark.asyncio
-async def test_attach_active_records_borrowed_not_owned():
-    """P5.3: an attached focused tab is borrowed, not owned."""
+async def test_open_background_passes_bound_group_id():
+    """Once a session has a bound groupId, the next open passes it back to the
+    extension as the durable key (so the same group is reused)."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
-        async def respond_attach():
+        await _open_in_group(upstream, ext, "https://a/", 10, 100, "A")
+
+        async def respond():
             cmd = await ext.next_command()
+            assert cmd["type"] == "createTab"
+            assert cmd["groupId"] == 100  # the bound id is threaded through
             await ext.respond(cmd["id"], result={
-                "tabId": 77, "url": "https://focused/", "title": "F"})
-        r = asyncio.create_task(respond_attach())
-        await upstream.attach_active_tab(session_id="A")
+                "tabId": 11, "url": "https://a2/", "title": "t", "groupId": 100})
+        r = asyncio.create_task(respond())
+        out = await upstream.open_background_tab(
+            "https://a2/", group_name="Agent", session_id="A")
         await r
-        assert upstream._borrowed["A"] == {77}
-        assert 77 not in upstream._owned.get("A", set())
+        assert out["groupId"] == 100
 
 
 @pytest.mark.asyncio
-async def test_end_session_closes_owned_keeps_borrowed():
-    """P5.4: end_session closes owned tabs, keeps borrowed ones."""
+async def test_attach_active_adopts_into_group():
+    """attach_active = adopt: the focused tab is moved into the session's group
+    and the returned groupId is bound to the session (no borrowed flag)."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
-        await _open_owned(upstream, ext, "https://owned/", 30, 300, "A")
+        async def respond_attach():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "attachActive"
+            await ext.respond(cmd["id"], result={
+                "tabId": 77, "url": "https://focused/", "title": "F",
+                "groupId": 55})
+        r = asyncio.create_task(respond_attach())
+        info = await upstream.attach_active_tab(session_id="A", group_name="A")
+        await r
+        assert info["tabId"] == 77
+        assert info["groupId"] == 55
+        assert upstream._groups["A"] == 55
+
+
+@pytest.mark.asyncio
+async def test_attach_active_passes_bound_group():
+    """When the session already has a bound groupId, attach_active threads it
+    to the extension so the focused tab joins the same group."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await _open_in_group(upstream, ext, "https://a/", 10, 100, "A")
 
         async def respond_attach():
             cmd = await ext.next_command()
+            assert cmd["type"] == "attachActive"
+            assert cmd["groupId"] == 100
             await ext.respond(cmd["id"], result={
-                "tabId": 88, "url": "https://borrowed/", "title": "B"})
+                "tabId": 12, "url": "https://f/", "title": "f", "groupId": 100})
         r = asyncio.create_task(respond_attach())
-        await upstream.attach_active_tab(session_id="A")
+        await upstream.attach_active_tab(session_id="A", group_name="A")
         await r
 
-        async def respond_close():
-            cmd = await ext.next_command()
-            assert cmd["type"] == "closeTab"
-            assert cmd["tabId"] == 30
-            await ext.respond(cmd["id"], result={"ok": True, "tabId": 30})
-        c = asyncio.create_task(respond_close())
-        result = await upstream.end_session("A")
-        await c
 
-        assert result == {"closed": [30], "kept": [88]}
-        # tracking cleared
-        assert "A" not in upstream._owned
-        assert "A" not in upstream._borrowed
+@pytest.mark.asyncio
+async def test_end_session_closes_whole_group():
+    """DECIDED: end_session closes the WHOLE group — every member tab resolved
+    from live membership — and `kept` is always empty (no borrowed)."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await _open_in_group(upstream, ext, "https://a/", 30, 300, "A")
+
+        async def responder():
+            # end_session re-resolves live membership via queryGroup, then
+            # closes each member.
+            q = await ext.next_command()
+            assert q["type"] == "queryGroup"
+            assert q["groupId"] == 300  # bound id is the primary key
+            await ext.respond(q["id"], result={
+                "groupId": 300,
+                "tabs": [
+                    {"tabId": 30, "url": "https://a/", "title": "t",
+                     "active": True, "lastAccessed": 2},
+                    {"tabId": 31, "url": "https://b/", "title": "t",
+                     "active": False, "lastAccessed": 1},
+                ],
+            })
+            for _ in range(2):
+                c = await ext.next_command()
+                assert c["type"] == "closeTab"
+                await ext.respond(c["id"], result={"ok": True, "tabId": c["tabId"]})
+
+        r = asyncio.create_task(responder())
+        result = await upstream.end_session("A", group_name="A")
+        await r
+
+        assert sorted(result["closed"]) == [30, 31]
+        assert result["kept"] == []
+        assert "A" not in upstream._groups
 
 
 # ---- session-reconnect-recovery ------------------------------------------
@@ -476,8 +525,8 @@ async def test_recover_session_reattaches_tabs_and_rebuilds_state():
         assert result["tabId"] == 51
         assert result["targetId"] == "ext-tab-51"
         assert result["sessionId"].startswith("ext-sid-51-")
-        # state rebuilt
-        assert upstream._owned["bs-session-1"] == {50, 51}
+        # state rebuilt: the session is re-bound to the recovered groupId and
+        # each tab gets a fabricated CDP session (membership is the truth).
         assert upstream._groups["bs-session-1"] == 9
         assert set(upstream._sessions.values()) >= {50, 51}
 
@@ -496,9 +545,10 @@ async def test_recover_session_empty_group_raises():
 
 
 @pytest.mark.asyncio
-async def test_end_session_group_fallback_when_owned_empty():
-    """When _owned has nothing for the session but a group_name is given,
-    end_session recovers the group's tabs and closes them."""
+async def test_end_session_resolves_group_by_title_when_unbound():
+    """end_session always resolves membership from the live group; when the
+    session has no bound groupId (e.g. after a restart), the group_name (=
+    session name) is the recovery anchor used to find + close the tabs."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
         async def responder():
             q = await ext.next_command()
@@ -524,11 +574,45 @@ async def test_end_session_group_fallback_when_owned_empty():
 
 @pytest.mark.asyncio
 async def test_session_info_live_fields():
-    """P5.5: session_info reports group id, owned/borrowed counts, sample url."""
+    """session_info reports the session's bound group id + a sample url. The
+    authoritative tab membership comes from list_tabs (live group query); this
+    synchronous view is best-effort for whoami diagnostics."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
-        await _open_owned(upstream, ext, "https://owned/", 40, 400, "A")
+        await _open_in_group(upstream, ext, "https://owned/", 40, 400, "A")
         info = upstream.session_info("A")
         assert info["group_id"] == 400
-        assert info["owned_tabs"] == 1
-        assert info["borrowed_tabs"] == 0
         assert info["sample_url"] == "https://owned/"
+        assert "owned_tabs" not in info
+        assert "borrowed_tabs" not in info
+
+
+@pytest.mark.asyncio
+async def test_list_tabs_resolves_from_live_group_membership():
+    """list_tabs is the single source of truth: it returns whatever the live
+    group currently contains (groupId-keyed), including tabs the user dragged
+    in — not an in-memory owned/borrowed set."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await _open_in_group(upstream, ext, "https://a/", 70, 700, "A")
+
+        async def responder():
+            q = await ext.next_command()
+            assert q["type"] == "queryGroup"
+            assert q["groupId"] == 700
+            await ext.respond(q["id"], result={
+                "groupId": 700,
+                "tabs": [
+                    {"tabId": 70, "url": "https://a/", "title": "A",
+                     "active": True, "lastAccessed": 5},
+                    # A tab the user dragged into the group — visible despite
+                    # never being opened by the agent.
+                    {"tabId": 71, "url": "https://dragged-in/", "title": "D",
+                     "active": False, "lastAccessed": 4},
+                ],
+            })
+
+        r = asyncio.create_task(responder())
+        out = await upstream.list_tabs(session_id="A", group_name="A")
+        await r
+        assert out["groupId"] == 700
+        ids = {t["tabId"] for t in out["tabs"]}
+        assert ids == {70, 71}

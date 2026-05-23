@@ -212,40 +212,58 @@ class RelayServer:
         return await self._request(ext, {"type": "queryActiveTab"},
                                    timeout=timeout)
 
-    async def query_group_tabs(self, group_name: str, *,
+    async def query_group_tabs(self, group_name: str | None = None, *,
+                               group_id: int | None = None,
                                timeout: float = 5.0) -> dict | None:
-        """Session-reconnect-recovery: ask the extension for the tabs of the
-        tab group whose title == ``group_name`` (the durable per-session
-        anchor). Returns ``{"groupId":int,"tabs":[{tabId,url,title,active,
-        lastAccessed}, ...]}`` — ``groupId == -1`` / empty tabs when no group
-        matches. Returns None when no extension is connected (mirrors
+        """Live membership query: ask the extension for the tabs of the
+        session's tab group. ``group_id`` is the durable primary key (bind to
+        the numeric Chrome groupId); ``group_name`` (= session name) is the
+        recovery anchor used only when the id is lost / invalid. The extension
+        resolves id-first, title-fallback. Returns ``{"groupId":int,"tabs":
+        [{tabId,url,title,active,lastAccessed}, ...]}`` — ``groupId == -1`` /
+        empty tabs when no group matches (the session's browser has no tabs).
+        Returns None when no extension is connected (mirrors
         query_active_tab's caller-falls-back contract)."""
         ext = self._pick_active_extension()
         if ext is None:
             return None
-        return await self._request(
-            ext, {"type": "queryGroup", "groupName": group_name},
-            timeout=timeout)
+        body: dict = {"type": "queryGroup"}
+        if group_name:
+            body["groupName"] = group_name
+        if isinstance(group_id, int) and group_id >= 0:
+            body["groupId"] = group_id
+        return await self._request(ext, body, timeout=timeout)
 
     async def attach_active_tab(self, *,
+                                group_name: str | None = None,
+                                group_id: int | None = None,
                                 timeout: float = 10.0) -> GhostTarget:
-        """Daemon-driven equivalent of the popup's "Attach this tab" — asks
-        the extension to attach Chrome's currently-focused-window active tab
-        without needing the user to click the popup.
+        """Daemon-driven adopt (docs C1): ask the extension to MOVE Chrome's
+        currently-focused-window active tab into this session's tab group and
+        attach the debugger. ``group_id`` (durable) + ``group_name`` (recovery
+        anchor) identify the destination group; the extension refuses (error)
+        if the focused tab already belongs to a DIFFERENT session's group.
+
+        The adopted tab is a regular group member — it closes with the group on
+        ``end_session`` (no separate borrowed/owned flag).
 
         Retries on "already attached" the same way `attach_tab` does. Returns
-        the GhostTarget once the extension confirms. The extension also emits
-        `attached` as part of announceAttached, so the ghost ends up in
+        the GhostTarget (with a ``group_id`` attribute) once the extension
+        confirms. The extension also emits `attached`, so the ghost ends up in
         `ext.tabs` for the regular routing path.
         """
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
         last_err: Exception | None = None
+        body: dict = {"type": "attachActive"}
+        if group_name:
+            body["groupName"] = group_name
+        if isinstance(group_id, int) and group_id >= 0:
+            body["groupId"] = group_id
         for i in range(ATTACH_RETRY_LIMIT):
             try:
-                result = await self._request(
-                    ext, {"type": "attachActive"}, timeout=timeout)
+                result = await self._request(ext, body, timeout=timeout)
                 info = result or {}
                 tab_id_raw = info.get("tabId")
                 if not isinstance(tab_id_raw, int):
@@ -258,6 +276,10 @@ class RelayServer:
                     title=str(info.get("title", "")),
                     install_id=ext.install_id,
                 )
+                try:
+                    gt.group_id = int(info.get("groupId", -1))  # type: ignore[attr-defined]
+                except (TypeError, ValueError):
+                    gt.group_id = -1  # type: ignore[attr-defined]
                 ext.tabs[tab_id_raw] = gt
                 return gt
             except _CommandError as e:
@@ -328,16 +350,24 @@ class RelayServer:
         url: str,
         *,
         group_name: str | None = "Agent",
+        group_id: int | None = None,
         timeout: float = 10.0,
     ) -> GhostTarget:
         """Spec Phase B Feature 1: open a tab in the background (active=false)
-        in tab group ``group_name`` (default "Agent"), attach
-        ``chrome.debugger`` to it, and return a GhostTarget bound to the new
-        tab. The user's currently-active tab keeps focus.
+        in the session's tab group, attach ``chrome.debugger`` to it, and
+        return a GhostTarget bound to the new tab. The user's currently-active
+        tab keeps focus.
 
-        ``group_name=None`` skips the grouping step; the resulting GhostTarget
-        carries the extension-reported ``group_id`` (which may be ``-1`` when
-        no group was requested or when grouping failed in a recoverable way).
+        The session's group is identified by ``group_id`` (the durable numeric
+        Chrome groupId) when known; ``group_name`` (= session name) is the
+        recovery anchor used when the id is unknown / invalid (e.g. Chrome
+        auto-deleted an emptied group, so the next open recreates it). The
+        extension resolves id-first, title-fallback, create-if-missing.
+
+        ``group_name=None`` and no ``group_id`` skips the grouping step; the
+        resulting GhostTarget carries the extension-reported ``group_id``
+        (which may be ``-1`` when no group was requested or grouping failed in
+        a recoverable way).
         """
         ext = self._pick_active_extension()
         if ext is None:
@@ -345,6 +375,8 @@ class RelayServer:
         body: dict = {"type": "createTab", "url": url}
         if group_name:
             body["groupName"] = group_name
+        if isinstance(group_id, int) and group_id >= 0:
+            body["groupId"] = group_id
         result = await self._request(ext, body, timeout=timeout) or {}
         tab_id = int(result.get("tabId", -1))
         if tab_id < 0:

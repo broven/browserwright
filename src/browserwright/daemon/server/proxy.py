@@ -1151,8 +1151,9 @@ class Router:
             return
         try:
             # Pass group_name only when provided so callbacks with the legacy
-            # single-arg signature stay compatible (session-reconnect-recovery
-            # fallback closes the group's tabs when _owned is empty).
+            # single-arg signature stay compatible. group_name is the recovery
+            # anchor end_session uses to resolve the group's live membership
+            # (and close the whole group) when the session's groupId is unbound.
             if group_name is not None:
                 result = await self._end_session(session, group_name)
             else:
