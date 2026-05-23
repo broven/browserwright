@@ -1,11 +1,11 @@
 # Solidifying a flow into a task
 
-A "task" is a per-site Python file that bundles a reusable browser flow with metadata and a selftest. The runtime is filesystem-driven — drop the right files in the right place and `browser-skill task <site>/<name>` works immediately. No registry, no `solidify()` CLI call needed.
+A "task" is a per-site Python file that bundles a reusable browser flow with metadata and a selftest. The runtime is filesystem-driven — drop the right files in the right place and `browserwright task <site>/<name>` works immediately. No registry, no `solidify()` CLI call needed.
 
 ## Storage layout
 
 ```
-~/.browser-skill/site-skills/<eTLD+1>/
+~/.browserwright/site-skills/<eTLD+1>/
   SKILL.md          # one-line site summary, lists tasks
   memory.md         # frontmatter (site, host_patterns, aliases) + free notes
   tasks/
@@ -13,15 +13,15 @@ A "task" is a per-site Python file that bundles a reusable browser flow with met
     <name2>.py
 ```
 
-Three roots are searched in order: `./site-skills/` (CWD, git-trackable), then `$BS_HOME/site-skills/` (default `~/.browser-skill/site-skills/`), then the bundled starter. Write to the second one unless the user wants the task version-controlled with the project.
+Three roots are searched in order: `./site-skills/` (CWD, git-trackable), then `$BS_HOME/site-skills/` (default `~/.browserwright/site-skills/`), then the bundled starter. Write to the second one unless the user wants the task version-controlled with the project.
 
 ## Task file template
 
-`~/.browser-skill/site-skills/<site>/tasks/<name>.py`:
+`~/.browserwright/site-skills/<site>/tasks/<name>.py`:
 
 ```python
 """One-line description of what this task does."""
-from browser_skill import *
+from browserwright import *
 
 ARGS = {
     "query": {"type": "str", "required": True, "desc": "Search term"},
@@ -47,7 +47,7 @@ Module-level constants are all optional except `ARGS` and `run`. The runtime imp
 
 ## Site memory.md template
 
-`~/.browser-skill/site-skills/<site>/memory.md`:
+`~/.browserwright/site-skills/<site>/memory.md`:
 
 ```markdown
 ---
@@ -67,15 +67,15 @@ Anti-bot, rate limits, layouts that differ logged-in vs anonymous.
 - task 'search' created 2026-05-19
 ```
 
-`host_patterns` and `aliases` power query-based discovery (`browser-skill list-tasks --query=...`).
+`host_patterns` and `aliases` power query-based discovery (`browserwright list-tasks --query=...`).
 
 ## Procedure
 
 1. Confirm with the user that the flow is worth saving. Agree on a name like `<site>/<task>`.
 2. Use the `Write` tool to create:
-   - `~/.browser-skill/site-skills/<site>/tasks/<name>.py` — template above, with the actual REPL code substituted in.
-   - `~/.browser-skill/site-skills/<site>/memory.md` if the site folder didn't exist.
-   - `~/.browser-skill/site-skills/<site>/SKILL.md` if missing — one line per task is enough.
-3. Run `browser-skill task <site>/<name>` once to verify it works end to end.
+   - `~/.browserwright/site-skills/<site>/tasks/<name>.py` — template above, with the actual REPL code substituted in.
+   - `~/.browserwright/site-skills/<site>/memory.md` if the site folder didn't exist.
+   - `~/.browserwright/site-skills/<site>/SKILL.md` if missing — one line per task is enough.
+3. Run `browserwright task <site>/<name>` once to verify it works end to end.
 
-The filesystem is the database. Don't use `browser-skill save` / `propose_solidify()` / `solidify()` — direct file writes are cleaner and don't go through a JSON spec.
+The filesystem is the database. Don't use `browserwright save` / `propose_solidify()` / `solidify()` — direct file writes are cleaner and don't go through a JSON spec.

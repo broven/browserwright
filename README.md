@@ -4,9 +4,9 @@ An AI-agent–friendly stack for driving a real Chrome from the terminal over CD
 
 ```
 .
-├── browser-daemon/   Layer 1 — CDP WebSocket URL resolver (5 backends)
-├── browser-skill/    Layer 2 — REPL / primitives / site skills / memory / solidify
-├── skill/            Claude Code skill bundle (symlink this to ~/.claude/skills/browser-skill)
+├── browserwright-daemon/   Layer 1 — CDP WebSocket URL resolver (5 backends)
+├── browserwright/    Layer 2 — REPL / primitives / site skills / memory / solidify
+├── skill/            Claude Code skill bundle (symlink this to ~/.claude/skills/browserwright)
 ├── browser-connection.md   Why this stack exists (CDP discovery, Chrome 144+ popups)
 └── README.md
 ```
@@ -29,25 +29,25 @@ That's why the legacy `autoconnect` backend (which connected via Chrome's `--rem
 Clone the repo, then from the repo root:
 
 ```bash
-# 1. browser-daemon (Layer 1)
-( cd browser-daemon && python3.11 -m venv .venv && .venv/bin/pip install -e . )
+# 1. browserwright-daemon (Layer 1)
+( cd browserwright-daemon && python3.11 -m venv .venv && .venv/bin/pip install -e . )
 
-# 2. browser-skill (Layer 2)
-( cd browser-skill && python3.11 -m venv .venv && .venv/bin/pip install -e . )
+# 2. browserwright (Layer 2)
+( cd browserwright && python3.11 -m venv .venv && .venv/bin/pip install -e . )
 
 # 3. Symlink the two CLIs onto $PATH (no system-Python pollution)
 mkdir -p ~/.local/bin
-ln -sf "$PWD/browser-daemon/.venv/bin/browser-daemon" ~/.local/bin/browser-daemon
-ln -sf "$PWD/browser-skill/.venv/bin/browser-skill"   ~/.local/bin/browser-skill
+ln -sf "$PWD/browserwright-daemon/.venv/bin/browserwright-daemon" ~/.local/bin/browserwright-daemon
+ln -sf "$PWD/browserwright/.venv/bin/browserwright"   ~/.local/bin/browserwright
 
 # 4. (optional) Install as a Claude Code skill — symlink the whole bundle
 mkdir -p ~/.claude/skills
-ln -sf "$PWD/skill" ~/.claude/skills/browser-skill
+ln -sf "$PWD/skill" ~/.claude/skills/browserwright
 
 # 5. Verify
-browser-daemon version
-browser-skill version
-browser-daemon doctor
+browserwright-daemon version
+browserwright version
+browserwright-daemon doctor
 ```
 
 The symlink approach means any update to the repo is immediately visible to both your shell and Claude Code — no re-install.
@@ -56,10 +56,10 @@ The symlink approach means any update to the repo is immediately visible to both
 
 ```bash
 # Start an isolated Chrome (own profile dir, won't touch your daily Chrome)
-browser-daemon launch-chrome --port 9333 --profile bs-smoke --persistent --json
+browserwright-daemon launch-chrome --port 9333 --profile bs-smoke --persistent --json
 
 # Drive it
-BD_PORT=9333 BD_BACKEND=rdp browser-skill <<'PY'
+BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
 new_tab("https://example.com")
 wait_for_load()
 info = page_info()
@@ -79,35 +79,35 @@ Clean up: `kill <pid>` (the `launch-chrome --json` output includes the pid).
 
 ```bash
 # (a) Inline heredoc — one-off scripts, all primitives pre-imported
-browser-skill <<'PY'
+browserwright <<'PY'
 new_tab("https://news.ycombinator.com")
 wait_for_load()
 print(page_info())
 PY
 
 # (b) Long-lived REPL — long sessions, single shared upstream ws
-browser-skill repl start
-browser-skill exec 'print(page_info())'
-browser-skill exec 'click_at_xy(120, 240)'
-browser-skill repl status
-browser-skill repl stop
+browserwright repl start
+browserwright exec 'print(page_info())'
+browserwright exec 'click_at_xy(120, 240)'
+browserwright repl status
+browserwright repl stop
 
 # (c) Solidified task — reusable, pre-saved flow
-browser-skill list-tasks
-browser-skill list-tasks --query="search the web"
-browser-skill task wikipedia.org/lookup --title="Wikipedia"
+browserwright list-tasks
+browserwright list-tasks --query="search the web"
+browserwright task wikipedia.org/lookup --title="Wikipedia"
 ```
 
 ### Choose a backend
 
 | Scenario | Backend | How |
 |---|---|---|
-| Scripts / iterative work *(default)* | `rdp` + isolated Chrome | `browser-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=rdp` |
-| Your daily Chrome | `extension` | `browser-daemon serve --backend extension` + load `browser-daemon/chrome-extension/` once; zero popups |
+| Scripts / iterative work *(default)* | `rdp` + isolated Chrome | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=rdp` |
+| Your daily Chrome | `extension` | `browserwright-daemon serve --backend extension` + load `browserwright-daemon/chrome-extension/` once; zero popups |
 | Fingerprint browser (AdsPower / MultiLogin / 比特浏览器) | `rdp` | point `BD_PORT` at the tool's exposed port |
-| Remote Chrome (Browser Use / Browserless / Hyperbrowser) | `cloud` | `browser-daemon serve --backend cloud --provider <name>` + auth env vars |
+| Remote Chrome (Browser Use / Browserless / Hyperbrowser) | `cloud` | `browserwright-daemon serve --backend cloud --provider <name>` + auth env vars |
 
-Interactive wizard: `browser-skill install` — walks the decision tree and writes your pick to `~/.browser-skill/global.md`.
+Interactive wizard: `browserwright install` — walks the decision tree and writes your pick to `~/.browserwright/global.md`.
 
 ### Primitives (pre-imported in every REPL)
 
@@ -119,40 +119,40 @@ Interactive wizard: `browser-skill install` — walks the decision tree and writ
 - **Memory:** `remember`, `remember_global`, `remember_preference`, `memory_read`
 - **Solidify:** `propose_solidify`, `solidify`
 
-Full catalogue in `browser-skill/README.md`.
+Full catalogue in `browserwright/README.md`.
 
 ### Diagnostics
 
 ```bash
-browser-daemon doctor                  # which backends are live, why each is/isn't usable
-browser-daemon list-backends
-browser-skill doctor                   # skill-side health
-browser-daemon stats --name default    # observability counters when `serve` is running
+browserwright-daemon doctor                  # which backends are live, why each is/isn't usable
+browserwright-daemon list-backends
+browserwright doctor                   # skill-side health
+browserwright-daemon stats --name default    # observability counters when `serve` is running
 ```
 
 ## Claude Code integration
 
-The `skill/` directory at the repo root is a Claude Code skill bundle. Symlink it to `~/.claude/skills/browser-skill` (step 4 of install above) and Claude Code will discover it. After install, prompts like *"open example.com and screenshot it"* or *"scrape the HN front page"* will trigger the skill automatically.
+The `skill/` directory at the repo root is a Claude Code skill bundle. Symlink it to `~/.claude/skills/browserwright` (step 4 of install above) and Claude Code will discover it. After install, prompts like *"open example.com and screenshot it"* or *"scrape the HN front page"* will trigger the skill automatically.
 
 The skill always recommends the isolated-Chrome path, so it won't spam Allow popups against your daily Chrome.
 
 ## Uninstall
 
 ```bash
-rm ~/.local/bin/browser-daemon ~/.local/bin/browser-skill
-rm ~/.claude/skills/browser-skill
-rm -rf browser-daemon/.venv browser-skill/.venv
-rm -rf ~/.cache/browser-daemon ~/.browser-skill
+rm ~/.local/bin/browserwright-daemon ~/.local/bin/browserwright
+rm ~/.claude/skills/browserwright
+rm -rf browserwright-daemon/.venv browserwright/.venv
+rm -rf ~/.cache/browserwright-daemon ~/.browserwright
 ```
 
 ## Further reading
 
 - `TESTING.md` — map of all test suites, what each covers, and how to run them
 - `browser-connection.md` — *why* this stack exists (CDP discovery paths, Chrome 144+ popup mechanics)
-- `browser-daemon/README.md` — backend internals, env vars, `config.toml`
-- `browser-skill/README.md` — full primitive surface, v0.4 / v0.5 release notes
-- `browser-skill/ONBOARDING.md` — contributor-oriented architecture tour
-- `browser-skill/design.md` — full specification
+- `browserwright-daemon/README.md` — backend internals, env vars, `config.toml`
+- `browserwright/README.md` — full primitive surface, v0.4 / v0.5 release notes
+- `browserwright/ONBOARDING.md` — contributor-oriented architecture tour
+- `browserwright/design.md` — full specification
 
 ## License
 

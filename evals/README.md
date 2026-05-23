@@ -1,4 +1,4 @@
-# skills-eval (browser-skill)
+# skills-eval (browserwright)
 
 A tiny, text-level harness that measures whether **our `skill/SKILL.md` actually
 steers a model to the right command *choice***. It feeds
@@ -9,7 +9,7 @@ to a real agent CLI, captures the agent's **text reply** (the commands/plan it
 emits), and **scores the text** — it never launches a real browser.
 
 That cheapness is the whole point. This is complementary to the heavyweight live
-e2e suites (`browser-daemon/tests/e2e`, `browser-skill/tests/agent-e2e`, which
+e2e suites (`browserwright-daemon/tests/e2e`, `browserwright/tests/agent-e2e`, which
 drive a real Chrome): this harness is deterministic, fast, and free in `--mock`
 mode, so every SKILL.md edit gets a red/green signal before you pay for a live
 run. It operationalizes the team's
@@ -62,7 +62,7 @@ python3 evals/run.py --json              # machine-readable; exit 1 on fail (CI)
 
 ## Categories
 
-- **`skill-loading`** — does the agent reach for `browser-skill` (and a
+- **`skill-loading`** — does the agent reach for `browserwright` (and a
   non-clobbering nav) before acting on a page?
 - **`skill-selection`** — does it pick the browser when (and only when) the
   browser is the right tool? Includes a *distractor* case (a pure docs lookup)
@@ -125,7 +125,7 @@ is a bug.
   transient `503`s show up as an empty response → FAIL. Re-run, or rely on the
   deterministic `--mock` proof for CI. Keep real runs to one or a few cases.
 - **Not a substitute for live.** Use this for fast iteration on SKILL.md
-  steering; use the live e2e suites (`browser-daemon/tests/e2e`,
-  `browser-skill/tests/agent-e2e`) to confirm the commands actually drive a
+  steering; use the live e2e suites (`browserwright-daemon/tests/e2e`,
+  `browserwright/tests/agent-e2e`) to confirm the commands actually drive a
   browser.
 ```

@@ -1,4 +1,4 @@
-# .config/wt.toml — browser-skill / browser-daemon worktree lifecycle
+# .config/wt.toml — browserwright worktree lifecycle
 #
 # Source of truth. Conductor and Superset wrappers (conductor.json,
 # .superset/config.json) are generated from this file via:
@@ -8,18 +8,17 @@
 # variables are needed — all paths are relative. No env fallback chains
 # needed — no dynamic ports/workspace names.
 
-# Pre-warm uv envs for both packages so the first `uv run` in a fresh
-# worktree is instant rather than resolving deps on-demand.
+# Pre-warm the uv env so the first `uv run` in a fresh worktree is instant
+# rather than resolving deps on-demand. Single package now (the agent-facing
+# layer + the bundled daemon under browserwright.daemon).
 [post-create]
-sync-daemon = "cd browser-daemon && uv sync --extra test"
-sync-skill  = "cd browser-skill  && uv sync --extra test"
+sync = "uv sync --extra test"
 
-# Unit tests for both packages. agent-e2e is excluded: it requires the
-# claude_agent_sdk (not in the default venv) and a live Chrome extension.
-# Real-Chrome e2e can be run separately via: cd browser-daemon && tests/e2e/run.sh
+# Unit tests. agent-e2e is excluded: it requires the claude_agent_sdk (not in
+# the default venv) and a live Chrome extension. real_chrome e2e is opt-in and
+# can be run separately via: tests/daemon/e2e/run.sh
 [pre-merge]
-test-daemon = "cd browser-daemon && uv run --extra test python -m pytest -q"
-test-skill  = "cd browser-skill  && uv run --extra test python -m pytest -q --ignore=tests/agent-e2e"
+test = "uv run --extra test python -m pytest -q -m 'not real_chrome' --ignore=tests/skill/agent-e2e"
 
 # Kill any stale test daemon on port 29989 left by an interrupted e2e run.
 [pre-remove]

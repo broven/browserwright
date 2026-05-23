@@ -1,5 +1,5 @@
 [tasks.reinstall]
-description = "Sync deps and entry points for browser-daemon and browser-skill after a merge"
+description = "Sync deps and entry points for the browserwright package (single venv, two console scripts)"
 dir = "{{config_root}}"
 run = """
 #!/usr/bin/env bash
@@ -9,37 +9,36 @@ REPO="{{config_root}}"
 LOCAL_BIN="$HOME/.local/bin"
 mkdir -p "$LOCAL_BIN"
 
-for pkg in browser-daemon browser-skill; do
-  venv="$REPO/$pkg/.venv"
+venv="$REPO/.venv"
 
-  # Create venv if missing
-  if [[ ! -x "$venv/bin/python" ]]; then
-    echo "[$pkg] creating venv..."
-    python3.11 -m venv "$venv"
-  fi
+# Create the single repo venv if missing.
+if [[ ! -x "$venv/bin/python" ]]; then
+  echo "creating venv..."
+  python3.11 -m venv "$venv"
+fi
 
-  echo "[$pkg] syncing editable install..."
-  uv pip install --python "$venv/bin/python" -e "$REPO/$pkg"
+echo "syncing editable install..."
+uv pip install --python "$venv/bin/python" -e "$REPO[test,ux]"
 
-  # Ensure ~/.local/bin symlink
-  bin_name="$pkg"
+# Ensure ~/.local/bin symlinks for BOTH console scripts the package ships.
+for bin_name in browserwright browserwright-daemon; do
   src="$venv/bin/$bin_name"
   dst="$LOCAL_BIN/$bin_name"
   if [[ ! -L "$dst" || "$(readlink "$dst")" != "$src" ]]; then
-    echo "[$pkg] linking $dst -> $src"
+    echo "linking $dst -> $src"
     ln -sf "$src" "$dst"
   fi
 done
 
-# Ensure skill dir symlinks
+# Ensure skill dir symlinks.
 skill_src="$REPO/skill"
-for skill_dst in "$HOME/.claude/skills/browser-skill" "$HOME/.pi/agent/skills/browser-skill"; do
+for skill_dst in "$HOME/.claude/skills/browserwright" "$HOME/.pi/agent/skills/browserwright"; do
   if [[ ! -L "$skill_dst" || "$(readlink "$skill_dst")" != "$skill_src" ]]; then
-    echo "[browser-skill] linking $skill_dst -> $skill_src"
+    echo "linking $skill_dst -> $skill_src"
     mkdir -p "$(dirname "$skill_dst")"
     ln -sfn "$skill_src" "$skill_dst"
   fi
 done
 
-echo "Done. Installed: browser-daemon, browser-skill, Claude skill"
+echo "Done. Installed: browserwright (+ browserwright-daemon), Claude skill"
 """

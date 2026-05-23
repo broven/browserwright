@@ -1,11 +1,11 @@
 # Resident Userscripts
 
-Resident userscripts are the persistent automation leg of browser-skill: an agent writes a Tampermonkey-style `.user.js` file, pushes it to the daemon, and the Chrome extension registers it with `chrome.userScripts`. This runs in parallel to CDP session control. Use CDP to open pages, inspect DOM, and verify behavior; use userscripts when code should keep running automatically on every matching page load.
+Resident userscripts are the persistent automation leg of browserwright: an agent writes a Tampermonkey-style `.user.js` file, pushes it to the daemon, and the Chrome extension registers it with `chrome.userScripts`. This runs in parallel to CDP session control. Use CDP to open pages, inspect DOM, and verify behavior; use userscripts when code should keep running automatically on every matching page load.
 
 ## Mental model
 
 - Source of truth is the local `.user.js` file you edit.
-- `browser-skill userscript push path/to/file.user.js` parses the header, sends it through `browser-daemon`, and the extension stores and registers it.
+- `browserwright userscript push path/to/file.user.js` parses the header, sends it through `browserwright-daemon`, and the extension stores and registers it.
 - Identity is `@namespace/@name`; pushing the same identity updates the existing script.
 - Scripts run in Chrome's `USER_SCRIPT` world on matching pages, without a CDP session attached.
 
@@ -43,8 +43,8 @@ Supported v1 metadata directives:
 ## Golden workflow
 
 1. Write or edit `something.user.js`.
-2. Push it: `browser-skill userscript push something.user.js`.
-3. Open the target site through a browser-skill CDP heredoc.
+2. Push it: `browserwright userscript push something.user.js`.
+3. Open the target site through a browserwright CDP heredoc.
 4. Verify the intended effect.
 5. If red, edit the file, push again, reload or reopen the target page, and re-verify.
 
@@ -54,14 +54,14 @@ If the target tab is already open, `--verify` collapses steps 2–4 into one
 command: push, reload the live tab, and capture a fresh screenshot.
 
 ```bash
-browser-skill userscript push something.user.js --verify
+browserwright userscript push something.user.js --verify
 ```
 
 On a successful push it reloads the currently-active matching tab, lets it
 settle, captures a screenshot, and prints the screenshot path so you see the
 result without a separate reload→screenshot round-trip. If the push fails it
 returns the failure and does **not** reload/screenshot a stale page — fix the
-script and push again. `--verify` is a browser-skill convenience and is never
+script and push again. `--verify` is a browserwright convenience and is never
 forwarded to the daemon. Open the target tab first; `--verify` reloads whatever
 tab is currently active, it does not navigate for you.
 
@@ -75,11 +75,11 @@ tab is currently active, it does not navigate for you.
 ## Command cheat sheet
 
 ```bash
-browser-skill userscript push ./example.user.js
-browser-skill userscript list --site=https://example.com/page
-browser-skill userscript toggle bd.userscripts/Example\ Helper --enabled=false
-browser-skill userscript logs --limit=20
-browser-skill userscript remove bd.userscripts/Example\ Helper
+browserwright userscript push ./example.user.js
+browserwright userscript list --site=https://example.com/page
+browserwright userscript toggle bd.userscripts/Example\ Helper --enabled=false
+browserwright userscript logs --limit=20
+browserwright userscript remove bd.userscripts/Example\ Helper
 ```
 
 `install` is an alias of `push` and accepts `-` for stdin.

@@ -12,7 +12,7 @@ Tampermonkey-style userscripts, and the Chrome extension runs them
 browsing — no agent or daemon needs to be present at runtime.
 
 This is **purely additive**. The existing CDP session-driven browser control
-(`chrome.debugger` relay, sessions, `browser-skill` heredoc primitives) is kept
+(`chrome.debugger` relay, sessions, `browserwright` heredoc primitives) is kept
 untouched. The two legs run side by side and do not interfere.
 
 ## Decisions (locked)
@@ -54,7 +54,7 @@ Even with full-auto activation:
   Switch + a **global master switch**.
 - Each injection appends an **audit log** entry `{ts, scriptId, tabId, url}` to
   `chrome.storage.local` (ring buffer, ~500 cap). Surfaced via
-  `browser-skill userscript logs` for the agent to debug "did it inject?".
+  `browserwright userscript logs` for the agent to debug "did it inject?".
 
 ## Architecture
 
@@ -91,7 +91,7 @@ registration.
 **Audit log**: each injection appends `{ts, scriptId, tabId, url}` (ring buffer,
 ~500). Not necessarily shown in popup; for post-hoc debugging.
 
-### 2. Daemon channel + `browser-skill userscript` CLI
+### 2. Daemon channel + `browserwright userscript` CLI
 
 **Channel reuse**: same relay ws, new message types (not CDP frames):
 ```
@@ -101,7 +101,7 @@ registration.
 Extension dispatcher gains a `userscript.*` branch beside CDP. Daemon gains a
 small reqId-keyed RPC wrapper.
 
-**CLI** (`browser-skill userscript ...`) — **does NOT require `BD_SESSION`**
+**CLI** (`browserwright userscript ...`) — **does NOT require `BD_SESSION`**
 (it manages the persistent store, not an agent session). Still needs the daemon
 running + extension connected; loud-fails with "load the extension first"
 otherwise.
@@ -130,7 +130,7 @@ of truth is local `.user.js` files. CLI doesn't care where code comes from.
 - **Sync**: explicit `userscript push <name>` → daemon reads file, parses
   header, pushes to store, re-registers → live immediately.
 
-Local files live at `~/.browser-skill/userscripts/<name>.user.js`.
+Local files live at `~/.browserwright/userscripts/<name>.user.js`.
 
 ### Script format — self-contained `.user.js`
 
@@ -158,7 +158,7 @@ future level-b/c upgrade. Warnings returned to the caller.
 
 ```
 Write hn-tidy.user.js  →  userscript push hn-tidy
-   →  BD_SESSION=$sid browser-skill <<'PY'   (open HN, screenshot/DOM assert)
+   →  BD_SESSION=$sid browserwright <<'PY'   (open HN, screenshot/DOM assert)
    →  green: done, resident;  red: Edit file → push → re-verify
 ```
 

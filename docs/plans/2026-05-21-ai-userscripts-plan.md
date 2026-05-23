@@ -8,7 +8,7 @@ on matching sites via `chrome.userScripts`, driven through the existing
 daemon↔extension relay.
 
 **Architecture:** Source of truth = local `.user.js` files the agent edits.
-Flow on `push`: `browser-skill userscript` (thin shim) → `browser-daemon
+Flow on `push`: `browserwright userscript` (thin shim) → `browserwright-daemon
 userscript` CLI (reads file, parses `==UserScript==` header) → daemon control
 verb `BrowserDaemon.userscript.*` in `proxy.py` → `RelayServer._request` →
 extension `userscript.*` message → `chrome.storage.local` + `chrome.userScripts`
@@ -43,25 +43,25 @@ existing Chrome-for-Testing e2e harness on port 29989.
     from user scripts (used for the injection audit log).
   - `runAt` ∈ `'document_start' | 'document_end' | 'document_idle'`.
 - **Existing relay RPC:** `RelayServer._request(ext, body, *, timeout)` at
-  `browser-daemon/src/browser_daemon/server/relay.py:429` allocates an id, sends
+  `browserwright-daemon/src/browserwright/daemon/server/relay.py:429` allocates an id, sends
   `body` to the extension ws, awaits the matching `{type:"response", id, result|error}`.
   Reuse it; do **not** invent a new transport.
 - **Extension dispatcher:** `handleDaemonMessage(msg)` switch at
-  `browser-daemon/chrome-extension/background.js:200`. Responses go back via
+  `browserwright-daemon/chrome-extension/background.js:200`. Responses go back via
   `safeSend({ type:"response", id, result })` or `{ ..., error:{ code, message }}`.
 - **Daemon control dispatch:** `_handle_browserdaemon()` at
-  `browser-daemon/src/browser_daemon/server/proxy.py:672`, verbs named
+  `browserwright-daemon/src/browserwright/daemon/server/proxy.py:672`, verbs named
   `BrowserDaemon.*`, results sent with `_send_to_client(client_id, _result_response(req_id, {...}))`.
 - **Daemon CLI ws shim pattern:** `_disconnect_via_ws()` at
-  `browser-daemon/src/browser_daemon/cli.py:555` shows how to open a transient ws
+  `browserwright-daemon/src/browserwright/daemon/cli.py:555` shows how to open a transient ws
   to the daemon control socket (`_ipc.sock_path(cfg.name)` on POSIX) and send a
   `BrowserDaemon.*` method.
-- **browser-skill CLI dispatch:** `main()` at
-  `browser-skill/src/browser_skill/cli.py:470`; subcommand groups like
+- **browserwright CLI dispatch:** `main()` at
+  `browserwright/src/browserwright/cli.py:470`; subcommand groups like
   `_cmd_session` at `:388`; kv-arg parser `_parse_kv_args` at `:61`.
 - **Commit after every task.** Tests are pytest. Run daemon tests with
-  `cd browser-daemon && uv run pytest <path> -v`; skill tests with
-  `cd browser-skill && uv run pytest <path> -v`.
+  `cd browserwright-daemon && uv run pytest <path> -v`; skill tests with
+  `cd browserwright && uv run pytest <path> -v`.
 
 ---
 
@@ -70,7 +70,7 @@ existing Chrome-for-Testing e2e harness on port 29989.
 ### Task 0: Grant `userScripts` + `<all_urls>` in the manifest
 
 **Files:**
-- Modify: `browser-daemon/chrome-extension/manifest.json`
+- Modify: `browserwright-daemon/chrome-extension/manifest.json`
 
 **Step 1:** Add `"userScripts"` to the `permissions` array and `"<all_urls>"` to
 `host_permissions`. Result:
@@ -95,31 +95,31 @@ existing Chrome-for-Testing e2e harness on port 29989.
 Also bump `"version"` to `"0.5.0"`.
 
 **Step 2: Verify** the JSON parses:
-Run: `python -c "import json; json.load(open('browser-daemon/chrome-extension/manifest.json'))"`
+Run: `python -c "import json; json.load(open('browserwright-daemon/chrome-extension/manifest.json'))"`
 Expected: no output, exit 0.
 
 **Step 3: Commit**
 ```bash
-git add browser-daemon/chrome-extension/manifest.json
+git add browserwright-daemon/chrome-extension/manifest.json
 git commit -m "feat(ext): grant userScripts + <all_urls> for resident userscripts"
 ```
 
 ---
 
-## Phase 1 — `==UserScript==` metadata parser (browser-daemon, pure Python, TDD)
+## Phase 1 — `==UserScript==` metadata parser (browserwright-daemon, pure Python, TDD)
 
 ### Task 1: Parse the metadata header into a structured record
 
 **Files:**
-- Create: `browser-daemon/src/browser_daemon/userscripts.py`
-- Test: `browser-daemon/tests/test_userscripts_parse.py`
+- Create: `browserwright-daemon/src/browserwright/daemon/userscripts.py`
+- Test: `browserwright-daemon/tests/test_userscripts_parse.py`
 
 **Step 1: Write the failing tests**
 
 ```python
-# browser-daemon/tests/test_userscripts_parse.py
+# browserwright-daemon/tests/test_userscripts_parse.py
 import pytest
-from browser_daemon.userscripts import parse_userscript, UserscriptParseError
+from browserwright.daemon.userscripts import parse_userscript, UserscriptParseError
 
 BASIC = """\
 // ==UserScript==
@@ -196,13 +196,13 @@ def test_no_match_raises():
 ```
 
 **Step 2: Run to verify they fail**
-Run: `cd browser-daemon && uv run pytest tests/test_userscripts_parse.py -v`
+Run: `cd browserwright-daemon && uv run pytest tests/test_userscripts_parse.py -v`
 Expected: FAIL (module not found).
 
 **Step 3: Implement the parser**
 
 ```python
-# browser-daemon/src/browser_daemon/userscripts.py
+# browserwright-daemon/src/browserwright/daemon/userscripts.py
 """Parse Tampermonkey-style ``==UserScript==`` headers into structured records.
 
 v1 capability surface is plain page JS (no GM_* APIs); unsupported metadata
@@ -328,24 +328,24 @@ def parse_userscript(text: str) -> Userscript:
 ```
 
 **Step 4: Run to verify pass**
-Run: `cd browser-daemon && uv run pytest tests/test_userscripts_parse.py -v`
+Run: `cd browserwright-daemon && uv run pytest tests/test_userscripts_parse.py -v`
 Expected: all PASS.
 
 **Step 5: Commit**
 ```bash
-git add browser-daemon/src/browser_daemon/userscripts.py browser-daemon/tests/test_userscripts_parse.py
+git add browserwright-daemon/src/browserwright/daemon/userscripts.py browserwright-daemon/tests/test_userscripts_parse.py
 git commit -m "feat(daemon): parse ==UserScript== metadata headers"
 ```
 
 ---
 
-## Phase 2 — Relay + daemon control verbs (browser-daemon, TDD where possible)
+## Phase 2 — Relay + daemon control verbs (browserwright-daemon, TDD where possible)
 
 ### Task 2: Add `userscript_request` to RelayServer
 
 **Files:**
-- Modify: `browser-daemon/src/browser_daemon/server/relay.py` (near `send_cdp`, ~line 393)
-- Test: `browser-daemon/tests/test_relay_userscript.py`
+- Modify: `browserwright-daemon/src/browserwright/daemon/server/relay.py` (near `send_cdp`, ~line 393)
+- Test: `browserwright-daemon/tests/test_relay_userscript.py`
 
 **Step 1: Write the failing test** — model it on the existing relay tests
 (inspect `tests/test_relay.py` for the fake-extension-connection helper and reuse
@@ -354,11 +354,11 @@ sends `{type:"userscript.<verb>", ...payload}` to the extension conn and returns
 the `result`.
 
 ```python
-# browser-daemon/tests/test_relay_userscript.py
+# browserwright-daemon/tests/test_relay_userscript.py
 import asyncio
 import json
 import pytest
-from browser_daemon.server.relay import RelayServer
+from browserwright.daemon.server.relay import RelayServer
 
 class FakeConn:
     def __init__(self): self.sent = []
@@ -392,7 +392,7 @@ async def test_userscript_request_forwards_and_returns_result():
 > `self._extension_for_tab`, so a no-tab "pick any" variant may need adding.
 
 **Step 2: Run → fail.**
-Run: `cd browser-daemon && uv run pytest tests/test_relay_userscript.py -v`
+Run: `cd browserwright-daemon && uv run pytest tests/test_relay_userscript.py -v`
 
 **Step 3: Implement** in `relay.py`:
 
@@ -416,14 +416,14 @@ async def userscript_request(self, verb: str, payload: dict, *,
 
 **Step 4: Run → pass. Step 5: Commit**
 ```bash
-git add browser-daemon/src/browser_daemon/server/relay.py browser-daemon/tests/test_relay_userscript.py
+git add browserwright-daemon/src/browserwright/daemon/server/relay.py browserwright-daemon/tests/test_relay_userscript.py
 git commit -m "feat(daemon): RelayServer.userscript_request bridges control verbs to extension"
 ```
 
 ### Task 3: Delegate from ExtensionUpstream
 
 **Files:**
-- Modify: `browser-daemon/src/browser_daemon/server/extension_upstream.py` (~line 250)
+- Modify: `browserwright-daemon/src/browserwright/daemon/server/extension_upstream.py` (~line 250)
 
 **Step 1:** Add a thin delegate (no new test; covered by Task 4 + e2e):
 ```python
@@ -434,15 +434,15 @@ Verify the relay attribute name (`self._relay` vs `self.relay`) by reading the f
 
 **Step 2: Commit**
 ```bash
-git add browser-daemon/src/browser_daemon/server/extension_upstream.py
+git add browserwright-daemon/src/browserwright/daemon/server/extension_upstream.py
 git commit -m "feat(daemon): ExtensionUpstream delegates userscript_request to relay"
 ```
 
 ### Task 4: Add `BrowserDaemon.userscript.*` control verbs in proxy.py
 
 **Files:**
-- Modify: `browser-daemon/src/browser_daemon/server/proxy.py` (`_handle_browserdaemon`, ~line 672)
-- Test: `browser-daemon/tests/test_proxy_userscript.py`
+- Modify: `browserwright-daemon/src/browserwright/daemon/server/proxy.py` (`_handle_browserdaemon`, ~line 672)
+- Test: `browserwright-daemon/tests/test_proxy_userscript.py`
 
 **Step 1: Write the failing test** — inspect `tests/` for how the Router is
 constructed with a fake upstream/client in existing proxy tests, and assert that
@@ -479,19 +479,19 @@ obtained in this method (read the surrounding code at line 672+).
 
 **Step 4: Run → pass. Step 5: Commit**
 ```bash
-git add browser-daemon/src/browser_daemon/server/proxy.py browser-daemon/tests/test_proxy_userscript.py
+git add browserwright-daemon/src/browserwright/daemon/server/proxy.py browserwright-daemon/tests/test_proxy_userscript.py
 git commit -m "feat(daemon): BrowserDaemon.userscript.* control verbs"
 ```
 
 ---
 
-## Phase 3 — Daemon CLI `browser-daemon userscript ...`
+## Phase 3 — Daemon CLI `browserwright-daemon userscript ...`
 
 ### Task 5: Implement the daemon CLI subcommand
 
 **Files:**
-- Modify: `browser-daemon/src/browser_daemon/cli.py` (add subcommand + ws shim near `_disconnect_via_ws` ~line 555 and the arg dispatch)
-- Test: `browser-daemon/tests/test_cli_userscript.py`
+- Modify: `browserwright-daemon/src/browserwright/daemon/cli.py` (add subcommand + ws shim near `_disconnect_via_ws` ~line 555 and the arg dispatch)
+- Test: `browserwright-daemon/tests/test_cli_userscript.py`
 
 **Subcommands:**
 - `push <file>` — read file → `parse_userscript` → send `BrowserDaemon.userscript.install` with `{"script": us.to_payload()}`. Print `{id, identity, warnings}` as JSON. (`install` is an alias of `push` that also accepts `-`/stdin.)
@@ -506,9 +506,9 @@ and a payload whose `script.id` equals the parsed id. Monkeypatch the ws-send
 helper so no real daemon is needed:
 
 ```python
-# browser-daemon/tests/test_cli_userscript.py
+# browserwright-daemon/tests/test_cli_userscript.py
 import json
-from browser_daemon import cli
+from browserwright.daemon import cli
 
 def test_push_parses_and_sends_install(tmp_path, monkeypatch):
     f = tmp_path / "x.user.js"
@@ -538,8 +538,8 @@ first and match it.
 
 **Step 4: Run → pass. Step 5: Commit**
 ```bash
-git add browser-daemon/src/browser_daemon/cli.py browser-daemon/tests/test_cli_userscript.py
-git commit -m "feat(daemon): browser-daemon userscript {push,list,remove,toggle,logs} CLI"
+git add browserwright-daemon/src/browserwright/daemon/cli.py browserwright-daemon/tests/test_cli_userscript.py
+git commit -m "feat(daemon): browserwright-daemon userscript {push,list,remove,toggle,logs} CLI"
 ```
 
 ---
@@ -552,7 +552,7 @@ git commit -m "feat(daemon): browser-daemon userscript {push,list,remove,toggle,
 ### Task 6: Userscript store + registration engine
 
 **Files:**
-- Modify: `browser-daemon/chrome-extension/background.js`
+- Modify: `browserwright-daemon/chrome-extension/background.js`
 
 **Step 1:** Add a storage module section. Records live under
 `chrome.storage.local` key `userscripts` (object keyed by `id`), plus a master
@@ -649,14 +649,14 @@ usSyncAll().catch(e => console.warn("[bd-relay] usSyncAll on init failed:", e));
 
 **Step 5: Commit**
 ```bash
-git add browser-daemon/chrome-extension/background.js
+git add browserwright-daemon/chrome-extension/background.js
 git commit -m "feat(ext): userscript store + chrome.userScripts registration engine"
 ```
 
 ### Task 7: `userscript.*` relay-message dispatch + injection-log listener
 
 **Files:**
-- Modify: `browser-daemon/chrome-extension/background.js`
+- Modify: `browserwright-daemon/chrome-extension/background.js`
 
 **Step 1:** Add cases in `handleDaemonMessage` switch (before `default`):
 ```javascript
@@ -778,7 +778,7 @@ async function doUserscriptToggleLocal(id, enabled) {
 
 **Step 5: Commit**
 ```bash
-git add browser-daemon/chrome-extension/background.js
+git add browserwright-daemon/chrome-extension/background.js
 git commit -m "feat(ext): userscript.* relay dispatch, match helper, injection audit log"
 ```
 
@@ -789,8 +789,8 @@ git commit -m "feat(ext): userscript.* relay dispatch, match helper, injection a
 ### Task 8: Popup shows this-site scripts with toggles
 
 **Files:**
-- Modify: `browser-daemon/chrome-extension/popup.html`
-- Modify: `browser-daemon/chrome-extension/popup.js`
+- Modify: `browserwright-daemon/chrome-extension/popup.html`
+- Modify: `browserwright-daemon/chrome-extension/popup.js`
 
 **Step 1 (popup.html):** Add a section below the attached-tabs list:
 ```html
@@ -840,27 +840,27 @@ via CDP if practical; otherwise toggle is asserted through `userscript.toggle`).
 
 **Step 4: Commit**
 ```bash
-git add browser-daemon/chrome-extension/popup.html browser-daemon/chrome-extension/popup.js
+git add browserwright-daemon/chrome-extension/popup.html browserwright-daemon/chrome-extension/popup.js
 git commit -m "feat(ext): popup lists this-site userscripts with toggles + master switch"
 ```
 
 ---
 
-## Phase 6 — browser-skill CLI shim (agent-facing)
+## Phase 6 — browserwright CLI shim (agent-facing)
 
-### Task 9: `browser-skill userscript ...` delegates to `browser-daemon userscript`
+### Task 9: `browserwright userscript ...` delegates to `browserwright-daemon userscript`
 
 **Files:**
-- Modify: `browser-skill/src/browser_skill/cli.py` (`main()` dispatch ~line 470, HELP ~line 26)
-- Test: `browser-skill/tests/test_cli_userscript.py`
+- Modify: `browserwright/src/browserwright/cli.py` (`main()` dispatch ~line 470, HELP ~line 26)
+- Test: `browserwright/tests/test_cli_userscript.py`
 
-**Step 1: Write the failing test** — assert `browser-skill userscript push f.user.js`
-subprocesses `browser-daemon userscript push f.user.js` (monkeypatch
+**Step 1: Write the failing test** — assert `browserwright userscript push f.user.js`
+subprocesses `browserwright-daemon userscript push f.user.js` (monkeypatch
 `subprocess.run`), and that `userscript` appears in HELP.
 
 ```python
-# browser-skill/tests/test_cli_userscript.py
-from browser_skill import cli
+# browserwright/tests/test_cli_userscript.py
+from browserwright import cli
 
 def test_userscript_delegates_to_daemon(monkeypatch):
     calls = {}
@@ -870,7 +870,7 @@ def test_userscript_delegates_to_daemon(monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", fake_run, raising=False)
     rc = cli._cmd_userscript(["push", "f.user.js"])
     assert rc == 0
-    assert calls["argv"][:2] == ["browser-daemon", "userscript"]
+    assert calls["argv"][:2] == ["browserwright-daemon", "userscript"]
     assert "push" in calls["argv"]
 
 def test_help_mentions_userscript():
@@ -880,14 +880,14 @@ def test_help_mentions_userscript():
 **Step 2: Run → fail.**
 
 **Step 3: Implement** `_cmd_userscript(args)` (delegates via `subprocess.run`
-`["browser-daemon", "userscript", *args]`, propagating returncode), register
+`["browserwright-daemon", "userscript", *args]`, propagating returncode), register
 `if cmd == "userscript": sys.exit(_cmd_userscript(rest))` in `main()`, and add a
 `userscript` line to `HELP`. Ensure `import subprocess` exists.
 
 **Step 4: Run → pass. Step 5: Commit**
 ```bash
-git add browser-skill/src/browser_skill/cli.py browser-skill/tests/test_cli_userscript.py
-git commit -m "feat(skill): browser-skill userscript shim to daemon CLI"
+git add browserwright/src/browserwright/cli.py browserwright/tests/test_cli_userscript.py
+git commit -m "feat(skill): browserwright userscript shim to daemon CLI"
 ```
 
 ---
@@ -904,7 +904,7 @@ git commit -m "feat(skill): browser-skill userscript shim to daemon CLI"
 mental model (resident-Tampermonkey leg, parallel to CDP); `==UserScript==`
 header spec + v1-supported directives + graceful degradation; capability-a
 boundary (plain page JS, no `GM_*`); the **golden workflow**
-(`Write/Edit .user.js → browser-skill userscript push → open target site via CDP
+(`Write/Edit .user.js → browserwright userscript push → open target site via CDP
 heredoc and verify → red ⇒ Edit → push → re-verify`); the **verification menu**
 (UI change → DOM snapshot/screenshot; data pull → extract & judge; pure injection
 → read a shared DOM sentinel such as `document.documentElement.dataset.us*` (not `window.__us_*`, which is isolated in `USER_SCRIPT`); "always verify after writing"); command
@@ -927,8 +927,8 @@ git commit -m "docs(skill): userscripts authoring guide + link from SKILL.md"
 ### Task 11: e2e — install → inject → toggle → remove
 
 **Files:**
-- Create: `browser-daemon/tests/e2e/test_userscripts_e2e.py`
-- Inspect first: `browser-daemon/tests/e2e/run.sh` and an existing e2e test to
+- Create: `browserwright-daemon/tests/e2e/test_userscripts_e2e.py`
+- Inspect first: `browserwright-daemon/tests/e2e/run.sh` and an existing e2e test to
   reuse the harness fixtures (Chrome-for-Testing on port 29989, extension
   backend, `run_skill`/session helpers).
 
@@ -936,13 +936,13 @@ git commit -m "docs(skill): userscripts authoring guide + link from SKILL.md"
 1. Write a temp `.user.js` whose code sets a shared DOM sentinel such as `document.documentElement.setAttribute('data-us-e2e', 'ok')` and matches a
    stable local/test page served by the harness (reuse whatever page existing
    e2e tests load).
-2. `browser-daemon userscript push <file>` (or the skill shim).
+2. `browserwright-daemon userscript push <file>` (or the skill shim).
 3. Open the matching page via the existing CDP session helper; `Runtime.evaluate`
    read `document.documentElement.getAttribute('data-us-e2e')` → expect `'ok'`.
-4. `browser-daemon userscript toggle <identity> --enabled=false`; reload page;
+4. `browserwright-daemon userscript toggle <identity> --enabled=false`; reload page;
    expect the DOM sentinel absent.
-5. `browser-daemon userscript logs` → expect at least one entry with the script id.
-6. `browser-daemon userscript remove <identity>`; `list` → empty.
+5. `browserwright-daemon userscript logs` → expect at least one entry with the script id.
+6. `browserwright-daemon userscript remove <identity>`; `list` → empty.
 
 > **NOTE:** match patterns must cover the harness's test page origin. If the
 > harness serves `http://localhost:<port>/...`, use `http://localhost/*` or the
@@ -950,23 +950,23 @@ git commit -m "docs(skill): userscripts authoring guide + link from SKILL.md"
 > tests before finalizing the pattern.
 
 **Step 2: Run the e2e suite**
-Run: `cd browser-daemon && bash tests/e2e/run.sh -k userscripts -v` (adapt to how
+Run: `cd browserwright-daemon && bash tests/e2e/run.sh -k userscripts -v` (adapt to how
 run.sh forwards pytest args; if it doesn't, run the full e2e once).
 Expected: PASS.
 
 **Step 3: Commit**
 ```bash
-git add browser-daemon/tests/e2e/test_userscripts_e2e.py
+git add browserwright-daemon/tests/e2e/test_userscripts_e2e.py
 git commit -m "test(e2e): resident userscript install/inject/toggle/remove"
 ```
 
 ### Task 12: Full regression — both suites green
 
 **Step 1:** Run daemon unit suite:
-`cd browser-daemon && uv run pytest -q`
+`cd browserwright-daemon && uv run pytest -q`
 **Step 2:** Run skill unit suite:
-`cd browser-skill && uv run pytest -q`
-**Step 3:** Run e2e once: `cd browser-daemon && bash tests/e2e/run.sh`
+`cd browserwright && uv run pytest -q`
+**Step 3:** Run e2e once: `cd browserwright-daemon && bash tests/e2e/run.sh`
 Expected: all green. If anything fails, fix before final commit. Do not overfit
 e2e assertions to exact wording — assert behavior (sentinel present/absent, log
 entry exists, list empty after remove).

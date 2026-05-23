@@ -6,7 +6,7 @@
 
 **Architecture:** A short opaque incrementing **session id** is the isolation key. A file-locked **ledger** (`$BS_HOME/sessions/`) maps id → `{backend, daemon_endpoint, workspace, owner, name, last_seen}`. Creation is **explicit** (agent picks `extension` / `rdp --create` / `rdp --attach`); usage is **transparent** (every call just carries `--session <id>`). Extension = one shared daemon multiplexing per-session tab groups; RDP = one daemon per session (1:1). The global REPL daemon is removed (the silent cross-talk vector). Ownership rule: who `create`s, closes; `attach` only reminds.
 
-**Tech Stack:** Python 3.11, pytest (+ pytest-asyncio for daemon), `fcntl` file locks, CDP over websockets. Two packages: `browser-skill` (Layer 2) and `browser-daemon` (Layer 1).
+**Tech Stack:** Python 3.11, pytest (+ pytest-asyncio for daemon), `fcntl` file locks, CDP over websockets. Two packages: `browserwright` (Layer 2) and `browserwright-daemon` (Layer 1).
 
 **Source design:** `docs/plans/2026-05-20-session-model-design.md`. Code is the only source of truth; touchpoints cite `path:line`.
 
@@ -28,7 +28,7 @@
 **Phases 0–3 are fully specified below (bite-sized TDD).** Phases 4–7 are task-level breakdowns (exact files, test names, commands, code sketches, acceptance criteria); **expand each into bite-sized steps with a per-phase `writing-plans` pass before executing it**, re-reading the daemon internals it touches.
 
 Commit after every passing task. Run skill tests with:
-`( cd browser-skill && .venv/bin/python -m pytest tests/<file>::<test> -v )`
+`( cd browserwright && .venv/bin/python -m pytest tests/<file>::<test> -v )`
 
 ---
 
@@ -37,10 +37,10 @@ Commit after every passing task. Run skill tests with:
 A pure, daemon-free module. The single source of truth mapping a short id to its session record. File-locked so concurrent `session new` from parallel agents never collide on an id.
 
 **Files:**
-- Create: `browser-skill/src/browser_skill/session_registry.py`
-- Test: `browser-skill/tests/test_session_registry.py`
+- Create: `browserwright/src/browserwright/session_registry.py`
+- Test: `browserwright/tests/test_session_registry.py`
 
-Ledger lives at `$BS_HOME/sessions/ledger.json` (BS_HOME default `~/.browser-skill`, matching `session.py:63`). Shape:
+Ledger lives at `$BS_HOME/sessions/ledger.json` (BS_HOME default `~/.browserwright`, matching `session.py:63`). Shape:
 ```json
 {"next_id": 3, "sessions": {
   "1": {"id":"1","backend":"extension","daemon_endpoint":"default",
@@ -52,7 +52,7 @@ Ledger lives at `$BS_HOME/sessions/ledger.json` (BS_HOME default `~/.browser-ski
 
 **Step 1 — failing test** (`tests/test_session_registry.py`):
 ```python
-from browser_skill import session_registry as reg
+from browserwright import session_registry as reg
 
 def test_allocate_increments_from_one(tmp_bs_home):
     a = reg.allocate(backend="extension", daemon_endpoint="default", owner="attach")
@@ -74,7 +74,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 def _home() -> Path:
-    return Path(os.path.expanduser(os.environ.get("BS_HOME", "~/.browser-skill")))
+    return Path(os.path.expanduser(os.environ.get("BS_HOME", "~/.browserwright")))
 
 def _dir() -> Path:
     d = _home() / "sessions"
@@ -117,7 +117,7 @@ def get(session_id: str) -> Optional[dict]:
     return json.loads(p.read_text())["sessions"].get(session_id)
 ```
 **Step 4 — run, expect pass.** **Step 5 — commit:**
-`git add browser-skill/src/browser_skill/session_registry.py browser-skill/tests/test_session_registry.py && git commit -m "feat(skill): session ledger id allocation"`
+`git add browserwright/src/browserwright/session_registry.py browserwright/tests/test_session_registry.py && git commit -m "feat(skill): session ledger id allocation"`
 
 ### Task 0.2: concurrent allocate yields unique ids (lock works)
 **Test:**
@@ -170,17 +170,17 @@ def test_prune_drops_idle(tmp_bs_home, monkeypatch):
 Kill the silent-default vector: no session id → loud, actionable error. The daemon endpoint a call talks to comes from the **session record**, not the import-time `BD_NAME`.
 
 **Files:**
-- Modify: `browser-skill/src/browser_skill/errors.py` (add `NoSession`)
-- Create: `browser-skill/src/browser_skill/session_ctx.py` (resolve current session)
-- Modify: `browser-skill/src/browser_skill/mode_b_client.py:39` (drop `_DEFAULT_NAME` default)
-- Modify: `browser-skill/src/browser_skill/repl/inline.py` (refuse at entry when no session)
-- Test: `browser-skill/tests/test_session_ctx.py`, update `tests/test_mode_b_client.py`
+- Modify: `browserwright/src/browserwright/errors.py` (add `NoSession`)
+- Create: `browserwright/src/browserwright/session_ctx.py` (resolve current session)
+- Modify: `browserwright/src/browserwright/mode_b_client.py:39` (drop `_DEFAULT_NAME` default)
+- Modify: `browserwright/src/browserwright/repl/inline.py` (refuse at entry when no session)
+- Test: `browserwright/tests/test_session_ctx.py`, update `tests/test_mode_b_client.py`
 
 ### Task 1.1: `NoSession` error
 **Test** (`tests/test_session_ctx.py`):
 ```python
 import pytest
-from browser_skill.errors import NoSession
+from browserwright.errors import NoSession
 
 def test_nosession_message_is_actionable():
     e = NoSession()
@@ -195,7 +195,7 @@ class NoSession(BrowserSkillError):
     def __init__(self, detail: str = ""):
         self.detail = detail
         super().__init__(
-            "no session: run `browser-skill session new --backend <extension|rdp> ...` "
+            "no session: run `browserwright session new --backend <extension|rdp> ...` "
             "first, then pass --session <id> (or BD_SESSION=<id>) on every call. " + detail
         )
 ```
@@ -215,7 +215,7 @@ def test_resolve_session_unknown_id_raises(tmp_bs_home, monkeypatch):
         session_ctx.resolve_session()
 
 def test_resolve_session_returns_record_and_touches(tmp_bs_home, monkeypatch):
-    from browser_skill import session_registry as reg
+    from browserwright import session_registry as reg
     sid = reg.allocate(backend="extension", daemon_endpoint="default", owner="attach")
     monkeypatch.setenv("BD_SESSION", sid)
     rec = session_ctx.resolve_session()
@@ -231,10 +231,10 @@ Run → PASS. Commit.
 **Test** (update `tests/test_mode_b_client.py`): assert that constructing the client for a session uses the session record's `daemon_endpoint`, and that no `"default"` fallback exists.
 ```python
 def test_client_uses_session_daemon_endpoint(tmp_bs_home, monkeypatch):
-    from browser_skill import session_registry as reg, mode_b_client
-    sid = reg.allocate(backend="rdp", daemon_endpoint="browser-daemon-s7.sock", owner="create")
+    from browserwright import session_registry as reg, mode_b_client
+    sid = reg.allocate(backend="rdp", daemon_endpoint="browserwright-daemon-s7.sock", owner="create")
     c = mode_b_client.client_for_session(reg.get(sid))
-    assert c.name == "browser-daemon-s7.sock"  # not "default"
+    assert c.name == "browserwright-daemon-s7.sock"  # not "default"
 ```
 **Implement:** add `client_for_session(record) -> ModeBClient` that builds the endpoint from `record["daemon_endpoint"]`; remove the module-level `_DEFAULT_NAME` default (callers must pass a name/endpoint). Update `auto_client()` callers accordingly (grep usages first). Run → PASS. Commit.
 
@@ -249,9 +249,9 @@ def test_client_uses_session_daemon_endpoint(tmp_bs_home, monkeypatch):
 ## Phase 2 — CLI `session` subcommands + `whoami`
 
 **Files:**
-- Modify: `browser-skill/src/browser_skill/cli.py` (add `_cmd_session`, `_cmd_whoami`, dispatch + HELP)
-- Create: `browser-skill/src/browser_skill/session_create.py` (creation logic per mode)
-- Test: update `browser-skill/tests/test_cli.py`
+- Modify: `browserwright/src/browserwright/cli.py` (add `_cmd_session`, `_cmd_whoami`, dispatch + HELP)
+- Create: `browserwright/src/browserwright/session_create.py` (creation logic per mode)
+- Test: update `browserwright/tests/test_cli.py`
 
 ### Task 2.1: `session new --backend extension` registers an attach session
 **Test** (`tests/test_cli.py`): call `cli.main(["session","new","--backend=extension","--name=research"])`, capture stdout, assert it prints a bare id (`1`), and the ledger has one extension/attach entry named research.
@@ -270,7 +270,7 @@ def test_client_uses_session_daemon_endpoint(tmp_bs_home, monkeypatch):
 - attach session → `session end` does **not** close, prints a reminder mentioning the browser is still running, removes the ledger entry, exit 0.
 ```python
 def test_session_end_attach_emits_reminder(tmp_bs_home, capsys, monkeypatch):
-    from browser_skill import session_registry as reg
+    from browserwright import session_registry as reg
     sid = reg.allocate(backend="rdp", daemon_endpoint="d", owner="attach", name="fp")
     cli.main(["session","end",f"--session={sid}"])
     out = capsys.readouterr().out
@@ -325,7 +325,7 @@ extension and rdp each implement; this is what Phases 5/6 fill in.
 - **4b** `backends/extension.py` `resolve()` always raises `Unavailable`, and `active_tab.py` calls it → `active-tab` always fails under extension. Test (`tests/test_active_tab.py`): extension `active-tab` routes through the relay path, not `resolve()`. Fix `active_tab.py` to branch to relay for extension.
 - **4c** `server/extension_upstream.py:258-262`: unsupported `Target.createTarget` returns misleading `-32601 "requires a sessionId"`. Test (`tests/test_extension_upstream_errors.py`): `Target.createTarget` fast-fails with a message naming `new_page`/`openBackgroundTab`. Fix the error branch.
 
-Run: `( cd browser-daemon && .venv/bin/python -m pytest tests/test_extension_upstream.py tests/test_active_tab.py tests/test_extension_upstream_errors.py -v )`.
+Run: `( cd browserwright-daemon && .venv/bin/python -m pytest tests/test_extension_upstream.py tests/test_active_tab.py tests/test_extension_upstream_errors.py -v )`.
 
 ---
 
@@ -353,7 +353,7 @@ Tests live in `tests/test_extension_upstream.py`, `tests/test_multiclient.py`, n
 **Goal:** `session new --backend rdp` binds a session 1:1 to a daemon+browser. `--create` launches an isolated Chrome (reuse `launch-chrome`) + a daemon named for the session; `--attach <port|recipe>` attaches to an already-running browser (fingerprint). `session end` closes only create-owned browsers; attach emits the reminder (wired in Phase 2.3, now real).
 
 **Tasks:**
-1. `session_create.new` (rdp create): call `browser-daemon launch-chrome --port <p> --profile <sid>` + start/point a daemon; record its socket as `daemon_endpoint`, `owner="create"`. Test (subprocess mocked): ledger endpoint set, owner=create.
+1. `session_create.new` (rdp create): call `browserwright-daemon launch-chrome --port <p> --profile <sid>` + start/point a daemon; record its socket as `daemon_endpoint`, `owner="create"`. Test (subprocess mocked): ledger endpoint set, owner=create.
 2. (rdp attach): given a port/recipe, point a daemon at it; `owner="attach"`. For fingerprint recipes, the launch recipe comes from skill memory (Phase 7). Test: owner=attach, target recorded.
 3. `session end` (create): stop daemon + kill the launched Chrome. Test: close path invoked. (attach: reminder only — already covered 2.3.)
 4. Reaper: `session prune` also stops orphaned create-owned daemons whose ledger entry is idle past timeout. Test: idle create session → browser/daemon stopped.
@@ -369,7 +369,7 @@ Tests live in `tests/test_extension_upstream.py`, `tests/test_multiclient.py`, n
 **Tasks:**
 1. New memory accessor `memory/session_decisions.py` (mirror `global_mem.py`): `lookup(situation) -> decision|None`, `record(situation, decision)`. Test (tmp_bs_home): record then lookup round-trips.
 2. `session_create.choose(situation) -> decision`: on hit return it; on miss raise `NeedsUserConfirm` (reuse `errors.py:99`) with a proposal listing the three modes. Test: miss raises NeedsUserConfirm naming extension/rdp-create/rdp-attach.
-3. Wire `choose` into the agent flow + SKILL.md guidance ("before session new, consult decision memory; if absent, ask which browser and record"). Update `skill/SKILL.md` + `browser-skill/SKILL.md`. Test: guidance text present (grep) — and add an `ai-e2e-tests` case mirroring the existing Case-pattern for ask-first.
+3. Wire `choose` into the agent flow + SKILL.md guidance ("before session new, consult decision memory; if absent, ask which browser and record"). Update `skill/SKILL.md` + `browserwright/SKILL.md`. Test: guidance text present (grep) — and add an `ai-e2e-tests` case mirroring the existing Case-pattern for ask-first.
 
 ---
 
@@ -379,7 +379,7 @@ Tests live in `tests/test_extension_upstream.py`, `tests/test_multiclient.py`, n
 - `tmp_bs_home` fixture (`tests/conftest.py:8`) gives a temp `$BS_HOME` and resets memory singletons — use it for every ledger/memory test.
 - Daemon tests use `pytest-asyncio` (`asyncio_mode=auto`) + fake extension/relay fixtures. `RelayServer(port=0)` binds ephemeral (relay.py:70).
 - Run a package's full suite before declaring a phase done:
-  `( cd browser-skill && .venv/bin/python -m pytest -q )` / `( cd browser-daemon && .venv/bin/python -m pytest -q )`.
+  `( cd browserwright && .venv/bin/python -m pytest -q )` / `( cd browserwright-daemon && .venv/bin/python -m pytest -q )`.
 
 ## Risks / watch-items
 

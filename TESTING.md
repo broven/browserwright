@@ -9,29 +9,29 @@ AI agent / Claude Code
         ↓
 skill/                         Agent-facing skill documentation
         ↓
-browser-skill/                 Layer 2: agent API, sessions, memory, primitives
+browserwright/                 Layer 2: agent API, sessions, memory, primitives
         ↓
-browser-daemon/                Layer 1: browser/CDP connection, proxy, backends
+browserwright-daemon/                Layer 1: browser/CDP connection, proxy, backends
         ↓
 Chrome / extension / RDP / cloud browser
 ```
 
-- `browser-daemon` tests mostly prove the low-level browser connection and CDP proxy work.
-- `browser-skill` tests mostly prove the agent-facing API, session model, memory, and primitives work.
-- `browser-daemon/tests/e2e` and `browser-skill/tests/agent-e2e` exercise larger end-to-end paths.
+- `browserwright-daemon` tests mostly prove the low-level browser connection and CDP proxy work.
+- `browserwright` tests mostly prove the agent-facing API, session model, memory, and primitives work.
+- `browserwright-daemon/tests/e2e` and `browserwright/tests/agent-e2e` exercise larger end-to-end paths.
 
 ## Test locations
 
 ```text
-browser-daemon/tests/              pytest: daemon unit + integration tests
-browser-daemon/tests/e2e/          pytest: real Chrome + extension + daemon E2E
-browser-skill/tests/               pytest: skill unit + offline integration tests
-browser-skill/tests/agent-e2e/     promptfoo + Claude SDK agent E2E, plus harness tests
+browserwright-daemon/tests/              pytest: daemon unit + integration tests
+browserwright-daemon/tests/e2e/          pytest: real Chrome + extension + daemon E2E
+browserwright/tests/               pytest: skill unit + offline integration tests
+browserwright/tests/agent-e2e/     promptfoo + Claude SDK agent E2E, plus harness tests
 evals/                             text-level skills-eval (command-choice gating)
 .github/workflows/                 CI entry points
 ```
 
-## 1. `browser-daemon/tests/`
+## 1. `browserwright-daemon/tests/`
 
 Daemon-layer pytest suite.
 
@@ -52,29 +52,29 @@ Covers:
 Representative files:
 
 ```text
-browser-daemon/tests/test_auth.py
-browser-daemon/tests/test_cloud_backend.py
-browser-daemon/tests/test_env.py
-browser-daemon/tests/test_extension_upstream.py
-browser-daemon/tests/test_proxy.py
-browser-daemon/tests/test_relay.py
-browser-daemon/tests/test_serve.py
-browser-daemon/tests/test_serve_extension.py
-browser-daemon/tests/test_launch_chrome.py
-browser-daemon/tests/test_schema_lock.py
+browserwright-daemon/tests/test_auth.py
+browserwright-daemon/tests/test_cloud_backend.py
+browserwright-daemon/tests/test_env.py
+browserwright-daemon/tests/test_extension_upstream.py
+browserwright-daemon/tests/test_proxy.py
+browserwright-daemon/tests/test_relay.py
+browserwright-daemon/tests/test_serve.py
+browserwright-daemon/tests/test_serve_extension.py
+browserwright-daemon/tests/test_launch_chrome.py
+browserwright-daemon/tests/test_schema_lock.py
 ```
 
 Run:
 
 ```bash
-cd browser-daemon
+cd browserwright-daemon
 python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
 Note: real Chrome E2E tests under `tests/e2e/` are opt-in and are skipped unless explicitly selected.
 
-## 2. `browser-daemon/tests/e2e/`
+## 2. `browserwright-daemon/tests/e2e/`
 
 Real-browser E2E suite.
 
@@ -82,8 +82,8 @@ These tests start:
 
 - a real Chrome for Testing instance
 - the real unpacked Chrome extension, patched to a test relay port
-- a real `browser-daemon serve`
-- `browser-skill` CLI calls against the daemon
+- a real `browserwright-daemon serve`
+- `browserwright` CLI calls against the daemon
 
 Covers:
 
@@ -97,17 +97,17 @@ Covers:
 Files:
 
 ```text
-browser-daemon/tests/e2e/test_l0_smoke.py
-browser-daemon/tests/e2e/test_l1_roundtrip.py
-browser-daemon/tests/e2e/test_l2_user_flows.py
-browser-daemon/tests/e2e/test_l3_parity.py
-browser-daemon/tests/e2e/test_patch_extension.py
+browserwright-daemon/tests/e2e/test_l0_smoke.py
+browserwright-daemon/tests/e2e/test_l1_roundtrip.py
+browserwright-daemon/tests/e2e/test_l2_user_flows.py
+browserwright-daemon/tests/e2e/test_l3_parity.py
+browserwright-daemon/tests/e2e/test_patch_extension.py
 ```
 
 Run:
 
 ```bash
-cd browser-daemon
+cd browserwright-daemon
 uv run pytest tests/e2e/ -v
 # or
 uv run pytest -m real_chrome -v
@@ -121,7 +121,7 @@ npx @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing
 
 The suite uses isolated ports/profile directories and does not touch the production daemon or daily Chrome profile.
 
-## 3. `browser-skill/tests/`
+## 3. `browserwright/tests/`
 
 Skill-layer pytest suite.
 
@@ -142,29 +142,29 @@ Covers:
 Representative files:
 
 ```text
-browser-skill/tests/test_cli.py
-browser-skill/tests/test_daemon_client.py
-browser-skill/tests/test_mode_b_client.py
-browser-skill/tests/test_memory.py
-browser-skill/tests/test_primitives_f4_catchup.py
-browser-skill/tests/test_primitives_offline.py
-browser-skill/tests/test_session_*.py
-browser-skill/tests/test_solidify.py
-browser-skill/tests/test_subscriptions.py
-browser-skill/tests/test_v02_features.py
+browserwright/tests/test_cli.py
+browserwright/tests/test_daemon_client.py
+browserwright/tests/test_mode_b_client.py
+browserwright/tests/test_memory.py
+browserwright/tests/test_primitives_f4_catchup.py
+browserwright/tests/test_primitives_offline.py
+browserwright/tests/test_session_*.py
+browserwright/tests/test_solidify.py
+browserwright/tests/test_subscriptions.py
+browserwright/tests/test_v02_features.py
 ```
 
 Run:
 
 ```bash
-cd browser-skill
+cd browserwright
 python -m pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-Some tests under `browser-skill/tests/agent-e2e/` need additional agent-e2e dependencies; run those separately if collection fails in a minimal environment.
+Some tests under `browserwright/tests/agent-e2e/` need additional agent-e2e dependencies; run those separately if collection fails in a minimal environment.
 
-## 4. `browser-skill/tests/agent-e2e/`
+## 4. `browserwright/tests/agent-e2e/`
 
 Promptfoo + Claude Agent SDK tests for the v2 sub-agent behavior.
 
@@ -173,13 +173,13 @@ This suite asks a real or lightweight Claude provider to perform agent-facing br
 Important files:
 
 ```text
-browser-skill/tests/agent-e2e/README.md
-browser-skill/tests/agent-e2e/promptfooconfig.yaml
-browser-skill/tests/agent-e2e/promptfooconfig-trigger.yaml
-browser-skill/tests/agent-e2e/provider.py
-browser-skill/tests/agent-e2e/provider_trigger.py
-browser-skill/tests/agent-e2e/hooks.py
-browser-skill/tests/agent-e2e/scorers/
+browserwright/tests/agent-e2e/README.md
+browserwright/tests/agent-e2e/promptfooconfig.yaml
+browserwright/tests/agent-e2e/promptfooconfig-trigger.yaml
+browserwright/tests/agent-e2e/provider.py
+browserwright/tests/agent-e2e/provider_trigger.py
+browserwright/tests/agent-e2e/hooks.py
+browserwright/tests/agent-e2e/scorers/
 ```
 
 Cases:
@@ -195,7 +195,7 @@ Cases:
 Run full A-D suite:
 
 ```bash
-cd browser-skill/tests/agent-e2e
+cd browserwright/tests/agent-e2e
 PROMPTFOO_PYTHON=.venv-agent-e2e/bin/python \
 PROMPTFOO_PYTHON_TIMEOUT=600000 \
   npx promptfoo eval -c promptfooconfig.yaml --no-cache
@@ -204,7 +204,7 @@ PROMPTFOO_PYTHON_TIMEOUT=600000 \
 Run lightweight Case E only:
 
 ```bash
-cd browser-skill/tests/agent-e2e
+cd browserwright/tests/agent-e2e
 PROMPTFOO_PYTHON=.venv-agent-e2e/bin/python \
   npx promptfoo eval -c promptfooconfig-trigger.yaml --no-cache
 ```
@@ -237,28 +237,28 @@ python3 evals/run.py --case cu-01      # one real run via codex
 
 No CI is set up — all suites run locally. `python3 evals/run.py --mock`
 (cost-free, exits 1 on failure) and the pytest suites are the local gates; the
-promptfoo suite under `browser-skill/tests/agent-e2e/` is local/manual.
+promptfoo suite under `browserwright/tests/agent-e2e/` is local/manual.
 
 ## Suggested local check order
 
 For normal development:
 
 ```bash
-cd browser-daemon && python -m pytest tests -q
-cd ../browser-skill && python -m pytest tests -q
+cd browserwright-daemon && python -m pytest tests -q
+cd ../browserwright && python -m pytest tests -q
 ```
 
 Before changing backend/proxy/extension behavior:
 
 ```bash
-cd browser-daemon
+cd browserwright-daemon
 uv run pytest tests/e2e/ -v
 ```
 
 Before changing agent-facing docs, memory, sessions, or primitives:
 
 ```bash
-cd browser-skill/tests/agent-e2e
+cd browserwright/tests/agent-e2e
 PROMPTFOO_PYTHON=.venv-agent-e2e/bin/python \
   npx promptfoo eval -c promptfooconfig-trigger.yaml --no-cache
 ```
@@ -267,11 +267,11 @@ Before release:
 
 ```bash
 # daemon + skill pytest
-cd browser-daemon && python -m pytest tests -q
-cd ../browser-skill && python -m pytest tests -q
+cd browserwright-daemon && python -m pytest tests -q
+cd ../browserwright && python -m pytest tests -q
 
 # real browser e2e
-cd ../browser-daemon && uv run pytest tests/e2e/ -v
+cd ../browserwright-daemon && uv run pytest tests/e2e/ -v
 
 # skills-eval (cost-free, command-choice gate)
 cd .. && python3 evals/run.py --mock

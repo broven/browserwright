@@ -45,5 +45,5 @@ Thumbs.db
 node_modules/
 
 # E2E test artifacts
-browser-daemon/tests/e2e/_artifacts/
-browser-daemon/tests/e2e/_bs_home/
+tests/daemon/e2e/_artifacts/
+tests/daemon/e2e/_bs_home/

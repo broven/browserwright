@@ -1,6 +1,6 @@
 # Browser Connection Notes: AutoConnect, Remote Debugging Port, and CDP WebSocket
 
-> **历史说明（2026-05）**：本文写于 `autoconnect` backend 还在 daemon 内时。如今 `autoconnect` 已经从 `browser-daemon` 移除（Chrome 144+ popup-accumulation hazard 没法靠"开发者自律"防住）。要驱动用户日常 Chrome，请用 **`extension` backend**：`browser-daemon serve --backend extension` + 装配套未打包扩展，靠 `chrome.debugger` 中继 CDP，零 popup、零横幅。下文中对 AutoConnect 的描述属于 Chrome 自身这条能力的 field notes，仍然准确，但 daemon 不再走这条路。
+> **历史说明（2026-05）**：本文写于 `autoconnect` backend 还在 daemon 内时。如今 `autoconnect` 已经从 `browserwright-daemon` 移除（Chrome 144+ popup-accumulation hazard 没法靠"开发者自律"防住）。要驱动用户日常 Chrome，请用 **`extension` backend**：`browserwright-daemon serve --backend extension` + 装配套未打包扩展，靠 `chrome.debugger` 中继 CDP，零 popup、零横幅。下文中对 AutoConnect 的描述属于 Chrome 自身这条能力的 field notes，仍然准确，但 daemon 不再走这条路。
 
 本文总结 Chrome 浏览器自动化/调试里几个容易混淆的概念：
 

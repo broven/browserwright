@@ -5,7 +5,7 @@
 
 ## 0. 范围与基线准则
 
-- 本工具(`browser-skill` + `browser-daemon`)**仅由 code agent 调用**,owner 不手动使用。
+- 本工具(`browserwright` + `browserwright-daemon`)**仅由 code agent 调用**,owner 不手动使用。
 - owner 会在**同一个 worktree 同时跑多个 code agent**。因此身份不能从 cwd 派生,必须显式创建。
 - 基线准则:
   - **P1** 多个 code agent 并发用浏览器、互不影响。
@@ -20,14 +20,14 @@
 
 | 层 | 全局状态 | 是否按身份隔离 | 证据 |
 |---|---|---|---|
-| Skill REPL daemon | `$BS_HOME/repl.sock` + `repl.pid` + 共享 `globals_`/`Session` 单例 | ❌ 整机单例 | `browser-skill/src/browser_skill/repl/_proto.py:16-23`、`repl/inline.py:36`、`repl/server.py:174` |
-| 默认 daemon 名 | `BD_NAME` 缺省 `"default"`,**import 时定死** | ❌ 两个没设 `BD_NAME` 的会话共用一个 daemon / 同一个 Chrome | `browser-skill/src/browser_skill/mode_b_client.py:39` |
-| extension relay 端口 | `DEFAULT_RELAY_PORT = 19989` | ❌ 两个 extension daemon 撞端口 | `browser-daemon/src/browser_daemon/server/relay.py` |
-| (daemon 内)extension session 表 | `ExtensionUpstream._sessions` 单一共享 dict | ❌ A 铸的 sessionId 对 B 可见/可 detach | `browser-daemon/src/browser_daemon/server/extension_upstream.py:119` |
+| Skill REPL daemon | `$BS_HOME/repl.sock` + `repl.pid` + 共享 `globals_`/`Session` 单例 | ❌ 整机单例 | `browserwright/src/browserwright/repl/_proto.py:16-23`、`repl/inline.py:36`、`repl/server.py:174` |
+| 默认 daemon 名 | `BD_NAME` 缺省 `"default"`,**import 时定死** | ❌ 两个没设 `BD_NAME` 的会话共用一个 daemon / 同一个 Chrome | `browserwright/src/browserwright/mode_b_client.py:39` |
+| extension relay 端口 | `DEFAULT_RELAY_PORT = 19989` | ❌ 两个 extension daemon 撞端口 | `browserwright-daemon/src/browserwright/daemon/server/relay.py` |
+| (daemon 内)extension session 表 | `ExtensionUpstream._sessions` 单一共享 dict | ❌ A 铸的 sessionId 对 B 可见/可 detach | `browserwright-daemon/src/browserwright/daemon/server/extension_upstream.py:119` |
 
 ### 1.2 已确认的事故(本设计的动机案例)
 
-agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp`。但此前另一个会话(register-machine,`BD_NAME=nst`,env backend 驱动指纹浏览器)跑过 `browser-skill repl start`(`install.py` 还推荐这么做)。机制:
+agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp`。但此前另一个会话(register-machine,`BD_NAME=nst`,env backend 驱动指纹浏览器)跑过 `browserwright repl start`(`install.py` 还推荐这么做)。机制:
 
 1. REPL daemon 启动时把 `BD_NAME=nst`/backend **冻结**进它的 `Session` 单例(`mode_b_client.py:39` 的 `_DEFAULT_NAME` 在 import 时取值;`repl/server.py:174` 的 `globals_` 只建一次)。
 2. agent H 的 heredoc 命中 `is_repl_running()`(`repl/inline.py:36`)被无条件转发;`send_exec` **只发代码、不发 env**(`repl/client.py:59`)。
@@ -53,9 +53,9 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 
 ### 2.1 生命周期与传播 〔决策 1、3〕
 
-- `browser-skill session new` → 返回 `session_id`(短 token)。
-- agent 之后**每次** `browser-skill` 调用都带 `BD_SESSION=<id>`(每个 heredoc 是新进程,必须每次带;不能用 cwd 推断,因为一个 worktree 多 agent)。
-- `browser-skill session end` → 关闭该 session 的 group/标签、释放 daemon 侧状态。
+- `browserwright session new` → 返回 `session_id`(短 token)。
+- agent 之后**每次** `browserwright` 调用都带 `BD_SESSION=<id>`(每个 heredoc 是新进程,必须每次带;不能用 cwd 推断,因为一个 worktree 多 agent)。
+- `browserwright session end` → 关闭该 session 的 group/标签、释放 daemon 侧状态。
 - **回收**:显式 `session end` 为主;另加**兜底 reaper**清理僵尸 session(agent 进程跨子进程难探测存活,需基于空闲时间或心跳)。
 
 ### 2.2 两种"页面去向"模式 〔决策 2〕
@@ -77,13 +77,13 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 
 ### 2.5 砍掉全局 REPL daemon
 
-- REPL daemon 对 agent 工作流近乎零收益:贵的那条到 Chrome 的 ws 由 Layer-1 `browser-daemon` 持有,REPL 只省 Python import + 跨调用变量保活,而 agent 的 heredoc 都是自包含的。
+- REPL daemon 对 agent 工作流近乎零收益:贵的那条到 Chrome 的 ws 由 Layer-1 `browserwright-daemon` 持有,REPL 只省 Python import + 跨调用变量保活,而 agent 的 heredoc 都是自包含的。
 - **移除**全局 REPL daemon 及 `install.py:578/581/602/626` 对它的推荐。`repl/inline.py` 保留进程内执行路径(`:53`)。
 - 若将来确需"保温",必须**按 session_id 命名空间**重做,且 inline 复用前**校验身份、不符则响亮报错**——绝不能再静默转发。
 
 ### 2.6 加 `whoami` 自省
 
-- `browser-skill whoami` 输出:当前 `session_id`、backend、物理 Chrome 身份(install_id)、group、归属标签数、一个样本 URL。让 agent 任何时候能确认"我连对了没"。
+- `browserwright whoami` 输出:当前 `session_id`、backend、物理 Chrome 身份(install_id)、group、归属标签数、一个样本 URL。让 agent 任何时候能确认"我连对了没"。
 
 ### 2.7 顺带修(仅限阻塞本设计的抽象泄漏)
 
@@ -95,7 +95,7 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 
 ## 3. 实现触点(file:line 地图)
 
-**browser-skill**
+**browserwright**
 - `repl/inline.py:36` — 删除"命中全局 REPL daemon 即转发"的分支(或改为按 session 校验)。
 - `repl/_proto.py:16-23`、`repl/server.py`、`repl/client.py`、`cli.py:86` — 移除全局 REPL daemon(或按 session 命名空间)。
 - `mode_b_client.py:39` — `BD_NAME` 不在 import 时定死;引入 `BD_SESSION` 读取。
@@ -105,7 +105,7 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 - `cli.py` — 新增 `session new|end`、`whoami` 子命令。
 - `install.py:578/581/602/626` — 删除 `repl start` 推荐。
 
-**browser-daemon**
+**browserwright-daemon**
 - `server/extension_upstream.py:119`(`_sessions`)、`:71-75`(sessionId 铸造)、`:258-262`(createTarget 报错)、`:44-51`/`:241`(未实现列表)。
 - `server/relay.py`(`DEFAULT_RELAY_PORT`、`ext.tabs`、`attach_tab :255-296`、`attach_active_tab :214-253`、`_pick_active_extension :395-399`)— 按 session 跟踪标签/group;relay 端口按 daemon 隔离。
 - `server/proxy.py:676-681`(getBackendInfo kind)、`:721-965`(attach/open/close handlers — 加 session 维度)。
@@ -117,13 +117,13 @@ agent H 想经 extension 操作 owner 日常 Chrome,显式带了 `BD_BACKEND=rdp
 
 ## 4. 删除清单(AI-slop / 已被代码取代,删)
 
-- `browser-daemon/design.md`
-- `browser-daemon/design-v2.md`
-- `browser-daemon/design-review.md`
-- `browser-skill/design.md`
+- `browserwright-daemon/design.md`
+- `browserwright-daemon/design-v2.md`
+- `browserwright-daemon/design-review.md`
+- `browserwright/design.md`
 - `docs/plans/` 下全部(均为已实现功能的 AI 计划/交接稿)
 
-**保留(load-bearing,勿删)**:`skill/SKILL.md`、`skill/memory.md`、`browser-skill/SKILL.md`、`browser-skill/ONBOARDING.md`、`src/.../site_skills_starter/*/SKILL.md|memory.md`、各 `README.md`、`browser-connection.md`(Chrome CDP 现场笔记,有价值,后续可 trim)。
+**保留(load-bearing,勿删)**:`skill/SKILL.md`、`skill/memory.md`、`browserwright/SKILL.md`、`browserwright/ONBOARDING.md`、`src/.../site_skills_starter/*/SKILL.md|memory.md`、各 `README.md`、`browser-connection.md`(Chrome CDP 现场笔记,有价值,后续可 trim)。
 
 ---
 

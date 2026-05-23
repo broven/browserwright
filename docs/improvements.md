@@ -20,7 +20,7 @@
 **收尾 — 全部已处理**:
 - ✅ **D3 文风**人审通过:`skill/trust-boundaries.md` + SKILL.md 两段(名失败模式→规则→CORRECT/WRONG,有声音、不泛泛),无需改。
 - ✅ **S6 follow-up**:`explain_rpc_error` 改为 staticmethod 并接到实时站点 `cdp.py`(新 `_rpc_error_fix`,-32601 时给具名"daemon 陈旧"fix);`test_version_coherence.py` 加 wiring 测试。
-- ✅ **version drift 根因=S5 bug**(doctor schema 检查只认 `1`,而当前 daemon 发 `2`):改为接受 `_SUPPORTED_DOCTOR_SCHEMAS=(1,2)`,并修了那条用 v1 掩盖问题的测试(加回归断言)。**非陈旧 CLI**——on-PATH `browser-skill` 指向 repo venv、`browser-daemon` 0.5.3。
+- ✅ **version drift 根因=S5 bug**(doctor schema 检查只认 `1`,而当前 daemon 发 `2`):改为接受 `_SUPPORTED_DOCTOR_SCHEMAS=(1,2)`,并修了那条用 v1 掩盖问题的测试(加回归断言)。**非陈旧 CLI**——on-PATH `browserwright` 指向 repo venv、`browserwright-daemon` 0.5.3。
 
 ---
 
@@ -37,13 +37,13 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 | A1 | ws `max_size=None`,修截图响应超 1 MiB 被丢 → `extension disconnected` | L2 | ✅ | commit `2483b24`,`server/relay.py` |
 | A2 | daemon↔CLI 版本一致性:运行中 daemon 比安装代码旧时**自检并自动重启**;CLI 把自己发出的 `-32601 unknown method` 改写成"daemon 陈旧,请重启",不透传 raw JSON-RPC | L2 | ✅ | S6:版本经 pong→`status --json` 暴露;`ensure_version_coherent()` 接入 `auto_client`,不匹配/缺版本→stop+serve;`explain_rpc_error()` 改写 `-32601`(对任意 method 通用,已设 staticmethod 并接到实时站点 `cdp.py` `_rpc_error_fix`)。gate `test_version_coherence.py` 7(daemon)+13(skill) |
 | A3 | **错误 envelope 约定**:每个 error 带一个 `next`/`fix` 下一步串(对照已有的好例子 `NeedsUserConfirm` 的 `proposal`) | L1/L2 | ✅ | S5:`BrowserSkillError` 基类加 `fix`,各类设 `default_fix`,module 级 `serialize()` 把 `fix` 带进 agent 可见 JSON。覆盖 NoSession/CDPError/DaemonUnavailable/PageLoadFailed/AuthWall 等高频站点 |
-| A4 | `browser-skill doctor`:`{status,message,fix}` 检查表,含 relay/extension/daemon PID/helper 解析 | L2 | ✅ | S5:`doctor_checks()` 回 `{name,status,message,fix}`,**每个 fail 必带 fix**(`add()` 强制);`--json` + 人读;有 fail 则 exit≠0。gate `test_doctor_and_errors.py` 10。**注**:未做 live-launch 探针(doctor 不开 Chrome) |
+| A4 | `browserwright doctor`:`{status,message,fix}` 检查表,含 relay/extension/daemon PID/helper 解析 | L2 | ✅ | S5:`doctor_checks()` 回 `{name,status,message,fix}`,**每个 fail 必带 fix**(`add()` 强制);`--json` + 人读;有 fail 则 exit≠0。gate `test_doctor_and_errors.py` 10。**注**:未做 live-launch 探针(doctor 不开 Chrome) |
 
 ## B. 感知(降低"理解页面"成本)
 
 | | 条目 | 层 | 状态 | 备注 / 证据 |
 |---|---|---|---|---|
-| B1 | `snapshot()`:交互元素 a11y-ish 树,**无状态 + 坐标制**(返回 role/name/中心 xy,喂现有 `click_at_xy`,不引入 ref store) | L1 | ✅ | S1 下沉到 `primitives/inspect.py` + `EXPORTS` + SKILL.md;gate `browser-skill/tests/test_perception.py` |
+| B1 | `snapshot()`:交互元素 a11y-ish 树,**无状态 + 坐标制**(返回 role/name/中心 xy,喂现有 `click_at_xy`,不引入 ref store) | L1 | ✅ | S1 下沉到 `primitives/inspect.py` + `EXPORTS` + SKILL.md;gate `browserwright/tests/test_perception.py` |
 | B2 | `describe_page()`:视觉/样式取证(bg-image/bg-color/mix-blend-mode/filter/`::before/::after` + `:root` CSS 变量),回答"这页长这样是谁画的" | L1 | ✅ | S1 下沉 + 已加 `viewport_only=True`(屏外样式节点过滤);CSS 变量仅同源(carry-over 限制)。gate 同上 |
 | B3 | 编号标注截图(set-of-mark),标号映射到**坐标**而非 ref | L1 | ✅ | S8:`capture_screenshot(annotate=True)` 从 `snapshot()` 画 `[N]` 角标,回 legend `[{n,role,name,x,y}]`(无 ref)。gate `test_annotate_screenshot.py` 3 |
 
@@ -51,7 +51,7 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 
 | | 条目 | 层 | 状态 | 备注 / 证据 |
 |---|---|---|---|---|
-| C1 | `diff_snapshot(before, after=None)`:**无状态**(agent 显式传上一张快照,不暂存),回 `added/removed/changed/unchanged` 摘要 —— agent 自验"动作是否生效"的廉价手段 | L1 | ✅ | S2 落地 `primitives/inspect.py` + `EXPORTS` + SKILL.md;身份=role+name+粗位置桶。gate `browser-skill/tests/test_diff_snapshot.py` 6/6。借鉴 `agent-browser` diff snapshot |
+| C1 | `diff_snapshot(before, after=None)`:**无状态**(agent 显式传上一张快照,不暂存),回 `added/removed/changed/unchanged` 摘要 —— agent 自验"动作是否生效"的廉价手段 | L1 | ✅ | S2 落地 `primitives/inspect.py` + `EXPORTS` + SKILL.md;身份=role+name+粗位置桶。gate `browserwright/tests/test_diff_snapshot.py` 6/6。借鉴 `agent-browser` diff snapshot |
 | C2 | 改状态操作配一步式验证,如 `userscript push --verify`(push→reload 实时 tab→回新截图) | L1 | ✅ | S4:`_cmd_userscript` 加 `--verify`,push 成功后 `cdp("Page.reload")`+截图并打印路径。gate `test_userscript_verify.py` 3(mock 编排;真实 e2e 仍需 live extension) |
 | C3 | first-class `reload(*, hard=False)` 原语(原来只能 `goto_url(self)`,不直观,agent 因此让 owner 刷新) | L1 | ✅ | S3:`primitives/page.py`(`Page.reload`+`wait_for_load`)+ `EXPORTS` + SKILL.md。gate `test_reload.py` 5 |
 | C4 | SKILL.md 行为规则:"浏览器完全由你驾驶,凡你能做的浏览器动作绝不让 owner 代劳" | L3 | ✅ | S3:SKILL.md 加规则;🎯 `cu-04` eval(forbidden 6 个中英变体抗过拟合)绿 |
@@ -60,7 +60,7 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 
 | | 条目 | 层 | 状态 | 备注 / 证据 |
 |---|---|---|---|---|
-| D1 | **skill 文档由运行代码生成、与版本锁死**(`browser-skill --print-skill`):agent 读到的指南永远 == 运行的 helper 面 | L1 | ✅ | S7:`skill_doc.render()` 从 `EXPORTS`(签名+docstring 首行)+ `__version__` 运行时生成,新增/删原语零改自动同步。gate `test_print_skill.py` 5(版本+全 EXPORTS 成员) |
+| D1 | **skill 文档由运行代码生成、与版本锁死**(`browserwright --print-skill`):agent 读到的指南永远 == 运行的 helper 面 | L1 | ✅ | S7:`skill_doc.render()` 从 `EXPORTS`(签名+docstring 首行)+ `__version__` 运行时生成,新增/删原语零改自动同步。gate `test_print_skill.py` 5(版本+全 EXPORTS 成员) |
 | D2 | session/attach 恢复规则:attach 失败 → `ensure_real_tab()`/`open_background()`,**不要新建 session**;active tab 是内部/扩展页时 `attach_active()` 自动降级 | L1/L2 | ✅ | S8:`attach_active()` 对非可附着内部 URL 自动降级 `open_background`;SKILL.md 加恢复规则。gate `test_attach_recovery.py` 5 + `cu-05` eval(forbidden 新建 session 多变体) |
 | D3 | SKILL.md 文风:"先点名失败模式再给规则" + CORRECT/WRONG 成对例子 + 正经 trust-boundaries 文档(页面内容一律视为不可信) | L3 | ✅ | S8:新 `skill/trust-boundaries.md` + SKILL.md "Trust boundaries"/"Attach failed" 段(名失败模式 + CORRECT/WRONG)。gate `cu-06` 注入 eval。**文风本身只能人审** |
 

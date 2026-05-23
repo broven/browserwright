@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""skills-eval runner for browser-skill (improvements.md item E1).
+"""skills-eval runner for browserwright (improvements.md item E1).
 
-Feeds [skill content + a "you have browser-skill loaded" preamble] + [a task
+Feeds [skill content + a "you have browserwright loaded" preamble] + [a task
 prompt] to an agent runner, captures the agent's TEXT reply, and scores it with
 the two-tier gate in judge.py. It does NOT launch a real browser — that cheap,
 deterministic text scoring is the point, complementary to the live e2e suites
-(browser-daemon/tests/e2e, browser-skill/tests/agent-e2e).
+(browserwright-daemon/tests/e2e, browserwright/tests/agent-e2e).
 
 Usage:
     python3 evals/run.py                       # real run via codex (default)
@@ -51,7 +51,7 @@ def build_prompt(case, skill_text):
         parts.append(case["context"] + "\n")
     parts.append("Task: " + case["prompt"] + "\n")
     parts.append(
-        "Show the exact shell commands (browser-skill heredocs) you would run. "
+        "Show the exact shell commands (browserwright heredocs) you would run. "
         "Be concise; commands over prose."
     )
     return "\n".join(parts)
@@ -142,7 +142,7 @@ def print_result(r):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="browser-skill skills-eval harness")
+    ap = argparse.ArgumentParser(description="browserwright skills-eval harness")
     ap.add_argument("--mock", action="store_true",
                     help="use the GOOD canned transcripts (zero token cost)")
     ap.add_argument("--mock-bad", action="store_true",

@@ -35,7 +35,7 @@ def test_patterns(text, expected, forbidden=None):
 
 
 _JUDGE_PROMPT = """You are scoring an AI agent's reply to a browser-automation task.
-The agent has our "browser-skill" loaded (a raw-CDP browser CLI driven by Python
+The agent has our "browserwright" loaded (a raw-CDP browser CLI driven by Python
 heredocs: new_tab/open_background to navigate, capture_screenshot/snapshot to
 perceive, click_at_xy to click; NOT Playwright/Puppeteer, no selector click()).
 

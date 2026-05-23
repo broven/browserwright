@@ -1,6 +1,6 @@
-# browser-skill memory
+# browserwright memory
 
-The agent reads this file on every browser-skill invocation. It carries two things:
+The agent reads this file on every browserwright invocation. It carries two things:
 
 1. **Backend capability table** — static reference for which Chrome the user can drive, and how.
 2. **User preference** — mutable. The agent writes here when the user expresses a choice.
@@ -9,9 +9,9 @@ The agent reads this file on every browser-skill invocation. It carries two thin
 
 | Backend | Connects to | How to use |
 |---|---|---|
-| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `browser-daemon launch-chrome --port 9333 --profile bs-dev --persistent` then prefix the call: `BD_PORT=9333 BD_BACKEND=rdp browser-skill <<'PY' ... PY` |
-| `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browser-daemon serve --backend extension` then load the bundled `chrome-extension/` directory |
-| `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browser-daemon serve --backend cloud --provider <name>` + provider auth env vars |
+| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent` then prefix the call: `BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY' ... PY` |
+| `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve --backend extension` then load the bundled `chrome-extension/` directory |
+| `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --backend cloud --provider <name>` + provider auth env vars |
 | `env` | An externally-supplied CDP URL | Set `BROWSER_DAEMON_CDP_URL=ws://...` before calling |
 
 > The legacy `autoconnect` backend (which connected to Chrome's `--remote-debugging-port=9222` and triggered an Allow popup on every ws handshake) was removed. To drive the user's daily Chrome, use `extension` — load the relay extension once and reuse it indefinitely with zero popups.
@@ -27,7 +27,7 @@ scenarios:
   - name: personal
     when: 用户个人任务、需要已登录账号或 cookie ("我的 X" / 私信 / 消息 / 个人 dashboard / 已登录的网盘 / 邮件)
     backend: extension
-    launch_command: browser-daemon serve --backend extension
+    launch_command: browserwright-daemon serve --backend extension
     env: {}
     notes: |
       User has the unpacked extension loaded into their daily Chrome
@@ -39,7 +39,7 @@ scenarios:
   - name: public
     when: 公共页面、无需 cookie 的一次性抓取、UI 测试、文档/示例站、批量 http_get
     backend: rdp
-    launch_command: browser-daemon launch-chrome --port 9333 --profile bs-dev --persistent
+    launch_command: browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent
     env:
       BD_PORT: 9333
       BD_BACKEND: rdp
@@ -59,11 +59,11 @@ scenarios:
 ```
 
 <!--
-Each browser-skill invocation:
+Each browserwright invocation:
   1. Read the task description the user just gave.
   2. Match it to a `when:` field above (top-down, first match wins).
   3. Use that scenario's `backend`, `launch_command`, and `env`. Prepend the env vars
-     to the `browser-skill` call. If the scenario needs user-specific values (e.g., a
+     to the `browserwright` call. If the scenario needs user-specific values (e.g., a
      fingerprint browser port), ask the user before proceeding.
   4. If no scenario matches, use `default_backend` and consider asking the user
      whether this new type of work deserves its own scenario entry here.
