@@ -45,9 +45,10 @@ class Session:
         # ``resolve_ws_url`` / ``ws_url`` semantics through the methods we use
         # below. (Mode A — the subprocess resolver — was removed.)
         #
-        # ``record`` is a resolved session ledger record (P1). When given, the
-        # daemon endpoint comes from ``record["daemon_endpoint"]`` rather than
-        # the import-time default — this is how multiple agents stay isolated.
+        # ``record`` is a resolved session ledger record. There is one global
+        # daemon on a fixed socket; the session's ``id`` is carried as the ws
+        # client label (``skill-s<id>``) so the daemon routes this client to the
+        # session's UpstreamContext (per-session isolation lives daemon-side now).
         # Stored as ``session_record`` to avoid shadowing the ``record()`` method.
         self.session_record = record
         if daemon is None:

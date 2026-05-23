@@ -121,8 +121,7 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
             "the reconnect-recovery anchor for this session."
         )
     if backend == "extension":
-        # `daemon_endpoint` is a legacy ledger field (removed in P4); pass "".
-        sid = reg.allocate(backend="extension", daemon_endpoint="",
+        sid = reg.allocate(backend="extension",
                            owner="attach", name=name, unique_name=True)
         _ensure_daemon_running()
         return sid
@@ -136,7 +135,7 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
             workspace = {"port": int(attach), "target": attach}
         else:
             workspace = None
-        sid = reg.allocate(backend="rdp", daemon_endpoint="", owner=owner,
+        sid = reg.allocate(backend="rdp", owner=owner,
                            name=name, workspace=workspace, unique_name=True)
         _ensure_daemon_running()
         return sid

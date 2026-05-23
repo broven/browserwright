@@ -39,7 +39,7 @@ def _locked() -> Iterator[dict]:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def allocate(*, backend: str, daemon_endpoint: str, owner: str,
+def allocate(*, backend: str, owner: str,
              workspace: Optional[object] = None, name: Optional[str] = None,
              unique_name: bool = False) -> str:
     now = time.time()
@@ -62,7 +62,7 @@ def allocate(*, backend: str, daemon_endpoint: str, owner: str,
         sid = str(data["next_id"])
         data["next_id"] += 1
         data["sessions"][sid] = {
-            "id": sid, "backend": backend, "daemon_endpoint": daemon_endpoint,
+            "id": sid, "backend": backend,
             "workspace": workspace, "owner": owner, "name": name,
             "created_at": now, "last_seen": now,
         }

@@ -388,7 +388,7 @@ def _cmd_session(args: list[str]) -> int:
             return 0
         for r in rows:
             print(f"  {r['id']:>3}  {r['backend']:9s} {r['owner']:6s} "
-                  f"{(r.get('name') or '-'):16s} {r['daemon_endpoint']}")
+                  f"{(r.get('name') or '-'):16s}")
         return 0
 
     if sub == "prune":
@@ -448,7 +448,7 @@ def _cmd_whoami(args: list[str]) -> int:
     except NoSession as e:
         print(str(e), file=sys.stderr)
         return e.exit_code
-    view = {k: rec.get(k) for k in ("id", "backend", "owner", "name", "daemon_endpoint")}
+    view = {k: rec.get(k) for k in ("id", "backend", "owner", "name")}
     sys.stdout.write(json.dumps(view, default=str) + "\n")
     return 0
 
