@@ -14,8 +14,6 @@ The agent reads this file on every browserwright invocation. It carries two thin
 | `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --backend cloud --provider <name>` + provider auth env vars |
 | `env` | An externally-supplied CDP URL | Set `BROWSER_DAEMON_CDP_URL=ws://...` before calling |
 
-> The legacy `autoconnect` backend (which connected to Chrome's `--remote-debugging-port=9222` and triggered an Allow popup on every ws handshake) was removed. To drive the user's daily Chrome, use `extension` — load the relay extension once and reuse it indefinitely with zero popups.
-
 ## User preference
 
 The user runs different kinds of work in different browsers. Match the task to a `scenarios:` entry (top-down, first match wins). If nothing matches, fall back to `default_backend`.

@@ -22,7 +22,7 @@ ws://127.0.0.1:<port>/devtools/browser/<browser-id>
 
 ## Driving the user's daily Chrome
 
-The legacy `autoconnect` backend (connect via Chrome's `--remote-debugging-port=9222` with the "Allow remote debugging?" popup-per-ws hazard on Chrome 144+) was removed in 2026-05. To drive the user's daily Chrome, use the **extension** backend:
+To drive the user's daily Chrome, use the **extension** backend (it relays CDP through the unpacked extension's `chrome.debugger` API — no remote-debugging port, no Allow popups):
 
 ```bash
 # 1. Load the unpacked extension once (browserwright-daemon ships it under chrome-extension/).

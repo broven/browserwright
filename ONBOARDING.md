@@ -42,10 +42,6 @@ Are you running scripted / iterative tests?
                 Hyperbrowser, generic CDP-compatible) → option 4
 ```
 
-> The legacy `autoconnect` backend (Chrome `--remote-debugging-port=9222`
-> with the per-ws Allow popup) was removed in 2026-05. `extension` is the
-> only path that drives the user's daily Chrome.
-
 The install wizard codifies this same decision tree —
 `browserwright install` and answer the prompts.
 
