@@ -83,14 +83,17 @@ all `backend_name` branching (`Session.backend_name` stays for diagnostics only)
 | `ensureSession` | attach client to shared `relay_context` | create context, launch Chrome, open upstream |
 | `openTab(url)` (was `openBackgroundTab`) | `ext.open_background_tab` (durable tab group) | `Target.createTarget` + attach |
 | `closeTab` | `ext.close_tab` | `Target.closeTarget` |
-| `endSession` | close owned tabs, keep borrowed | close the whole owned Chrome + drop context |
-| attach working target (was `attachActiveTab`) | `ext.attach_active_tab` (popup/active pick) | first/new target — daemon owns Chrome, no user-active ambiguity |
+| `endSession` | close the whole session group — ALL member tabs (DECIDED) | close the whole owned Chrome + drop context |
+| `attach_active` (kept as a first-class verb) | adopt the user's focused tab **into this session's group** (see C1) | fallback to `current_page` — the daemon-owned Chrome's current front tab |
 | `recoverSession` | rebuild from durable tab group | re-attach to surviving targets, else relaunch |
 | `userscript.*` | extension impl | rdp impl via `Page.addScriptToEvaluateOnNewDocument` (or document as N/A with a uniform, non-`-32601` answer) |
 
-Rule: a verb must never surface `-32601` ("requires the extension backend") to
-the downstream. Either it has an rdp implementation, or it returns a uniform
-documented result that is identical in shape across backends.
+Rule (revised, locked with user): every verb returns a **same-shape, honest**
+result on every backend. Where a concept is backend-specific, the daemon falls
+back to the **nearest honest equivalent** — never a fabricated value — and the
+divergence is documented, not hidden, and never surfaced as `-32601`. "Uniform
+shape" is required; "identical meaning" is not. A fallback that *lies* (returns
+something that doesn't truthfully describe the backend) is forbidden.
 
 ## Downstream API — the contract (DECIDE HERE; annotate inline)
 
@@ -120,9 +123,47 @@ surface — same name, same return shape, daemon dispatches by context backend:
 | `open(url, *, background=True)` | open a new working tab for THIS session, attach, bind as current. Returns `{targetId,tabId,url,title}`. **Replaces both `new_tab` and `open_background`.** | `openBackgroundTab` (tab group = session name) | `Target.createTarget` |
 | `close_tab(target_id \| session_id)` | close one of the session's tabs; invalidate its session | `chrome.tabs.remove` | `Target.closeTarget` |
 | `list_tabs()` | the session's tabs `[{targetId,url,title,attached}]` | attached ghost targets in group | `Target.getTargets` |
-| `current_page()` | the session's current working tab; auto-open/attach if none | cached → recover → (see C1) | cached → first target → create |
+| `current_page()` | the session's current working tab; auto-open if none | cached → recover → `open()` a new tab (NOT adopt — DECIDED) | cached → first target → create |
 | `current_tab()` | current binding or `None` | same | same |
 | `ensure_real_tab()` | switch off internal pages to a real one | same | same |
+
+#### The extension "browser" = the session's tab group (locked with user)
+
+The unifying model: **a session IS a logical browser.** On rdp that browser is a
+dedicated Chrome process (own profile). On extension it is **one Chrome tab
+group, owned exclusively by that session** — session ↔ group is 1:1, and the
+group name is the session name. This is the extension analogue of rdp's dedicated
+Chrome, and it makes the group the durable, user-visible, restart-surviving
+identity of the session's browser.
+
+Three invariants make this real (current code does NOT yet enforce them — they
+are work):
+
+- **Bind to `groupId`, not the title.** On session create, create the group,
+  capture its `groupId`, and persist it (session state / ledger). All later
+  operations key on `groupId`. The title (= session name) is used *only* as a
+  recovery anchor when the `groupId` is lost across a daemon restart. Reason: a
+  user can rename a group, and Chrome allows duplicate group titles — keying on
+  title (today's `chrome.tabGroups.query({title})`) is unstable and can collide
+  across sessions.
+- **The group's live membership is the single source of truth** for what is "in
+  this session's browser." `list_tabs` / `Target.getTargets` (extension branch) /
+  `current_page` resolve from `chrome.tabs.query({groupId})`, **not** the
+  in-memory `_owned`/`_borrowed` sets — those miss tabs the user dragged in,
+  popups, and tabs recovered after a restart.
+- **Entering/leaving the group = entering/leaving the session's browser.** A tab
+  dragged out of the group leaves the session (daemon detaches + drops it via
+  tab/group events); a tab the user opens *outside* the group is invisible to the
+  session. Once enumeration is scoped to `groupId`, sessions are mutually
+  invisible even though they share one Chrome (storage is still shared — see C4).
+
+**Consequence — no `_owned`/`_borrowed` tracking (DECIDED `endSession` = close
+whole group).** Because endSession closes every member of the group and
+enumeration is already groupId membership, the daemon does not need the
+owned-vs-borrowed distinction at all. Delete the `_owned`/`_borrowed` sets.
+"Don't want a tab closed when the session ends? Drag it out of the session's
+group first." adopt simplifies to "move the tab into the group" — it closes with
+the group like any other member.
 
 Proposed decisions baked in (override inline if you disagree):
 - **Collapse `new_tab` + `open_background` → `open(url, background=True)`.** Keep
@@ -130,47 +171,63 @@ Proposed decisions baked in (override inline if you disagree):
 - **`background=` is honored only on extension** (real user focus to protect);
   on rdp it's a no-op (no user, every tab is "background").
 - **`group=` drops from the public signature.** It was the extension's durable
-  reconnect anchor — make it an internal detail (daemon uses session name),
-  not something the downstream passes. (See C2.)
+  reconnect anchor — make it an internal detail: the daemon derives the group
+  from the session (name → group on create, `groupId` thereafter), the downstream
+  never passes it. (See the tab-group model above and C2.)
 - **Drop the `NeedsUserConfirm` "zero attached tabs" raise** from `list_tabs`/
   `current_tab`. It encodes an extension-only mental model. Unified behavior:
   `current_page()` just opens a working tab; `list_tabs()` returns `[]`.
+- **`current_page()` empty fallback = `open()` a new tab, NOT adopt (DECIDED).**
+  Adopt moves the user's focused tab into the group — too invasive for an
+  implicit "get current page" call. Only the explicit `attach_active()` adopts.
+- **`endSession` closes the whole session group (DECIDED).** No owned/borrowed
+  distinction (see the consequence note above).
 
 ### Tier C — CANNOT be made semantically identical (your call)
 
 These are where "unify" can only mean "uniform shape / never `-32601`", NOT
 "same meaning". I need your decision on each.
 
-- **C1. "Attach the user's currently-focused tab" (`attach_active`).** Only
-  meaningful on extension — rdp owns an isolated Chrome with no user and no
-  foreground tab. Options:
-  - (a) Keep `attach_active()` in the surface; on rdp it degrades to
-    `current_page()` (returns the session's working tab). Uniform shape, silent
-    semantic difference.
-  - (b) Drop `attach_active()` as a public verb; fold "prefer the user's focused
-    tab" into `current_page()` as an extension-only nuance. One fewer verb.
-  - (c) Keep it extension-only but return a uniform, documented "not applicable
-    on this backend" result (NOT `-32601`) on rdp.
-  My lean: **(b)** — fewest concepts downstream.
+- **C1. `attach_active` — DECIDED (locked with user): keep as a first-class
+  verb, `adopt` semantics on extension, fallback to `current_page` on rdp.**
+  - **extension = adopt** (replaces the old "borrow" behavior): find the user's
+    focused tab → `chrome.tabs.group({groupId, tabIds:[t]})` to **move it into
+    this session's group** → attach the debugger. The tab is now a group member;
+    it closes with the group on `endSession` like any other member (no separate
+    "owned" flag — see the consequence note in Tier B).
+    - **Conflict rule (DECIDED): refuse.** If the focused tab already belongs to
+      *another* session's group, `attach_active` returns an error and does NOT
+      steal it. (We do not move it out of the other session's group.)
+  - **rdp = fallback to `current_page`**: the daemon owns the Chrome, so "the
+    page currently shown" is the session's current front tab (no human contends
+    for focus). CDP has no first-class "which target is active", so define it as
+    the session's current bound target (multi-window: most-recently-fronted);
+    create+attach if none. This is an honest equivalent, not a fabricated value,
+    so it satisfies the revised Rule above.
 
-- **C2. Cross-restart durability / `recoverSession`.** Extension recovers a
-  session's tabs after a daemon restart because they live in the user's
-  persistent Chrome (tab group survives). rdp's Chrome is a child the daemon
-  launched — if the daemon dies, does the Chrome (and its tabs/cookies) survive?
-  - If rdp Chrome dies with the daemon → "recover" can only relaunch a FRESH
-    Chrome (state lost). That's a real semantic gap.
-  - Decision needed: do we want rdp sessions to survive daemon restarts at all
-    (launch Chrome detached + reconnect by port), or accept that rdp = ephemeral
-    and `recover` is extension-only / a no-op on rdp?
-  My lean: **rdp is ephemeral for v1**; `recover` is a uniform no-op on rdp
-  (returns the live tabs, or relaunches empty). Revisit detached-Chrome later.
+- **C2. Cross-restart durability / `recoverSession` — DECIDED: rdp is ephemeral
+  for v1.** rdp's Chrome is a daemon child and dies with the daemon. `recover`
+  on rdp is a uniform no-op (returns live tabs, or relaunches empty — state
+  lost). On daemon startup, clean up orphaned rdp Chrome processes / `bs-s{id}`
+  profiles left by a prior crash. Detached-survivable rdp (launch detached +
+  reconnect by port) is explicitly deferred past v1. Extension recovery (rebuild
+  from the durable tab group via title→groupId) is unchanged.
 
-- **C3. `userscript.*`.** Extension injects via the extension's content-script
-  machinery (persists across navigations, isolated world). rdp equivalent is
-  `Page.addScriptToEvaluateOnNewDocument`. Close but not identical (isolated-world
-  + match patterns differ). Decision: implement an rdp shim with documented
-  caveats, or mark uniform-but-degraded?
-  My lean: **rdp shim via `addScriptToEvaluateOnNewDocument`**, caveats in docs.
+- **C3. `userscript.*` — proceeding with the rdp shim** (no objection raised).
+  rdp implements via `Page.addScriptToEvaluateOnNewDocument`; caveats (MAIN-world
+  vs the extension's isolated world, match-pattern differences) documented. If
+  you'd rather defer to a uniform honest "not-supported-on-rdp" answer, say so.
+
+- **C4. Storage/cookie isolation is NOT uniform — and no fallback can smooth it
+  (it's an ambient property, not a verb).** rdp gives each session a dedicated
+  Chrome profile → isolated cookies/localStorage. The extension's tab group
+  isolates only the *tab set*, not storage: all extension sessions live in the
+  user's one profile and **share cookies / origin-keyed storage / login state**
+  with each other and with the user. This is intentional (the whole point of the
+  extension backend is to reuse the user's real logged-in session), but it must
+  be stated in the contract: downstream must not assume two extension sessions
+  are isolated the way two rdp sessions are. Two extension sessions hitting the
+  same origin share that origin's cookies; two rdp sessions do not.
 
 ## RPCs
 
@@ -221,3 +278,25 @@ denaming breaks the old per-session-rdp-daemon model until Phase 3 lands)
 - Unified interface adds work: P2/P3 must implement the **rdp counterparts** of
   the session verbs (openTab/closeTab/endSession/attach/recover) so none returns
   `-32601`; P5 removes `backend_name` branching from the skill primitives.
+- **extension tab-group invariants (new work):** bind the session to a captured
+  `groupId` (persisted), key all ops on `groupId`, use the title only as the
+  restart recovery anchor; make `chrome.tabs.query({groupId})` the source of
+  truth for membership (not `_owned`/`_borrowed`); wire tab/group events so a tab
+  dragged out of the group is detached + dropped from the session. This replaces
+  today's `chrome.tabGroups.query({title})`-by-title lookup (`background.js`).
+- **`attach_active` adopt + refuse-on-conflict:** adopting moves the user's tab
+  into the session's group (it then closes with the group on `endSession`) — a
+  change from today's borrow semantics; refuse (error, no steal) when the tab
+  already belongs to another session's group.
+- **Empty groups auto-delete (Chrome behavior):** a group with zero tabs is
+  removed by Chrome and its `groupId` goes invalid. So a session that closed its
+  last tab has no live group; the next `open()` recreates the group from the
+  session name. This is why the title is kept as the recovery anchor.
+- **rdp orphan cleanup (C2 ephemeral):** on daemon startup, kill stray Chrome
+  processes / remove `bs-s{id}` profile dirs from a prior daemon crash before
+  serving, so ephemeral rdp sessions start clean.
+- **Chrome-extension `background.js` is in scope:** the groupId-binding +
+  membership-as-truth + adopt + drag-out-detach work lands in `background.js`,
+  replacing today's `chrome.tabGroups.query({title})` title lookup. Fold into
+  P2/P3's extension implementation (not a separate phase, but new surface area
+  beyond the Python daemon).
