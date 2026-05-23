@@ -1,41 +1,40 @@
 """IPC plumbing for Mode B (§6.7).
 
-Ported from browser-harness `_ipc.py` — the file-naming / path-traversal / ping
-patterns are field-tested. Two changes from the source:
-1. Prefix is `browserwright-daemon-` instead of `bu-` (separate product).
+Ported from browser-harness `_ipc.py` — the file-naming / ping patterns are
+field-tested. Two changes from the source:
+1. Prefix is `browserwright-daemon` instead of `bu-` (separate product).
 2. Ping is HTTP (`GET /__ping__`) over the local socket *before* a ws upgrade
    ever happens — this lets stale-detection work without negotiating a CDP
    session. Spec §6.7 says the ping should be CDP `Browser.getVersion`; we
    defer that to the ws layer once a daemon is live, but the cold-start
    stale-check before bind needs cheaper plumbing.
 
+There is exactly ONE daemon, so the endpoint is a fixed path (no per-instance
+name — the `BD_NAME` concept was removed; see docs/refactor-single-daemon.md):
+
 POSIX:
-    sock_path     = {XDG_RUNTIME_DIR | /tmp}/browserwright-daemon-{NAME}.sock
-    log_path      = {TMPDIR | /tmp}/browserwright-daemon-{NAME}.log
-    pid_path      = {XDG_RUNTIME_DIR | /tmp}/browserwright-daemon-{NAME}.pid
+    sock_path     = {XDG_RUNTIME_DIR | /tmp}/browserwright-daemon.sock
+    log_path      = {TMPDIR | /tmp}/browserwright-daemon.log
+    pid_path      = {XDG_RUNTIME_DIR | /tmp}/browserwright-daemon.pid
 
 Windows:
-    port_path     = %TEMP%/browserwright-daemon-{NAME}.port  (atomic-written JSON)
-    log_path      = %TEMP%/browserwright-daemon-{NAME}.log
-    pid_path      = %TEMP%/browserwright-daemon-{NAME}.pid
+    port_path     = %TEMP%/browserwright-daemon.port  (atomic-written JSON)
+    log_path      = %TEMP%/browserwright-daemon.log
+    pid_path      = %TEMP%/browserwright-daemon.pid
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import re
 import secrets
 import socket
 import sys
 import tempfile
 from pathlib import Path
 
-from .errors import UserError
-
 
 IS_WINDOWS = sys.platform == "win32"
-_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 _PREFIX = "browserwright-daemon"
 
 
@@ -46,9 +45,8 @@ def _runtime_dir() -> Path:
     """Where sock + pid + (Windows) port file live.
 
     AF_UNIX sun_path has a hard 104-byte budget on macOS. `tempfile.gettempdir()`
-    on macOS returns `/var/folders/...` which would blow that budget for any
-    non-trivial NAME — so we use `/tmp` on POSIX explicitly. On Windows we use
-    `%TEMP%`, no path-length issue.
+    on macOS returns `/var/folders/...` which would blow that budget — so we use
+    `/tmp` on POSIX explicitly. On Windows we use `%TEMP%`, no path-length issue.
     """
     if (xdg := os.environ.get("XDG_RUNTIME_DIR")):
         return Path(xdg)
@@ -66,76 +64,63 @@ def _tmp_dir() -> Path:
     return Path("/tmp")
 
 
-def check_name(name: str) -> str:
-    """Path-traversal guard. Mirrors browser-harness `_ipc.py:31-33`."""
-    if not _NAME_RE.match(name or ""):
-        raise UserError(
-            f"invalid BD_NAME {name!r}: must match [A-Za-z0-9_-]{{1,64}}"
-        )
-    return name
+def sock_path() -> Path:
+    return _runtime_dir() / f"{_PREFIX}.sock"
 
 
-def sock_path(name: str) -> Path:
-    check_name(name)
-    return _runtime_dir() / f"{_PREFIX}-{name}.sock"
-
-
-def port_path(name: str) -> Path:
+def port_path() -> Path:
     """Windows token file. Holds JSON {port, token}."""
-    check_name(name)
-    return _runtime_dir() / f"{_PREFIX}-{name}.port"
+    return _runtime_dir() / f"{_PREFIX}.port"
 
 
-def log_path(name: str) -> Path:
-    check_name(name)
-    return _tmp_dir() / f"{_PREFIX}-{name}.log"
+def log_path() -> Path:
+    return _tmp_dir() / f"{_PREFIX}.log"
 
 
-def pid_path(name: str) -> Path:
-    check_name(name)
-    return _runtime_dir() / f"{_PREFIX}-{name}.pid"
+def pid_path() -> Path:
+    return _runtime_dir() / f"{_PREFIX}.pid"
 
 
-def endpoint_describe(name: str) -> dict:
+def endpoint_describe() -> dict:
     """Public-facing description of the IPC endpoint for `status` / `url --mode-b-proxy`.
     Spec §6.1 --json shape."""
     if IS_WINDOWS:
-        port, token = read_port_file(name)
+        port, token = read_port_file()
         if port is None:
             return {"schema_version": 1, "transport": "tcp",
-                    "host": "127.0.0.1", "port": None, "token": None, "name": name}
+                    "host": "127.0.0.1", "port": None, "token": None}
         return {"schema_version": 1, "transport": "tcp",
-                "host": "127.0.0.1", "port": port, "token": token, "name": name}
+                "host": "127.0.0.1", "port": port, "token": token}
     return {"schema_version": 1, "transport": "unix",
-            "path": str(sock_path(name)), "name": name}
+            "path": str(sock_path())}
 
 
 # ---- Windows port-file: atomic write + read --------------------------------
 
 
-def write_port_file(name: str, port: int, token: str) -> None:
+def write_port_file(port: int, token: str) -> None:
     """Atomic write {.tmp → os.replace} so a concurrent reader never sees a
     half-written file. Mirrors browser-harness `_ipc.py:179-181`."""
-    pf = port_path(name)
+    pf = port_path()
     pf.parent.mkdir(parents=True, exist_ok=True)
     tmp = pf.with_name(pf.name + ".tmp")
     tmp.write_text(json.dumps({"port": port, "token": token}))
     os.replace(tmp, pf)
 
 
-def read_port_file(name: str) -> tuple[int | None, str | None]:
+def read_port_file() -> tuple[int | None, str | None]:
     try:
-        d = json.loads(port_path(name).read_text())
+        d = json.loads(port_path().read_text())
         return int(d["port"]), str(d["token"])
     except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
         return None, None
 
 
-def cleanup_endpoint(name: str) -> None:
+def cleanup_endpoint() -> None:
     """Best-effort: nuke socket / port file. Called on graceful shutdown and
     by `stop` before bind. Silent on missing files."""
-    paths = [sock_path(name) if not IS_WINDOWS else port_path(name),
-             pid_path(name)]
+    paths = [sock_path() if not IS_WINDOWS else port_path(),
+             pid_path()]
     for p in paths:
         try:
             p.unlink()
@@ -146,15 +131,14 @@ def cleanup_endpoint(name: str) -> None:
 # ---- ping handshake (stale-detect) -----------------------------------------
 #
 # Spec §6.7 calls for CDP `Browser.getVersion` over ws. But before we know
-# whether the listener at `name` is *our* daemon, the cheapest probe is an
-# HTTP GET that our daemon recognizes specifically and that anything else
-# either rejects or doesn't answer.
+# whether the listener is *our* daemon, the cheapest probe is an HTTP GET that
+# our daemon recognizes specifically and that anything else either rejects or
+# doesn't answer.
 #
 # We use an HTTP request the ws server can intercept via process_request. The
 # `/__ping__` path is reserved for this — daemon's process_request returns a
-# 200 with body {"pong": true, "pid": N} on POSIX or {"pong": true, "pid": N,
-# "token": "..."} on Windows. A foreign listener might 404 or send garbage;
-# anything not matching counts as "stale."
+# 200 with body {"pong": true, "pid": N, "version": "..."}. A foreign listener
+# might 404 or send garbage; anything not matching counts as "stale."
 
 
 def make_pong_body(pid: int) -> bytes:
@@ -192,9 +176,7 @@ def parse_pong(body: bytes) -> tuple[int | None, str | None]:
     return pid, version
 
 
-async def ping_status_async(
-    name: str, timeout: float = 1.0,
-) -> tuple[int | None, str | None]:
+async def ping_status_async(timeout: float = 1.0) -> tuple[int | None, str | None]:
     """Async client-side ping returning ``(pid, version)``.
 
     ``pid`` is None when the endpoint is not a live daemon (refused / wrong /
@@ -208,13 +190,13 @@ async def ping_status_async(
     none = (None, None)
     try:
         if IS_WINDOWS:
-            port, _ = read_port_file(name)
+            port, _ = read_port_file()
             if port is None:
                 return none
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port), timeout=timeout)
         else:
-            p = sock_path(name)
+            p = sock_path()
             if not p.exists():
                 return none
             reader, writer = await asyncio.wait_for(
@@ -261,20 +243,18 @@ async def ping_status_async(
             pass
 
 
-async def ping_async(name: str, timeout: float = 1.0) -> int | None:
+async def ping_async(timeout: float = 1.0) -> int | None:
     """Async client-side ping. Returns the daemon's reported PID, or None
     when the endpoint is not a live daemon. Thin wrapper over
     :func:`ping_status_async` for callers that only care about liveness/pid."""
-    pid, _version = await ping_status_async(name, timeout=timeout)
+    pid, _version = await ping_status_async(timeout=timeout)
     return pid
 
 
-def ping_status_sync(
-    name: str, timeout: float = 1.0,
-) -> tuple[int | None, str | None]:
+def ping_status_sync(timeout: float = 1.0) -> tuple[int | None, str | None]:
     """Synchronous ``(pid, version)`` probe for CLI paths without a running
     loop. Returns ``(None, None)`` when nothing answers."""
-    coro = ping_status_async(name, timeout=timeout)
+    coro = ping_status_async(timeout=timeout)
     try:
         return asyncio.run(coro)
     except RuntimeError:
@@ -282,24 +262,24 @@ def ping_status_sync(
         return None, None
 
 
-def ping_sync(name: str, timeout: float = 1.0) -> int | None:
+def ping_sync(timeout: float = 1.0) -> int | None:
     """Synchronous variant for CLI status / stop paths that don't already
     have an event loop running. Returns the daemon's PID, or None."""
-    pid, _version = ping_status_sync(name, timeout=timeout)
+    pid, _version = ping_status_sync(timeout=timeout)
     return pid
 
 
 # ---- POSIX socket bind helper ---------------------------------------------
 
 
-def make_unix_socket(name: str) -> socket.socket:
+def make_unix_socket() -> socket.socket:
     """Create + bind an AF_UNIX SOCK_STREAM with 0600 perms via umask(0o077).
 
     Returns the bound, listening-ready socket. Pass it to
     `websockets.unix_serve(handler, sock=...)`. Mirrors browser-harness
     `_ipc.py:166-170`.
     """
-    path = sock_path(name)
+    path = sock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
@@ -331,15 +311,15 @@ def make_tcp_socket() -> tuple[socket.socket, int, str]:
 # ---- pid file helpers ------------------------------------------------------
 
 
-def write_pid(name: str, pid: int) -> None:
-    p = pid_path(name)
+def write_pid(pid: int) -> None:
+    p = pid_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(f"{pid}\n")
 
 
-def read_pid(name: str) -> int | None:
+def read_pid() -> int | None:
     try:
-        s = pid_path(name).read_text().strip()
+        s = pid_path().read_text().strip()
         v = int(s)
         return v if 0 < v < (1 << 31) else None
     except (FileNotFoundError, ValueError, OSError):

@@ -107,7 +107,7 @@ async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
         raise Unavailable("active-tab: no id=1 response from daemon relay")
 
     if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file(cfg.name)
+        port, token = _ipc.read_port_file()
         if port is None:
             raise Unavailable("active-tab: no daemon running (extension relay)")
         url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-active-tab"
@@ -115,7 +115,7 @@ async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
             await ws.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.getActiveTab"}))
             msg = await _drain(ws)
     else:
-        path = _ipc.sock_path(cfg.name)
+        path = _ipc.sock_path()
         if not path.exists():
             raise Unavailable("active-tab: no daemon running (extension relay)")
         async with websockets.unix_connect(

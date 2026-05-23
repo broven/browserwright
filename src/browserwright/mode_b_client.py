@@ -16,7 +16,7 @@ removed; the skill always talks to a running daemon over its socket).
 
 Discovery:
   - Endpoint path comes from ``browserwright-daemon status --json`` (or directly
-    ``${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon-${BD_NAME}.sock``).
+    ``${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock``).
   - On connect, the client appends ``?client=skill-repl`` to the URL.
 
 The CDPSession transport connects to our Mode B unix endpoint (translated to
@@ -37,20 +37,13 @@ from typing import Any, Optional
 from .errors import DaemonUnavailable
 
 
-def _default_name() -> str:
-    """Live ``BD_NAME`` lookup. NOT a module-level constant: freezing identity
-    at import time was the silent cross-talk root (P1). Callers resolving a
-    session pass an explicit endpoint via :func:`client_for_session` instead."""
-    return os.environ.get("BD_NAME", "default")
-
-
-def _default_socket_path(name: Optional[str] = None) -> Path:
+def _default_socket_path() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    return Path(base) / f"browserwright-daemon-{name or _default_name()}.sock"
+    return Path(base) / "browserwright-daemon.sock"
 
 
-def _windows_port_file(name: Optional[str] = None) -> Path:
-    return Path(os.environ.get("TEMP", "/tmp")) / f"browserwright-daemon-{name or _default_name()}.port"
+def _windows_port_file() -> Path:
+    return Path(os.environ.get("TEMP", "/tmp")) / "browserwright-daemon.port"
 
 
 class ModeBClient:
@@ -59,8 +52,7 @@ class ModeBClient:
     open. Active-tab / disconnect / uiState are sent over the same socket.
     """
 
-    def __init__(self, *, name: Optional[str] = None):
-        self.name = name or _default_name()
+    def __init__(self) -> None:
         self._endpoint: Optional[str] = None
         self._transport: Optional[str] = None  # "unix" or "tcp"
         self._token: Optional[str] = None
@@ -78,7 +70,7 @@ class ModeBClient:
         daemon CLI is on a slow path."""
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "status", "--name", self.name, "--json"],
+                ["browserwright-daemon", "status", "--json"],
                 capture_output=True, text=True, timeout=3,
             )
             if proc.returncode == 0 and proc.stdout.strip():
@@ -90,12 +82,12 @@ class ModeBClient:
 
         # POSIX fallback: just look at the well-known socket path.
         if os.name != "nt":
-            sock_path = _default_socket_path(self.name)
+            sock_path = _default_socket_path()
             if sock_path.exists():
                 return {"transport": "unix", "path": str(sock_path)}
 
         # Windows fallback: look at the port file.
-        port_file = _windows_port_file(self.name)
+        port_file = _windows_port_file()
         if port_file.exists():
             try:
                 data = json.loads(port_file.read_text(encoding="utf-8"))
@@ -108,7 +100,7 @@ class ModeBClient:
                     }
             except (OSError, ValueError):
                 pass
-        raise DaemonUnavailable(f"no Mode B endpoint for BD_NAME={self.name!r}")
+        raise DaemonUnavailable("no Mode B endpoint — the daemon is not running")
 
     @staticmethod
     def _normalize_endpoint_info(info: dict) -> dict:
@@ -223,8 +215,7 @@ class ModeBClient:
         """
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "backend-info",
-                 "--name", self.name, "--json"],
+                ["browserwright-daemon", "backend-info", "--json"],
                 capture_output=True, text=True, timeout=5,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -248,7 +239,7 @@ class ModeBClient:
         wired into ``Session`` when a CDP connection is up."""
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "active-tab", "--name", self.name, "--json"],
+                ["browserwright-daemon", "active-tab", "--json"],
                 capture_output=True, text=True, timeout=8,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -279,8 +270,7 @@ class ModeBClient:
         """
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "attach-active",
-                 "--name", self.name, "--json"],
+                ["browserwright-daemon", "attach-active", "--json"],
                 capture_output=True, text=True, timeout=20,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -297,7 +287,7 @@ class ModeBClient:
         keep our socket alive. Used by REPL idle policy."""
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "disconnect", "--name", self.name,
+                ["browserwright-daemon", "disconnect",
                  "--reason", reason],
                 capture_output=True, text=True, timeout=5,
             )
@@ -320,7 +310,6 @@ class ModeBClient:
         """
         self.last_cli_error = None
         cmd = ["browserwright-daemon", "open-background",
-               "--name", self.name,
                "--url", url,
                "--group", group]
         try:
@@ -362,7 +351,7 @@ class ModeBClient:
         if not session_id and not target_id:
             return None
         self.last_cli_error = None
-        cmd = ["browserwright-daemon", "close-tab", "--name", self.name]
+        cmd = ["browserwright-daemon", "close-tab"]
         if target_id:
             cmd += ["--target-id", target_id]
         if session_id:
@@ -426,7 +415,7 @@ class ModeBClient:
         :meth:`is_alive`."""
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "status", "--name", self.name, "--json"],
+                ["browserwright-daemon", "status", "--json"],
                 capture_output=True, text=True, timeout=3,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -464,7 +453,7 @@ class ModeBClient:
         """Stop the running daemon (mirrors the PID-guarded ``stop`` CLI)."""
         try:
             subprocess.run(
-                ["browserwright-daemon", "stop", "--name", self.name],
+                ["browserwright-daemon", "stop"],
                 capture_output=True, text=True, timeout=10,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -480,7 +469,7 @@ class ModeBClient:
         kill the daemon. Callers that know the backend the old daemon was
         serving (see ``ensure_version_coherent``) pass it through so the
         replacement keeps serving the same backend."""
-        cmd = ["browserwright-daemon", "serve", "--name", self.name]
+        cmd = ["browserwright-daemon", "serve"]
         if backend:
             cmd += ["--backend", backend]
         try:
@@ -558,20 +547,17 @@ class ModeBClient:
 # ---- factory: build a client bound to a resolved session ------------
 
 def client_for_session(record: dict) -> ModeBClient:
-    """Build a Mode B client whose endpoint comes from the session *record*
-    (P1), not the import-time default. ``record["daemon_endpoint"]`` is the
-    daemon name/socket this session is bound to.
+    """Build a Mode B client for the single global daemon (fixed socket).
 
     The connection carries the session identity as its client label
-    (``skill-s<id>``) for daemon-side observability; falls back to the default
-    ``skill-repl`` when the record has no id.
+    (``skill-s<id>``) for daemon-side observability and per-session routing;
+    falls back to the default ``skill-repl`` when the record has no id.
 
     Construction is lazy — ``DaemonUnavailable`` surfaces only when a primitive
     first resolves the ws — but when the daemon *is* already up we restart it if
     it's running stale code (S6 / A2-a), so we don't lean on newer RPCs against
-    an old protocol. There is no backend guessing: the backend is whatever the
-    session's daemon was started to serve."""
-    client = ModeBClient(name=record["daemon_endpoint"])
+    an old protocol."""
+    client = ModeBClient()
     sid = record.get("id")
     if sid:
         client._client_label = f"skill-s{sid}"

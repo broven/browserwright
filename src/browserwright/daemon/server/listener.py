@@ -49,33 +49,34 @@ logger = logging.getLogger(__name__)
 
 
 async def run_serve(cfg: Config) -> int:
-    """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code."""
-    name = cfg.name
-    _ipc.check_name(name)
+    """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code.
 
+    There is exactly one global daemon on a fixed socket — no instance name.
+    """
     # Stale-detect: ping any existing endpoint before binding. If something
-    # answers, refuse to start a second copy of ourselves — but if the ping
-    # comes back negative, we cleanup the dead socket file and proceed.
-    existing_pid = await _ipc.ping_async(name, timeout=1.0)
+    # answers, refuse to start a second copy of ourselves (enforces the
+    # "at most one global daemon" invariant) — but if the ping comes back
+    # negative, we cleanup the dead socket file and proceed.
+    existing_pid = await _ipc.ping_async(timeout=1.0)
     if existing_pid is not None:
         print(
-            f"browserwright-daemon[{name}] already running (pid {existing_pid}); "
-            f"use `browserwright-daemon stop --name {name}` to shut it down",
+            f"browserwright-daemon already running (pid {existing_pid}); "
+            f"use `browserwright-daemon stop` to shut it down",
             file=sys.stderr,
         )
         return 1
-    _ipc.cleanup_endpoint(name)
+    _ipc.cleanup_endpoint()
 
     # Log file is best-effort — we route Python logging to it but never crash
     # the daemon over a write failure.
-    _wire_logging(name)
+    _wire_logging()
     # v0.5: opt-in JSON log formatter. After _wire_logging adds the
     # file/console handlers, swap formatters in place if BD_LOG_JSON=1.
     install_json_logging_if_requested()
-    logger.info("browserwright-daemon %s starting (name=%s, backend=%s)",
-                __version__, name, cfg.backend or "auto")
+    logger.info("browserwright-daemon %s starting (backend=%s)",
+                __version__, cfg.backend or "auto")
 
-    state = DaemonState(name=name, backend_name=cfg.backend or "auto")
+    state = DaemonState(backend_name=cfg.backend or "auto")
     router = Router(state)
     upstream = _UpstreamHolder(state, router, cfg)
 
@@ -95,10 +96,10 @@ async def run_serve(cfg: Config) -> int:
                 pass  # e.g. inside pytest event loop
 
     # PID file (best-effort).
-    _ipc.write_pid(name, os.getpid())
+    _ipc.write_pid(os.getpid())
 
     handler = _ClientHandler(state, router, upstream, cfg)
-    server = await _open_server(name, handler)
+    server = await _open_server(handler)
 
     # v0.4: for `--backend extension`, start the relay ws server eagerly so
     # `browserwright-daemon doctor` can probe `__status__` even before any Skill
@@ -114,7 +115,7 @@ async def run_serve(cfg: Config) -> int:
             logger.info("extension relay started on port %d", port)
         except OSError as e:
             print(
-                f"browserwright-daemon[{name}] failed to bind extension relay: {e}",
+                f"browserwright-daemon failed to bind extension relay: {e}",
                 file=sys.stderr,
             )
             server.close()
@@ -122,7 +123,7 @@ async def run_serve(cfg: Config) -> int:
                 await server.wait_closed()
             except Exception:
                 pass
-            _ipc.cleanup_endpoint(name)
+            _ipc.cleanup_endpoint()
             return 2
 
     idle_task: asyncio.Task | None = None
@@ -130,7 +131,7 @@ async def run_serve(cfg: Config) -> int:
         idle_task = asyncio.create_task(_idle_watchdog(state, upstream, cfg.idle_close_after))
     try:
         await stop.wait()
-        logger.info("browserwright-daemon[%s] shutdown requested", name)
+        logger.info("browserwright-daemon shutdown requested")
         await _graceful_shutdown(state, router, upstream)
     finally:
         if idle_task is not None:
@@ -145,17 +146,17 @@ async def run_serve(cfg: Config) -> int:
             await server.wait_closed()
         except Exception:
             pass
-        _ipc.cleanup_endpoint(name)
+        _ipc.cleanup_endpoint()
     return 0
 
 
 # ---- log wiring ------------------------------------------------------------
 
 
-def _wire_logging(name: str) -> None:
+def _wire_logging() -> None:
     """Route the daemon's logger to a file under TMPDIR. Best-effort."""
     try:
-        log_p = _ipc.log_path(name)
+        log_p = _ipc.log_path()
         log_p.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(str(log_p), encoding="utf-8")
         handler.setFormatter(logging.Formatter(
@@ -173,15 +174,15 @@ def _wire_logging(name: str) -> None:
 # ---- websockets server with single-client gate ----------------------------
 
 
-async def _open_server(name: str, handler: "_ClientHandler"):
+async def _open_server(handler: "_ClientHandler"):
     """Bind the listener with correct umask / file perms for POSIX, or the
     token file for Windows. The HTTP /__ping__ path is intercepted here so
     stale-detect works without a ws upgrade."""
-    process_request = _make_process_request(name, handler)
+    process_request = _make_process_request(handler)
 
     if _ipc.IS_WINDOWS:
         sock, port, token = _ipc.make_tcp_socket()
-        _ipc.write_port_file(name, port, token)
+        _ipc.write_port_file(port, token)
         handler.token = token
         server = await serve(
             handler.serve_one,
@@ -195,10 +196,10 @@ async def _open_server(name: str, handler: "_ClientHandler"):
         logger.info("listening on 127.0.0.1:%d (token=%s...)", port, token[:8])
         return server
 
-    sock = _ipc.make_unix_socket(name)
+    sock = _ipc.make_unix_socket()
     # Verify the 0600 perms — spec §6.2 promises it; failing loudly here is
     # better than silently exposing the socket.
-    st = os.stat(_ipc.sock_path(name))
+    st = os.stat(_ipc.sock_path())
     if (st.st_mode & 0o777) != 0o600:
         logger.warning("unexpected sock perms %o", st.st_mode & 0o777)
     server = await unix_serve(
@@ -210,11 +211,11 @@ async def _open_server(name: str, handler: "_ClientHandler"):
         ping_interval=20,
         ping_timeout=20,
     )
-    logger.info("listening on %s", _ipc.sock_path(name))
+    logger.info("listening on %s", _ipc.sock_path())
     return server
 
 
-def _make_process_request(name: str, handler: "_ClientHandler"):
+def _make_process_request(handler: "_ClientHandler"):
     """Intercept the HTTP handshake.
 
     Two responsibilities:

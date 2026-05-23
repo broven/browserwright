@@ -592,8 +592,7 @@ def run() -> int:
             print("         `chrome-extension/` directory.")
             print("         (Hint: `browserwright-daemon extension-path --json` prints it.)")
         print("  2. Start the daemon in extension-relay mode:")
-        print("       browserwright-daemon serve --backend extension"
-              f" --name {os.environ.get('BD_NAME', 'default')}")
+        print("       browserwright-daemon serve --backend extension")
         print("       (Mode B socket only — Mode A subprocess cannot host the")
         print("        relay; the daemon will raise DaemonUnavailable on Mode A.)")
         print("  3. In Chrome, click the extension icon → 'Attach this tab'.")
@@ -617,8 +616,7 @@ def run() -> int:
             print(f"       cert: {cloud_fields['cloud_cert_file']}")
             print(f"       key:  {cloud_fields['cloud_key_file']}")
         print("  3. Start the daemon in cloud-relay mode:")
-        print(f"       browserwright-daemon serve --backend cloud --provider {provider}"
-              f" --name {os.environ.get('BD_NAME', 'default')}")
+        print(f"       browserwright-daemon serve --backend cloud --provider {provider}")
         print("       (daemon-impl-2 may also expose `browserwright-daemon set-credentials`")
         print("        — check `browserwright-daemon --help` once v0.5 is installed.)")
         print("  4. Verify: `browserwright-daemon doctor --json` →")

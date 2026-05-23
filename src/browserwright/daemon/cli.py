@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 from xml.sax.saxutils import escape as _xml_escape
 from typing import NoReturn
@@ -108,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
               "[backends.extension].port in config.toml."))
 
     # stop (v0.2)
-    p_stop = sub.add_parser("stop", help="stop a running daemon (by BD_NAME)")
+    p_stop = sub.add_parser("stop", help="stop the running daemon")
     _add_name(p_stop)
     p_stop.add_argument("--timeout", type=float, default=5.0,
                         help="seconds to wait for graceful shutdown before SIGKILL")
@@ -311,9 +310,11 @@ def _add_port(sp: argparse.ArgumentParser) -> None:
 
 
 def _add_name(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("--name", default=None,
-                    help="daemon instance name for multi-instance setups; "
-                         "overrides BD_NAME (default 'default')")
+    """No-op. The `--name` / BD_NAME daemon-instance concept was removed: there
+    is exactly one global daemon on a fixed socket (docs/refactor-single-daemon.md).
+    Kept as a no-op so the (many) call sites need not all be deleted at once;
+    they carry no flag now."""
+    return None
 
 
 # ---- shared config building ------------------------------------------------
@@ -326,7 +327,6 @@ def _cfg_from_args(args) -> Config:
         cli_port=getattr(args, "port", None),
         cli_chrome_binary=getattr(args, "chrome_binary", None),
         cli_config_path=getattr(args, "config", None),
-        cli_name=getattr(args, "name", None),
         # v0.5.3 Task #24: serve-only flag; argparse Namespace shape varies
         # per subcommand, so getattr-with-default keeps non-serve calls clean.
         cli_extension_port=getattr(args, "extension_port", None),
@@ -345,7 +345,7 @@ def _cmd_url(args, cfg: Config) -> int:
     # (Spec §6.1: bare socket path on POSIX, host:port + token on Windows.)
     if getattr(args, "mode_b_proxy", False):
         from . import _ipc
-        ep = _ipc.endpoint_describe(cfg.name)
+        ep = _ipc.endpoint_describe()
         if args.json:
             print(json.dumps(ep, sort_keys=True))
         else:
@@ -415,13 +415,12 @@ def _cmd_stop(args, cfg: Config) -> int:
     from . import platforms
     import signal, time
 
-    pid = _ipc.ping_sync(cfg.name, timeout=1.0)
+    pid = _ipc.ping_sync(timeout=1.0)
     if pid is None:
         # No live daemon. Still clean up stale files so the next `serve` can
         # bind freshly without manual intervention.
-        _ipc.cleanup_endpoint(cfg.name)
-        print(f"no live daemon at name={cfg.name!r}; cleaned up stale files",
-              file=sys.stderr)
+        _ipc.cleanup_endpoint()
+        print("no live daemon; cleaned up stale files", file=sys.stderr)
         return 0
 
     start0 = platforms.proc_start_time(pid)
@@ -434,19 +433,19 @@ def _cmd_stop(args, cfg: Config) -> int:
         return platforms.proc_start_time(pid) == start0
 
     if not _same_process():
-        _ipc.cleanup_endpoint(cfg.name)
+        _ipc.cleanup_endpoint()
         print(f"daemon pid {pid} was recycled by another process; not "
               f"signalling it", file=sys.stderr)
         return 0
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _ipc.cleanup_endpoint(cfg.name)
+        _ipc.cleanup_endpoint()
         return 0
     # Wait for the daemon to exit gracefully.
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
-        if _ipc.ping_sync(cfg.name, timeout=0.3) is None:
+        if _ipc.ping_sync(timeout=0.3) is None:
             return 0
         time.sleep(0.1)
     # Still alive — force, but only if the pid is still the same process.
@@ -458,7 +457,7 @@ def _cmd_stop(args, cfg: Config) -> int:
     else:
         print(f"daemon pid {pid} was recycled before SIGKILL; not signalling "
               f"it", file=sys.stderr)
-    _ipc.cleanup_endpoint(cfg.name)
+    _ipc.cleanup_endpoint()
     return 0
 
 
@@ -467,19 +466,17 @@ def _cmd_backend_info(args, cfg: Config) -> int:
     `BrowserwrightDaemon.getBackendInfo`'s ws response so the mode_b_client
     subprocess shim can parse it directly."""
     import asyncio
-    _validate_daemon_name(cfg.name)
     return asyncio.run(_run_backend_info(args, cfg))
 
 
 async def _run_backend_info(args, cfg: Config) -> int:
     from . import _ipc
-    pid = await _ipc.ping_async(cfg.name, timeout=1.0)
+    pid = await _ipc.ping_async(timeout=1.0)
     if pid is None:
         if args.json:
-            print(json.dumps({"running": False, "name": cfg.name},
-                             sort_keys=True))
+            print(json.dumps({"running": False}, sort_keys=True))
         else:
-            print(f"daemon[{cfg.name}] not running", file=sys.stderr)
+            print("daemon not running", file=sys.stderr)
         return 2
     try:
         info = await _rpc_via_ws(
@@ -519,15 +516,15 @@ async def _run_stats(args, cfg: Config) -> int:
     # asyncio.run raises RuntimeError, so use the async ping directly —
     # ping_sync's fallback returns None and we'd misreport "not running"
     # even when a daemon was listening.
-    pid = await _ipc.ping_async(cfg.name, timeout=1.0)
+    pid = await _ipc.ping_async(timeout=1.0)
     if pid is None:
-        print(f"daemon[{cfg.name}] not running", file=sys.stderr)
+        print("daemon not running", file=sys.stderr)
         return 2
 
     import websockets
-    sock_path = _ipc.sock_path(cfg.name)
+    sock_path = _ipc.sock_path()
     if _ipc.IS_WINDOWS:
-        ep = _ipc.endpoint_describe(cfg.name)
+        ep = _ipc.endpoint_describe()
         ws_url = f"ws://127.0.0.1:{ep['port']}/?client=stats-cli&token={ep['token']}"
         conn = await websockets.connect(ws_url, compression=None)
     else:
@@ -563,11 +560,10 @@ async def _run_stats(args, cfg: Config) -> int:
 def _cmd_status(args, cfg: Config) -> int:
     """Report endpoint + liveness. JSON shape used by Skill for status pings."""
     from . import _ipc
-    pid, version = _ipc.ping_status_sync(cfg.name, timeout=1.0)
-    ep = _ipc.endpoint_describe(cfg.name)
+    pid, version = _ipc.ping_status_sync(timeout=1.0)
+    ep = _ipc.endpoint_describe()
     status = {
         "schema_version": 1,
-        "name": cfg.name,
         "alive": pid is not None,
         "pid": pid,
         "version": version,
@@ -577,9 +573,9 @@ def _cmd_status(args, cfg: Config) -> int:
         print(json.dumps(status, sort_keys=True))
     else:
         if pid is None:
-            print(f"daemon[{cfg.name}] not running")
+            print("daemon not running")
         else:
-            print(f"daemon[{cfg.name}] alive (pid {pid})")
+            print(f"daemon alive (pid {pid})")
             if ep["transport"] == "unix":
                 print(f"  socket: {ep['path']}")
             else:
@@ -604,7 +600,7 @@ async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
     from . import _ipc
 
     if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file(cfg.name)
+        port, token = _ipc.read_port_file()
         if port is None:
             print("no daemon running", file=sys.stderr)
             return 2
@@ -620,7 +616,7 @@ async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
             print(f"disconnect failed: {e}", file=sys.stderr)
             return 2
     else:
-        path = _ipc.sock_path(cfg.name)
+        path = _ipc.sock_path()
         if not path.exists():
             print("no daemon running", file=sys.stderr)
             return 2
@@ -652,7 +648,7 @@ async def _attach_active_via_ws(cfg: Config, args) -> int:
     from . import _ipc
 
     if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file(cfg.name)
+        port, token = _ipc.read_port_file()
         if port is None:
             print("no daemon running", file=sys.stderr)
             return 2
@@ -663,7 +659,7 @@ async def _attach_active_via_ws(cfg: Config, args) -> int:
         except Exception as e:
             print(f"attach-active failed: {e}", file=sys.stderr)
             return 1
-    path = _ipc.sock_path(cfg.name)
+    path = _ipc.sock_path()
     if not path.exists():
         print("no daemon running", file=sys.stderr)
         return 2
@@ -708,7 +704,7 @@ async def _attach_active_roundtrip(ws, args) -> int:
 def _cmd_logs(args, cfg: Config) -> int:
     """Print log file path, or tail -f it."""
     from . import _ipc
-    log = _ipc.log_path(cfg.name)
+    log = _ipc.log_path()
     if not args.follow:
         print(log)
         return 0
@@ -817,7 +813,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
         raise DaemonError(f"{method} no id=1 response after 20 frames")
 
     if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file(cfg.name)
+        port, token = _ipc.read_port_file()
         if port is None:
             raise Unavailable("no daemon running")
         url = f"ws://127.0.0.1:{port}/?token={token}&client={client_label}"
@@ -827,7 +823,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
             }))
             msg = await _drain_until_response(ws)
     else:
-        path = _ipc.sock_path(cfg.name)
+        path = _ipc.sock_path()
         if not path.exists():
             raise Unavailable("no daemon running")
         async with websockets.unix_connect(
@@ -1023,30 +1019,9 @@ def _cmd_end_session(args, cfg: Config) -> int:
 # macOS LaunchAgents are the right primitive — Linux/systemd-user support
 # is deferred (no users hitting it yet on this codebase).
 
-_LAUNCHAGENT_LABEL_PREFIX = "com.browserwright-daemon."
-
-# Per the IPC contract (see `_ipc._NAME_RE`) but a touch wider — we accept
-# dots too because LaunchAgent labels routinely contain them. The cap stays
-# 64 chars to keep filesystem paths bounded.
-_DAEMON_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
-
-
-def _validate_daemon_name(name: str) -> str:
-    """Reject anything outside ``[A-Za-z0-9._-]{1,64}`` BEFORE it touches the
-    filesystem (plist path), the LaunchAgent label, or any XML interpolation.
-
-    Without this guard ``--name '../../tmp/evil'`` would write the plist
-    outside ``~/Library/LaunchAgents`` and ``--name 'weird<chars>'`` would
-    yield malformed plist XML. We also rely on this elsewhere to keep
-    cli-level handling consistent with `_ipc.check_name`'s socket-naming
-    constraint.
-    """
-    if not _DAEMON_NAME_RE.match(name or ""):
-        raise UserError(
-            "--name must be alphanumeric/dot/dash/underscore, 1-64 chars; "
-            f"got {name!r}"
-        )
-    return name
+# There is exactly one global daemon, so the LaunchAgent has one fixed label
+# and one plist (no per-instance name — BD_NAME was removed).
+_LAUNCHAGENT_LABEL = "com.browserwright-daemon"
 
 
 def _launchagent_dir() -> "Path":
@@ -1054,8 +1029,8 @@ def _launchagent_dir() -> "Path":
     return Path.home() / "Library" / "LaunchAgents"
 
 
-def _launchagent_plist_path(name: str) -> "Path":
-    return _launchagent_dir() / f"{_LAUNCHAGENT_LABEL_PREFIX}{name}.plist"
+def _launchagent_plist_path() -> "Path":
+    return _launchagent_dir() / f"{_LAUNCHAGENT_LABEL}.plist"
 
 
 def _resolve_browserwright_daemon_bin() -> str:
@@ -1077,21 +1052,20 @@ def _resolve_browserwright_daemon_bin() -> str:
     )
 
 
-def _build_plist(*, label: str, name: str, backend: str,
-                 extension_port: int | None) -> str:
+def _build_plist(*, backend: str, extension_port: int | None) -> str:
     """Emit the plist content. Kept inline (no XML lib) — the schema is
     fixed + tiny, and we avoid a dependency. Every interpolated value passes
-    through ``xml.sax.saxutils.escape`` (belt + suspenders alongside the
-    ``_validate_daemon_name`` guard the callers must run first). Pure: no
-    side effects — the caller is responsible for creating the log dir.
+    through ``xml.sax.saxutils.escape``. Pure: no side effects — the caller is
+    responsible for creating the log dir.
     """
     bin_path = _resolve_browserwright_daemon_bin()
-    args = [bin_path, "serve", "--backend", backend, "--name", name]
+    args = [bin_path, "serve", "--backend", backend]
     if extension_port is not None:
         args += ["--extension-port", str(extension_port)]
     log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
-    stdout_path = f"{log_dir}/{name}.stdout.log"
-    stderr_path = f"{log_dir}/{name}.stderr.log"
+    stdout_path = f"{log_dir}/browserwright-daemon.stdout.log"
+    stderr_path = f"{log_dir}/browserwright-daemon.stderr.log"
+    label = _LAUNCHAGENT_LABEL
     # PATH carried over so any subprocess the daemon spawns (e.g. chrome)
     # is discoverable. /usr/local/bin + /opt/homebrew/bin cover both
     # Intel and Apple Silicon Homebrew layouts. Constant, no escape needed.
@@ -1144,10 +1118,8 @@ def _cmd_install(args, cfg: Config) -> int:
               "for Linux run `browserwright-daemon serve` from a systemd-user "
               "unit yourself for now", file=sys.stderr)
         return 1
-    name = args.name or os.environ.get("BD_NAME") or "default"
-    _validate_daemon_name(name)
-    label = f"{_LAUNCHAGENT_LABEL_PREFIX}{name}"
-    plist_path = _launchagent_plist_path(name)
+    label = _LAUNCHAGENT_LABEL
+    plist_path = _launchagent_plist_path()
     if plist_path.exists() and not args.force:
         print(f"error: {plist_path} already exists. "
               f"Use --force to replace.", file=sys.stderr)
@@ -1158,8 +1130,7 @@ def _cmd_install(args, cfg: Config) -> int:
     log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
     os.makedirs(log_dir, exist_ok=True)
     content = _build_plist(
-        label=label, name=name, backend=args.backend,
-        extension_port=args.extension_port,
+        backend=args.backend, extension_port=args.extension_port,
     )
     # If --force and the plist exists, unload the old one first so launchctl
     # picks up the new ProgramArguments cleanly.
@@ -1176,7 +1147,6 @@ def _cmd_install(args, cfg: Config) -> int:
         return 3
     print(json.dumps({
         "ok": True,
-        "name": name,
         "label": label,
         "plist": str(plist_path),
         "backend": args.backend,
@@ -1189,18 +1159,16 @@ def _cmd_uninstall(args, cfg: Config) -> int:
     if sys.platform != "darwin":
         print("error: `uninstall` is macOS-only", file=sys.stderr)
         return 1
-    name = args.name or os.environ.get("BD_NAME") or "default"
-    _validate_daemon_name(name)
-    plist_path = _launchagent_plist_path(name)
+    plist_path = _launchagent_plist_path()
     if not plist_path.exists():
-        print(json.dumps({"ok": False, "name": name,
+        print(json.dumps({"ok": False,
                           "reason": "no LaunchAgent installed"},
                          sort_keys=True))
         return 0
     rc, _, err = _launchctl("unload", str(plist_path))
     # Even on unload failure (e.g. wasn't loaded), we still remove the plist.
     plist_path.unlink()
-    payload = {"ok": True, "name": name, "removed": str(plist_path)}
+    payload = {"ok": True, "removed": str(plist_path)}
     if rc != 0 and err.strip():
         payload["unload_warning"] = err.strip()
     print(json.dumps(payload, sort_keys=True))
@@ -1208,61 +1176,36 @@ def _cmd_uninstall(args, cfg: Config) -> int:
 
 
 def _cmd_list(args, cfg: Config) -> int:
-    from pathlib import Path
-    instances = []
-    # Installed LaunchAgents (macOS).
-    la_dir = _launchagent_dir()
-    if la_dir.exists():
-        for plist in sorted(la_dir.glob(f"{_LAUNCHAGENT_LABEL_PREFIX}*.plist")):
-            name = plist.stem[len(_LAUNCHAGENT_LABEL_PREFIX):]
-            running_pid = _ipc_ping(name)
-            instances.append({
-                "name": name,
-                "service": "launchagent",
-                "plist": str(plist),
-                "running": running_pid is not None,
-                "pid": running_pid,
-            })
-    # Also surface daemons reachable on a socket but NOT registered as
-    # LaunchAgents (manual `browserwright-daemon serve` invocations).
-    from . import _ipc
-    sock_dir = _ipc.sock_path("default").parent
-    seen_names = {i["name"] for i in instances}
-    if sock_dir.exists():
-        for sock in sorted(sock_dir.glob("browserwright-daemon-*.sock")):
-            stem = sock.stem  # e.g. "browserwright-daemon-myrepl"
-            name = stem[len("browserwright-daemon-"):]
-            if name in seen_names:
-                continue
-            running_pid = _ipc_ping(name)
-            if running_pid is None:
-                continue
-            instances.append({
-                "name": name,
-                "service": "manual",
-                "plist": None,
-                "running": True,
-                "pid": running_pid,
-            })
+    """Report the single global daemon: whether it's installed as a
+    LaunchAgent and whether it's running on the socket."""
+    plist_path = _launchagent_plist_path()
+    installed = plist_path.exists()
+    service = "launchagent" if installed else "manual"
+    running_pid = _ipc_ping()
+    info = {
+        "service": service,
+        "plist": str(plist_path) if installed else None,
+        "running": running_pid is not None,
+        "pid": running_pid,
+    }
     if args.json:
-        print(json.dumps({"instances": instances}, sort_keys=True))
+        print(json.dumps(info, sort_keys=True))
         return 0
-    if not instances:
-        print("no daemon instances found")
+    if not installed and running_pid is None:
+        print("no daemon installed or running")
         return 0
-    print(f"{'NAME':<20} {'SERVICE':<12} {'RUNNING':<8} {'PID':<8}")
-    for inst in instances:
-        running = "yes" if inst["running"] else "no"
-        pid = str(inst["pid"]) if inst["pid"] else "-"
-        print(f"{inst['name']:<20} {inst['service']:<12} {running:<8} {pid:<8}")
+    running = "yes" if info["running"] else "no"
+    pid = str(running_pid) if running_pid else "-"
+    print(f"{'SERVICE':<12} {'RUNNING':<8} {'PID':<8}")
+    print(f"{service:<12} {running:<8} {pid:<8}")
     return 0
 
 
-def _ipc_ping(name: str) -> int | None:
+def _ipc_ping() -> int | None:
     """Tiny wrapper around ipc.ping_sync that swallows everything."""
     try:
         from . import _ipc
-        return _ipc.ping_sync(name, timeout=0.5)
+        return _ipc.ping_sync(timeout=0.5)
     except Exception:
         return None
 

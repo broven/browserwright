@@ -18,17 +18,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-# Path-traversal guard for BD_NAME — sourced from browser-harness _ipc.py:31-33.
-# Matches the regex spec §6.7 nails down.
+# Path-traversal guard for the `launch-chrome --profile` name — sourced from
+# browser-harness _ipc.py:31-33. (No longer used for a daemon instance name;
+# BD_NAME was removed — see docs/refactor-single-daemon.md.)
 _NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
 def check_name(name: str) -> str:
+    """Path-traversal guard for filesystem-bound names (e.g. `--profile`)."""
     if not _NAME_RE.match(name or ""):
         from .errors import UserError
 
         raise UserError(
-            f"invalid BD_NAME {name!r}: must match [A-Za-z0-9_-]{{1,64}}"
+            f"invalid name {name!r}: must match [A-Za-z0-9_-]{{1,64}}"
         )
     return name
 
@@ -117,7 +119,6 @@ class BackendsConfig:
 class Config:
     """Resolved daemon config — flat, immutable after build."""
 
-    name: str = "default"
     backend: str | None = None             # explicit --backend / BD_BACKEND
     timeout: float = 5.0                   # per-backend resolve timeout, seconds
     cdp_ws: str | None = None              # BD_CDP_WS / BU_CDP_WS — env backend uses this
@@ -147,7 +148,6 @@ def load(
     cli_port: int | None = None,
     cli_chrome_binary: str | None = None,
     cli_config_path: str | None = None,
-    cli_name: str | None = None,
     cli_extension_port: int | None = None,
     env: dict[str, str] | None = None,
 ) -> Config:
@@ -167,8 +167,6 @@ def load(
     cfg = Config()
 
     # toml level
-    if "name" in toml and isinstance(toml["name"], str):
-        cfg.name = toml["name"]
     if "timeout" in toml and isinstance(toml["timeout"], (int, float)):
         cfg.timeout = float(toml["timeout"])
     # v0.5.2 Task #14: `default_backend` from config.toml. The README has
@@ -218,8 +216,6 @@ def load(
         cfg.idle_close_after = float(toml["idle_close_after"])
 
     # env level — BD_* wins over BU_*
-    if "BD_NAME" in e:
-        cfg.name = e["BD_NAME"]
     if "BD_TIMEOUT" in e:
         try:
             cfg.timeout = float(e["BD_TIMEOUT"])
@@ -330,12 +326,8 @@ def load(
         cfg.backends.rdp.port = cli_port
     if cli_chrome_binary is not None:
         cfg.chrome_binary = cli_chrome_binary
-    if cli_name is not None:
-        cfg.name = cli_name
     if cli_extension_port is not None:
         # v0.5.3 Task #24: CLI tops env / toml for the extension relay port.
         cfg.backends.extension.port = cli_extension_port
 
-    # Validate name as the very last step (in case env injected garbage)
-    check_name(cfg.name)
     return cfg

@@ -135,7 +135,6 @@ class ClientState:
 @dataclass
 class DaemonState:
     """Whole-process mutable state. ONE instance per daemon."""
-    name: str
     backend_name: str
     upstream_phase: UpstreamPhase = UpstreamPhase.DISCONNECTED
     upstream_ws_url: str | None = None
