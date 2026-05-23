@@ -23,7 +23,7 @@ from pathlib import Path
 
 # Ensure the daemon e2e test helpers are importable.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DAEMON_E2E = _REPO_ROOT / "browserwright-daemon" / "tests" / "e2e"
+_DAEMON_E2E = _REPO_ROOT / "tests" / "daemon" / "e2e"
 if str(_DAEMON_E2E) not in sys.path:
     sys.path.insert(0, str(_DAEMON_E2E))
 
@@ -48,7 +48,7 @@ RDP_PORT = 39990
 # macOS AF_UNIX 104-byte sun_path budget.
 RUNTIME_DIR = "/tmp/bd-agent-e2e-rt"
 
-EXT_SOURCE_DIR = _REPO_ROOT / "browserwright-daemon" / "chrome-extension"
+EXT_SOURCE_DIR = _REPO_ROOT / "chrome-extension"
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "_workspace"
 ARTIFACTS_DIR = Path(__file__).resolve().parent / "_artifacts"
 
@@ -99,12 +99,19 @@ def start_session() -> None:
     # 1. Patch extension
     patched_ext = patch_extension_dir(EXT_SOURCE_DIR, relay_port=EXT_PORT)
 
+    daemon_env = scrubbed_env()
+    src_path = str(_REPO_ROOT / "src")
+    old_pythonpath = daemon_env.get("PYTHONPATH", "")
+    daemon_env["PYTHONPATH"] = (
+        src_path if not old_pythonpath else f"{src_path}{os.pathsep}{old_pythonpath}"
+    )
+
     # 2. Spawn daemon (isolated by its own XDG_RUNTIME_DIR + relay port)
     daemon = spawn_daemon(
         EXT_PORT,
         RUNTIME_DIR,
         log_path,
-        env=scrubbed_env(),
+        env=daemon_env,
     )
 
     # 3. Find and launch Chrome for Testing

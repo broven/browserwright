@@ -1,13 +1,13 @@
-# v2 SDK Sub-Agent E2E Tests
+# v2 Codex Agent E2E Tests
 
-Tests whether the `skill/*.md` documentation + `browserwright` code let a real Claude Agent SDK sub-agent use the browser fluently. Complements v1 (fixture-style, 291 unit / 11 e2e) which tests code correctness directly.
+Tests whether the `skill/*.md` documentation + `browserwright` code let a real Codex Agent use the browser fluently. Complements v1 (fixture-style, 291 unit / 11 e2e) which tests code correctness directly.
 
 ## How to run
 
 ### Prerequisites
 
 - Chrome for Testing: `npx @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing`
-- Auth: `ANTHROPIC_API_KEY` env var, or a logged-in `claude` CLI session
+- Auth: `OPENAI_API_KEY`, `CODEX_API_KEY`, or a logged-in `codex` CLI session
 
 ### Full suite (Cases A-D, needs daemon + Chrome)
 
@@ -29,9 +29,9 @@ npx promptfoo view
 ```
 promptfooconfig.yaml      # Case A-D: full daemon + Chrome
 hooks.py                  # beforeAll: daemon+Chrome, beforeEach: workspace reset
-provider.py               # claude-agent-sdk wrapper for Cases A-D
-agent_runner.py           # ClaudeSDKClient wrapper with mock-user
-guards.py                 # PreToolUse hook: restrict tools
+provider.py               # disabled legacy claude-agent-sdk wrapper
+agent_runner.py           # disabled legacy ClaudeSDKClient wrapper
+guards.py                 # disabled legacy PreToolUse hook tests
 workspace.py              # Build/reset isolated workspace
 scorers/
   case_a.py               # Connect + open + summarize
@@ -71,15 +71,16 @@ Cases are a **north-star spec** for the skill's target behavior. When a case goe
 
 ## Model matrix
 
-The default provider uses `claude-sonnet-4-6`. To test with Opus, add a second provider:
+The default provider uses `gpt-5.3-codex`. To test another Codex model:
 
 ```yaml
-# Uncomment to add Opus matrix:
-# - id: "file://provider.py"
-#   label: "opus"
-#   config:
-#     model: "claude-opus-4-6"
-#     max_turns: 25
+- id: "openai:codex-sdk"
+  label: "codex-mini"
+  config:
+    model: "gpt-5.1-codex-mini"
+    working_dir: "./_workspace/skill"
+    skip_git_repo_check: true
+    sandbox_mode: "workspace-write"
 ```
 
 ## CI

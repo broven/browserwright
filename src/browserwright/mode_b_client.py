@@ -60,6 +60,10 @@ class ModeBClient:
         # client label sent on the ws query string for daemon observability;
         # session-bound clients override this with ``skill-s<id>``.
         self._client_label: str = "skill-repl"
+        # The session id, emitted on the ws query as ``?session=<id>`` — this is
+        # the key the daemon's dispatcher routes on (rdp sessions reach their
+        # own UpstreamContext through it). None for the bare REPL client.
+        self._session_id: Optional[str] = None
 
     # ---- endpoint discovery ---------------------------------------------
 
@@ -178,16 +182,20 @@ class ModeBClient:
         if self._cached_ws:
             return self._cached_ws
         ep = self.discover()
+        # Session-bound clients carry ``?session=<id>`` — the daemon dispatcher
+        # routes on this (not on the client label). Without it an rdp session
+        # resolves to None → the shared (extension) context.
+        session_q = f"&session={self._session_id}" if self._session_id else ""
         if ep["transport"] == "unix":
             # websockets.sync.client.connect doesn't support ws+unix:// natively;
             # we hand it a pre-built socket via the `sock=` kwarg instead.
             # Return a sentinel URL the CDPSession layer recognises.
-            url = f"ws+unix://{ep['path']}?client={client_label}"
+            url = f"ws+unix://{ep['path']}?client={client_label}{session_q}"
         else:
             tok = ep.get("token", "")
             host = ep.get("host", "127.0.0.1")
             port = ep["port"]
-            url = f"ws://{host}:{port}?token={tok}&client={client_label}"
+            url = f"ws://{host}:{port}?token={tok}&client={client_label}{session_q}"
         self._cached_ws = url
         self._endpoint = ep.get("path") or f"{ep.get('host')}:{ep.get('port')}"
         self._transport = ep["transport"]
@@ -561,6 +569,7 @@ def client_for_session(record: dict) -> ModeBClient:
     sid = record.get("id")
     if sid:
         client._client_label = f"skill-s{sid}"
+        client._session_id = str(sid)
     if client.is_alive() and client.ensure_version_coherent():
         client.wait_until_alive()
     return client

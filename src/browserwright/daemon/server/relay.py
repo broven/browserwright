@@ -216,10 +216,10 @@ class RelayServer:
                                group_id: int | None = None,
                                timeout: float = 5.0) -> dict | None:
         """Live membership query: ask the extension for the tabs of the
-        session's tab group. ``group_id`` is the durable primary key (bind to
-        the numeric Chrome groupId); ``group_name`` (= session name) is the
-        recovery anchor used only when the id is lost / invalid. The extension
-        resolves id-first, title-fallback. Returns ``{"groupId":int,"tabs":
+        session's tab group. ``group_id`` is the durable primary key (the
+        numeric Chrome groupId); ``group_name`` is accepted for older callers
+        but is not a lookup key because titles are not unique. Returns
+        ``{"groupId":int,"tabs":
         [{tabId,url,title,active,lastAccessed}, ...]}`` — ``groupId == -1`` /
         empty tabs when no group matches (the session's browser has no tabs).
         Returns None when no extension is connected (mirrors
@@ -240,9 +240,10 @@ class RelayServer:
                                 timeout: float = 10.0) -> GhostTarget:
         """Daemon-driven adopt (docs C1): ask the extension to MOVE Chrome's
         currently-focused-window active tab into this session's tab group and
-        attach the debugger. ``group_id`` (durable) + ``group_name`` (recovery
-        anchor) identify the destination group; the extension refuses (error)
-        if the focused tab already belongs to a DIFFERENT session's group.
+        attach the debugger. ``group_id`` identifies the destination group;
+        ``group_name`` is only the title to apply if a new group is created.
+        The extension refuses (error) if the focused tab already belongs to a
+        DIFFERENT session's group.
 
         The adopted tab is a regular group member — it closes with the group on
         ``end_session`` (no separate borrowed/owned flag).
@@ -360,10 +361,10 @@ class RelayServer:
         tab keeps focus.
 
         The session's group is identified by ``group_id`` (the durable numeric
-        Chrome groupId) when known; ``group_name`` (= session name) is the
-        recovery anchor used when the id is unknown / invalid (e.g. Chrome
-        auto-deleted an emptied group, so the next open recreates it). The
-        extension resolves id-first, title-fallback, create-if-missing.
+        Chrome groupId) when known; ``group_name`` (= session name) is only the
+        human-visible title to use when a new group must be created. The
+        extension resolves by id, or creates a new group when the id is absent
+        or invalid.
 
         ``group_name=None`` and no ``group_id`` skips the grouping step; the
         resulting GhostTarget carries the extension-reported ``group_id``

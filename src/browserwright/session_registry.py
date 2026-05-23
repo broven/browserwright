@@ -93,8 +93,20 @@ def touch(session_id: str) -> Optional[dict]:
 
 
 def update(session_id: str, **fields) -> Optional[dict]:
-    """Patch arbitrary fields on a session record."""
-    return _with_entry(session_id, lambda e: e.update(**fields))
+    """Patch fields on a session record.
+
+    ``backend`` is fixed at creation and immutable for the session's whole life
+    (single-daemon refactor, decision 2): a change to a DIFFERENT backend is
+    rejected. Raising before ``e.update`` (and before ``_locked``'s post-yield
+    ``write_text``) leaves the ledger untouched. A no-op same-value patch is
+    allowed so callers that re-write the whole record don't trip the guard."""
+    def _patch(e: dict) -> None:
+        if "backend" in fields and fields["backend"] != e.get("backend"):
+            raise ValueError(
+                f"session {session_id!r} backend is immutable: refusing to "
+                f"change {e.get('backend')!r} → {fields['backend']!r}")
+        e.update(**fields)
+    return _with_entry(session_id, _patch)
 
 
 def remove(session_id: str) -> Optional[dict]:

@@ -23,7 +23,7 @@ def _attached_session() -> str:
         # Transparent reconnect-recovery: re-attach to this session's own tab
         # across daemon restart / extension reconnect / new process. This does
         # NOT steal the user's focused tab — it re-binds the tab this session
-        # already owns (anchored on the durable tab-group title == name).
+        # already owns (anchored on the persisted tab-group id).
         from ..session_runtime import ensure_session_target
         if ensure_session_target(sess):
             return sess.cdp.attach(sess.current_target_id)

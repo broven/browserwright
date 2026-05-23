@@ -1,14 +1,15 @@
 """Transparent reconnect-recovery for a session's tab binding.
 
-A session's durable anchor is its **name == Chrome tab-group title**. The
-ledger record carries a ``runtime`` cache (``current_target_id``, ``group_id``,
-``owned_tab_ids``, ``updated_at``) as a *fast path* only — the source of truth
-is the tab group, recoverable via the daemon verb ``BrowserwrightDaemon.recoverSession``.
+A session's durable extension anchor is its Chrome tab-group id. The ledger
+record carries a ``runtime`` cache (``current_target_id``, ``group_id``,
+``owned_tab_ids``, ``updated_at``) as a fast path — the source of truth is the
+live tab group keyed by that numeric id, recoverable via the daemon verb
+``BrowserwrightDaemon.recoverSession``.
 
 These helpers let primitives re-attach to a session's tab across daemon
-restarts / extension reconnects / new ``bs run`` processes without the caller
+daemon restarts / extension reconnects / new ``bs run`` processes without the caller
 doing anything: ``ensure_session_target`` runs a 3-step fallback (in-process →
-ledger.runtime fast path → group-anchor recovery).
+ledger.runtime fast path → group-id recovery).
 """
 from __future__ import annotations
 
@@ -89,8 +90,9 @@ def ensure_session_target(sess) -> Optional[str]:
     2. ledger ``runtime.current_target_id`` → try ``cdp.attach(tid)`` (FAST
        PATH, no group query). The daemon auto-reattaches the debugger; a
        stale/closed tab raises → fall through.
-    3. group anchor: ``BrowserwrightDaemon.recoverSession`` by name → register +
-       persist the new binding. On CDPError / empty group return None.
+    3. group id: ``BrowserwrightDaemon.recoverSession`` by persisted group id
+       → register + persist the new binding. On CDPError / empty group return
+       None.
 
     Returns the targetId, or None when nothing could be recovered (brand-new
     session with no tabs yet)."""
@@ -111,14 +113,19 @@ def ensure_session_target(sess) -> Optional[str]:
             except CDPError:
                 pass  # stale/closed tab — fall through to group recovery
 
-    # Step 3: authoritative group-anchor recovery.
-    name = rec.get("name") if isinstance(rec, dict) else None
+    # Step 3: durable group recovery by the persisted numeric groupId — NOT the
+    # title (names aren't unique; the session = the tab group, keyed by id). The
+    # groupId is cached in ledger.runtime.group_id on every open; without it
+    # there's nothing to recover (a brand-new session, or Chrome itself
+    # restarted and reassigned group ids — which needs no recovery).
+    runtime = (rec.get("runtime") or {}) if isinstance(rec, dict) else {}
+    gid = runtime.get("group_id")
     sid = rec.get("id") if isinstance(rec, dict) else _resolve_sid(sess)
-    if not name:
+    if not isinstance(gid, int) or gid < 0:
         return None
     try:
         payload = sess.cdp.send(
-            "BrowserwrightDaemon.recoverSession", groupName=name, bsSession=sid,
+            "BrowserwrightDaemon.recoverSession", groupId=gid, bsSession=sid,
         )
     except CDPError:
         return None

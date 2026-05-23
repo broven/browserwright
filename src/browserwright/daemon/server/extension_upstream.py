@@ -135,7 +135,7 @@ class ExtensionUpstream:
         # the group's live membership (chrome.tabs.query({groupId})) is the
         # SINGLE source of truth for what's in the session — there is no
         # owned/borrowed bookkeeping. ``group_name`` (= session name) is only a
-        # recovery anchor used to re-find the group after the groupId is lost.
+        # human-visible title used when creating a new group.
         self._groups: dict[str, int] = {}        # bs session → tab-group id
         self._tab_url: dict[int, str] = {}        # tab_id → last-known url
 
@@ -149,14 +149,17 @@ class ExtensionUpstream:
             self._groups[session_id] = group_id
 
     async def _group_member_tabs(self, session_id: str | None,
-                                 group_name: str | None) -> tuple[int, list[int]]:
+                                 group_id: int | None = None) -> tuple[int, list[int]]:
         """Resolve the session's live group membership = the source of truth.
-        Returns ``(group_id, [tab_id, ...])``. Keys on the bound groupId first,
-        falls back to the title (recovery anchor). Empty list when the session
-        has no live group (e.g. its last tab closed and Chrome auto-deleted the
-        group)."""
+        Returns ``(group_id, [tab_id, ...])``. Keyed ONLY on the numeric Chrome
+        groupId — the session's in-memory bound id first, else the persisted id
+        passed in. The title is never a lookup key (names aren't unique;
+        decision 6). Empty list when the session has no live group (never opened
+        a tab, or its last tab closed and Chrome auto-deleted the group)."""
         gid = self._groups.get(session_id) if session_id else None
-        info = await self._relay.query_group_tabs(group_name, group_id=gid)
+        if gid is None:
+            gid = group_id
+        info = await self._relay.query_group_tabs(group_id=gid)
         if not info:
             return (-1, [])
         live_gid = int(info.get("groupId", -1))
@@ -186,14 +189,15 @@ class ExtensionUpstream:
         }
 
     async def end_session(self, session_id: str,
-                          group_name: str | None = None) -> dict:
+                          group_id: int | None = None) -> dict:
         """Tear down a session's browser (DECIDED): close the WHOLE tab group —
         every member tab — then the group disappears. Membership is resolved
-        from the live group (groupId first, title fallback), NOT from any
-        owned/borrowed set. Returns ``{closed: [...], kept: []}`` (``kept`` is
-        always empty now — there is no borrowed distinction; drag a tab out of
-        the group first to spare it)."""
-        group_id, members = await self._group_member_tabs(session_id, group_name)
+        from the live group by numeric groupId (bound id first, else the
+        persisted id passed in), NOT from any owned/borrowed set or title.
+        Returns ``{closed: [...], kept: []}`` (``kept`` is always empty now —
+        there is no borrowed distinction; drag a tab out of the group to spare
+        it)."""
+        group_id, members = await self._group_member_tabs(session_id, group_id)
         self._groups.pop(session_id, None)
         closed: list[int] = []
         for tab_id in members:
@@ -209,12 +213,14 @@ class ExtensionUpstream:
         return {"closed": closed, "kept": []}
 
     async def list_tabs(self, session_id: str | None = None,
-                        group_name: str | None = None) -> dict:
+                        group_id: int | None = None) -> dict:
         """The session's tabs, resolved from LIVE group membership (the source
-        of truth) — never from an in-memory set. Returns
-        ``{groupId, tabs:[{tabId, url, title, attached}, ...]}``."""
+        of truth) by numeric groupId — never an in-memory set or the title.
+        Returns ``{groupId, tabs:[{tabId, url, title, attached}, ...]}``."""
         gid = self._groups.get(session_id) if session_id else None
-        info = await self._relay.query_group_tabs(group_name, group_id=gid)
+        if gid is None:
+            gid = group_id
+        info = await self._relay.query_group_tabs(group_id=gid)
         if not info:
             return {"groupId": -1, "tabs": []}
         live_gid = int(info.get("groupId", -1))
@@ -232,6 +238,32 @@ class ExtensionUpstream:
             if isinstance(t.get("tabId"), int)
         ]
         return {"groupId": live_gid, "tabs": tabs}
+
+    async def scoped_target_infos(self, session_id: str | None) -> list[dict]:
+        """CDP ``targetInfos`` for the session's browser = its tab group ONLY.
+
+        The source of truth is the live group membership (by the session's bound
+        groupId); we filter the global ghost list down to tabs that belong to
+        this session's group so two sessions sharing one Chrome stay mutually
+        invisible at enumeration. Shape matches the unscoped ``Target.getTargets``
+        interception."""
+        _gid, member_tabs = await self._group_member_tabs(session_id)
+        members = set(member_tabs)
+        out: list[dict] = []
+        for g in self._relay.list_ghost_targets():
+            tab_id = _tab_id_from_target_id(g.target_id)
+            if tab_id is None or tab_id not in members:
+                continue
+            out.append({
+                "targetId": g.target_id,
+                "type": g.type,
+                "url": g.url,
+                "title": g.title,
+                "attached": True,
+                "canAccessOpener": False,
+                "browserContextId": "",
+            })
+        return out
 
     @property
     def ws_url(self) -> str | None:
@@ -445,11 +477,10 @@ class ExtensionUpstream:
         fabricate a sessionId, and return
         ``{sessionId, targetId, tabId, url, title, groupId}``.
 
-        The session's group is keyed on the bound groupId (durable); the group
-        NAME is passed as the recovery anchor so the extension can recreate the
-        group when its last tab had closed and Chrome auto-deleted it. The
-        returned groupId is (re)bound to the session — that's the only
-        per-session state we keep; membership comes from the live group."""
+        The session's group is keyed on the bound groupId (durable). The group
+        name is only the human-visible title used when a new group must be
+        created. The returned groupId is (re)bound to the session — that's the
+        only per-session state we keep; membership comes from the live group."""
         gid = self._groups.get(session_id) if session_id else None
         gt = await self._relay.create_background_tab(
             url, group_name=group_name, group_id=gid, background=background)
@@ -470,26 +501,26 @@ class ExtensionUpstream:
             "groupId": group_id,
         }
 
-    async def recover_session(self, session_id: str | None,
-                              group_name: str) -> dict:
-        """Session-reconnect-recovery: after an extension↔daemon reconnect or a
-        daemon restart, the in-memory session→tab bindings are gone but the
-        Chrome tab group (title == session name) survives. Query that group,
-        re-attach the debugger to each of its tabs, rebuild ``_sessions`` /
-        ``_groups`` (the session→groupId binding), and return a representative
-        target with the same shape as ``open_background_tab``.
+    async def recover_session(self, session_id: str | None, *,
+                              group_id: int) -> dict:
+        """Session-reconnect-recovery: after a daemon restart (Chrome still
+        running) the in-memory session→tab bindings are gone, but the Chrome
+        tab group survives. Query that group **by its persisted numeric
+        groupId** (NOT the title — names aren't unique), re-attach the debugger
+        to each of its tabs, rebuild ``_sessions`` / ``_groups``, and return a
+        representative target with the same shape as ``open_background_tab``.
 
-        Title→groupId is the recovery path: across a restart the bound groupId
-        is gone, so we look the group up by its title (= session name), which
-        Chrome preserves on the surviving group.
+        The persisted groupId comes from the skill's ledger ``runtime.group_id``
+        (written on every open). If Chrome itself restarted the groupId is gone
+        and nothing is recovered — by design (a closed Chrome needs no
+        recovery).
 
         Raises (proxy maps to a CDP error) when no group matches or it has no
         tabs."""
-        # Recovery anchor is the title; the bound id is gone after a restart.
-        info = await self._relay.query_group_tabs(group_name)
+        info = await self._relay.query_group_tabs(group_id=group_id)
         if not info or not info.get("tabs"):
             raise RuntimeError(
-                f"no recoverable tabs for group {group_name!r} "
+                f"no recoverable tabs for group id {group_id} "
                 "(group missing or empty)")
         group_id = int(info.get("groupId", -1))
         tabs = info["tabs"]
@@ -519,7 +550,7 @@ class ExtensionUpstream:
             }
         if not recovered:
             raise RuntimeError(
-                f"group {group_name!r} had tabs but none had a usable tabId")
+                f"group id {group_id} had tabs but none had a usable tabId")
         # Representative tab: most-recently-accessed, else first.
         rep_id = max(recovered, key=lambda t: meta[t]["lastAccessed"])
         rep = meta[rep_id]

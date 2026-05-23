@@ -237,11 +237,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_name(p_es)
     p_es.add_argument("--session", required=True,
                       help="the browserwright session id whose tabs to clean up")
-    p_es.add_argument("--group-name", default=None,
-                      help="durable tab-group title for session-reconnect "
-                           "recovery: when the daemon lost this session's "
-                           "owned-tab tracking (reconnect / restart), close "
-                           "the tabs in this group instead")
+    p_es.add_argument("--group-id", default=None, type=int,
+                      help="durable numeric tab-group id for session teardown: "
+                           "when the daemon lost this session's in-memory "
+                           "binding (reconnect / restart), close the tabs in "
+                           "this group instead (names aren't unique, so the id "
+                           "is the key)")
     # Output is always JSON (single-line discipline); no --json flag.
 
     # userscript — resident extension userscripts
@@ -988,8 +989,8 @@ def _cmd_end_session(args, cfg: Config) -> int:
     """P5: tear down a browserwright session's extension tabs (owned closed,
     borrowed kept). Prints the {closed, kept} JSON result."""
     es_params: dict = {"session": args.session}
-    if getattr(args, "group_name", None):
-        es_params["groupName"] = args.group_name
+    if getattr(args, "group_id", None) is not None:
+        es_params["groupId"] = args.group_id
     try:
         result = _run(_rpc_via_ws(
             cfg,

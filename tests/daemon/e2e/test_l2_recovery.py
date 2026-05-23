@@ -4,12 +4,11 @@ These exercise the north-star behavior: a code agent keeps calling with the
 same browserwright session id, and the skill transparently re-attaches to the
 session's tab WITHOUT any explicit attach — across separate `bs run` processes
 (in-process `current_target_id` is gone) and even when the ledger.runtime fast
-path is stale (forcing the group-title `recoverSession` fallback).
+    path is stale (forcing the group-id `recoverSession` fallback).
 
-The group-fallback test transitively proves name->tab-group: `recoverSession`
-finds the tab purely by querying the Chrome tab group whose title == the
-session name, which only succeeds if `open_background` actually titled the
-group with the session name.
+The group-fallback test proves `open_background` persisted the numeric Chrome
+tab group id and `recoverSession` uses that id instead of the mutable group
+title.
 """
 from __future__ import annotations
 
@@ -96,11 +95,10 @@ def test_recovery_fast_path_across_processes(ext_ready, e2e_daemon):
         ledger.unlink(missing_ok=True)
 
 
-def test_recovery_via_group_when_runtime_stale(ext_ready, e2e_daemon):
+def test_recovery_via_group_id_when_runtime_stale(ext_ready, e2e_daemon):
     """When the ledger.runtime fast path points at a dead target (simulating a
-    browser restart that changed tab ids), process B must fall back to
-    BrowserwrightDaemon.recoverSession, which finds the tab by the group whose title
-    == the session name. Transitively proves name->tab-group titling."""
+    stale tab binding), process B must fall back to recoverSession by the
+    persisted numeric group id."""
     rd = e2e_daemon.runtime_dir
     sid = "rec-group"
     ledger = _seed_session(sid, "cf-bots2")
@@ -109,21 +107,21 @@ def test_recovery_via_group_when_runtime_stale(ext_ready, e2e_daemon):
                       backend="extension", runtime_dir=rd,
                       extra_env={"BD_SESSION": sid})
         assert a.returncode == 0, (a.stdout, a.stderr)
-        _payload(a)
+        opened = _payload(a)
 
-        # Clobber the fast-path cache with a bogus/stale target so attach fails
-        # and recovery must go through the group-title query.
+        # Clobber the fast-path target so attach fails, but keep the persisted
+        # group id so recovery goes through the numeric group lookup.
         data = json.loads(ledger.read_text())
         data["sessions"][sid]["runtime"] = {
             "current_target_id": "ext-tab-999999",
-            "group_id": -1, "owned_tab_ids": [], "updated_at": 0,
+            "group_id": opened["groupId"], "owned_tab_ids": [], "updated_at": 0,
         }
         ledger.write_text(json.dumps(data), encoding="utf-8")
 
         b = run_skill(script=_OPERATE_SCRIPT, backend="extension",
                       runtime_dir=rd, extra_env={"BD_SESSION": sid})
         assert b.returncode == 0, (
-            f"group-fallback recovery failed; stdout={b.stdout!r} stderr={b.stderr!r}")
+            f"group-id recovery failed; stdout={b.stdout!r} stderr={b.stderr!r}")
         assert "RecoverGroup" in _payload(b)["title"]
     finally:
         ledger.unlink(missing_ok=True)

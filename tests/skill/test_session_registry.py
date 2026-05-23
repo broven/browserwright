@@ -40,6 +40,34 @@ def test_update_patches_fields(tmp_bs_home):
     assert reg.get(sid)["workspace"] == {"group_id": 7}
 
 
+def test_update_rejects_backend_change(tmp_bs_home):
+    """#4: backend is fixed at creation and immutable for the session's whole
+    life. update() must REJECT a change to a different backend, but still allow
+    a no-op same-value patch and unrelated fields."""
+    import pytest
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    with pytest.raises(ValueError):
+        reg.update(sid, backend="extension")
+    assert reg.get(sid)["backend"] == "rdp"  # unchanged
+    # Same-value patch + unrelated fields still go through.
+    reg.update(sid, backend="rdp", workspace={"port": 9333})
+    assert reg.get(sid)["workspace"] == {"port": 9333}
+
+
+def test_session_new_allows_duplicate_names(tmp_bs_home, monkeypatch):
+    """Names are the Chrome tab-group TITLE only — no longer globally unique
+    (Chrome allows duplicate group titles; internal binding is by groupId). So
+    `session new` must accept two sessions with the same name."""
+    from browserwright import session_create
+
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    a = session_create.new(backend="extension", name="dup")
+    b = session_create.new(backend="extension", name="dup")
+    assert a != b
+    assert reg.get(a)["name"] == reg.get(b)["name"] == "dup"
+
+
 def test_remove_then_get_none(tmp_bs_home):
     sid = reg.allocate(backend="rdp", owner="create")
     assert reg.remove(sid)["id"] == sid

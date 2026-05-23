@@ -83,12 +83,14 @@ def test_fast_path_uses_runtime_cache_no_recover(tmp_bs_home):
 
 
 def test_fallback_recovers_by_group_and_writes_runtime(tmp_bs_home):
-    """No runtime / attach raises → sends recoverSession(groupName=...),
-    registers the binding, writes ledger.runtime, sets current_target_id."""
+    """Persisted runtime.group_id (no current_target_id) → sends
+    recoverSession(groupId=...), registers the binding, writes ledger.runtime,
+    sets current_target_id. Recovery keys on the durable groupId, not the title
+    (names are no longer unique)."""
     from browserwright import session_registry as reg
     from browserwright.session_runtime import ensure_session_target
 
-    sid, rec = _ledger_session(name="cf-bots")  # no runtime cached
+    sid, rec = _ledger_session(name="cf-bots", runtime={"group_id": 4})
     cdp = _StubCDP(recover_response={
         "sessionId": "ws-sid-9", "targetId": "ext-tab-9", "tabId": 9,
         "url": "https://x.test", "title": "X", "groupId": 4,
@@ -101,7 +103,7 @@ def test_fallback_recovers_by_group_and_writes_runtime(tmp_bs_home):
 
     recover = [(m, p) for m, p in cdp.calls if m == "BrowserwrightDaemon.recoverSession"]
     assert len(recover) == 1
-    assert recover[0][1]["groupName"] == "cf-bots"
+    assert recover[0][1]["groupId"] == 4
     assert recover[0][1]["bsSession"] == sid
     # binding registered locally + written back to the ledger cache
     assert cdp._sessions["ext-tab-9"] == "ws-sid-9"
@@ -112,7 +114,8 @@ def test_fallback_after_stale_runtime_attach_failure(tmp_bs_home):
     """Stale runtime tab (attach raises) → falls through to recoverSession."""
     from browserwright.session_runtime import ensure_session_target
 
-    sid, rec = _ledger_session(runtime={"current_target_id": "ext-tab-stale"})
+    sid, rec = _ledger_session(
+        runtime={"current_target_id": "ext-tab-stale", "group_id": 4})
     cdp = _StubCDP(attach_raises=True, recover_response={
         "sessionId": "ws-sid-2", "targetId": "ext-tab-2",
     })

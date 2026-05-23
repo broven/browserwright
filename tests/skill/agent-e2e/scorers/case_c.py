@@ -17,39 +17,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scorers._artifacts import dump as _dump_artifacts
+from scorers._codex_trace import get_trace, iter_trace_text, used_browserwright
 
 
 def _iter_text_blocks(trace: list[dict]):
     """Yield every text/result string in the trace (assistant text + tool results)."""
-    for entry in trace:
-        content = entry.get("content", "")
-        blocks = content if isinstance(content, list) else [content]
-        for b in blocks:
-            if isinstance(b, str):
-                yield b
-            elif isinstance(b, dict):
-                if isinstance(b.get("text"), str):
-                    yield b["text"]
-                if isinstance(b.get("content"), str):
-                    yield b["content"]
-                if isinstance(b.get("content"), list):
-                    for inner in b["content"]:
-                        if isinstance(inner, dict) and isinstance(inner.get("text"), str):
-                            yield inner["text"]
-                inp = b.get("input")
-                if isinstance(inp, dict) and isinstance(inp.get("command"), str):
-                    yield inp["command"]
+    yield from iter_trace_text(trace)
 
 
 def _used_browserwright(trace: list[dict]) -> bool:
-    for entry in trace:
-        content = entry.get("content")
-        for block in (content if isinstance(content, list) else []):
-            if isinstance(block, dict) and block.get("type") == "tool_use" \
-                    and block.get("name") == "Bash":
-                if "browserwright" in (block.get("input") or {}).get("command", ""):
-                    return True
-    return False
+    return used_browserwright(trace)
 
 
 def _reached_hn(trace: list[dict]) -> bool:
@@ -78,8 +55,7 @@ def _count_headlines(output: str) -> int:
 
 
 def get_assert(output: str, context: dict) -> dict:
-    meta = context.get("providerResponse", {}).get("metadata", {})
-    trace = meta.get("trace", [])
+    trace = get_trace(context)
 
     components = []
 

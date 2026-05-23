@@ -216,3 +216,37 @@ def test_session_built_from_record_targets_fixed_socket(tmp_bs_home, monkeypatch
     with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
         assert sess.daemon.discover()["path"].endswith("browserwright-daemon.sock")
     shutil.rmtree(short, ignore_errors=True)
+
+
+def test_session_bound_ws_url_carries_session_param(tmp_bs_home):
+    """#1 regression: an rdp session must reach its OWN daemon context. The
+    daemon dispatcher routes on the ws ``?session=<id>`` query, so the client
+    MUST emit it — carrying the id only in the ``client=`` label leaves the
+    dispatcher resolving ``None`` → the shared (extension) context."""
+    from browserwright import session_registry as reg
+    from browserwright.session import Session
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    sess = Session(record=reg.get(sid))
+    with patch.object(sess.daemon, "discover",
+                      return_value={"transport": "unix", "path": "/tmp/bw.sock"}):
+        url = sess.daemon.ws_url()
+    assert f"session={sid}" in url
+    assert f"client=skill-s{sid}" in url  # label kept for observability
+
+
+def test_client_session_param_matches_daemon_dispatch_key(tmp_bs_home):
+    """#1 regression: the query key the client emits is the exact key the
+    daemon's dispatcher parses (``session``) — proving the two halves agree."""
+    from urllib.parse import urlsplit
+    from browserwright import session_registry as reg
+    from browserwright.session import Session
+    from browserwright.daemon.server.listener import _parse_query
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    sess = Session(record=reg.get(sid))
+    with patch.object(sess.daemon, "discover",
+                      return_value={"transport": "unix", "path": "/tmp/bw.sock"}):
+        url = sess.daemon.ws_url()
+    q = _parse_query("/?" + urlsplit(url).query)
+    assert q.get("session") == sid

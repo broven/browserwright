@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
+    "@openai/codex-sdk": "^0.128.0",
     "promptfoo": "^0.121.11"
   }
 }

@@ -130,12 +130,20 @@ class Router:
         # session's owned tabs, keeps borrowed ones.
         self._end_session: Callable[[str], Awaitable[dict]] | None = None
         # Session-reconnect-recovery (extension backend only). Rebuilds a
-        # session's tab bindings from the durable tab group titled with the
-        # session name. Signature: (bs_session | None, group_name) -> dict.
+        # session's tab bindings from the durable tab group, found by its
+        # persisted numeric groupId (not the title). Signature:
+        # (bs_session | None, *, group_id) -> dict.
         self._recover_session: (
-            Callable[[str | None, str], Awaitable[dict]] | None) = None
+            Callable[..., Awaitable[dict]] | None) = None
         self._userscript_request: (
             Callable[[str, dict], Awaitable[dict | None]] | None) = None
+        # Extension-backend-only: scope Target.getTargets to a session's tab
+        # group so sessions sharing the one Chrome are mutually invisible.
+        # listener wires this to ExtensionUpstream.scoped_target_infos.
+        # Signature: (session_id) -> list[targetInfo dict]; scopes by the
+        # session's bound groupId.
+        self._scoped_targets: (
+            Callable[[str | None], Awaitable[list[dict]]] | None) = None
         # Phase 3 (docs/refactor-single-daemon.md): rdp raw-CDP command channel.
         # Set by listener._open_chrome_upstream to the UpstreamConnection's
         # daemon-internal `send_command` when this is an rdp (or env/cloud)
@@ -159,6 +167,39 @@ class Router:
 
     def unregister_client(self, client_id: int) -> None:
         self._client_sends.pop(client_id, None)
+
+    async def release_client(self, client_id: int) -> ClientState | None:
+        """Release a downstream client and close its primary upstream sessions.
+
+        ``DaemonState.release_client`` only mutates bookkeeping. The router owns
+        the wire side effects, so a client websocket disappearing still sends
+        real ``Target.detachFromTarget`` frames for sessions where that client
+        was the primary owner. Read-only secondary sessions are local views and
+        need no upstream detach.
+        """
+        client = self.state.clients.get(client_id)
+        if client is None:
+            return None
+        for binding in list(client.sessions.values()):
+            if binding.readonly:
+                continue
+            await self._detach_upstream_best_effort(binding.upstream_session_id)
+        return self.state.release_client(client_id)
+
+    async def _detach_upstream_best_effort(self, upstream_session_id: str) -> None:
+        """Send an upstream detach without expecting a client response."""
+        if self._upstream_send is None:
+            return
+        upstream_id = self.state.allocate_upstream_id()
+        msg = {
+            "id": upstream_id,
+            "method": "Target.detachFromTarget",
+            "params": {"sessionId": upstream_session_id},
+        }
+        try:
+            await self._upstream_send(json.dumps(msg))
+        except Exception as e:  # noqa: BLE001 - disconnect cleanup is best-effort.
+            logger.warning("best-effort upstream detach failed: %r", e)
 
     def update_upstream_send(self, fn: Callable[[str], Awaitable[None]] | None) -> None:
         self._upstream_send = fn
@@ -203,6 +244,26 @@ class Router:
         # dropping (the v0.3 bug) caused 30s CDP timeouts on the client side
         # when two clients raced lazy-open.
         if not await self._gate_upstream_ready(client, text, msg=msg):
+            return
+
+        # --- Target.getTargets scoping (extension: this session's group only) ---
+        # The skill's list_tabs / current_page enumerate via Target.getTargets.
+        # On the shared extension upstream the raw handler returns EVERY ghost
+        # across all sessions; scope it to the requesting client's tab group so
+        # sessions stay mutually invisible. rdp keeps the normal forward (its
+        # Chrome is already private to the session).
+        if (method == "Target.getTargets"
+                and self.state.backend_name == "extension"
+                and self._scoped_targets is not None
+                and client.session_id):
+            try:
+                infos = await self._scoped_targets(client.session_id)
+            except Exception as e:  # noqa: BLE001
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603, f"getTargets scoping failed: {e!r}"))
+                return
+            await self._send_to_client(client.client_id, _result_response(
+                req_id, {"targetInfos": infos}))
             return
 
         # --- Target.attachToTarget interceptor ---
@@ -827,10 +888,18 @@ class Router:
                     "BrowserwrightDaemon.attachActiveTab requires the extension backend"))
                 return
             attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-            attach_session = attach_params.get("session")
+            # The session is already known from the connection's ?session=<id>;
+            # fall back to a legacy param only if a client predates that wiring.
+            attach_session = client.session_id or attach_params.get("session")
             attach_session = attach_session if isinstance(attach_session, str) and attach_session else None
             try:
-                info = await self._attach_active_tab(session_id=attach_session)
+                # Adopt into THIS session's tab group. The title is cosmetic:
+                # prefer the ledger name when the daemon can see it, otherwise
+                # fall back to the bound session id. The durable association is
+                # still the returned numeric groupId.
+                info = await self._attach_active_tab(
+                    session_id=attach_session,
+                    group_name=client.session_name or client.session_id)
             except Exception as e:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32000, f"attach active failed: {e!r}"))
@@ -965,6 +1034,13 @@ class Router:
         # param so a mixed-version skill still binds ownership correctly.
         session = params.get("bsSession") or params.get("session")
         session = session if isinstance(session, str) and session else None
+        # The group identity is the session's NAME, fixed (and required +
+        # unique) at `session new` and stored in the ledger — the daemon reads
+        # it off the connection (client.session_name) rather than the caller
+        # re-passing it on every open. This is an authoritative lookup, NOT a
+        # fallback: the session IS the tab group (decision 6).
+        if group_name is None:
+            group_name = client.session_name or client.session_id
         # `background` (default True) protects the user's focus on the
         # extension backend; background=False opens the tab in the foreground.
         background = params.get("background")
@@ -1018,19 +1094,31 @@ class Router:
         """Session-reconnect-recovery.
 
         After a reconnect / daemon restart the in-memory session→tab bindings
-        are gone, but the Chrome tab group (title == session name) persists.
+        are gone, but the Chrome tab group id persisted in the session ledger
+        may still identify a live group.
         Recover the tabs from that group, re-attach, and register a regular
         client-side binding for the representative tab so subsequent CDP
         commands route through the normal sessionId translation path (mirrors
         openBackgroundTab). Requires backend=extension."""
-        # Param validation runs FIRST (schema-lock smoke test calls every
-        # method with no params and asserts code != -32601 'unknown method').
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        group_name = params.get("groupName")
-        if not isinstance(group_name, str) or not group_name:
+        # rdp is ephemeral (decision 9): the daemon-owned Chrome dies with the
+        # daemon, so there is nothing durable to recover. Surviving targets are
+        # re-attached by the skill's in-process / ledger fast paths, so recover
+        # is an honest no-op here — NEVER -32601 (revised Rule: same-shape,
+        # honest, nearest equivalent). This runs before param validation so the
+        # schema-lock smoke test (no params) sees a result, not an error.
+        if self.state.backend_name == "rdp":
+            await self._send_to_client(client.client_id, _result_response(
+                req_id, {"recovered": [], "groupId": -1, "tabs": []}))
+            return
+        # Recovery keys on the persisted numeric groupId (the session's durable
+        # tab-group id from the ledger), NOT the title — names aren't unique.
+        # Validation FIRST so the schema-lock smoke test sees -32602, != -32601.
+        group_id = params.get("groupId")
+        if not isinstance(group_id, int) or group_id < 0:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserwrightDaemon.recoverSession requires params.groupName"))
+                "BrowserwrightDaemon.recoverSession requires params.groupId"))
             return
         if self._recover_session is None:
             # Lazy-open mirror of openBackgroundTab.
@@ -1051,7 +1139,7 @@ class Router:
         bs_session = params.get("bsSession")
         bs_session = bs_session if isinstance(bs_session, str) and bs_session else None
         try:
-            result = await self._recover_session(bs_session, group_name)
+            result = await self._recover_session(bs_session, group_id=group_id)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"recoverSession failed: {e!r}"))
@@ -1095,29 +1183,40 @@ class Router:
         """Phase 2: backend-neutral session verb. Idempotent.
 
         The backend is read from the ledger (NOT a param) by the dispatcher in
-        listener / Daemon, so by the time a client reaches this Router it is
-        ALREADY routed to the right context:
+        listener / Daemon, so by the time a client reaches this Router it must
+        already be routed to the right context:
           - extension/env/cloud → the shared context (this Router). The client
             is attached; ensureSession is a no-op success.
           - rdp → a per-session context. `Daemon.context_for(session_id)`
             already created the context (its state/router/holder) when this
-            client connected with `?session=`; we re-invoke it here so a
-            client that connected sessionless and only later learned its id can
-            still materialize the context. Phase 3 makes the holder launch the
-            per-session Chrome — for now context creation is success enough.
+            client connected with `?session=`.
 
         Returns `{ "ok": true }`. Never `-32601`.
         """
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = params.get("session_id") or params.get("session")
         session = session if isinstance(session, str) and session else None
+        if not client.session_id:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserwrightDaemon.ensureSession requires the websocket "
+                "to connect with ?session=<id>; sessionless clients cannot "
+                "materialize or switch session contexts"))
+            return
+        if session is not None and session != client.session_id:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                f"BrowserwrightDaemon.ensureSession session mismatch: "
+                f"connection is bound to {client.session_id!r}, request asked "
+                f"for {session!r}"))
+            return
         daemon = self.daemon
-        if session and daemon is not None:
+        if daemon is not None:
             try:
                 # Idempotent get-or-create of the session's context. For
                 # extension/env/cloud this returns the shared context (no-op);
                 # for rdp it ensures the per-session context exists.
-                daemon.context_for(session)  # type: ignore[attr-defined]
+                daemon.context_for(client.session_id)  # type: ignore[attr-defined]
             except Exception as e:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603, f"ensureSession failed: {e!r}"))
@@ -1160,8 +1259,8 @@ class Router:
                     req_id, {"ok": True, "closed": [], "kept": [],
                              "backend": "rdp"}))
                 return
-        group_name = params.get("groupName")
-        group_name = group_name if isinstance(group_name, str) and group_name else None
+        group_id = params.get("groupId")
+        group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
         if self._end_session is None:
             # Lazy-open mirror of openBackgroundTab.
             if (self._ensure_upstream is not None
@@ -1178,12 +1277,13 @@ class Router:
                 "BrowserwrightDaemon.endSession requires the extension backend"))
             return
         try:
-            # Pass group_name only when provided so callbacks with the legacy
-            # single-arg signature stay compatible. group_name is the recovery
-            # anchor end_session uses to resolve the group's live membership
-            # (and close the whole group) when the session's groupId is unbound.
-            if group_name is not None:
-                result = await self._end_session(session, group_name)
+            # Pass group_id only when provided so callbacks with the legacy
+            # single-arg signature stay compatible. group_id is the persisted
+            # numeric tab-group id end_session uses to resolve the group's live
+            # membership (and close the whole group) when the session's bound
+            # groupId is unavailable (e.g. after a daemon restart).
+            if group_id is not None:
+                result = await self._end_session(session, group_id)
             else:
                 result = await self._end_session(session)
         except Exception as e:

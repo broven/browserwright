@@ -1,4 +1,4 @@
-description: "v2 SDK sub-agent E2E — browserwright"
+description: "v2 Codex Agent E2E — browserwright"
 
 extensions:
   - "file://hooks.py:run_hook"
@@ -10,13 +10,44 @@ defaultTest:
     timeout: 600000
 
 prompts:
-  - "{{task}}"
+  - |-
+    You are a coding agent. Your current working directory contains SKILL.md.
+    Read SKILL.md first, then use the browserwright CLI exactly as documented.
+    Follow its confirmation guidance, but when this eval task includes an
+    explicit pre-approved reply, treat that as the user's confirmation.
+
+    Task:
+    {{task}}
+
+    {% if user_replies %}
+    Pre-approved user reply for this eval:
+    {{user_replies}}
+    {% endif %}
 
 providers:
-  - id: "file://provider.py"
+  # Claude Agent SDK provider kept in provider.py for reference, but disabled
+  # while the real code-agent E2E suite targets Codex Agent.
+  # - id: "file://provider.py"
+  #   config:
+  #     model: "claude-sonnet-4-6"
+  #     max_turns: 20
+  - id: "openai:codex-sdk"
     config:
-      model: "claude-sonnet-4-6"
-      max_turns: 20
+      model: "{{ env.CODEX_AGENT_E2E_MODEL | default('gpt-5.3-codex') }}"
+      working_dir: "./_workspace/skill"
+      skip_git_repo_check: true
+      sandbox_mode: "workspace-write"
+      approval_policy: "never"
+      model_reasoning_effort: "medium"
+      enable_streaming: true
+      cli_env:
+        BS_HOME: "../.browserwright"
+        XDG_RUNTIME_DIR: "/tmp/bd-agent-e2e-rt"
+        TMPDIR: "/tmp/bd-agent-e2e-rt"
+        BD_EXTENSION_PORT: "39989"
+        BD_BACKEND: "extension"
+        no_proxy: "127.0.0.1,localhost"
+        NO_PROXY: "127.0.0.1,localhost"
 
 tests:
   # ── Case A: connect + open + summarize ──────────────────────

@@ -130,7 +130,9 @@ def test_session_new_extension_requires_name(tmp_bs_home, capsys):
     assert reg.list_all() == []  # nothing persisted on rejection
 
 
-def test_session_new_duplicate_name_rejected(tmp_bs_home, capsys):
+def test_session_new_duplicate_name_allowed(tmp_bs_home, capsys):
+    """Names are the Chrome tab-group TITLE only — not unique (the session is
+    bound internally by its numeric groupId). Two sessions may share a name."""
     from browserwright import session_registry as reg
 
     rc = _main(["session", "new", "--backend=extension", "--name=dup"])
@@ -138,14 +140,13 @@ def test_session_new_duplicate_name_rejected(tmp_bs_home, capsys):
     assert rc == 0
 
     rc = _main(["session", "new", "--backend=extension", "--name=dup"])
-    err = capsys.readouterr().err
-    assert rc == 1
-    # message names the conflicting session id so a code agent can act
-    assert first in err
-    # the first session is still in the ledger; no second one was created
+    second = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert second != first
+    # both sessions exist in the ledger, sharing the name
     rows = reg.list_all()
-    assert len(rows) == 1
-    assert rows[0]["id"] == first
+    assert len(rows) == 2
+    assert {r["name"] for r in rows} == {"dup"}
 
 
 def test_session_new_rdp_create_vs_attach(tmp_bs_home, capsys, monkeypatch):

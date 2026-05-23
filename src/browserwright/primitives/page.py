@@ -242,7 +242,7 @@ def open(url: str = "about:blank", *, background: bool = True) -> dict:
     re-bind. See SKILL.md "Persisting a tab handle across heredocs".
     """
     sess = current_session()
-    _name, sid = _session_name_and_id(sess)
+    _, sid = _session_name_and_id(sess)  # name is the daemon's concern (group title)
     try:
         payload = sess.cdp.send(
             "BrowserwrightDaemon.openBackgroundTab",
@@ -369,7 +369,7 @@ def current_page() -> dict:
 
     Unified across backends — no ``backend_name`` branch. Resolution order:
       1. the cached current target, if it's still a live tab of this session;
-      2. transparent reconnect-recovery (ledger.runtime → group anchor);
+      2. transparent reconnect-recovery (ledger.runtime → group id);
       3. an existing tab of the session (first real page);
       4. else ``open()`` a fresh working tab.
 

@@ -9,12 +9,18 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
-from claude_agent_sdk.types import (
-    PreToolUseHookInput,
-    HookContext,
-    SyncHookJSONOutput,
-)
+try:
+    from claude_agent_sdk.types import (
+        PreToolUseHookInput,
+        HookContext,
+        SyncHookJSONOutput,
+    )
+except ModuleNotFoundError:  # pragma: no cover - legacy SDK intentionally disabled.
+    PreToolUseHookInput = dict[str, Any]
+    HookContext = Any
+    SyncHookJSONOutput = dict[str, Any]
 
 # Set by agent_runner before the agent starts.
 WORKSPACE_ROOT: Path | None = None

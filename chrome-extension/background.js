@@ -16,8 +16,7 @@
 // Tab-group = session's browser (see docs/refactor-single-daemon.md): a
 // session's durable identity is a Chrome tab GROUP. The daemon binds to the
 // numeric `groupId` (passed back on every op); `groupName` (= session name) is
-// ONLY a recovery anchor used to re-find the group after the groupId is lost
-// (daemon/SW restart, or Chrome auto-deleted an emptied group). Live group
+// only the human-visible title applied when a new group is created. Live group
 // membership (`chrome.tabs.query({groupId})`) is the single source of truth
 // for what is "in" the session; a tab dragged out of the group leaves the
 // session (we detach it and emit `detached`).
@@ -513,7 +512,7 @@ async function doAttachActive(id, groupId, groupName) {
       return;
     }
     // Resolve this session's destination group (existing groupId if still
-    // live, else recover by title, else create a fresh one on the tab).
+    // live, else create a fresh one on the tab).
     const ourGroupId = await _resolveSessionGroup(groupId, groupName);
     const tabGroup = typeof tab.groupId === "number" ? tab.groupId : -1;
     const inAGroup = tabGroup >= 0;  // -1 == chrome.tabGroups.TAB_GROUP_ID_NONE
@@ -532,7 +531,7 @@ async function doAttachActive(id, groupId, groupName) {
     }
     // Move the tab into our group (idempotent if already a member). When we
     // had no live group, chrome.tabs.group({tabIds}) creates one and we name
-    // it with the session name as the recovery anchor.
+    // it with the session name for human-readable Chrome UI.
     let finalGroupId = ourGroupId;
     try {
       finalGroupId = await _ensureTabInGroup(tab.id, groupName, ourGroupId);
@@ -569,26 +568,14 @@ async function doAttachActive(id, groupId, groupName) {
 async function _resolveSessionGroup(groupId, groupName) {
   // Return the live groupId for this session, or -1 if none exists yet.
   // Primary key = the numeric groupId the daemon remembers; if that group
-  // still exists, use it. Otherwise fall back to the title (recovery anchor)
-  // — a daemon/SW restart or a Chrome-auto-deleted empty group loses the id
-  // but the surviving group keeps its title. Never creates a group here.
+  // still exists, use it. Do not query by groupName because titles are
+  // user-editable and not unique. Never creates a group here.
   if (typeof groupId === "number" && groupId >= 0) {
     try {
       await chrome.tabGroups.get(groupId);
       return groupId;  // still live
     } catch (_e) {
-      // groupId went invalid (empty group auto-deleted, etc.) — recover below.
-    }
-  }
-  if (typeof groupName === "string" && groupName) {
-    try {
-      const matching = await chrome.tabGroups.query({ title: groupName });
-      if (Array.isArray(matching) && matching.length > 0) {
-        matching.sort((a, b) => a.id - b.id);
-        return matching[0].id;
-      }
-    } catch (_e) {
-      // fall through to "no group"
+      // groupId went invalid (empty group auto-deleted, etc.).
     }
   }
   return -1;
@@ -606,9 +593,8 @@ async function doCreateTab(id, url, groupName, sessionGroupId, background) {
     const tab = await chrome.tabs.create({ url, active });
     let groupId = -1;
     // Bind the tab to the session's group. Prefer the daemon-remembered
-    // numeric groupId; recover by title if it went invalid (empty-group
-    // auto-delete / restart); create a fresh group named with the session
-    // name when neither is available.
+    // numeric groupId; create a fresh group named with the session name when
+    // no live id is available.
     if ((typeof sessionGroupId === "number" && sessionGroupId >= 0) ||
         (typeof groupName === "string" && groupName)) {
       try {
@@ -653,7 +639,7 @@ async function _ensureTabInGroup(tabId, groupName, resolvedGroupId) {
   // groupId-first (the durable binding): if the caller already resolved a
   // live groupId (via _resolveSessionGroup), join it directly. Otherwise
   // create a fresh group (chrome.tabs.group both creates and assigns) and
-  // name it with the session name as the recovery anchor.
+  // name it for human-readable Chrome UI.
   if (typeof resolvedGroupId === "number" && resolvedGroupId >= 0) {
     await chrome.tabs.group({ groupId: resolvedGroupId, tabIds: [tabId] });
     return resolvedGroupId;
@@ -761,10 +747,9 @@ async function doQueryActiveTab(id) {
 async function doQueryGroup(id, groupName, sessionGroupId) {
   // Live group membership = the single source of truth for "what's in this
   // session's browser" (docs invariant 2). The daemon asks for the tabs of
-  // the session's group; we resolve by the durable numeric groupId first and
-  // fall back to the title (recovery anchor) only when the id is gone
-  // (daemon/SW restart, empty-group auto-delete). Returns groupId -1 / [] when
-  // no group matches — the session's browser currently has no tabs.
+  // the session's group; we resolve only by the durable numeric groupId.
+  // Returns groupId -1 / [] when no group matches — the session's browser
+  // currently has no tabs.
   try {
     const groupId = await _resolveSessionGroup(sessionGroupId, groupName);
     if (groupId < 0) {

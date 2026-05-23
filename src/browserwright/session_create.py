@@ -116,13 +116,14 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     name = name.strip() if isinstance(name, str) else None
     if not name:
         raise ValueError(
-            "session new requires --name=NAME — a short, globally-unique label "
-            "(e.g. --name=cf-bots). It becomes the Chrome tab group title and "
-            "the reconnect-recovery anchor for this session."
+            "session new requires --name=NAME — a short label (e.g. "
+            "--name=cf-bots) that becomes the Chrome tab group title. It need "
+            "not be unique; the session is bound internally by its numeric "
+            "tab-group id, not the name."
         )
     if backend == "extension":
         sid = reg.allocate(backend="extension",
-                           owner="attach", name=name, unique_name=True)
+                           owner="attach", name=name)
         _ensure_daemon_running()
         return sid
     if backend == "rdp":
@@ -136,7 +137,7 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         else:
             workspace = None
         sid = reg.allocate(backend="rdp", owner=owner,
-                           name=name, workspace=workspace, unique_name=True)
+                           name=name, workspace=workspace)
         _ensure_daemon_running()
         return sid
     raise ValueError(f"unknown backend {backend!r} (use extension|rdp)")
@@ -179,11 +180,13 @@ def _end_extension_workspace(record: dict) -> None:
     attach-owned); only the tabs this session opened are closed. The
     ``end-session`` CLI no longer takes ``--name`` — there is one daemon."""
     cmd = ["browserwright-daemon", "end-session", "--session", record["id"]]
-    # Thread the durable group title so the daemon can fall back to closing
-    # tabs by group when its in-memory owned-tab table was wiped (restart).
-    group_name = record.get("name")
-    if group_name:
-        cmd += ["--group-name", group_name]
+    # Thread the durable numeric groupId (persisted in ledger.runtime on every
+    # open) so the daemon can close the whole group even when its in-memory
+    # binding was wiped (restart). The title is not used — names aren't unique.
+    runtime = record.get("runtime") or {}
+    gid = runtime.get("group_id")
+    if isinstance(gid, int) and gid >= 0:
+        cmd += ["--group-id", str(gid)]
     _run(cmd)
 
 

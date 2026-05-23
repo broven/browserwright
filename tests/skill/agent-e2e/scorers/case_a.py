@@ -15,10 +15,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scorers._artifacts import ARTIFACTS_DIR, dump as _dump_artifacts
+from scorers._codex_trace import count_failed_bash, get_trace, used_browserwright
 
 
 def _trace_mentions_example_com(trace: list[dict]) -> bool:
     """Check if any tool result in the trace mentions example.com."""
+    from scorers._codex_trace import iter_trace_text
+
+    if any("example.com" in text.lower() for text in iter_trace_text(trace)):
+        return True
     for entry in trace:
         content = entry.get("content", "")
         if isinstance(content, str) and "example.com" in content.lower():
@@ -37,23 +42,14 @@ def _trace_mentions_example_com(trace: list[dict]) -> bool:
 
 def _trace_used_browserwright(trace: list[dict]) -> bool:
     """Check if the agent used browserwright Bash commands."""
-    for entry in trace:
-        if entry.get("type") == "AssistantMessage":
-            for block in entry.get("content", []):
-                if block.get("type") == "tool_use" and block.get("name") == "Bash":
-                    cmd = block.get("input", {})
-                    if isinstance(cmd, dict):
-                        cmd = cmd.get("command", "")
-                    if "browserwright" in str(cmd):
-                        return True
-    return False
+    return used_browserwright(trace)
 
 
 def get_assert(output: str, context: dict) -> dict:
     """promptfoo assertion entry point."""
     components = []
     meta = context.get("providerResponse", {}).get("metadata", {})
-    trace = meta.get("trace", [])
+    trace = get_trace(context)
 
     # --- Component 1: browserwright usage + example.com in trace ---
     used_bs = _trace_used_browserwright(trace)
@@ -74,7 +70,7 @@ def get_assert(output: str, context: dict) -> dict:
     })
 
     # --- Component 2: wandering check (soft) ---
-    failed_bash = meta.get("failed_bash", 0)
+    failed_bash = meta.get("failed_bash", count_failed_bash(trace))
     wandered = failed_bash > 2
     components.append({
         "pass": True,  # soft — warning only

@@ -1,4 +1,4 @@
-"""Claude Agent SDK wrapper for agent-e2e tests.
+"""Legacy Claude Agent SDK wrapper for agent-e2e tests.
 
 SDK ResultMessage fields (claude-agent-sdk 0.2.82):
   subtype, duration_ms, duration_api_ms, is_error, num_turns, session_id,
@@ -19,16 +19,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import ClaudeSDKClient
-from claude_agent_sdk.types import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    HookMatcher,
-    ResultMessage,
-    TextBlock,
-    ToolUseBlock,
-    UserMessage,
-)
+try:
+    from claude_agent_sdk import ClaudeSDKClient
+    from claude_agent_sdk.types import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        HookMatcher,
+        ResultMessage,
+        TextBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+except ModuleNotFoundError:  # pragma: no cover - exercised when legacy SDK is absent.
+    ClaudeSDKClient = None
+    AssistantMessage = ClaudeAgentOptions = HookMatcher = ResultMessage = None
+    TextBlock = ToolUseBlock = UserMessage = None
 
 import guards
 
@@ -59,12 +64,12 @@ class AgentResult:
 def _msg_to_trace(msg: Any) -> dict[str, Any]:
     """Flatten an SDK message into a JSON-serializable dict for trace logging."""
     d: dict[str, Any] = {"type": type(msg).__name__}
-    if isinstance(msg, AssistantMessage):
+    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
         blocks = []
         for b in (msg.content or []):
-            if isinstance(b, TextBlock):
+            if TextBlock is not None and isinstance(b, TextBlock):
                 blocks.append({"type": "text", "text": b.text})
-            elif isinstance(b, ToolUseBlock):
+            elif ToolUseBlock is not None and isinstance(b, ToolUseBlock):
                 blocks.append({
                     "type": "tool_use",
                     "name": b.name,
@@ -74,9 +79,9 @@ def _msg_to_trace(msg: Any) -> dict[str, Any]:
             else:
                 blocks.append({"type": type(b).__name__, "raw": str(b)})
         d["content"] = blocks
-    elif isinstance(msg, UserMessage):
+    elif UserMessage is not None and isinstance(msg, UserMessage):
         d["content"] = str(msg.content)[:2000] if hasattr(msg, "content") else ""
-    elif isinstance(msg, ResultMessage):
+    elif ResultMessage is not None and isinstance(msg, ResultMessage):
         d["result"] = msg.result
         d["num_turns"] = msg.num_turns
         d["stop_reason"] = msg.stop_reason
@@ -136,6 +141,12 @@ async def run_agent(
     user_replies: list[str] | None = None,
 ) -> AgentResult:
     """Run a sub-agent against the workspace and return structured results."""
+    if ClaudeSDKClient is None:
+        raise RuntimeError(
+            "claude-agent-sdk is disabled for agent-e2e; use promptfoo's "
+            "openai:codex-sdk provider instead."
+        )
+
     run_env = env or {}
 
     # Tell the guard where the workspace is so it can scope path checks.

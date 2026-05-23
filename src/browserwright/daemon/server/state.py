@@ -112,6 +112,13 @@ class ClientState:
     """One connected ws client. v0.3: N of these exist at a time."""
     client_id: int
     label: str
+    # The browserwright session this client is bound to (ledger id) + its name.
+    # Set from the ws ``?session=<id>`` query at connect. On the shared
+    # extension context these scope browser-level enumeration (Target.getTargets)
+    # to THIS session's tab group so sessions are mutually invisible. None for
+    # the bare REPL client / single-context unit tests.
+    session_id: str | None = None
+    session_name: str | None = None
     sessions: dict[str, SessionBinding] = field(default_factory=dict)
     """local_session_id → SessionBinding owned by this client."""
     subscribed_focus: bool = False
@@ -170,13 +177,16 @@ class DaemonState:
 
     # ---- client lifecycle -------------------------------------------------
 
-    def allocate_client(self, label: str, *, client_id: int | None = None) -> ClientState:
+    def allocate_client(self, label: str, *, client_id: int | None = None,
+                        session_id: str | None = None,
+                        session_name: str | None = None) -> ClientState:
         # Phase 2: the Daemon passes a globally-unique client_id (unique across
         # all UpstreamContexts) so daemon logs never show two clients sharing a
         # number. When omitted (single-context callers / tests), fall back to
         # this state's own monotonic counter.
         cid = client_id if client_id is not None else next(self._next_client_id)
-        c = ClientState(client_id=cid, label=label or "anonymous")
+        c = ClientState(client_id=cid, label=label or "anonymous",
+                        session_id=session_id, session_name=session_name)
         self.clients[cid] = c
         return c
 

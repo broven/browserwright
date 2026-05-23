@@ -393,9 +393,18 @@ class _ClientHandler:
         holder = ctx.holder
 
         # Allocate with a globally-unique client id (unique across contexts)
-        # but register it in this context's own client table.
+        # but register it in this context's own client table. The session id +
+        # name (from the ledger) ride on the client so the shared extension
+        # context can scope Target.getTargets to this session's tab group.
+        session_name: str | None = None
+        if session_id:
+            from ... import session_registry
+            rec = session_registry.get(session_id)
+            if isinstance(rec, dict):
+                session_name = rec.get("name")
         client = state.allocate_client(
-            label, client_id=next(self.daemon._next_client_id))
+            label, client_id=next(self.daemon._next_client_id),
+            session_id=session_id, session_name=session_name)
 
         async def send_to_client(text: str) -> None:
             try:
@@ -432,7 +441,7 @@ class _ClientHandler:
             logger.warning("client %d crashed: %r", client.client_id, e)
         finally:
             metrics().client_disconnected_total += 1
-            state.release_client(client.client_id)
+            await router.release_client(client.client_id)
             router.unregister_client(client.client_id)
             # Upstream stays warm so other clients (or the next reconnect)
             # don't pay banner-flash for our churn.
@@ -785,9 +794,12 @@ class _UpstreamHolder:
         self.router._close_tab_by_target_id = ext.close_tab_by_target_id
         self.router._end_session = ext.end_session  # P5 per-session teardown
         # Session-reconnect-recovery: rebuild a session's tab bindings from the
-        # durable tab group whose title == the session name.
+        # persisted numeric tab-group id.
         self.router._recover_session = ext.recover_session
         self.router._userscript_request = ext.userscript_request
+        # Scope Target.getTargets to the requesting session's tab group so
+        # extension sessions sharing one Chrome are mutually invisible.
+        self.router._scoped_targets = ext.scoped_target_infos
         await self.state.set_connected(ext.ws_url or "ext://relay",
                                        was_popup=False)
 

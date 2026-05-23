@@ -257,7 +257,7 @@ async def test_attach_active_with_callback_binds_session_and_attacher():
     correctly under the returned sessionId."""
     state, router, cap, (client,) = _setup(backend="extension")
 
-    async def fake_attach_active(*, session_id=None):
+    async def fake_attach_active(*, session_id=None, group_name=None):
         return {
             "sessionId": "UPSTREAM-XSID-1",
             "targetId": "ext-tab-77",
@@ -293,7 +293,7 @@ async def test_attach_active_callback_failure_returns_error():
     than a hung request."""
     state, router, cap, (client,) = _setup(backend="extension")
 
-    async def boom(*, session_id=None):
+    async def boom(*, session_id=None, group_name=None):
         raise RuntimeError("relay says no")
 
     router._attach_active_tab = boom
@@ -946,6 +946,33 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
 
 
 @pytest.mark.asyncio
+async def test_router_release_client_detaches_primary_upstream_sessions():
+    """A disappearing websocket must not leave chrome.debugger/CDP attached."""
+    state, router, cap, (client,) = _setup("alice", backend="extension")
+    state.bind_session(
+        client.client_id, "local-primary", "UPSTREAM-PRIMARY",
+        "ext-tab-1", readonly=False)
+    state.claim_attacher(
+        "ext-tab-1", client.client_id, "local-primary", "UPSTREAM-PRIMARY")
+    state.bind_session(
+        client.client_id, "local-reader", "UPSTREAM-READER",
+        "ext-tab-2", readonly=True)
+
+    released = await router.release_client(client.client_id)
+
+    assert released is client
+    assert client.client_id not in state.clients
+    assert "ext-tab-1" not in state.attachers
+    detach_frames = [
+        m for m in cap.upstream
+        if m.get("method") == "Target.detachFromTarget"
+    ]
+    assert [m["params"]["sessionId"] for m in detach_frames] == [
+        "UPSTREAM-PRIMARY"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_close_tab_without_session_or_target_id_returns_invalid_params():
     state, router, cap, (client,) = _setup()
     async def _fake_close(sid: str) -> dict:
@@ -1004,40 +1031,50 @@ async def test_end_session_dispatch_invokes_callback():
 
 
 @pytest.mark.asyncio
-async def test_recover_session_missing_group_name_returns_invalid_params():
-    """No params → -32602 (validation FIRST so the schema-lock smoke test
-    sees code != -32601 'unknown method')."""
-    state, router, cap, (client,) = _setup()
+async def test_recover_session_missing_group_id_returns_invalid_params():
+    """No params on an extension context → -32602 (validation FIRST so the
+    schema-lock smoke test sees code != -32601). Recovery keys on the persisted
+    groupId now, not the title."""
+    state, router, cap, (client,) = _setup(backend="extension")
     await router.route_from_client(client, json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.recoverSession",
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["id"] == 1
     assert resp["error"]["code"] == -32602
-    assert "groupName" in resp["error"]["message"]
+    assert "groupId" in resp["error"]["message"]
 
 
 @pytest.mark.asyncio
-async def test_recover_session_without_callback_returns_method_not_found():
-    state, router, cap, (client,) = _setup()
+async def test_recover_session_on_rdp_is_honest_noop_not_minus_32601():
+    """#3: recoverSession must NEVER surface -32601 on rdp. An ephemeral rdp
+    Chrome has nothing durable to recover (surviving targets are re-attached by
+    the skill's in-process / ledger fast paths), so the honest answer is a
+    no-op success with empty ``recovered`` — not 'requires the extension
+    backend'. (rdp contexts never wire a _recover_session callback.)"""
+    state, router, cap, (client,) = _setup(backend="rdp")
+    router._recover_session = None
     await router.route_from_client(client, json.dumps({
         "id": 2, "method": "BrowserwrightDaemon.recoverSession",
-        "params": {"groupName": "sess"},
+        "params": {"groupId": 7, "bsSession": "5"},
     }))
     resp = cap.per_client[client.client_id][-1]
-    assert resp["error"]["code"] == -32601
-    assert "extension backend" in resp["error"]["message"]
+    assert resp["id"] == 2
+    assert "error" not in resp, resp
+    assert resp["result"]["recovered"] == []
 
 
 @pytest.mark.asyncio
 async def test_recover_session_with_callback_binds_and_returns_payload():
     """Happy path: callback wired + valid groupName → session binding +
-    attacher claimed, payload (incl. recovered list) returned."""
-    state, router, cap, (client,) = _setup()
+    attacher claimed, payload (incl. recovered list) returned. The recover
+    callback only exists on the EXTENSION context (rdp short-circuits to a
+    no-op), so this exercises backend=extension."""
+    state, router, cap, (client,) = _setup(backend="extension")
     seen: list[tuple] = []
 
-    async def _fake_recover(bs_session, group_name) -> dict:
-        seen.append((bs_session, group_name))
+    async def _fake_recover(bs_session, *, group_id) -> dict:
+        seen.append((bs_session, group_id))
         return {
             "sessionId": "UPSTREAM-SID-7",
             "targetId": "ext-tab-7",
@@ -1051,9 +1088,9 @@ async def test_recover_session_with_callback_binds_and_returns_payload():
     router._recover_session = _fake_recover
     await router.route_from_client(client, json.dumps({
         "id": 3, "method": "BrowserwrightDaemon.recoverSession",
-        "params": {"groupName": "my-session", "bsSession": "bs-42"},
+        "params": {"groupId": 4, "bsSession": "bs-42"},
     }))
-    assert seen == [("bs-42", "my-session")]
+    assert seen == [("bs-42", 4)]
     resp = cap.per_client[client.client_id][-1]
     assert resp["id"] == 3
     result = resp["result"]
@@ -1073,16 +1110,65 @@ async def test_recover_session_with_callback_binds_and_returns_payload():
 
 
 @pytest.mark.asyncio
-async def test_recover_session_callback_failure_returns_error():
+async def test_ensure_session_requires_session_bound_websocket():
     state, router, cap, (client,) = _setup()
+    await router.route_from_client(client, json.dumps({
+        "id": 10, "method": "BrowserwrightDaemon.ensureSession",
+        "params": {"session": "7"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 10
+    assert resp["error"]["code"] == -32602
+    assert "?session=<id>" in resp["error"]["message"]
 
-    async def _fake_recover(bs_session, group_name) -> dict:
+
+@pytest.mark.asyncio
+async def test_ensure_session_rejects_session_mismatch():
+    state, router, cap, (client,) = _setup()
+    client.session_id = "7"
+    await router.route_from_client(client, json.dumps({
+        "id": 11, "method": "BrowserwrightDaemon.ensureSession",
+        "params": {"session": "8"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 11
+    assert resp["error"]["code"] == -32602
+    assert "session mismatch" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_uses_connection_bound_session():
+    state, router, cap, (client,) = _setup()
+    client.session_id = "7"
+    calls: list[str | None] = []
+
+    class _Daemon:
+        def context_for(self, session_id):
+            calls.append(session_id)
+
+    router.daemon = _Daemon()
+    await router.route_from_client(client, json.dumps({
+        "id": 12, "method": "BrowserwrightDaemon.ensureSession",
+        "params": {"session": "7"},
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 12
+    assert resp["result"] == {"ok": True}
+    assert calls == ["7"]
+
+
+@pytest.mark.asyncio
+async def test_recover_session_callback_failure_returns_error():
+    # The recover callback only exists on the extension context.
+    state, router, cap, (client,) = _setup(backend="extension")
+
+    async def _fake_recover(bs_session, *, group_id) -> dict:
         raise RuntimeError("empty group")
 
     router._recover_session = _fake_recover
     await router.route_from_client(client, json.dumps({
         "id": 4, "method": "BrowserwrightDaemon.recoverSession",
-        "params": {"groupName": "empty"},
+        "params": {"groupId": 99},
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["error"]["code"] == -32603
@@ -1097,3 +1183,79 @@ async def test_end_session_requires_session_param():
     }))
     resp = cap.per_client[client.client_id][-1]
     assert resp["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_get_targets_scoped_to_client_session_on_extension():
+    """#2: on the extension backend Target.getTargets must be scoped to the
+    REQUESTING client's session tab group — never the global ghost list — so
+    two sessions sharing one Chrome are mutually invisible. The daemon answers
+    locally from the scoped query; it does NOT forward to the shared upstream."""
+    state, router, cap, (client,) = _setup(backend="extension")
+    client.session_id = "A"
+    client.session_name = "grp-A"
+
+    async def fake_scoped(session_id):
+        assert session_id == "A"  # scoped by the session's bound groupId, no title
+        return [{"targetId": "ext-tab-1", "type": "page",
+                 "url": "https://a/", "title": "A", "attached": True}]
+
+    router._scoped_targets = fake_scoped
+    await router.route_from_client(client, json.dumps({
+        "id": 5, "method": "Target.getTargets",
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 5
+    assert {t["targetId"] for t in resp["result"]["targetInfos"]} == {"ext-tab-1"}
+    assert not cap.upstream  # answered locally, not forwarded to the shared upstream
+
+
+@pytest.mark.asyncio
+async def test_open_background_uses_session_name_as_group_when_groupname_omitted():
+    """#2: the skill's open() omits groupName, so the daemon resolves the tab
+    group from the session's NAME (read off the connection, fixed at
+    `session new`) — an authoritative lookup, not a fallback. Otherwise the tab
+    is opened UNGROUPED and the session has no findable browser to enumerate."""
+    state, router, cap, (client,) = _setup(backend="extension")
+    client.session_id = "7"
+    client.session_name = "my-sess"
+    seen: dict = {}
+
+    async def _fake_open(url, group_name=None, *, session_id=None, background=True):
+        seen["group_name"] = group_name
+        seen["session_id"] = session_id
+        return {"sessionId": "U-1", "targetId": "ext-tab-1", "tabId": 1,
+                "url": url, "title": "t", "groupId": 9}
+
+    router._open_background_tab = _fake_open
+    await router.route_from_client(client, json.dumps({
+        "id": 4, "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://x/", "bsSession": "7"},
+    }))
+    assert seen["group_name"] == "my-sess"  # anchored on the session name
+    assert seen["session_id"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_open_background_falls_back_to_session_id_group_title():
+    """The daemon may not share BS_HOME with the skill, so it may not know the
+    ledger name. First open still needs a title so Chrome creates a group and
+    returns a durable numeric groupId for later recovery."""
+    state, router, cap, (client,) = _setup(backend="extension")
+    client.session_id = "7"
+    client.session_name = None
+    seen: dict = {}
+
+    async def _fake_open(url, group_name=None, *, session_id=None, background=True):
+        seen["group_name"] = group_name
+        seen["session_id"] = session_id
+        return {"sessionId": "U-1", "targetId": "ext-tab-1", "tabId": 1,
+                "url": url, "title": "t", "groupId": 9}
+
+    router._open_background_tab = _fake_open
+    await router.route_from_client(client, json.dumps({
+        "id": 4, "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://x/", "bsSession": "7"},
+    }))
+    assert seen["group_name"] == "7"
+    assert seen["session_id"] == "7"

@@ -478,7 +478,7 @@ async def test_end_session_closes_whole_group():
                 await ext.respond(c["id"], result={"ok": True, "tabId": c["tabId"]})
 
         r = asyncio.create_task(responder())
-        result = await upstream.end_session("A", group_name="A")
+        result = await upstream.end_session("A")  # group 300 is bound to "A"
         await r
 
         assert sorted(result["closed"]) == [30, 31]
@@ -498,7 +498,7 @@ async def test_recover_session_reattaches_tabs_and_rebuilds_state():
             # 1) queryGroup
             q = await ext.next_command()
             assert q["type"] == "queryGroup"
-            assert q["groupName"] == "sess-1"
+            assert q["groupId"] == 9  # recover by the persisted groupId, not the title
             await ext.respond(q["id"], result={
                 "groupId": 9,
                 "tabs": [
@@ -516,7 +516,7 @@ async def test_recover_session_reattaches_tabs_and_rebuilds_state():
                     "targetInfo": {"url": "", "title": ""}})
 
         r = asyncio.create_task(responder())
-        result = await upstream.recover_session("bs-session-1", "sess-1")
+        result = await upstream.recover_session("bs-session-1", group_id=9)
         await r
 
         assert sorted(result["recovered"]) == [50, 51]
@@ -540,20 +540,21 @@ async def test_recover_session_empty_group_raises():
 
         r = asyncio.create_task(responder())
         with pytest.raises((RuntimeError, ValueError)):
-            await upstream.recover_session("bs-x", "missing-group")
+            await upstream.recover_session("bs-x", group_id=999)
         await r
 
 
 @pytest.mark.asyncio
-async def test_end_session_resolves_group_by_title_when_unbound():
+async def test_end_session_resolves_group_by_passed_id_when_unbound():
     """end_session always resolves membership from the live group; when the
-    session has no bound groupId (e.g. after a restart), the group_name (=
-    session name) is the recovery anchor used to find + close the tabs."""
+    session has no bound groupId in memory (e.g. after a daemon restart), the
+    persisted numeric groupId passed in is the key used to find + close the tabs
+    — never the title (names aren't unique)."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
         async def responder():
             q = await ext.next_command()
             assert q["type"] == "queryGroup"
-            assert q["groupName"] == "sess-2"
+            assert q["groupId"] == 3  # the passed persisted id, not a title
             await ext.respond(q["id"], result={
                 "groupId": 3,
                 "tabs": [
@@ -567,7 +568,7 @@ async def test_end_session_resolves_group_by_title_when_unbound():
             await ext.respond(c["id"], result={"ok": True, "tabId": 60})
 
         r = asyncio.create_task(responder())
-        result = await upstream.end_session("never-tracked", group_name="sess-2")
+        result = await upstream.end_session("never-tracked", group_id=3)
         await r
         assert result["closed"] == [60]
 
@@ -611,8 +612,37 @@ async def test_list_tabs_resolves_from_live_group_membership():
             })
 
         r = asyncio.create_task(responder())
-        out = await upstream.list_tabs(session_id="A", group_name="A")
+        out = await upstream.list_tabs(session_id="A")
         await r
         assert out["groupId"] == 700
         ids = {t["tabId"] for t in out["tabs"]}
         assert ids == {70, 71}
+
+
+@pytest.mark.asyncio
+async def test_scoped_target_infos_filters_ghosts_to_session_group():
+    """#2: scoped_target_infos returns CDP target infos only for ghosts whose
+    tab is a live member of the session's group — another session's attached
+    tab (ext-tab-2) is excluded. This is the source-of-truth filter that makes
+    sessions mutually invisible at enumeration."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        await ext.announce_attached(tab_id=1, url="https://a/", title="A")
+        await ext.announce_attached(tab_id=2, url="https://b/", title="B")
+        await asyncio.sleep(0.05)
+
+        upstream._bind_group("A", 100)  # session A's browser = groupId 100
+
+        async def respond_query():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "queryGroup"
+            assert cmd.get("groupId") == 100  # scoped by groupId, no title
+            await ext.respond(cmd["id"], result={
+                "groupId": 100,
+                "tabs": [{"tabId": 1, "url": "https://a/", "title": "A",
+                          "active": True, "lastAccessed": 1}],
+            })
+
+        r = asyncio.create_task(respond_query())
+        infos = await upstream.scoped_target_infos(session_id="A")
+        await r
+        assert {ti["targetId"] for ti in infos} == {"ext-tab-1"}
