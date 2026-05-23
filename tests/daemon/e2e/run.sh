@@ -33,4 +33,6 @@ if [ "$has_path" -eq 0 ]; then
   set -- tests/daemon/e2e/ "$@"
 fi
 
-exec uv run --extra test python -m pytest "$@"
+# Test deps live in the `dev` dependency-group (PEP 735), which uv installs by
+# default — no `--extra test` (that extra doesn't exist).
+exec uv run python -m pytest "$@"

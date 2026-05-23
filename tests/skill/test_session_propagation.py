@@ -81,12 +81,14 @@ def test_open_uses_long_lived_ws_not_subprocess(monkeypatch):
     # cdp.attach(target_id) returns the same sid without re-attaching.
     assert sess.cdp._sessions["ext-tab-42"] == "ws-sid-1"
 
-    # Uniform return shape (no extension-only groupId).
+    # Uniform return shape; groupId is the session's tab-group id on extension
+    # (the durable reconnect anchor used by recoverSession), -1 on rdp.
     assert result == {
         "targetId": "ext-tab-42",
         "tabId": 42,
         "url": "https://example.com",
         "title": "Example",
+        "groupId": 7,
     }
     assert sess.current_target_id == "ext-tab-42"
 

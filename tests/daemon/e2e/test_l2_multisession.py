@@ -137,7 +137,8 @@ print(json.dumps({"results": results, "errors": errors}, sort_keys=True))
 if errors:
     raise SystemExit(1)
 '''
-    result = run_skill(script=script, backend="extension", timeout=90)
+    result = run_skill(script=script, backend="extension", timeout=90,
+                       runtime_dir=e2e_daemon.runtime_dir)
     assert result.returncode == 0, (
         f"skill exited {result.returncode};\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
     )

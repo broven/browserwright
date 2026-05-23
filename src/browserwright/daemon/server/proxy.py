@@ -68,6 +68,21 @@ def _event(method: str, params: dict, session_id: str | None = None) -> str:
     return json.dumps(msg)
 
 
+def _cmd_result(envelope: object) -> dict:
+    """Extract the CDP ``result`` dict from an ``UpstreamConnection.send_command``
+    envelope. send_command resolves to the FULL frame
+    (``{"id": N, "result": {...}}`` or ``{"id": N, "error": {...}}``), so the rdp
+    verb impls must unwrap ``result`` rather than reading fields off the envelope.
+    Raises ``RuntimeError`` on a CDP error or a malformed frame (the rdp handlers
+    catch it and surface -32603)."""
+    if not isinstance(envelope, dict):
+        raise RuntimeError(f"malformed CDP response: {envelope!r}")
+    if "error" in envelope and envelope["error"]:
+        raise RuntimeError(f"CDP error: {envelope['error']!r}")
+    result = envelope.get("result")
+    return result if isinstance(result, dict) else {}
+
+
 def _new_local_session_id(client_id: int) -> str:
     """Synthetic local sessionId. Spec doesn't pin the format — we pick a
     `c<client_id>-<random>` prefix so daemon logs make it obvious which
@@ -706,7 +721,7 @@ class Router:
                 return
             if self._userscript_request is None:
                 if (self._ensure_upstream is not None
-                        and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                        and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                     try:
                         await self._ensure_upstream()
                     except Exception as e:
@@ -798,7 +813,7 @@ class Router:
                 # cold daemon + extension already connected will become
                 # ready by the time ensure_upstream returns.
                 if (self._ensure_upstream is not None
-                        and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                        and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                     try:
                         await self._ensure_upstream()
                     except Exception as e:
@@ -932,7 +947,7 @@ class Router:
             # ready after ensure_upstream runs (listener wires the callbacks
             # inside _open_extension_upstream). Mirrors attachActiveTab.
             if (self._ensure_upstream is not None
-                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                 try:
                     await self._ensure_upstream()
                 except Exception as e:
@@ -1020,7 +1035,7 @@ class Router:
         if self._recover_session is None:
             # Lazy-open mirror of openBackgroundTab.
             if (self._ensure_upstream is not None
-                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                 try:
                     await self._ensure_upstream()
                 except Exception as e:
@@ -1150,7 +1165,7 @@ class Router:
         if self._end_session is None:
             # Lazy-open mirror of openBackgroundTab.
             if (self._ensure_upstream is not None
-                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                 try:
                     await self._ensure_upstream()
                 except Exception as e:
@@ -1212,7 +1227,7 @@ class Router:
         if self._close_tab is None:
             # Lazy-open mirror of openBackgroundTab + attachActiveTab.
             if (self._ensure_upstream is not None
-                    and self.state.upstream_phase == UpstreamPhase.DISCONNECTED):
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                 try:
                     await self._ensure_upstream()
                 except Exception as e:
@@ -1328,7 +1343,7 @@ class Router:
         try:
             created = await self._upstream_command(
                 "Target.createTarget", {"url": url})
-            target_id = created.get("targetId") if isinstance(created, dict) else None
+            target_id = _cmd_result(created).get("targetId")
             if not isinstance(target_id, str):
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
@@ -1337,7 +1352,7 @@ class Router:
             # Attach (flatten) so the daemon owns a session for this target.
             attached = await self._upstream_command(
                 "Target.attachToTarget", {"targetId": target_id, "flatten": True})
-            upstream_sid = attached.get("sessionId") if isinstance(attached, dict) else None
+            upstream_sid = _cmd_result(attached).get("sessionId")
             if not isinstance(upstream_sid, str):
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
@@ -1399,7 +1414,7 @@ class Router:
         url = ""
         title = ""
         try:
-            targets = await self._upstream_command("Target.getTargets", {})
+            targets = _cmd_result(await self._upstream_command("Target.getTargets", {}))
         except Exception:
             targets = None
         if isinstance(targets, dict):
@@ -1420,7 +1435,7 @@ class Router:
         try:
             attached = await self._upstream_command(
                 "Target.attachToTarget", {"targetId": target_id, "flatten": True})
-            upstream_sid = attached.get("sessionId") if isinstance(attached, dict) else None
+            upstream_sid = _cmd_result(attached).get("sessionId")
             if not isinstance(upstream_sid, str):
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
@@ -1554,7 +1569,7 @@ class Router:
                     res = await self._upstream_command(
                         "Page.addScriptToEvaluateOnNewDocument",
                         {"source": source}, usid)
-                    sid_id = res.get("identifier") if isinstance(res, dict) else None
+                    sid_id = _cmd_result(res).get("identifier")
                     if isinstance(sid_id, str):
                         ids.append(sid_id)
                 registry[identity] = {"identity": identity, "ids": ids,

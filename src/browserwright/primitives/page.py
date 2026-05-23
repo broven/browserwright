@@ -278,6 +278,9 @@ def open(url: str = "about:blank", *, background: bool = True) -> dict:
         "tabId": payload.get("tabId"),
         "url": payload.get("url", url),
         "title": payload.get("title", ""),
+        # groupId is the session's tab-group id on extension (the durable
+        # reconnect anchor), -1 on rdp (tab groups are an extension concept).
+        "groupId": payload.get("groupId", -1),
     }
 
 

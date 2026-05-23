@@ -317,13 +317,14 @@ async def test_attach_active_on_rdp_attaches_existing_front_target():
     state, router, cap, (client,) = _setup(backend="rdp")
 
     async def fake_cmd(method, params=None, session_id=None):
+        # send_command resolves to the FULL CDP envelope ({"id","result"}).
         if method == "Target.getTargets":
-            return {"targetInfos": [{
+            return {"id": -1, "result": {"targetInfos": [{
                 "targetId": "rdp-T1", "type": "page",
                 "url": "https://front.example/", "title": "Front",
-            }]}
+            }]}}
         if method == "Target.attachToTarget":
-            return {"sessionId": "UP-RDP-1"}
+            return {"id": -1, "result": {"sessionId": "UP-RDP-1"}}
         raise AssertionError(f"unexpected upstream cmd {method}")
 
     router._upstream_command = fake_cmd
@@ -352,12 +353,13 @@ async def test_attach_active_on_rdp_creates_tab_when_none_exists():
     state, router, cap, (client,) = _setup(backend="rdp")
 
     async def fake_cmd(method, params=None, session_id=None):
+        # send_command resolves to the FULL CDP envelope ({"id","result"}).
         if method == "Target.getTargets":
-            return {"targetInfos": []}
+            return {"id": -1, "result": {"targetInfos": []}}
         if method == "Target.createTarget":
-            return {"targetId": "rdp-new"}
+            return {"id": -1, "result": {"targetId": "rdp-new"}}
         if method == "Target.attachToTarget":
-            return {"sessionId": "UP-RDP-NEW"}
+            return {"id": -1, "result": {"sessionId": "UP-RDP-NEW"}}
         raise AssertionError(f"unexpected upstream cmd {method}")
 
     router._upstream_command = fake_cmd
