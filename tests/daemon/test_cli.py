@@ -97,28 +97,18 @@ def test_unknown_backend_exit_code_1():
     assert "totally-fake" in (out + err)
 
 
-# ---- serve requires an explicit backend (no silent auto fallback) --------
+# ---- serve no longer requires an explicit backend ------------------------
+#
+# Refactor (docs/refactor-single-daemon.md P1/P2): there is exactly ONE global
+# daemon serving BOTH backends, so `serve` no longer pins a single backend for
+# its lifetime. The old "fail loud on missing backend" guard + its `--name`
+# flag are gone — the tests that asserted them (test_serve_refuses_auto_backend,
+# test_serve_guard_unit_rejects_none_backend) were deleted, not weakened.
 
 
-def test_serve_refuses_auto_backend():
-    """`serve` with no backend pinned anywhere (CLI/env/toml) must error out
-    rather than silently auto-resolve to rdp. The long-lived daemon picks its
-    backend for its whole lifetime, so an accidental auto→rdp fallback (e.g. a
-    version-coherence respawn that dropped --backend) leaves the extension
-    relay un-bound and the extension unable to connect. Fail loud instead.
-
-    `_run` strips BD_BACKEND/BD_CONFIG, so this subprocess sees no backend."""
-    code, out, err = _run(["serve", "--name", "test-serve-guard"])
-    assert code == 1, f"expected UserError exit 1, got {code}; stderr={err!r}"
-    assert "backend" in err.lower()
-    # The guard must fire BEFORE the daemon starts listening — no socket bound.
-    assert out == ""
-
-
-def test_serve_guard_unit_allows_explicit_backend(monkeypatch):
-    """The guard lives in `_cmd_serve` and only blocks when cfg.backend is
-    None. An explicit backend sails through to run_serve."""
-    import asyncio
+def test_serve_unit_passes_backend_through(monkeypatch):
+    """`_cmd_serve` hands the (possibly None) backend straight to run_serve —
+    no guard, no auto-fallback rejection."""
     from browserwright.daemon import cli as cli_mod
     from browserwright.daemon.config import Config
 
@@ -137,38 +127,45 @@ def test_serve_guard_unit_allows_explicit_backend(monkeypatch):
     assert seen["backend"] == "rdp"
 
 
-def test_serve_guard_unit_rejects_none_backend():
+def test_serve_unit_allows_none_backend(monkeypatch):
+    """A missing backend no longer raises — the single daemon serves both."""
     from browserwright.daemon import cli as cli_mod
     from browserwright.daemon.config import Config
-    from browserwright.daemon.errors import UserError
-    import pytest
 
+    async def _fake_run_serve(cfg):
+        return 0
+
+    monkeypatch.setattr("browserwright.daemon.server.listener.run_serve",
+                        _fake_run_serve)
     cfg = Config()
     assert cfg.backend is None
-    with pytest.raises(UserError):
-        cli_mod._cmd_serve(object(), cfg)
+    assert cli_mod._cmd_serve(object(), cfg) == 0
 
 
 # ---- LaunchAgent install (v0.5.5) ----------------------------------------
+#
+# Single-global-daemon: the plist label is a fixed constant (no per-instance
+# name); `_build_plist(*, backend, extension_port)` no longer takes label/name,
+# and `serve` is spawned without `--name`. The old `--name` validation tests
+# (test_install_rejects_invalid_name / test_uninstall_rejects_invalid_name)
+# were deleted — there is no `--name` flag to validate anymore.
 
 
 def test_install_plist_content_includes_serve_args():
-    """The plist must spawn `browserwright-daemon serve --backend X --name Y` with
+    """The plist must spawn `browserwright-daemon serve --backend X` with
     KeepAlive and RunAtLoad. Direct unit test of the generator — we don't
     actually `launchctl load` in tests (side effects + needs a real macOS)."""
     from browserwright.daemon import cli as cli_mod
     content = cli_mod._build_plist(
-        label="com.browserwright-daemon.test1",
-        name="test1",
         backend="extension",
         extension_port=29999,
     )
-    assert "com.browserwright-daemon.test1" in content
+    assert "com.browserwright-daemon" in content
     assert "<string>serve</string>" in content
     assert "<string>--backend</string>" in content
     assert "<string>extension</string>" in content
-    assert "<string>--name</string>" in content
-    assert "<string>test1</string>" in content
+    # No per-instance --name flag in the single-global-daemon model.
+    assert "<string>--name</string>" not in content
     assert "<string>--extension-port</string>" in content
     assert "<string>29999</string>" in content
     assert "<key>RunAtLoad</key><true/>" in content
@@ -183,46 +180,16 @@ def test_install_plist_omits_extension_port_when_unspecified():
     daemon falls back to its default (19989)."""
     from browserwright.daemon import cli as cli_mod
     content = cli_mod._build_plist(
-        label="com.browserwright-daemon.t2", name="t2",
         backend="extension", extension_port=None,
     )
     assert "<string>--extension-port</string>" not in content
 
 
-def test_install_rejects_invalid_name():
-    """H-2 regression: --name must be alphanumeric/(dot)/dash/underscore so
-    it can't escape ~/Library/LaunchAgents/ or land malformed XML in the
-    plist. The check fires before any filesystem write — the upstream
-    config-level `check_name` is the first line of defense (and rejects
-    everything outside [A-Za-z0-9_-]{1,64}); the install-level
-    `_validate_daemon_name` is the belt-and-suspenders second guard. We
-    accept either error message — the security guarantee is "this path
-    NEVER touches the filesystem"."""
-    # Path-traversal attempt — must error out, never write a plist.
-    code, _, err = _run(["install", "--name", "../../tmp/evil"])
-    assert code == 1
-    assert "1-64" in err or "[A-Za-z0-9" in err
-    # XML-special chars (would corrupt the plist if interpolated raw).
-    code, _, err = _run(["install", "--name", "weird<chars>"])
-    assert code == 1
-    # Slash in the middle is invalid too.
-    code, _, err = _run(["install", "--name", "weird/name"])
-    assert code == 1
-
-
-def test_uninstall_rejects_invalid_name():
-    """Same name guard applies to uninstall (otherwise an attacker who can
-    craft args could unlink arbitrary plist paths via the un-validated
-    LaunchAgent dir join)."""
-    code, _, err = _run(["uninstall", "--name", "../../tmp/evil"])
-    assert code == 1
-
-
 def test_build_plist_escapes_special_characters_in_binary_path(monkeypatch):
-    """H-2 unit test: even after the name guard, every interpolated string
-    runs through xml.sax.saxutils.escape. We exercise the binary-path path
-    because real macOS paths can legitimately contain spaces and brackets
-    (e.g. "/Applications/Some <App>/.../browserwright-daemon")."""
+    """H-2 unit test: every interpolated string runs through
+    xml.sax.saxutils.escape. We exercise the binary-path path because real
+    macOS paths can legitimately contain spaces and brackets (e.g.
+    "/Applications/Some <App>/.../browserwright-daemon")."""
     import plistlib
     from browserwright.daemon import cli as cli_mod
 
@@ -230,8 +197,6 @@ def test_build_plist_escapes_special_characters_in_binary_path(monkeypatch):
     monkeypatch.setattr(cli_mod, "_resolve_browserwright_daemon_bin",
                         lambda: weird_path)
     content = cli_mod._build_plist(
-        label="com.browserwright-daemon.escape-test",
-        name="escape-test",
         backend="extension",
         extension_port=None,
     )
@@ -239,8 +204,8 @@ def test_build_plist_escapes_special_characters_in_binary_path(monkeypatch):
     # leaked in, plistlib raises an XML parse error.
     parsed = plistlib.loads(content.encode())
     assert parsed["ProgramArguments"][0] == weird_path
-    # Sanity: Label / name etc. round-trip too.
-    assert parsed["Label"] == "com.browserwright-daemon.escape-test"
+    # Sanity: the fixed Label round-trips too.
+    assert parsed["Label"] == "com.browserwright-daemon"
 
 
 def test_install_subcommand_refuses_on_non_darwin(monkeypatch):
@@ -251,7 +216,7 @@ def test_install_subcommand_refuses_on_non_darwin(monkeypatch):
         # negative test runs on CI Linux. Skip locally.
         import pytest as _pt
         _pt.skip("darwin host — non-darwin guard is exercised in CI")
-    code, _, err = _run(["install", "--name", "t3"])
+    code, _, err = _run(["install"])
     assert code != 0
     assert "macOS-only" in err
 
@@ -287,6 +252,6 @@ def test_end_session_subcommand_registered():
 
     assert "end-session" in cli._DISPATCH
     parser = cli._build_parser()
-    args = parser.parse_args(["end-session", "--session", "7", "--name", "d"])
+    args = parser.parse_args(["end-session", "--session", "7"])
     assert args.cmd == "end-session"
     assert args.session == "7"

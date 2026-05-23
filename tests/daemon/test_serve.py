@@ -148,16 +148,18 @@ def slow_resolver(monkeypatch, fake_upstream):
     return fake_upstream
 
 
-async def _spawn_daemon(name: str) -> tuple:
-    """Start a daemon listener task bound to the given name. Returns
-    (task, cfg) so tests can drive shutdown explicitly. Mostly for fixtures."""
-    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"}, cli_name=name)
+async def _spawn_daemon() -> tuple:
+    """Start the single global daemon listener task. Returns (task, cfg) so
+    tests can drive shutdown explicitly. Endpoint isolation between test
+    daemons comes from each fixture's `short_runtime` (a distinct
+    XDG_RUNTIME_DIR → distinct fixed socket path), NOT from a name."""
+    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"})
     cfg.backend = "env"
     cfg.timeout = 5.0
     task = asyncio.create_task(listener_mod.run_serve(cfg))
     for _ in range(30):
         await asyncio.sleep(0.05)
-        if _ipc.sock_path(cfg.name).exists():
+        if _ipc.sock_path().exists():
             break
     else:
         task.cancel()
@@ -171,13 +173,13 @@ async def _stop_daemon(task: asyncio.Task, cfg) -> None:
         await asyncio.wait_for(task, timeout=3.0)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
-    _ipc.cleanup_endpoint(cfg.name)
+    _ipc.cleanup_endpoint()
 
 
 @pytest.fixture
 async def daemon(short_runtime, patched_resolver):
     """Start the daemon listener as a task. Yield (cfg, stop_fn)."""
-    task, cfg = await _spawn_daemon("serve-test")
+    task, cfg = await _spawn_daemon()
     try:
         yield cfg
     finally:
@@ -188,7 +190,7 @@ async def daemon(short_runtime, patched_resolver):
 async def slow_daemon(short_runtime, slow_resolver):
     """Daemon whose upstream open is artificially delayed by 200ms — used to
     create a reliable lazy-open race window for Task #76 regression tests."""
-    task, cfg = await _spawn_daemon("serve-slow")
+    task, cfg = await _spawn_daemon()
     try:
         yield cfg
     finally:
@@ -225,7 +227,7 @@ async def _recv_response(ws, request_id: int, timeout: float = 3.0) -> dict:
 async def test_browser_getversion_round_trip(daemon):
     """The cardinal v0.2 contract: standard CDP through the daemon → Chrome
     (here: fake) → response back to client."""
-    async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
+    async with await _client_connect(_ipc.sock_path()) as ws:
         await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
         resp = await _recv_response(ws, 1)
         assert resp["result"]["product"] == "FakeChrome/1.0"
@@ -238,7 +240,7 @@ async def test_browser_getversion_round_trip(daemon):
 async def test_v03_second_client_accepted(daemon):
     """v0.2's single-client gate is retired. Two concurrent clients can hold
     independent ws connections + each issue standard CDP through the proxy."""
-    sock = _ipc.sock_path(daemon.name)
+    sock = _ipc.sock_path()
     async with await _client_connect(sock, label="alice") as a, \
                await _client_connect(sock, label="bob") as b:
         await a.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
@@ -264,7 +266,7 @@ async def test_v03_second_client_accepted(daemon):
 async def test_explicit_disconnect_emits_upstream_closed_event(daemon):
     """Spec §6.5: client invokes BrowserwrightDaemon.disconnect, daemon emits
     BrowserwrightDaemon.upstreamClosed before closing."""
-    async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
+    async with await _client_connect(_ipc.sock_path()) as ws:
         # Open upstream.
         await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
         await _recv_response(ws, 1)
@@ -294,7 +296,7 @@ async def test_daemon_does_not_auto_reconnect_after_disconnect(daemon):
     """Spec §9.4 anti-test: after explicit disconnect, daemon must NOT
     auto-reconnect. The next standard CDP command should re-open upstream
     only because *the client asks* for it."""
-    async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
+    async with await _client_connect(_ipc.sock_path()) as ws:
         # Open + check upstream is up.
         await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
         await _recv_response(ws, 1)
@@ -326,7 +328,7 @@ async def test_reconnect_after_client_close_warm_upstream(daemon):
     _UpstreamHolder which lacked `send_text` — only the inner
     UpstreamConnection has it. Fixed by adding a holder proxy method.
     """
-    sock = _ipc.sock_path(daemon.name)
+    sock = _ipc.sock_path()
 
     # Session 1: open + use upstream, then close without disconnect.
     async with await _client_connect(sock, label="client-a") as ws:
@@ -356,7 +358,7 @@ async def test_reconnect_after_client_close_warm_upstream(daemon):
 async def test_browserwright_daemon_get_active_tab_over_wire(daemon, fake_upstream):
     """End-to-end: client calls BrowserwrightDaemon.getActiveTab; daemon answers
     using its target table (populated from fake upstream's Target.targetCreated)."""
-    async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
+    async with await _client_connect(_ipc.sock_path()) as ws:
         # Open upstream so setDiscoverTargets fires + table populates.
         await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
         await _recv_response(ws, 1)
@@ -384,7 +386,7 @@ async def test_browserwright_daemon_get_active_tab_over_wire(daemon, fake_upstre
 async def test_ping_endpoint_returns_daemon_pid(daemon):
     """The ping handshake must succeed against a live daemon so `stop` can
     identify the right process."""
-    pid = await _ipc.ping_async(daemon.name, timeout=2.0)
+    pid = await _ipc.ping_async(timeout=2.0)
     assert pid == os.getpid()  # this test runs in the same process as the daemon
 
 
@@ -427,7 +429,7 @@ async def test_v03_two_clients_race_lazy_open_both_get_responses(slow_daemon):
     WARNING "no upstream") and the client timed out at 30s. The fixed
     daemon buffers per-client and drains on OPEN, so both get a real reply.
     """
-    sock = _ipc.sock_path(slow_daemon.name)
+    sock = _ipc.sock_path()
 
     async def request(label: str):
         async with await _client_connect(sock, label=label) as ws:
@@ -448,7 +450,7 @@ async def test_v03_pre_open_buffer_overflow_surfaces_to_client(slow_daemon):
     error on the 101st (and beyond). Earlier frames still replay on OPEN.
     """
     from browserwright.daemon.server.state import PRE_OPEN_BUFFER_LIMIT
-    sock = _ipc.sock_path(slow_daemon.name)
+    sock = _ipc.sock_path()
 
     async with await _client_connect(sock, label="overflow") as ws:
         # Fire 101 frames as fast as we can while the slow-resolver is
@@ -505,7 +507,7 @@ async def test_run_stats_against_live_daemon_does_not_misreport_not_running(
     from browserwright.daemon import cli as cli_mod
     from browserwright.daemon.config import load as load_cfg
 
-    cfg = load_cfg(cli_name=daemon.name)
+    cfg = load_cfg()
     cfg.backend = daemon.backend
 
     class _Args:
@@ -532,7 +534,7 @@ async def test_upstream_lifecycle_events_emitted_in_order(daemon):
     + .upstreamReady but they were never wired. Verify a connected client sees
     both events in order around the lazy upstream open.
     """
-    async with await _client_connect(_ipc.sock_path(daemon.name)) as ws:
+    async with await _client_connect(_ipc.sock_path()) as ws:
         # Lazy-open triggered by the first CDP frame.
         await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
 
@@ -570,7 +572,7 @@ async def test_upstream_lifecycle_events_emitted_in_order(daemon):
 async def test_upstream_lifecycle_events_reach_all_connected_clients(daemon):
     """When multiple clients are attached at lazy-open time, both events
     fan out to every one of them (per existing _broadcast pattern)."""
-    sock = _ipc.sock_path(daemon.name)
+    sock = _ipc.sock_path()
     async with await _client_connect(sock, label="alice") as a, \
                await _client_connect(sock, label="bob") as b:
         # First frame on `a` triggers lazy open. `b` should also see the events.

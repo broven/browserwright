@@ -49,11 +49,13 @@ def _stub_session_for_ws(monkeypatch, *, backend: str = "extension",
     return sess
 
 
-def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
-    """open_background() must dispatch BrowserwrightDaemon.openBackgroundTab over
-    sess.cdp.send (the long-lived ws), NOT via daemon.open_background()
-    (CLI subprocess that loses the sessionId binding on exit)."""
-    from browserwright.primitives.page import open_background
+def test_open_uses_long_lived_ws_not_subprocess(monkeypatch):
+    """open() must dispatch the unified BrowserwrightDaemon.openBackgroundTab
+    over sess.cdp.send (the long-lived ws), NOT via a CLI subprocess (which
+    loses the sessionId binding on exit). De-branched: no groupName on the
+    wire (the group is an internal daemon detail), and the result drops the
+    extension-only groupId — uniform {targetId,tabId,url,title}."""
+    from browserwright.primitives.page import open as open_tab
 
     sess = _stub_session_for_ws(monkeypatch, response={
         "sessionId": "ws-sid-1",
@@ -63,42 +65,41 @@ def test_open_background_uses_long_lived_ws_not_subprocess(monkeypatch):
         "title": "Example",
         "groupId": 7,
     })
-    result = open_background("https://example.com", group="Agent-Test")
+    result = open_tab("https://example.com")
 
-    # Wire shape: exactly one BrowserwrightDaemon.openBackgroundTab over sess.cdp.
-    # The session id threads through as the plain CDP param ``bsSession``
-    # (None here — the stub session is not bound to a ledger record).
+    # Wire shape: exactly one openBackgroundTab over sess.cdp. The session id
+    # threads through as the plain CDP param ``bsSession`` (None here — the
+    # stub session is not bound to a ledger record). ``background`` defaults to
+    # True; no ``groupName`` (the daemon derives the group from the session).
     assert sess.cdp.calls == [
         ("BrowserwrightDaemon.openBackgroundTab",
          {"session": None, "url": "https://example.com",
-          "groupName": "Agent-Test", "bsSession": None}),
+          "bsSession": None, "background": True}),
     ], f"unexpected wire calls: {sess.cdp.calls!r}"
 
     # The sid IS pre-registered in the local session map so a follow-up
     # cdp.attach(target_id) returns the same sid without re-attaching.
     assert sess.cdp._sessions["ext-tab-42"] == "ws-sid-1"
 
-    # Return shape matches the documented contract.
+    # Uniform return shape (no extension-only groupId).
     assert result == {
         "targetId": "ext-tab-42",
         "tabId": 42,
         "url": "https://example.com",
         "title": "Example",
-        "groupId": 7,
     }
     assert sess.current_target_id == "ext-tab-42"
 
 
-def test_open_background_derives_group_and_bssession_from_ledger(
-    tmp_bs_home, monkeypatch
-):
-    """open_background(url) with no explicit group, on a session named
-    --name=cf-bots, must carry groupName='cf-bots' and bsSession=<sid> on the
-    wire (derived from BD_SESSION → ledger)."""
+def test_open_derives_bssession_from_ledger(tmp_bs_home, monkeypatch):
+    """open(url) on a session bound via BD_SESSION → ledger must carry
+    bsSession=<sid> on the wire so the daemon routes the tab into the right
+    session's browser. The group is now an internal daemon detail derived from
+    the session — the downstream no longer passes groupName."""
     from browserwright import session_registry as reg
-    from browserwright.primitives.page import open_background
+    from browserwright.primitives.page import open as open_tab
 
-    sid = reg.allocate(backend="extension", daemon_endpoint="default",
+    sid = reg.allocate(backend="extension",
                        owner="attach", name="cf-bots")
     monkeypatch.setenv("BD_SESSION", sid)
 
@@ -106,12 +107,13 @@ def test_open_background_derives_group_and_bssession_from_ledger(
         "sessionId": "ws-sid-1", "targetId": "ext-tab-1", "tabId": 1,
         "url": "https://x.test", "title": "X", "groupId": 3,
     })
-    open_background("https://x.test")
+    open_tab("https://x.test")
 
     method, params = sess.cdp.calls[0]
     assert method == "BrowserwrightDaemon.openBackgroundTab"
-    assert params["groupName"] == "cf-bots"
     assert params["bsSession"] == sid
+    # The group is no longer part of the downstream wire contract.
+    assert "groupName" not in params
 
 
 def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):
@@ -140,22 +142,25 @@ def test_close_tab_uses_long_lived_ws_not_subprocess(monkeypatch):
     assert sess.current_target_id is None
 
 
-def test_attached_session_raises_on_extension_without_attach(monkeypatch):
-    """On extension backend, _attached_session() must refuse to silently
-    auto-attach the user's focused tab — raise NeedsUserConfirm with both
-    open_background AND attach_active named, with open_background listed
-    FIRST (the new default rule)."""
-    from browserwright.errors import NeedsUserConfirm
+def test_attached_session_auto_attaches_on_extension(monkeypatch):
+    """De-branched (docs §Tier B): _attached_session() no longer refuses on the
+    extension backend. With no tab bound it falls back through current_page() →
+    open() (a NEW working tab, NOT adopt — so it never steals the user's focused
+    tab), then returns the cached sid. No NeedsUserConfirm raise anymore."""
     from browserwright.primitives.interact import _attached_session
 
-    _stub_session_for_ws(monkeypatch, backend="extension")  # no target attached
-    with pytest.raises(NeedsUserConfirm) as exc_info:
-        _attached_session()
-    proposal = exc_info.value.proposal or ""
-    assert "open_background" in proposal
-    assert "attach_active" in proposal
-    # Default rule: open_background listed before attach_active.
-    assert proposal.index("open_background") < proposal.index("attach_active")
+    sess = _stub_session_for_ws(monkeypatch, backend="extension", response={
+        "sessionId": "ws-sid-1", "targetId": "ext-tab-1", "tabId": 1,
+        "url": "https://x.test", "title": "X", "groupId": 3,
+    })
+    sid = _attached_session()
+    # open() registered the daemon-minted (target, sid) pair, so re-attaching
+    # the now-current target returns that same upstream sid (not a fresh one).
+    assert sid == "ws-sid-1"
+    assert sess.current_target_id == "ext-tab-1"
+    # It went through the unified open verb, not a NeedsUserConfirm raise.
+    assert any(call[0] == "BrowserwrightDaemon.openBackgroundTab"
+               for call in sess.cdp.calls)
 
 
 def test_attached_session_auto_attaches_on_rdp(monkeypatch):

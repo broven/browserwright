@@ -23,7 +23,7 @@ def _extract_payload(result: SkillResult) -> dict:
     return json.loads(line)
 
 
-def test_extension_backend_multiple_sessions_operate_concurrently(ext_ready):
+def test_extension_backend_multiple_sessions_operate_concurrently(ext_ready, e2e_daemon):
     """Two independent skill Sessions can drive extension-backed Chrome at once.
 
     Regression target: extension backend session/attacher bookkeeping must be
@@ -36,7 +36,7 @@ import threading
 import traceback
 from urllib.parse import quote
 
-from browserwright import close_tab, js, open_background, wait_for_load
+from browserwright import close_tab, js, open, wait_for_load
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
 
@@ -66,9 +66,8 @@ def worker(name, initial_text):
                 f"<main id='value'>{initial_text}</main>"
                 "<script>window.e2eReady = true</script>"
             )
-            tab = open_background(
+            tab = open(
                 "data:text/html;charset=utf-8," + quote(html),
-                group="Agent E2E MultiSession",
             )
             target_id = tab["targetId"]
             wait_for_load()

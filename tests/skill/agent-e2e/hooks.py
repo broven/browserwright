@@ -43,7 +43,10 @@ from workspace import build_workspace, reset_workspace  # noqa: E402
 # ---------------------------------------------------------------------------
 EXT_PORT = 39989
 RDP_PORT = 39990
-DAEMON_NAME = "bd-agent-e2e"
+# Single-global-daemon: isolation is via a dedicated XDG_RUNTIME_DIR (→ a
+# distinct fixed socket) + the relay port, NOT a BD_NAME. Kept short for the
+# macOS AF_UNIX 104-byte sun_path budget.
+RUNTIME_DIR = "/tmp/bd-agent-e2e-rt"
 
 EXT_SOURCE_DIR = _REPO_ROOT / "browserwright-daemon" / "chrome-extension"
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "_workspace"
@@ -91,14 +94,15 @@ def start_session() -> None:
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = ARTIFACTS_DIR / "daemon.log"
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
 
     # 1. Patch extension
     patched_ext = patch_extension_dir(EXT_SOURCE_DIR, relay_port=EXT_PORT)
 
-    # 2. Spawn daemon
+    # 2. Spawn daemon (isolated by its own XDG_RUNTIME_DIR + relay port)
     daemon = spawn_daemon(
         EXT_PORT,
-        DAEMON_NAME,
+        RUNTIME_DIR,
         log_path,
         env=scrubbed_env(),
     )

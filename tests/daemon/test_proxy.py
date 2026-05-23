@@ -23,8 +23,8 @@ from browserwright.daemon.server.state import (
 # ---- shared scaffolding ---------------------------------------------------
 
 
-def _state(phase=UpstreamPhase.CONNECTED) -> DaemonState:
-    s = DaemonState(name="t", backend_name="rdp")
+def _state(phase=UpstreamPhase.CONNECTED, backend: str = "rdp") -> DaemonState:
+    s = DaemonState(backend_name=backend)
     s.upstream_phase = phase
     return s
 
@@ -54,9 +54,10 @@ class _Capture:
         self.disconnect_calls.append(reason)
 
 
-def _setup(*labels: str, phase=UpstreamPhase.CONNECTED, wire_upstream: bool = True):
+def _setup(*labels: str, phase=UpstreamPhase.CONNECTED, wire_upstream: bool = True,
+           backend: str = "rdp"):
     """Build a Router + state + one or more clients ready to receive sends."""
-    state = _state(phase=phase)
+    state = _state(phase=phase, backend=backend)
     cap = _Capture()
     router = Router(state)
     router.bind_lifecycle(cap.ensure_upstream, cap.trigger_disconnect)
@@ -240,7 +241,7 @@ async def test_unknown_browserdaemon_method_returns_method_not_found():
 async def test_attach_active_without_callback_returns_method_not_found():
     """Without an extension backend wired, BrowserwrightDaemon.attachActiveTab
     must surface -32601 instead of silently doing nothing."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
     await router.route_from_client(client, json.dumps({
         "id": 33, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -254,7 +255,7 @@ async def test_attach_active_with_callback_binds_session_and_attacher():
     """When the extension callback is wired, calling attachActiveTab must
     bind a local session + claim_attacher so subsequent CDP commands route
     correctly under the returned sessionId."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
 
     async def fake_attach_active(*, session_id=None):
         return {
@@ -290,7 +291,7 @@ async def test_attach_active_with_callback_binds_session_and_attacher():
 async def test_attach_active_callback_failure_returns_error():
     """If the callback raises, the client sees a CDP -32000 error rather
     than a hung request."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
 
     async def boom(*, session_id=None):
         raise RuntimeError("relay says no")
@@ -302,6 +303,72 @@ async def test_attach_active_callback_failure_returns_error():
     err = cap.per_client[client.client_id][-1]["error"]
     assert err["code"] == -32000
     assert "relay says no" in err["message"]
+
+
+# ---- unified attachActiveTab on the rdp backend (docs §C1) ---------------
+
+
+@pytest.mark.asyncio
+async def test_attach_active_on_rdp_attaches_existing_front_target():
+    """On an rdp context attachActiveTab must NOT be -32601 (no extension
+    callback wired). The daemon owns the Chrome, so it attaches an existing
+    page target (the session's current front tab) via raw CDP, returning the
+    same {sessionId,targetId,...} shape as the extension path."""
+    state, router, cap, (client,) = _setup(backend="rdp")
+
+    async def fake_cmd(method, params=None, session_id=None):
+        if method == "Target.getTargets":
+            return {"targetInfos": [{
+                "targetId": "rdp-T1", "type": "page",
+                "url": "https://front.example/", "title": "Front",
+            }]}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "UP-RDP-1"}
+        raise AssertionError(f"unexpected upstream cmd {method}")
+
+    router._upstream_command = fake_cmd
+    await router.route_from_client(client, json.dumps({
+        "id": 21, "method": "BrowserwrightDaemon.attachActiveTab",
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert resp["id"] == 21
+    assert "error" not in resp, resp
+    result = resp["result"]
+    assert result["targetId"] == "rdp-T1"
+    assert result["url"] == "https://front.example/"
+    # rdp has no Chrome tab id — uniform shape, honest null.
+    assert result["tabId"] is None
+    # Binding + attacher registered like the extension path.
+    own = state.attachers["rdp-T1"]
+    assert own.primary_client_id == client.client_id
+    assert own.upstream_session_id == "UP-RDP-1"
+    assert client.sessions[result["sessionId"]].target_id == "rdp-T1"
+
+
+@pytest.mark.asyncio
+async def test_attach_active_on_rdp_creates_tab_when_none_exists():
+    """When the daemon-owned Chrome has no page target, rdp attachActiveTab
+    creates one (mirrors the skill's current_page → open() empty fallback)."""
+    state, router, cap, (client,) = _setup(backend="rdp")
+
+    async def fake_cmd(method, params=None, session_id=None):
+        if method == "Target.getTargets":
+            return {"targetInfos": []}
+        if method == "Target.createTarget":
+            return {"targetId": "rdp-new"}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "UP-RDP-NEW"}
+        raise AssertionError(f"unexpected upstream cmd {method}")
+
+    router._upstream_command = fake_cmd
+    await router.route_from_client(client, json.dumps({
+        "id": 22, "method": "BrowserwrightDaemon.attachActiveTab",
+    }))
+    resp = cap.per_client[client.client_id][-1]
+    assert "error" not in resp, resp
+    assert resp["result"]["targetId"] == "rdp-new"
+    assert resp["result"]["tabId"] is None
+    assert resp["result"]["groupId"] == -1  # created via the open path
 
 
 # ---- v0.3 multi-client: single-attacher rule -----------------------------
@@ -632,7 +699,7 @@ async def test_open_background_without_callback_returns_method_not_found():
     """When backend != extension, the callback stays None and the handler
     must surface -32601 'requires extension backend' (NOT -32602 from
     missing-params)."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
     await router.route_from_client(client, json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://x/"},
@@ -647,7 +714,7 @@ async def test_open_background_without_callback_returns_method_not_found():
 async def test_open_background_with_callback_binds_session_and_attacher():
     """Happy path: callback wired, params valid → session binding + attacher
     ownership registered with the daemon-allocated LOCAL sessionId."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
 
     async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         assert url == "https://example.com/"
@@ -687,7 +754,7 @@ async def test_open_background_with_callback_binds_session_and_attacher():
 @pytest.mark.asyncio
 async def test_open_background_missing_url_returns_invalid_params():
     """params.url is required; absence → -32602."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
     await router.route_from_client(client, json.dumps({
         "id": 9, "method": "BrowserwrightDaemon.openBackgroundTab",
     }))
@@ -698,7 +765,7 @@ async def test_open_background_missing_url_returns_invalid_params():
 
 @pytest.mark.asyncio
 async def test_close_tab_without_callback_returns_method_not_found():
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
     await router.route_from_client(client, json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.closeTab",
         "params": {"sessionId": "anything"},
@@ -712,7 +779,7 @@ async def test_close_tab_without_callback_returns_method_not_found():
 async def test_close_tab_with_callback_cleans_session_state():
     """Happy path: open a tab, then close it; session binding + attacher
     table cleared after the close completes."""
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
     upstream_sid = "UPSTREAM-SID-99"
 
     async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
@@ -758,7 +825,7 @@ async def test_close_tab_with_callback_cleans_session_state():
 
 @pytest.mark.asyncio
 async def test_close_tab_unknown_local_session_returns_invalid_params():
-    state, router, cap, (client,) = _setup()
+    state, router, cap, (client,) = _setup(backend="extension")
     async def _fake_close(sid: str) -> dict:
         return {"ok": True, "tabId": 0}
     router._close_tab = _fake_close
@@ -775,7 +842,7 @@ async def test_close_tab_by_target_id_works_across_client_boundary():
     """CLI use-case: one ws opens the tab (binding lives on that client),
     a SECOND (fresh) ws calls closeTab with targetId. Lookup must reach the
     global state.attachers table, not just the local client's sessions."""
-    state, router, cap, (alice, bob) = _setup("alice", "bob")
+    state, router, cap, (alice, bob) = _setup("alice", "bob", backend="extension")
 
     async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         return {
@@ -824,7 +891,7 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
     `test_close_tab_by_target_id_works_across_client_boundary` never
     exercises (alice stays attached in that test, so the attacher table
     still has an entry)."""
-    state, router, cap, (alice, bob) = _setup("alice", "bob")
+    state, router, cap, (alice, bob) = _setup("alice", "bob", backend="extension")
 
     async def _fake_open(url: str, group_name: str | None = None, *, session_id: str | None = None) -> dict:
         return {

@@ -10,8 +10,6 @@ from pathlib import Path
 
 from .conftest import (
     TEST_EXT_PORT,
-    TEST_NAME,
-    TEST_RDP_NAME,
     TEST_RDP_PORT,
     scrubbed_env,
 )
@@ -24,20 +22,23 @@ class SkillResult:
     stderr: str
 
 
-def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = None,
+def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
+              extra_env: dict[str, str] | None = None,
               timeout: float = 30.0) -> SkillResult:
     """Invoke `browserwright` with the given heredoc-style Python script.
 
-    Sets env vars so the skill talks to the *test* Mode B daemon, not the
-    user's production daemon:
-
-        - `BD_NAME`            -> picks the scenario's daemon socket
-        - `BD_EXTENSION_PORT` / `BD_RDP_PORT` -> the scenario's upstream
-        - a ledger record (below) -> the session's backend + daemon_endpoint
+    Single-global-daemon: the skill reaches the *test* daemon (not the
+    developer's) via `XDG_RUNTIME_DIR` (the fixed socket lives there) — there is
+    no `BD_NAME` anymore. The ledger record carries only the session's
+    `backend`; the daemon routes per session. Relay/rdp upstream isolation is
+    via `BD_EXTENSION_PORT` / `BD_RDP_PORT`.
 
     Args:
         script: Python source the skill REPL will execute (heredoc body).
         backend: "extension" or "rdp".
+        runtime_dir: XDG_RUNTIME_DIR of the test daemon (yielded by the
+            `e2e_daemon` / `e2e_rdp_daemon` fixtures). May also be supplied via
+            `extra_env["XDG_RUNTIME_DIR"]`.
         extra_env: extra env merged on top.
         timeout: subprocess timeout in seconds.
 
@@ -53,16 +54,13 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
             "`pip install -e browserwright[test]`"
         )
 
-    # Both scenarios drive the browser *through* a Mode B daemon (Mode A — the
-    # direct-ws resolver — was removed). `extension` talks to the daemon at
-    # TEST_NAME (the `e2e_daemon` fixture, serving extension); `rdp` talks to a
-    # separate daemon at TEST_RDP_NAME (the `e2e_rdp_daemon` fixture, serving
-    # rdp). The skill routes by the ledger record's daemon_endpoint (set below
-    # to BD_NAME); each daemon serves exactly its backend.
-    daemon_name = TEST_NAME if backend == "extension" else TEST_RDP_NAME
     env = scrubbed_env()
-    env["BD_NAME"] = daemon_name
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / daemon_name)
+    # Point the skill at the test daemon's fixed socket via its runtime dir.
+    if runtime_dir is not None:
+        env["XDG_RUNTIME_DIR"] = runtime_dir
+        env["TMPDIR"] = runtime_dir
+    # Isolated BS_HOME per backend (ledger + memory).
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / backend)
     # Bypass proxy for localhost
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
@@ -79,8 +77,8 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
     # P1 session model: inline `browserwright <<PY` refuses to run unless a
     # ledger session is explicitly in scope. E2E helpers create a lightweight
     # ledger record directly in the isolated BS_HOME so tests don't depend on
-    # the developer's session state, with the record's daemon_endpoint pointing
-    # at the scenario's Mode B daemon.
+    # the developer's session state. The record carries only the session's
+    # backend — the single daemon routes per session (no daemon_endpoint).
     created_session_id = None
     if "BD_SESSION" not in env:
         import json
@@ -94,7 +92,6 @@ def run_skill(script: str, *, backend: str, extra_env: dict[str, str] | None = N
         record = {
             "id": created_session_id,
             "backend": backend,
-            "daemon_endpoint": daemon_name,
             "workspace": None,
             "owner": "attach",
             "name": "e2e-run-skill",

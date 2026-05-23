@@ -54,8 +54,8 @@ def test_ping_sync_still_returns_pid_only(monkeypatch):
     """Existing callers of ping_sync expect a bare pid. Adding version must not
     change that contract."""
     monkeypatch.setattr(
-        _ipc, "ping_status_sync", lambda name, timeout=1.0: (321, "9.9.9"))
-    assert _ipc.ping_sync("default", timeout=0.1) == 321
+        _ipc, "ping_status_sync", lambda timeout=1.0: (321, "9.9.9"))
+    assert _ipc.ping_sync(timeout=0.1) == 321
 
 
 # ---- status --json surfaces the running daemon's version ------------------
@@ -70,12 +70,12 @@ def test_status_json_includes_running_version(monkeypatch, capsys):
 
     monkeypatch.setattr(
         _ipc, "ping_status_sync",
-        lambda name, timeout=1.0: (777, "1.2.3"))
+        lambda timeout=1.0: (777, "1.2.3"))
     monkeypatch.setattr(
         _ipc, "endpoint_describe",
-        lambda name: {"transport": "unix", "path": "/tmp/x.sock"})
+        lambda: {"transport": "unix", "path": "/tmp/x.sock"})
 
-    rc = cli._cmd_status(_StatusArgs(), Config(name="default"))
+    rc = cli._cmd_status(_StatusArgs(), Config())
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["alive"] is True
@@ -88,12 +88,12 @@ def test_status_json_version_none_when_dead(monkeypatch, capsys):
     from browserwright.daemon.config import Config
 
     monkeypatch.setattr(
-        _ipc, "ping_status_sync", lambda name, timeout=1.0: (None, None))
+        _ipc, "ping_status_sync", lambda timeout=1.0: (None, None))
     monkeypatch.setattr(
         _ipc, "endpoint_describe",
-        lambda name: {"transport": "unix", "path": "/tmp/x.sock"})
+        lambda: {"transport": "unix", "path": "/tmp/x.sock"})
 
-    rc = cli._cmd_status(_StatusArgs(), Config(name="default"))
+    rc = cli._cmd_status(_StatusArgs(), Config())
     assert rc == 2
     out = json.loads(capsys.readouterr().out)
     assert out["alive"] is False

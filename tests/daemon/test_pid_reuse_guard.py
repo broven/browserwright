@@ -40,8 +40,8 @@ def _patch_common(monkeypatch, killed: list, pid=4242):
     """Make ping report a live daemon at ``pid`` and record os.kill targets."""
     from browserwright.daemon import cli, _ipc
 
-    monkeypatch.setattr(_ipc, "ping_sync", lambda name, timeout=1.0: pid)
-    monkeypatch.setattr(_ipc, "cleanup_endpoint", lambda name: None)
+    monkeypatch.setattr(_ipc, "ping_sync", lambda timeout=1.0: pid)
+    monkeypatch.setattr(_ipc, "cleanup_endpoint", lambda: None)
 
     def fake_kill(target_pid, sig):
         killed.append((target_pid, sig))
@@ -91,4 +91,4 @@ def test_stop_degrades_when_start_time_unavailable(monkeypatch):
 
 def _cfg():
     from browserwright.daemon.config import Config
-    return Config(name="default")
+    return Config()

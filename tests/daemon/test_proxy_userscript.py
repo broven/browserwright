@@ -8,7 +8,7 @@ from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
 @pytest.mark.asyncio
 async def test_browserdaemon_userscript_dispatch_invokes_callback():
-    state = DaemonState(name="t", backend_name="extension")
+    state = DaemonState(backend_name="extension")
     state.upstream_phase = UpstreamPhase.CONNECTED
     router = Router(state)
     client = state.allocate_client("skill-repl")

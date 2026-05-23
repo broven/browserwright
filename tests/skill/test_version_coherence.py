@@ -30,7 +30,7 @@ def _client_with_versions(monkeypatch, running, installed, *, backend="extension
     would leave the daemon dead. We stub ``get_backend_info`` to report
     ``backend`` and record ``_spawn_daemon``'s backend argument as part of the
     "serve" call so tests can assert it round-trips."""
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     monkeypatch.setattr(c, "running_daemon_version", lambda: running)
     monkeypatch.setattr(c, "installed_daemon_version", lambda: installed)
     monkeypatch.setattr(
@@ -95,7 +95,7 @@ def test_restart_with_unknowable_backend_spawns_without_pin(monkeypatch):
 def test_no_running_daemon_does_not_restart(monkeypatch):
     """If there's no daemon at all (not even reachable), coherence is a no-op —
     the normal ensure/spawn path owns cold-start, not the staleness guard."""
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     monkeypatch.setattr(c, "running_daemon_version", lambda: None)
     monkeypatch.setattr(c, "installed_daemon_version", lambda: "0.5.3")
     monkeypatch.setattr(c, "is_alive", lambda: False)
@@ -127,7 +127,7 @@ def test_version_probe_reads_status_json(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Proc())
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     assert c.running_daemon_version() == "0.4.0"
 
 
@@ -140,7 +140,7 @@ def test_version_probe_none_when_field_absent(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Proc())
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     assert c.running_daemon_version() is None
 
 
@@ -153,7 +153,7 @@ def test_installed_version_reads_version_subcommand(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Proc())
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     assert c.installed_daemon_version() == "0.5.3"
 
 
@@ -162,7 +162,7 @@ def test_installed_version_reads_version_subcommand(monkeypatch):
 # ============================================================================
 
 def test_rewrite_unknown_method_mentions_method_and_restart():
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     err = {"code": -32601, "message": "unknown BrowserwrightDaemon method: BrowserwrightDaemon.fooBar"}
     msg = c.explain_rpc_error("BrowserwrightDaemon.fooBar", err)
     low = msg.lower()
@@ -176,7 +176,7 @@ def test_rewrite_unknown_method_mentions_method_and_restart():
 
 def test_rewrite_is_generic_across_methods():
     """No hardcoded method name in the logic — works for any RPC."""
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     for method in ("BrowserwrightDaemon.userscript.install",
                    "BrowserwrightDaemon.totallyNewMethod",
                    "Page.navigate"):
@@ -189,7 +189,7 @@ def test_rewrite_is_generic_across_methods():
 def test_non_32601_error_passed_through_untouched():
     """Other error codes are real protocol errors, not staleness — don't
     rewrite them into a misleading 'restart the daemon' message."""
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     err = {"code": -32602, "message": "invalid params: missing url"}
     msg = c.explain_rpc_error("BrowserwrightDaemon.openBackgroundTab", err)
     assert "invalid params: missing url" in msg
@@ -197,7 +197,7 @@ def test_non_32601_error_passed_through_untouched():
 
 
 def test_is_stale_method_error_predicate():
-    c = ModeBClient(name="default")
+    c = ModeBClient()
     assert c.is_stale_method_error({"code": -32601, "message": "x"}) is True
     assert c.is_stale_method_error({"code": -32000, "message": "x"}) is False
     assert c.is_stale_method_error({}) is False

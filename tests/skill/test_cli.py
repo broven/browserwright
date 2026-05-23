@@ -152,19 +152,25 @@ def test_session_new_rdp_create_vs_attach(tmp_bs_home, capsys, monkeypatch):
     from browserwright import session_create
     from browserwright import session_registry as reg
 
-    monkeypatch.setattr(session_create, "_launch_daemon", lambda *a, **k: None)
+    # P3: the daemon (not session_create) launches/owns the per-session rdp
+    # Chrome on ensureSession. session_create just makes sure the one global
+    # daemon is up — stub that out so the test needs no real daemon.
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda *a, **k: None)
 
     rc = _main(["session", "new", "--backend=rdp", "--create", "--name=cr"])
     sid_create = capsys.readouterr().out.strip()
     assert rc == 0
     assert reg.get(sid_create)["owner"] == "create"
-    assert reg.get(sid_create)["daemon_endpoint"] == f"browserwright-daemon-s{sid_create}"
+    # No per-session daemon_endpoint anymore (single global daemon).
+    assert "daemon_endpoint" not in reg.get(sid_create)
 
     rc = _main(["session", "new", "--backend=rdp", "--attach=9222", "--name=at"])
     sid_attach = capsys.readouterr().out.strip()
     assert rc == 0
     assert reg.get(sid_attach)["owner"] == "attach"
-    assert reg.get(sid_attach)["workspace"] == {"target": 9222}
+    # P3: --attach records both the resolved port (for the daemon to pin to)
+    # and the original target.
+    assert reg.get(sid_attach)["workspace"] == {"port": 9222, "target": 9222}
 
 
 def test_session_end_create_closes(tmp_bs_home, capsys, monkeypatch):
@@ -173,7 +179,7 @@ def test_session_end_create_closes(tmp_bs_home, capsys, monkeypatch):
 
     closed = []
     monkeypatch.setattr(session_create, "_close_browser", lambda rec: closed.append(rec["id"]))
-    sid = reg.allocate(backend="rdp", daemon_endpoint="d", owner="create", name="job")
+    sid = reg.allocate(backend="rdp", owner="create", name="job")
     rc = _main(["session", "end", f"--session={sid}"])
     assert rc == 0
     assert closed == [sid]
@@ -183,7 +189,7 @@ def test_session_end_create_closes(tmp_bs_home, capsys, monkeypatch):
 def test_session_end_attach_emits_reminder(tmp_bs_home, capsys):
     from browserwright import session_registry as reg
 
-    sid = reg.allocate(backend="rdp", daemon_endpoint="d", owner="attach", name="fp")
+    sid = reg.allocate(backend="rdp", owner="attach", name="fp")
     rc = _main(["session", "end", f"--session={sid}"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -194,8 +200,8 @@ def test_session_end_attach_emits_reminder(tmp_bs_home, capsys):
 def test_session_list_and_prune(tmp_bs_home, capsys):
     from browserwright import session_registry as reg
 
-    a = reg.allocate(backend="extension", daemon_endpoint="default", owner="attach", name="a")
-    reg.allocate(backend="rdp", daemon_endpoint="d", owner="create", name="b")
+    a = reg.allocate(backend="extension", owner="attach", name="a")
+    reg.allocate(backend="rdp", owner="create", name="b")
     rc = _main(["session", "list"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -213,7 +219,7 @@ def test_session_list_and_prune(tmp_bs_home, capsys):
 def test_whoami_prints_ledger_view(tmp_bs_home, capsys):
     from browserwright import session_registry as reg
 
-    sid = reg.allocate(backend="rdp", daemon_endpoint="browserwright-daemon-s1",
+    sid = reg.allocate(backend="rdp",
                        owner="create", name="job")
     rc = _main(["whoami", f"--session={sid}"])
     out = capsys.readouterr().out
@@ -223,7 +229,8 @@ def test_whoami_prints_ledger_view(tmp_bs_home, capsys):
     assert data["backend"] == "rdp"
     assert data["owner"] == "create"
     assert data["name"] == "job"
-    assert data["daemon_endpoint"] == "browserwright-daemon-s1"
+    # daemon_endpoint was dropped from the ledger (single global daemon).
+    assert "daemon_endpoint" not in data
 
 
 def test_whoami_unknown_session_refuses(tmp_bs_home, capsys):

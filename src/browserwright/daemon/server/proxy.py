@@ -778,12 +778,17 @@ class Router:
             }))
             return
         if method == "BrowserwrightDaemon.attachActiveTab":
-            # v0.5.4: extension-backend-only. Bypasses the standard
-            # Target.attachToTarget flow because the targetId isn't known
-            # until the extension picks the focused-window active tab. We
-            # still register the resulting session in the proxy's binding
-            # tables so subsequent CDP commands on the returned sessionId
-            # route the same way an explicit attach would.
+            # Unified verb. On extension this adopts the user's focused-window
+            # active tab (the targetId isn't known until the extension picks
+            # it). On rdp the daemon owns the Chrome, so "the active tab" is
+            # the session's current front target (most-recently-fronted), and
+            # we create+attach one if none exists — an honest equivalent, NOT
+            # -32601 (docs §C1). Either path registers the resulting session
+            # in the binding tables so subsequent CDP commands route the same
+            # way an explicit attach would.
+            if self.state.backend_name == "rdp":
+                await self._rdp_attach_active(client, req_id)
+                return
             if self._attach_active_tab is None:
                 # Trigger lazy-open once; the listener wires
                 # `_attach_active_tab` inside _open_extension_upstream so a
@@ -1352,6 +1357,89 @@ class Router:
             "url": meta.get("url", url),
             "title": meta.get("title", ""),
             "groupId": -1,           # tab groups are extension-only
+        }))
+
+    async def _rdp_attach_active(
+        self, client: ClientState, req_id: int | None,
+    ) -> None:
+        """rdp `attachActiveTab` (docs §C1): the daemon owns this Chrome, so
+        there is no human-contended "focused tab". Define the active tab as the
+        session's current front target — reuse a page target this context is
+        already attached to (most-recently-fronted), else attach an existing
+        page target, else create one. Result shape matches the extension path.
+        This is an honest equivalent, never -32601."""
+        if self._upstream_command is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "attachActiveTab: rdp upstream not connected"))
+            return
+        # 1. Reuse a page target this client already has bound (front tab).
+        for local_sid, binding in client.sessions.items():
+            tid = binding.target_id
+            meta = self.state.targets.get(tid) or {}
+            if meta.get("type", "page") == "page":
+                await self._send_to_client(client.client_id, _result_response(
+                    req_id, {
+                        "sessionId": local_sid,
+                        "targetId": tid,
+                        "tabId": None,
+                        "url": meta.get("url", ""),
+                        "title": meta.get("title", ""),
+                    }))
+                return
+        # 2. Attach an existing page target the daemon-owned Chrome already has.
+        target_id: str | None = None
+        url = ""
+        title = ""
+        try:
+            targets = await self._upstream_command("Target.getTargets", {})
+        except Exception:
+            targets = None
+        if isinstance(targets, dict):
+            for info in targets.get("targetInfos", []):
+                if not isinstance(info, dict) or info.get("type") != "page":
+                    continue
+                tid = info.get("targetId")
+                if isinstance(tid, str):
+                    target_id = tid
+                    url = info.get("url", "")
+                    title = info.get("title", "")
+                    break
+        if target_id is None:
+            # 3. No tab at all — create one (mirrors the empty-fallback in the
+            # skill's current_page → open()).
+            await self._rdp_open_tab(client, req_id, "about:blank")
+            return
+        try:
+            attached = await self._upstream_command(
+                "Target.attachToTarget", {"targetId": target_id, "flatten": True})
+            upstream_sid = attached.get("sessionId") if isinstance(attached, dict) else None
+            if not isinstance(upstream_sid, str):
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"attachActiveTab: attach returned {attached!r}"))
+                return
+        except Exception as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"attachActiveTab failed: {e!r}"))
+            return
+        existing = self.state.attachers.get(target_id)
+        if existing is not None and existing.primary_client_id == client.client_id:
+            local_sid = existing.primary_local_session
+        else:
+            local_sid = _new_local_session_id(client.client_id)
+            self.state.bind_session(
+                client.client_id, local_sid, upstream_sid, target_id, readonly=False)
+            self.state.claim_attacher(
+                target_id, client.client_id, local_sid, upstream_sid)
+        self.state.note_target_info({
+            "targetId": target_id, "type": "page", "url": url, "title": title,
+        })
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "sessionId": local_sid,
+            "targetId": target_id,
+            "tabId": None,
+            "url": url,
+            "title": title,
         }))
 
     async def _rdp_close_tab(

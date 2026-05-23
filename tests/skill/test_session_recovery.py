@@ -58,7 +58,7 @@ class _StubSession:
 
 def _ledger_session(name="cf-bots", *, runtime=None):
     from browserwright import session_registry as reg
-    sid = reg.allocate(backend="extension", daemon_endpoint="default",
+    sid = reg.allocate(backend="extension",
                        owner="attach", name=name)
     if runtime is not None:
         reg.update(sid, runtime=runtime)
@@ -135,11 +135,15 @@ def test_empty_group_returns_none(tmp_bs_home):
     assert sess.current_target_id is None
 
 
-def test_entrypoint_still_raises_when_recovery_fails(tmp_bs_home, monkeypatch):
-    """When recovery yields nothing, the extension entrypoint keeps its
-    existing NeedsUserConfirm UX."""
+def test_entrypoint_opens_fresh_tab_when_recovery_fails(tmp_bs_home, monkeypatch):
+    """De-branched (docs §Tier B): when recovery yields nothing, the entrypoint
+    no longer raises NeedsUserConfirm on the extension backend. It falls through
+    to current_page() → open() (a NEW working tab, never adopt), uniform across
+    backends. Here the stub returns no openBackgroundTab payload, so open()
+    surfaces a CDPError — proving the path now goes through open(), NOT the old
+    extension-only NeedsUserConfirm refusal."""
     from browserwright import session as session_mod
-    from browserwright.errors import NeedsUserConfirm
+    from browserwright.errors import CDPError, NeedsUserConfirm
     from browserwright.primitives.interact import _attached_session
 
     sid, rec = _ledger_session(name="ghost2")
@@ -147,8 +151,11 @@ def test_entrypoint_still_raises_when_recovery_fails(tmp_bs_home, monkeypatch):
     sess = _StubSession(cdp, record=rec)
     monkeypatch.setattr(session_mod, "_singleton", sess)
 
-    with pytest.raises(NeedsUserConfirm):
+    with pytest.raises(CDPError) as exc_info:
         _attached_session()
+    # It went through open()'s unified verb, not the removed refusal.
+    assert not isinstance(exc_info.value, NeedsUserConfirm)
+    assert "openBackgroundTab" in str(exc_info.value)
 
 
 def test_persist_target_writes_runtime_on_open_background(tmp_bs_home, monkeypatch):

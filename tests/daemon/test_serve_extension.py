@@ -61,7 +61,7 @@ def patch_relay_port():
 @pytest.fixture
 async def ext_daemon(short_runtime, patch_relay_port):
     """Start a daemon in extension-backend mode. Yields (cfg, relay_port)."""
-    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"}, cli_name="serve-x")
+    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"})
     cfg.backend = "extension"
     cfg.backends.extension.port = patch_relay_port  # Task #24 knob
     cfg.timeout = 2.0
@@ -70,7 +70,7 @@ async def ext_daemon(short_runtime, patch_relay_port):
     # Wait for the unix socket to be ready.
     for _ in range(40):
         await asyncio.sleep(0.05)
-        if _ipc.sock_path(cfg.name).exists():
+        if _ipc.sock_path().exists():
             break
     else:
         task.cancel()
@@ -99,7 +99,7 @@ async def ext_daemon(short_runtime, patch_relay_port):
             await asyncio.wait_for(task, timeout=3.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        _ipc.cleanup_endpoint(cfg.name)
+        _ipc.cleanup_endpoint()
 
 
 async def _client_connect(sock_path: Path, *, label: str = "test-client"):
@@ -164,7 +164,7 @@ async def test_end_to_end_target_get_targets_via_extension(ext_daemon):
     target table, populated by the mock extension's `attached` push.
     """
     cfg, port = ext_daemon
-    sock = _ipc.sock_path(cfg.name)
+    sock = _ipc.sock_path()
 
     # Mock extension connects + announces a tab BEFORE the client.
     ext = _MockExtension()
@@ -192,7 +192,7 @@ async def test_end_to_end_browser_crash_returns_method_not_found(ext_daemon):
     """Spec §8.4: unsupported browser-level commands → -32601 surfaced to
     the client through the daemon's normal id-translation path."""
     cfg, port = ext_daemon
-    sock = _ipc.sock_path(cfg.name)
+    sock = _ipc.sock_path()
 
     ext = _MockExtension()
     await ext.connect(port, install_id="install-method-not-found")

@@ -89,22 +89,13 @@ def _stub_session(monkeypatch, *, backend: str, targets: list, current_target=No
     return sess
 
 
-def test_list_tabs_raises_on_extension_with_zero_ghosts(tmp_bs_home, monkeypatch):
-    """Extension backend with no attached tabs is an actionable state, not
-    an empty Chrome. The agent needs to call attach_active or
-    open_background, so list_tabs raises NeedsUserConfirm pointing there
-    instead of returning [] silently."""
-    from browserwright.errors import NeedsUserConfirm
+def test_list_tabs_returns_empty_on_extension_with_zero_tabs(tmp_bs_home, monkeypatch):
+    """Unified behavior (docs §Tier B): an empty session is a legitimate state
+    on EVERY backend — list_tabs returns [] rather than raising. The old
+    extension-only NeedsUserConfirm raise was dropped in the de-branching."""
     from browserwright.primitives import list_tabs
     _stub_session(monkeypatch, backend="extension", targets=[])
-    with pytest.raises(NeedsUserConfirm) as exc_info:
-        list_tabs()
-    assert "extension" in str(exc_info.value).lower()
-    proposal = exc_info.value.proposal or ""
-    assert "open_background" in proposal
-    assert "attach_active" in proposal
-    # Default rule: open_background listed before attach_active.
-    assert proposal.index("open_background") < proposal.index("attach_active")
+    assert list_tabs() == []
 
 
 def test_list_tabs_returns_empty_on_other_backend(tmp_bs_home, monkeypatch):
@@ -114,33 +105,20 @@ def test_list_tabs_returns_empty_on_other_backend(tmp_bs_home, monkeypatch):
     assert list_tabs() == []
 
 
-def test_new_tab_raises_on_extension_backend(tmp_bs_home, monkeypatch):
-    """new_tab() uses Target.createTarget, which the extension backend can't
-    issue — fail fast with the real verb (open_background) instead of letting
-    it blow up deep in the daemon. Regression from evals/feedback (~18 sessions
-    hit this; the daemon error even suggested a non-existent new_page())."""
-    from browserwright.errors import BrowserwrightError
+def test_new_tab_is_a_unified_open_alias(tmp_bs_home, monkeypatch):
+    """new_tab is now a thin DEPRECATED alias for open() — it no longer has an
+    extension-only guard. On every backend it issues the unified openBackground
+    Tab RPC (the stub CDP returns an empty payload here, so it surfaces a
+    CDPError about openBackgroundTab, NOT the old Target.createTarget guard)."""
+    from browserwright.errors import BrowserwrightError, CDPError
     from browserwright.primitives import new_tab
     _stub_session(monkeypatch, backend="extension", targets=[])
-    with pytest.raises(BrowserwrightError) as exc_info:
+    with pytest.raises((CDPError, BrowserwrightError)) as exc_info:
         new_tab("https://example.com")
     msg = str(exc_info.value)
-    assert "open_background" in msg
-    assert "extension" in msg.lower()
-
-
-def test_new_tab_guard_does_not_fire_on_rdp_backend(tmp_bs_home, monkeypatch):
-    """The guard is extension-only: on rdp/env new_tab must get PAST the
-    backend check (it then fails later in the stub CDP, not with our
-    BrowserwrightError guard)."""
-    from browserwright.errors import BrowserwrightError
-    from browserwright.primitives import new_tab
-    _stub_session(monkeypatch, backend="rdp", targets=[])
-    with pytest.raises(Exception) as exc_info:
-        new_tab("https://example.com")
-    # Past the guard → not our extension BrowserwrightError about open_background.
-    assert not (isinstance(exc_info.value, BrowserwrightError)
-                and "open_background" in str(exc_info.value))
+    # Routes through the unified verb, not the removed createTarget guard.
+    assert "openBackgroundTab" in msg or "open failed" in msg
+    assert "Target.createTarget" not in msg
 
 
 def test_list_tabs_chrome_only_ghost_on_extension_does_not_raise(
@@ -168,15 +146,15 @@ def test_list_tabs_chrome_only_ghost_on_extension_does_not_raise(
     assert len(list_tabs(include_chrome=True)) == 1
 
 
-def test_current_tab_raises_on_extension_without_attachment(tmp_bs_home, monkeypatch):
-    """Extension backend + no current_target_id → raise (the agent's next
-    move is attach_active). Mode A keeps returning None for the same shape."""
-    from browserwright.errors import NeedsUserConfirm
+def test_current_tab_returns_none_on_extension_without_attachment(
+        tmp_bs_home, monkeypatch):
+    """Unified behavior (docs §Tier B): current_tab returns None when no tab is
+    bound, on EVERY backend. The old extension-only NeedsUserConfirm raise was
+    dropped — None is a legitimate 'no tab bound yet' state."""
     from browserwright.primitives import current_tab
     _stub_session(monkeypatch, backend="extension", targets=[],
                   current_target=None)
-    with pytest.raises(NeedsUserConfirm):
-        current_tab()
+    assert current_tab() is None
 
 
 def test_current_tab_returns_none_on_other_backend_without_attachment(

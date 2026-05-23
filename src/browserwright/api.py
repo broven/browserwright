@@ -47,6 +47,7 @@ from .primitives import (
     load_site_skill,
     memory_read,
     new_tab,
+    open,
     open_background,
     page_info,
     reload,
@@ -68,8 +69,8 @@ from .primitives import (
 
 EXPORTS = [
     # navigation / tabs
-    "goto_url", "new_tab", "reload", "switch_tab", "list_tabs", "current_tab",
-    "current_page", "ensure_real_tab", "iframe_target",
+    "goto_url", "open", "new_tab", "reload", "switch_tab", "list_tabs",
+    "current_tab", "current_page", "ensure_real_tab", "iframe_target",
     "attach_readonly", "attach_active",
     "open_background", "close_tab",
     # input

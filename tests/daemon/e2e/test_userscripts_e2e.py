@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 
-from .conftest import TEST_EXT_PORT, TEST_NAME, scrubbed_env
+from .conftest import TEST_EXT_PORT, scrubbed_env
 from .helpers import run_skill
 
 
@@ -126,10 +126,14 @@ def _last_json(stdout: str) -> dict:
     return json.loads(line)
 
 
-def _daemon_userscript(args: list[str], *, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
+def _daemon_userscript(args: list[str], *, runtime_dir: str,
+                       timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
     daemon_bin = shutil.which("browserwright-daemon") or "browserwright-daemon"
     env = scrubbed_env()
-    env["BD_NAME"] = TEST_NAME
+    # Single-global-daemon: reach the test daemon's fixed socket via its
+    # XDG_RUNTIME_DIR (no BD_NAME).
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
     env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
@@ -142,8 +146,9 @@ def _daemon_userscript(args: list[str], *, timeout: float = 30.0) -> subprocess.
     )
 
 
-def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_chrome, tmp_path):
+def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e_chrome, tmp_path):
     _enable_user_scripts_toggle(e2e_chrome)
+    rd = e2e_daemon.runtime_dir  # the test daemon's XDG_RUNTIME_DIR (fixed socket)
 
     userjs = tmp_path / "e2e.user.js"
     userjs.write_text(
@@ -159,7 +164,7 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_chrome, tmp
         encoding="utf-8",
     )
 
-    pushed = _daemon_userscript(["push", str(userjs)])
+    pushed = _daemon_userscript(["push", str(userjs)], runtime_dir=rd)
     assert pushed.returncode == 0, pushed.stderr
     pushed_payload = json.loads(pushed.stdout)
     assert pushed_payload.get("sync", {}).get("ok") is True, pushed_payload
@@ -177,6 +182,7 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_chrome, tmp
             ),
             backend="extension",
             timeout=60,
+            runtime_dir=rd,
         )
         assert probe.returncode == 0, probe.stderr
         assert _last_json(probe.stdout)["sentinel"] == "ok"
@@ -184,16 +190,16 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_chrome, tmp
         # Injection on the matching page must have appended an audit-log entry.
         deadline = time.monotonic() + 5.0
         while True:
-            logs = _daemon_userscript(["logs", "--id", script_id, "--limit=20"])
+            logs = _daemon_userscript(["logs", "--id", script_id, "--limit=20"], runtime_dir=rd)
             assert logs.returncode == 0, logs.stderr
             if any(entry.get("id") == script_id for entry in json.loads(logs.stdout)["logs"]):
                 break
             if time.monotonic() > deadline:
-                all_logs = _daemon_userscript(["logs", "--limit=50"])
+                all_logs = _daemon_userscript(["logs", "--limit=50"], runtime_dir=rd)
                 raise AssertionError(f"missing audit log for {script_id}: filtered={logs.stdout} all={all_logs.stdout}")
             time.sleep(0.2)
 
-        toggled = _daemon_userscript(["toggle", identity, "--enabled=false"])
+        toggled = _daemon_userscript(["toggle", identity, "--enabled=false"], runtime_dir=rd)
         assert toggled.returncode == 0, toggled.stderr
         disabled_probe = run_skill(
             script=(
@@ -204,12 +210,13 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_chrome, tmp
             ),
             backend="extension",
             timeout=60,
+            runtime_dir=rd,
         )
         assert disabled_probe.returncode == 0, disabled_probe.stderr
         assert _last_json(disabled_probe.stdout)["sentinel"] is None
 
-    removed = _daemon_userscript(["remove", identity])
+    removed = _daemon_userscript(["remove", identity], runtime_dir=rd)
     assert removed.returncode == 0, removed.stderr
-    listed = _daemon_userscript(["list", "--site=http://127.0.0.1/e2e"])
+    listed = _daemon_userscript(["list", "--site=http://127.0.0.1/e2e"], runtime_dir=rd)
     assert listed.returncode == 0, listed.stderr
     assert json.loads(listed.stdout)["scripts"] == []

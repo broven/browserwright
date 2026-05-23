@@ -27,21 +27,10 @@ def _attached_session() -> str:
         from ..session_runtime import ensure_session_target
         if ensure_session_target(sess):
             return sess.cdp.attach(sess.current_target_id)
-        # Extension backend: do NOT silently steal the user's focused tab
-        # (current_page() would call attach_active() and grab it). Raise
-        # with named next steps; open_background listed first (default).
-        if sess.backend_name == "extension":
-            from ..errors import NeedsUserConfirm
-            raise NeedsUserConfirm(
-                what="no tab attached on extension backend",
-                proposal=(
-                    "call `open_background(url, group='Agent')` to spawn a "
-                    "fresh background tab (does not steal user focus), "
-                    "OR `attach_active()` if the task is explicitly "
-                    "'drive the user's current tab'. Then re-run."
-                ),
-            )
-        # rdp/env: safe to auto-fallback — isolated Chrome, no user collision.
+        # No tab bound and none to recover. Safe to auto-fallback on EVERY
+        # backend now: current_page()'s empty fallback is open() (a fresh
+        # working tab in the session's browser), NOT attach_active()/adopt —
+        # so it never steals the user's focused tab (docs §Tier B).
         from .page import current_page
         current_page()
     return sess.cdp.attach(sess.current_target_id)

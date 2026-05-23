@@ -7,16 +7,17 @@ from pathlib import Path
 from .helpers import run_skill
 
 
-def test_open_background_and_query_dom(ext_ready):
+def test_open_background_and_query_dom(ext_ready, e2e_daemon):
     script = (
         "import json\n"
-        "h = open_background('data:text/html,<h1>e2e</h1>')\n"
+        "h = open('data:text/html,<h1>e2e</h1>')\n"
         "wait_for_load()\n"
         "txt = js(\"document.querySelector('h1').textContent\")\n"
         "info = page_info()\n"
         "print(json.dumps({'text': txt, 'title': info.get('title'), 'url': info.get('url')}))\n"
     )
-    result = run_skill(script=script, backend="extension")
+    result = run_skill(script=script, backend="extension",
+                       runtime_dir=e2e_daemon.runtime_dir)
     assert result.returncode == 0, (
         f"skill exited {result.returncode}; stderr={result.stderr!r}"
     )
@@ -29,15 +30,16 @@ def test_open_background_and_query_dom(ext_ready):
     assert payload["url"].startswith("data:text/html")
 
 
-def test_screenshot_is_non_trivial(ext_ready, tmp_path):
+def test_screenshot_is_non_trivial(ext_ready, e2e_daemon, tmp_path):
     out_png = tmp_path / "shot.png"
     script = (
-        f"open_background('data:text/html,<h1 style=\"font-size:120px\">SHOT</h1>')\n"
+        f"open('data:text/html,<h1 style=\"font-size:120px\">SHOT</h1>')\n"
         "wait_for_load()\n"
         f"path = capture_screenshot({str(out_png)!r})\n"
         f"print(path)\n"
     )
-    result = run_skill(script=script, backend="extension", timeout=60)
+    result = run_skill(script=script, backend="extension", timeout=60,
+                       runtime_dir=e2e_daemon.runtime_dir)
     assert result.returncode == 0, (
         f"skill exited {result.returncode}; stderr={result.stderr!r}"
     )

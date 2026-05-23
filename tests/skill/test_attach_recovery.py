@@ -4,12 +4,13 @@ internal / extension page Chrome's debugger cannot attach to.
 Session-1 failure mode: the agent's active tab was a ``chrome-extension://`` page,
 ``attach_active()`` raised, and the agent reacted by spawning FIVE brand-new
 sessions instead of recovering. The fix: when the active tab is a non-attachable
-internal URL, ``attach_active()`` auto-falls back to ``open_background()`` (a
-fresh background tab) rather than bubbling the raise.
+internal URL, ``attach_active()`` auto-falls back to ``open()`` (a fresh working
+tab in the session's browser) rather than bubbling the raise. (Post-de-branching
+the fallback is the unified ``open()``; it used to be ``open_background()``.)
 
-These are SEAM/MOCK tests — they patch ``sess.cdp.send`` and ``open_background``
-to assert the *fallback path is taken*, with no live browser. The condition is
-kept generic: any non-attachable internal URL (chrome://, chrome-extension://,
+These are SEAM/MOCK tests — they patch ``sess.cdp.send`` and ``open`` to assert
+the *fallback path is taken*, with no live browser. The condition is kept
+generic: any non-attachable internal URL (chrome://, chrome-extension://,
 devtools://, …) triggers the fallback, not one hardcoded scheme.
 """
 from __future__ import annotations
@@ -49,14 +50,13 @@ def patched(monkeypatch):
     ``open_background`` so we can observe the fallback without a browser."""
     from browserwright.primitives import page as page_mod
 
-    state = {"open_background_called_with": None}
+    state = {"open_called_with": None}
 
-    def fake_open_background(url, *, group=None):
-        state["open_background_called_with"] = {"url": url, "group": group}
-        return {"targetId": "bg-tab-1", "tabId": 7, "url": url,
-                "title": "", "groupId": 1}
+    def fake_open(url="about:blank", *, background=True):
+        state["open_called_with"] = {"url": url, "background": background}
+        return {"targetId": "bg-tab-1", "tabId": 7, "url": url, "title": ""}
 
-    monkeypatch.setattr(page_mod, "open_background", fake_open_background)
+    monkeypatch.setattr(page_mod, "open", fake_open)
 
     def _install(attach_error_msg):
         cdp = _FakeCDP(attach_error_msg)
@@ -82,12 +82,12 @@ def test_attach_active_falls_back_to_open_background_on_internal_url(patched, er
 
     result = attach_active()
 
-    # Fallback path was taken: open_background was called, no raise escaped.
-    assert state["open_background_called_with"] is not None, (
-        "expected attach_active() to fall back to open_background() on a "
+    # Fallback path was taken: open() was called, no raise escaped.
+    assert state["open_called_with"] is not None, (
+        "expected attach_active() to fall back to open() on a "
         "non-attachable internal active tab, not re-raise"
     )
-    # And the result is the open_background tab handle (so callers chain on it).
+    # And the result is the open() tab handle (so callers chain on it).
     assert result.get("targetId") == "bg-tab-1"
     # It really did try attach first (we recovered, not skipped).
     assert "BrowserwrightDaemon.attachActiveTab" in cdp.calls
@@ -107,7 +107,6 @@ def test_attach_active_reraises_on_unrelated_cdp_error(patched):
     with pytest.raises(CDPError):
         attach_active()
 
-    assert state["open_background_called_with"] is None, (
-        "unrelated CDPError must not silently trigger the open_background "
-        "fallback"
+    assert state["open_called_with"] is None, (
+        "unrelated CDPError must not silently trigger the open() fallback"
     )

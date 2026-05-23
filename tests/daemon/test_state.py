@@ -14,7 +14,7 @@ from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
 
 def _state() -> DaemonState:
-    return DaemonState(name="t", backend_name="rdp")
+    return DaemonState(backend_name="rdp")
 
 
 # ---- upstream phase transitions -------------------------------------------

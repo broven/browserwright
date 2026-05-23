@@ -141,7 +141,7 @@ async def test_pre_open_overflow_counter_increments():
     )
 
     reset_metrics_for_test()
-    state = DaemonState(name="t", backend_name="x")
+    state = DaemonState(backend_name="x")
     state.upstream_phase = UpstreamPhase.DISCONNECTED
     router = Router(state)
 
@@ -215,7 +215,7 @@ async def test_browserwright_daemon_stats_method_returns_snapshot(
 
     monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
 
-    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"}, cli_name="stats-test")
+    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"})
     cfg.backend = "env"
     cfg.timeout = 3.0
 
@@ -223,13 +223,13 @@ async def test_browserwright_daemon_stats_method_returns_snapshot(
     # Wait for socket bind.
     for _ in range(40):
         await asyncio.sleep(0.05)
-        if _ipc.sock_path(cfg.name).exists():
+        if _ipc.sock_path().exists():
             break
 
     try:
         # Connect a client + invoke BrowserwrightDaemon.stats.
         ws = await websockets.unix_connect(
-            str(_ipc.sock_path(cfg.name)),
+            str(_ipc.sock_path()),
             uri="ws://localhost/?client=stats-test",
             compression=None,
         )
@@ -250,6 +250,6 @@ async def test_browserwright_daemon_stats_method_returns_snapshot(
             await asyncio.wait_for(task, timeout=3.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        _ipc.cleanup_endpoint(cfg.name)
+        _ipc.cleanup_endpoint()
         fake_up.close()
         await fake_up.wait_closed()

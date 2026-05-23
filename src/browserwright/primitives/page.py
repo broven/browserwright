@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..errors import BrowserwrightError, CDPError, NeedsUserConfirm, PageLoadFailed
+from ..errors import CDPError, PageLoadFailed
 from ..session import current_session
 
 
@@ -35,13 +35,18 @@ def _is_nonattachable_internal_url_error(msg: str | None) -> bool:
 
 
 def attach_active() -> dict:
-    """v0.5.4: extension-backend-only. Attach the user's currently-focused-
-    window active tab in Chrome without requiring a popup click.
+    """First-class verb: bind the session to its "active" tab.
+
+    Unified across backends — the daemon dispatches by the session's
+    (immutable) backend, so this primitive never branches:
+      - extension: adopt the user's currently-focused-window active tab into
+        this session's tab group (the analogue of rdp's owned Chrome).
+      - rdp: the daemon owns the Chrome, so "active" = the session's current
+        front target (most-recently-fronted), created+attached if none.
 
     Returns ``{targetId, tabId, url, title}``. The Session's current target
     is set so subsequent primitives (``js``, ``goto_url``, ``capture_screenshot``)
-    operate on this tab. Raises ``CDPError`` if the daemon backend isn't
-    extension or no extension is connected.
+    operate on this tab.
 
     The returned ``targetId`` stays valid across heredocs as long as the tab
     is open and the daemon is alive — print it, capture it in the agent's
@@ -50,10 +55,6 @@ def attach_active() -> dict:
     deterministic than re-attaching the focused tab on every heredoc,
     which can drift if the user clicks another window between calls.
     See SKILL.md "Persisting a tab handle across heredocs".
-
-    For non-extension backends (rdp/env) the existing ``current_page()``
-    helper already resolves the active tab via Target.getTargets — use
-    that path instead.
     """
     from collections import deque as _deque
     sess = current_session()
@@ -65,24 +66,15 @@ def attach_active() -> dict:
     try:
         result = sess.cdp.send("BrowserwrightDaemon.attachActiveTab")
     except CDPError as e:
-        # D2 recovery: the user's *focused* tab may be an internal page Chrome's
-        # debugger refuses to attach to (chrome://, chrome-extension://,
-        # devtools://, a New Tab Page, …). That's not a fatal error — it just
-        # means "the active tab isn't drivable". Instead of bubbling the raise
-        # (which in session-1 led the agent to spawn five fresh sessions), fall
-        # back to open_background(): a new, attachable background tab the agent
-        # can drive without stealing user focus. Kept generic — any
+        # The user's *focused* tab may be an internal page Chrome's debugger
+        # refuses to attach to (chrome://, chrome-extension://, devtools://, a
+        # New Tab Page, …). That's not fatal — it just means "the active tab
+        # isn't drivable". Fall back to open(): a fresh attachable working tab
+        # in this session's browser the agent can drive. Generic — any
         # non-attachable internal URL triggers it, no scheme hardcoded.
         if _is_nonattachable_internal_url_error(e.cdp_message):
-            return open_background("about:blank", group="Agent")
-        raise CDPError(
-            method="BrowserwrightDaemon.attachActiveTab",
-            params={},
-            cdp_message=(e.cdp_message or
-                         "attach_active() requires the extension backend; "
-                         "start the daemon with `browserwright-daemon serve "
-                         "--backend extension` and load the chrome-extension/."),
-        ) from e
+            return open("about:blank")
+        raise
     if not result:
         raise CDPError(
             method="BrowserwrightDaemon.attachActiveTab",
@@ -141,12 +133,19 @@ def attach_readonly(target_id: str) -> str:
 
 
 def list_tabs(include_chrome: bool = True) -> list[dict]:
+    """The session's tabs ``[{targetId, url, title, attached}]``.
+
+    Unified across backends (docs §Tier B): the daemon scopes enumeration to
+    the session's browser (extension = the session's tab group; rdp = the
+    daemon-owned Chrome's targets). Returns ``[]`` when the session has no
+    tabs — an empty session is a legitimate state, not an error.
+    """
     sess = current_session()
     res = sess.cdp.send("Target.getTargets")
-    # Page-type targets, unfiltered — used for the "any attached at all?" check.
-    raw_pages = [t for t in res.get("targetInfos", []) if t.get("type") == "page"]
     out: list[dict] = []
-    for t in raw_pages:
+    for t in res.get("targetInfos", []):
+        if t.get("type") != "page":
+            continue
         if not include_chrome and t.get("url", "").startswith(_INTERNAL):
             continue
         out.append({
@@ -155,37 +154,16 @@ def list_tabs(include_chrome: bool = True) -> list[dict]:
             "title": t.get("title", ""),
             "attached": t.get("attached", False),
         })
-    # Extension backend returns only ghost targets — tabs the user has
-    # explicitly attached. Zero ghosts isn't "Chrome has no tabs", it's
-    # "you haven't attached one yet"; the agent's next move is
-    # `attach_active()` (drive the user's focused tab) or
-    # `open_background(url)` (open a fresh tab in the agent group). Decide
-    # based on the unfiltered page-target count — a ghost on chrome://newtab/
-    # IS attached, just hidden by include_chrome=False; falsely raising
-    # there would silently clear the cached attachment in current_page().
-    if not raw_pages and sess.backend_name == "extension":
-        raise NeedsUserConfirm(
-            what="extension backend has zero attached tabs",
-            proposal=(
-                "call `open_background(url, group='Agent')` to spawn a new "
-                "background tab in the Agent group (does not steal user focus), "
-                "or `attach_active()` to drive the focused-window tab if the "
-                "task is explicitly 'use my current tab'"
-            ),
-        )
     return out
 
 
 def current_tab() -> dict | None:
-    """The tab Skill is currently attached to (may be stale / chrome:// page).
+    """The tab Skill is currently bound to, or ``None`` if none yet.
 
-    rdp / env backends: returns ``None`` when no tab has been attached yet —
-    a legitimate "Chrome has tabs but Skill hasn't picked one" state.
-
-    Extension backend: ``None`` is never legitimate here because the
-    daemon only knows about explicitly-attached ghost targets. Raise
-    instead so the agent learns to call ``attach_active()`` /
-    ``open_background()`` first.
+    Unified across backends (docs §Tier B): returns the current binding (may
+    be stale / a chrome:// page) or ``None`` when the session hasn't picked a
+    tab. ``None`` is a legitimate "no tab bound yet" state — call
+    ``current_page()`` (auto-opens) or ``attach_active()`` to get one.
     """
     sess = current_session()
     if not sess.current_target_id:
@@ -196,16 +174,6 @@ def current_tab() -> dict | None:
         for t in list_tabs():
             if t["targetId"] == sess.current_target_id:
                 return t
-    if sess.backend_name == "extension":
-        raise NeedsUserConfirm(
-            what="no tab attached on extension backend",
-            proposal=(
-                "call `open_background(url, group='Agent')` to spawn a "
-                "background tab (does not steal user focus), or "
-                "`attach_active()` to attach the focused-window tab if "
-                "the task is explicitly 'use my current tab'"
-            ),
-        )
     return None
 
 
@@ -256,45 +224,67 @@ def switch_tab(target) -> dict:
     return {"targetId": target_id}
 
 
-def new_tab(url: str = "about:blank") -> dict:
-    """Create a new tab and bind the Session to it.
+def open(url: str = "about:blank", *, background: bool = True) -> dict:
+    """Open a new working tab in this session's browser, attach, bind as
+    current. The unified tab-opening primitive (docs §Tier B) — replaces
+    both ``new_tab`` and ``open_background``.
 
-    Returns ``{targetId, url}``. The ``targetId`` stays valid across
-    heredocs as long as the tab is open and the daemon is alive — print
-    it, capture it in the agent's conversation, and use
-    ``switch_tab(targetId)`` in later heredocs to re-bind. See SKILL.md
-    "Persisting a tab handle across heredocs".
+    Returns ``{targetId, tabId, url, title}``. The daemon dispatches by the
+    session's (immutable) backend, so this primitive never branches:
+      - extension: opens the tab in this session's tab group; ``background=``
+        is honored (``True`` = don't steal the user's focus).
+      - rdp: ``Target.createTarget``; ``background=`` is a no-op (no human
+        focus to protect — every tab is "background").
+
+    The ``targetId`` stays valid across heredocs as long as the tab is open
+    and the daemon is alive — print it, capture it in the agent's
+    conversation, and use ``switch_tab(targetId)`` in later heredocs to
+    re-bind. See SKILL.md "Persisting a tab handle across heredocs".
     """
     sess = current_session()
-    if sess.backend_name == "extension":
-        # Target.createTarget is a browser-level command the extension backend
-        # cannot issue — it would fail deep in the daemon with a confusing
-        # "requires a sessionId" / createTarget error. Fail fast here with the
-        # real verb so the agent (or a solidified task calling new_tab) recovers.
-        raise BrowserwrightError(
-            "new_tab() uses Target.createTarget, which the extension backend "
-            "cannot issue. Open a tab with open_background(url, group=\"Agent\") "
-            "(background tab, no focus steal), or attach_active() to drive the "
-            "user's focused tab. new_tab() works only on the rdp/env backend.",
-            fix="use open_background(url, group=\"Agent\") on the extension backend",
+    _name, sid = _session_name_and_id(sess)
+    try:
+        payload = sess.cdp.send(
+            "BrowserwrightDaemon.openBackgroundTab",
+            url=url, bsSession=sid, background=background,
         )
-    res = sess.cdp.send("Target.createTarget", url=url)
-    target_id = res["targetId"]
-    sess.cdp.attach(target_id)
-    sess.current_target_id = target_id
-    from ..session_runtime import persist_target
-    persist_target(target_id, sess=sess)
-    if url not in ("", "about:blank"):
-        # ``Target.createTarget`` returns before the URL is actually loading,
-        # and an empty about:blank may pass readyState=='complete' the first
-        # time we poll. Wait until location.href has actually moved off
-        # about:blank *and* readyState is complete — bounded by the same
-        # timeout.
-        try:
-            _wait_for_real_load(url, timeout=15.0)
-        except PageLoadFailed:
-            pass
-    return {"targetId": target_id, "url": url}
+    except CDPError as e:
+        raise CDPError(
+            method="BrowserwrightDaemon.openBackgroundTab",
+            params={"url": url},
+            cdp_message=(
+                f"open failed: {e.cdp_message}. Requires a running daemon."
+            ),
+        ) from e
+    if not payload:
+        raise CDPError(
+            method="BrowserwrightDaemon.openBackgroundTab",
+            params={"url": url},
+            cdp_message="daemon returned an empty payload",
+        )
+    target_id = payload.get("targetId")
+    session_id = payload.get("sessionId")
+    if not target_id or not session_id:
+        raise CDPError(
+            method="BrowserwrightDaemon.openBackgroundTab",
+            params={"url": url},
+            cdp_message=f"daemon returned incomplete payload: {payload!r}",
+        )
+    from ..session_runtime import persist_target, register_recovered
+    register_recovered(sess, payload)
+    persist_target(target_id, group_id=payload.get("groupId"), sess=sess)
+    return {
+        "targetId": target_id,
+        "tabId": payload.get("tabId"),
+        "url": payload.get("url", url),
+        "title": payload.get("title", ""),
+    }
+
+
+def new_tab(url: str = "about:blank") -> dict:
+    """DEPRECATED alias for :func:`open`. Kept for one release so existing
+    callers / solidified tasks don't break. Use ``open(url)`` instead."""
+    return open(url)
 
 
 def _wait_for_real_load(target_url: str, *, timeout: float) -> bool:
@@ -372,56 +362,42 @@ def reload(*, hard: bool = False) -> dict:
 
 
 def current_page() -> dict:
-    """User's visually-foreground tab (US1). Auto-attaches.
+    """The session's current working tab; auto-opens one if none (docs §Tier B).
 
-    rdp / env backends use ``browserwright-daemon active-tab --json`` to find
-    the most-recently-activated target and switch to it.
+    Unified across backends — no ``backend_name`` branch. Resolution order:
+      1. the cached current target, if it's still a live tab of this session;
+      2. transparent reconnect-recovery (ledger.runtime → group anchor);
+      3. an existing tab of the session (first real page);
+      4. else ``open()`` a fresh working tab.
 
-    Extension backend has no notion of "active tab" outside of attached
-    ghosts, so we route through ``attach_active()`` instead — the daemon
-    asks the extension to attach Chrome's focused-window active tab right
-    now. The first call in a session triggers Chrome's yellow banner;
-    subsequent calls in the same session reuse the cached target.
+    The empty fallback is ``open()`` (a NEW tab), NOT ``attach_active()`` —
+    adopt moves the user's focused tab, too invasive for an implicit call
+    (docs: "current_page() empty fallback = open() NOT adopt").
     """
     sess = current_session()
-    if sess.backend_name == "extension":
-        if sess.current_target_id:
-            try:
-                for t in list_tabs(include_chrome=False):
-                    if t["targetId"] == sess.current_target_id:
-                        return {**t, "accuracy": "exact"}
-            except NeedsUserConfirm:
-                # Cached target got reaped (tab closed). Fall through to a
-                # fresh attach instead of bubbling the raise.
-                sess.current_target_id = None
-        # Transparent reconnect-recovery: re-attach to this session's tab
-        # (ledger.runtime fast path → group anchor) before grabbing the
-        # user's focused tab via attach_active().
-        from ..session_runtime import ensure_session_target
-        recovered = ensure_session_target(sess)
-        if recovered:
-            for t in list_tabs(include_chrome=False):
-                if t["targetId"] == recovered:
-                    return {**t, "accuracy": "exact"}
-            return {"targetId": recovered, "accuracy": "exact"}
-        info = attach_active()
-        return {**info, "accuracy": "exact"}
-    info = sess.daemon.active_tab()
-    if info and info.get("targetId"):
-        sess.last_active_tab = info
-        # Confirm the targetId is actually reachable on our ws before
-        # blindly switching to it (cross-Chrome confusion guard).
-        if any(t["targetId"] == info["targetId"]
-               for t in list_tabs(include_chrome=False)):
-            switch_tab(info["targetId"])
-            return {**info, "accuracy": info.get("accuracy", "unknown")}
-    # Degrade: pick first real tab, or open a fresh one.
-    tabs = [t for t in list_tabs(include_chrome=False)]
+    # 1. Cached current target still valid?
+    if sess.current_target_id:
+        for t in list_tabs(include_chrome=False):
+            if t["targetId"] == sess.current_target_id:
+                return {**t, "accuracy": "exact"}
+        # Cached target gone (tab closed). Drop it and fall through.
+        sess.current_target_id = None
+    # 2. Transparent reconnect-recovery before opening anything new.
+    from ..session_runtime import ensure_session_target
+    recovered = ensure_session_target(sess)
+    if recovered:
+        for t in list_tabs(include_chrome=False):
+            if t["targetId"] == recovered:
+                return {**t, "accuracy": "exact"}
+        return {"targetId": recovered, "accuracy": "exact"}
+    # 3. Any existing real tab of the session.
+    tabs = list_tabs(include_chrome=False)
     if tabs:
         switch_tab(tabs[0])
         return {"targetId": tabs[0]["targetId"], "url": tabs[0]["url"],
                 "title": tabs[0]["title"], "accuracy": "unknown"}
-    return new_tab("about:blank") | {"accuracy": "unknown"}
+    # 4. Empty session — open a fresh working tab (NOT adopt).
+    return open("about:blank") | {"accuracy": "unknown"}
 
 
 def wait(seconds: float = 1.0) -> None:
@@ -481,65 +457,15 @@ def _session_name_and_id(sess) -> tuple[Any, Any]:
     return None, None
 
 
-def open_background(url: str, *, group: Optional[str] = None) -> dict:
-    """Phase B Feature 1 — open a new Chrome tab in the background.
+def open_background(url: str, *, group: str | None = None) -> dict:
+    """DEPRECATED alias for :func:`open` (``background=True``). Kept for one
+    release so existing callers / solidified tasks don't break.
 
-    The tab is created with ``active: false`` so the user's currently-focused
-    tab keeps focus; the new tab is placed in a Chrome tab group and
-    ``chrome.debugger`` is attached. The group title defaults to the current
-    session's ``name`` (the durable reconnect-recovery anchor); pass an
-    explicit ``group=`` to override. Returns
-    ``{"targetId","tabId","url","title","groupId"}``. After this call,
-    ``sess.current_target_id`` points at the new tab and subsequent primitives
-    (``js``, ``capture_screenshot``, etc.) operate on it.
-
-    Extension backend only. On other backends (rdp, cloud) the daemon
-    answers ``-32601`` which we translate to ``CDPError``.
+    The ``group=`` kwarg is now an internal daemon detail (the group is
+    derived from the session) — it is accepted but ignored. Use
+    ``open(url, background=True)`` instead.
     """
-    sess = current_session()
-    name, sid = _session_name_and_id(sess)
-    if group is None:
-        group = name  # may stay None if no session/name resolvable
-    try:
-        payload = sess.cdp.send(
-            "BrowserwrightDaemon.openBackgroundTab",
-            url=url, groupName=group, bsSession=sid,
-        )
-    except CDPError as e:
-        raise CDPError(
-            method="BrowserwrightDaemon.openBackgroundTab",
-            params={"url": url, "groupName": group},
-            cdp_message=(
-                f"open_background failed: {e.cdp_message}. "
-                "Requires the extension backend with a running daemon."
-            ),
-        ) from e
-    if not payload:
-        raise CDPError(
-            method="BrowserwrightDaemon.openBackgroundTab",
-            params={"url": url, "groupName": group},
-            cdp_message="daemon returned an empty payload",
-        )
-    target_id = payload.get("targetId")
-    session_id = payload.get("sessionId")
-    if not target_id or not session_id:
-        raise CDPError(
-            method="BrowserwrightDaemon.openBackgroundTab",
-            params={"url": url, "groupName": group},
-            cdp_message=f"daemon returned incomplete payload: {payload!r}",
-        )
-    # Pre-register the daemon-minted sessionId in the CDPSession's session
-    # map (reused by recovery) and persist the binding to the ledger cache.
-    from ..session_runtime import persist_target, register_recovered
-    register_recovered(sess, payload)
-    persist_target(target_id, group_id=payload.get("groupId"), sess=sess)
-    return {
-        "targetId": target_id,
-        "tabId": payload.get("tabId"),
-        "url": payload.get("url", url),
-        "title": payload.get("title", ""),
-        "groupId": payload.get("groupId", -1),
-    }
+    return open(url, background=True)
 
 
 def close_tab(

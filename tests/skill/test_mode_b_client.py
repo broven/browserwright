@@ -47,7 +47,8 @@ def test_discover_unix_via_path_fallback(monkeypatch):
     from browserwright.mode_b_client import ModeBClient
 
     short = _short_tmp()
-    sock_path = short / "browserwright-daemon-foo.sock"
+    # Single-global-daemon: the socket is a FIXED name under XDG_RUNTIME_DIR.
+    sock_path = short / "browserwright-daemon.sock"
     sock_path.write_text("")  # daemon would normally bind here
 
     class _FailProc:
@@ -56,7 +57,7 @@ def test_discover_unix_via_path_fallback(monkeypatch):
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(short))
     with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
-        client = ModeBClient(name="foo")
+        client = ModeBClient()
         ep = client.discover()
     assert ep["transport"] == "unix"
     assert ep["path"] == str(sock_path)
@@ -86,16 +87,15 @@ def test_is_alive_pings_socket(monkeypatch):
     t.start()
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(short))
-    monkeypatch.setenv("BD_NAME", "x")
 
     class _FailProc:
         returncode = 1
         stdout = ""
 
     with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
-        # ``status --json`` fails → falls back to socket path inspection
+        # ``status --json`` fails → falls back to the FIXED socket path
         # → file exists → ping succeeds because we're listening.
-        sock_target = short / "browserwright-daemon-x.sock"
+        sock_target = short / "browserwright-daemon.sock"
         sock_target.write_text("")
         # Move the listening socket to that path (re-bind).
         srv.close()
@@ -107,7 +107,7 @@ def test_is_alive_pings_socket(monkeypatch):
         srv2.bind(str(sock_target))
         srv2.listen(1)
         threading.Thread(target=lambda: (srv2.accept(), None), daemon=True).start()
-        client = ModeBClient(name="x")
+        client = ModeBClient()
         assert client.is_alive() is True
         srv2.close()
     shutil.rmtree(short, ignore_errors=True)
@@ -117,14 +117,13 @@ def test_is_alive_false_when_no_endpoint(monkeypatch):
     from browserwright.mode_b_client import ModeBClient
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent/dir")
-    monkeypatch.setenv("BD_NAME", "ghost")
 
     class _FailProc:
         returncode = 1
         stdout = ""
 
     with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
-        assert ModeBClient(name="ghost").is_alive() is False
+        assert ModeBClient().is_alive() is False
 
 
 def test_ws_url_unix_format(monkeypatch):
@@ -166,7 +165,6 @@ def test_client_is_lazy_when_socket_absent(monkeypatch):
     from browserwright.errors import DaemonUnavailable
     from browserwright.mode_b_client import ModeBClient
 
-    monkeypatch.setenv("BD_NAME", "absent")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent")
 
     class _FailProc:
@@ -174,7 +172,7 @@ def test_client_is_lazy_when_socket_absent(monkeypatch):
         stdout = ""
 
     with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
-        client = ModeBClient(name="absent")
+        client = ModeBClient()
         assert isinstance(client, ModeBClient)
         assert client.is_alive() is False
         # Lazy: the error is deferred to first use, not construction.
@@ -182,32 +180,39 @@ def test_client_is_lazy_when_socket_absent(monkeypatch):
             client.resolve_ws_url()
 
 
-def test_client_uses_session_daemon_endpoint(tmp_bs_home, monkeypatch):
-    """P1: the endpoint a call talks to comes from the session record, not a
-    frozen module-level ``"default"``."""
+def test_client_for_session_uses_session_label(tmp_bs_home, monkeypatch):
+    """Single-global-daemon: there is no per-session endpoint anymore. A
+    client built for a session talks to the ONE fixed socket and carries the
+    session identity only as its client label (skill-s<id>) for daemon-side
+    routing/observability."""
     from browserwright import mode_b_client
     from browserwright import session_registry as reg
 
-    sid = reg.allocate(backend="rdp", daemon_endpoint="browserwright-daemon-s7.sock",
-                       owner="create")
+    sid = reg.allocate(backend="rdp", owner="create")
     c = mode_b_client.client_for_session(reg.get(sid))
-    assert c.name == "browserwright-daemon-s7.sock"  # not "default"
+    assert isinstance(c, mode_b_client.ModeBClient)
+    assert c._client_label == f"skill-s{sid}"
 
 
-def test_default_name_is_not_frozen_at_import(monkeypatch):
-    """BD_NAME is read live, so changing it after import takes effect."""
-    from browserwright import mode_b_client
-
-    monkeypatch.setenv("BD_NAME", "live-changed")
-    assert mode_b_client.ModeBClient().name == "live-changed"
-
-
-def test_session_built_from_record_uses_endpoint(tmp_bs_home):
-    """Threading a record into Session picks the record's daemon endpoint."""
+def test_session_built_from_record_targets_fixed_socket(tmp_bs_home, monkeypatch):
+    """Threading a record into Session yields a client for the single global
+    daemon's fixed socket, labelled with the session id."""
     from browserwright import session_registry as reg
     from browserwright.session import Session
 
-    sid = reg.allocate(backend="rdp", daemon_endpoint="browserwright-daemon-s9.sock",
-                       owner="create")
+    short = _short_tmp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short))
+    # Lay down the fixed socket file so discover()'s path fallback resolves it.
+    (short / "browserwright-daemon.sock").write_text("")
+    sid = reg.allocate(backend="rdp", owner="create")
+
+    class _FailProc:
+        returncode = 1
+        stdout = ""
+
     sess = Session(record=reg.get(sid))
-    assert sess.daemon.name == "browserwright-daemon-s9.sock"
+    assert sess.daemon._client_label == f"skill-s{sid}"
+    # The endpoint, once discovered, is the fixed socket under XDG_RUNTIME_DIR.
+    with patch("browserwright.mode_b_client.subprocess.run", return_value=_FailProc()):
+        assert sess.daemon.discover()["path"].endswith("browserwright-daemon.sock")
+    shutil.rmtree(short, ignore_errors=True)

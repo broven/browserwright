@@ -21,7 +21,7 @@ def _last_json(stdout: str) -> dict:
     return json.loads(line)
 
 
-def test_background_tab_reports_visible_and_focused(ext_ready):
+def test_background_tab_reports_visible_and_focused(ext_ready, e2e_daemon):
     """A backgrounded tab we never switch to should still look focused+visible."""
     script = (
         "import json\n"
@@ -34,7 +34,8 @@ def test_background_tab_reports_visible_and_focused(ext_ready):
         "}''')\n"
         "print(json.dumps(state))\n"
     )
-    result = run_skill(script=script, backend="extension")
+    result = run_skill(script=script, backend="extension",
+                        runtime_dir=e2e_daemon.runtime_dir)
     assert result.returncode == 0, (
         f"skill exited {result.returncode}; stderr={result.stderr!r}"
     )
@@ -44,7 +45,7 @@ def test_background_tab_reports_visible_and_focused(ext_ready):
     assert state["hasFocus"] is True, state
 
 
-def test_background_tab_raf_keeps_advancing(ext_ready):
+def test_background_tab_raf_keeps_advancing(ext_ready, e2e_daemon):
     """Anti-overfit: prove rAF actually runs off-screen, not just that the
     visibility flags read nicely. A page increments a counter on every
     requestAnimationFrame frame and writes it to the DOM; a backgrounded tab
@@ -66,7 +67,8 @@ def test_background_tab_raf_keeps_advancing(ext_ready):
         "second = int(js(\"document.getElementById('n').textContent\"))\n"
         "print(json.dumps({'first': first, 'second': second}))\n"
     )
-    result = run_skill(script=script, backend="extension", timeout=60)
+    result = run_skill(script=script, backend="extension", timeout=60,
+                        runtime_dir=e2e_daemon.runtime_dir)
     assert result.returncode == 0, (
         f"skill exited {result.returncode}; stderr={result.stderr!r}"
     )

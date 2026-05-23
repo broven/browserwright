@@ -17,13 +17,12 @@ import json
 import time
 from pathlib import Path
 
-from .conftest import TEST_NAME
 from .helpers import SkillResult, run_skill
 
 
 def _bs_home() -> Path:
     # Mirror the BS_HOME that helpers.run_skill pins for the extension backend.
-    return Path(__file__).resolve().parent / "_bs_home" / TEST_NAME
+    return Path(__file__).resolve().parent / "_bs_home" / "extension"
 
 
 def _seed_session(sid: str, name: str) -> Path:
@@ -35,7 +34,7 @@ def _seed_session(sid: str, name: str) -> Path:
     ledger = sessions / "ledger.json"
     now = time.time()
     record = {
-        "id": sid, "backend": "extension", "daemon_endpoint": TEST_NAME,
+        "id": sid, "backend": "extension",
         "workspace": None, "owner": "attach", "name": name,
         "created_at": now, "last_seen": now,
     }
@@ -72,20 +71,22 @@ _OPERATE_SCRIPT = (
 )
 
 
-def test_recovery_fast_path_across_processes(ext_ready):
+def test_recovery_fast_path_across_processes(ext_ready, e2e_daemon):
     """Process A opens a tab in session 'cf-bots'; process B (new process,
     empty in-process current_target_id) operates it with no attach — must
     transparently recover from the persisted ledger.runtime fast path."""
+    rd = e2e_daemon.runtime_dir
     sid = "rec-fast"
     ledger = _seed_session(sid, "cf-bots")
     try:
         a = run_skill(script=_OPEN_SCRIPT.format(title="RecoverFast"),
-                      backend="extension", extra_env={"BD_SESSION": sid})
+                      backend="extension", runtime_dir=rd,
+                      extra_env={"BD_SESSION": sid})
         assert a.returncode == 0, (a.stdout, a.stderr)
         _payload(a)  # tab opened
 
         b = run_skill(script=_OPERATE_SCRIPT, backend="extension",
-                      extra_env={"BD_SESSION": sid})
+                      runtime_dir=rd, extra_env={"BD_SESSION": sid})
         assert b.returncode == 0, (
             f"transparent recovery failed; stdout={b.stdout!r} stderr={b.stderr!r}")
         # The extension prepends a "👀 " attach-marker to the live DOM title;
@@ -95,16 +96,18 @@ def test_recovery_fast_path_across_processes(ext_ready):
         ledger.unlink(missing_ok=True)
 
 
-def test_recovery_via_group_when_runtime_stale(ext_ready):
+def test_recovery_via_group_when_runtime_stale(ext_ready, e2e_daemon):
     """When the ledger.runtime fast path points at a dead target (simulating a
     browser restart that changed tab ids), process B must fall back to
     BrowserwrightDaemon.recoverSession, which finds the tab by the group whose title
     == the session name. Transitively proves name->tab-group titling."""
+    rd = e2e_daemon.runtime_dir
     sid = "rec-group"
     ledger = _seed_session(sid, "cf-bots2")
     try:
         a = run_skill(script=_OPEN_SCRIPT.format(title="RecoverGroup"),
-                      backend="extension", extra_env={"BD_SESSION": sid})
+                      backend="extension", runtime_dir=rd,
+                      extra_env={"BD_SESSION": sid})
         assert a.returncode == 0, (a.stdout, a.stderr)
         _payload(a)
 
@@ -118,7 +121,7 @@ def test_recovery_via_group_when_runtime_stale(ext_ready):
         ledger.write_text(json.dumps(data), encoding="utf-8")
 
         b = run_skill(script=_OPERATE_SCRIPT, backend="extension",
-                      extra_env={"BD_SESSION": sid})
+                      runtime_dir=rd, extra_env={"BD_SESSION": sid})
         assert b.returncode == 0, (
             f"group-fallback recovery failed; stdout={b.stdout!r} stderr={b.stderr!r}")
         assert "RecoverGroup" in _payload(b)["title"]

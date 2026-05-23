@@ -17,13 +17,19 @@ def _extract_payload(stdout: str) -> dict:
 
 
 @pytest.mark.parametrize("backend,fixture_name,nav_fn", [
-    ("extension", "ext_ready", "open_background"),
+    ("extension", "ext_ready", "open"),
     ("rdp", "e2e_rdp_daemon", "goto_url"),
 ])
 def test_dom_query_parity(backend, fixture_name, nav_fn, request):
-    # Both scenarios drive the browser through their Mode B daemon (the fixture
-    # ensures daemon + Chrome are up); no direct-ws injection.
-    request.getfixturevalue(fixture_name)
+    # Both scenarios drive the browser through the single global daemon (the
+    # fixture ensures daemon + Chrome are up); no direct-ws injection.
+    fixture_val = request.getfixturevalue(fixture_name)
+    # Resolve the daemon's XDG_RUNTIME_DIR (its fixed socket): the rdp fixture
+    # yields it directly; for extension, read it off the e2e_daemon handle.
+    if backend == "rdp":
+        runtime_dir = fixture_val
+    else:
+        runtime_dir = request.getfixturevalue("e2e_daemon").runtime_dir
     script = (
         "import json\n"
         f"{nav_fn}({PAGE!r})\n"
@@ -32,7 +38,7 @@ def test_dom_query_parity(backend, fixture_name, nav_fn, request):
         "title = js(\"document.title\")\n"
         "print(json.dumps({'txt': txt, 'title': title}))\n"
     )
-    result = run_skill(script=script, backend=backend)
+    result = run_skill(script=script, backend=backend, runtime_dir=runtime_dir)
     assert result.returncode == 0, result.stderr
     payload = _extract_payload(result.stdout)
     assert payload["txt"] == "P"

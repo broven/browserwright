@@ -189,7 +189,7 @@ def launch_cft_with_extension(
 class DaemonHandle:
     proc: subprocess.Popen
     ext_port: int
-    name: str
+    runtime_dir: str   # XDG_RUNTIME_DIR the daemon's fixed socket lives under
     log_path: Path
 
 
@@ -212,12 +212,15 @@ def port_free(port: int) -> bool:
 
 def spawn_daemon(
     ext_port: int,
-    name: str,
+    runtime_dir: str,
     log_path: Path,
     *,
     env: dict[str, str] | None = None,
 ) -> DaemonHandle:
-    """Spawn ``browserwright-daemon serve`` and wait until /__status__ responds."""
+    """Spawn ``browserwright-daemon serve`` and wait until /__status__ responds.
+
+    Single-global-daemon: isolation is via ``runtime_dir`` (XDG_RUNTIME_DIR →
+    distinct fixed socket) + the relay port, NOT a ``--name``."""
     if not port_free(ext_port):
         raise RuntimeError(
             f"port {ext_port} already in use; another daemon running? "
@@ -225,7 +228,9 @@ def spawn_daemon(
         )
 
     run_env = env or scrubbed_env()
-    run_env["BD_NAME"] = name
+    run_env["XDG_RUNTIME_DIR"] = runtime_dir
+    run_env["TMPDIR"] = runtime_dir
+    run_env["BD_EXTENSION_PORT"] = str(ext_port)
     run_env["BD_CONFIG"] = ""
 
     log_fh = open(log_path, "wb")
@@ -235,7 +240,6 @@ def spawn_daemon(
             "serve",
             "--backend", "extension",
             "--extension-port", str(ext_port),
-            "--name", name,
             "-v",
         ],
         stdout=log_fh,
@@ -255,7 +259,8 @@ def spawn_daemon(
         log_fh.close()
         raise
 
-    return DaemonHandle(proc=proc, ext_port=ext_port, name=name, log_path=log_path)
+    return DaemonHandle(proc=proc, ext_port=ext_port,
+                        runtime_dir=runtime_dir, log_path=log_path)
 
 
 def poll_status(

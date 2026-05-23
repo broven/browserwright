@@ -153,13 +153,13 @@ def patched_resolver(monkeypatch, fake_upstream):
 
 @pytest.fixture
 async def daemon(short_runtime, patched_resolver):
-    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"}, cli_name="mc")
+    cfg = load(env={"NO_PROXY": "127.0.0.1,localhost"})
     cfg.backend = "env"
     cfg.timeout = 5.0
     task = asyncio.create_task(listener_mod.run_serve(cfg))
     for _ in range(30):
         await asyncio.sleep(0.05)
-        if _ipc.sock_path(cfg.name).exists():
+        if _ipc.sock_path().exists():
             break
     else:
         task.cancel()
@@ -172,7 +172,7 @@ async def daemon(short_runtime, patched_resolver):
             await asyncio.wait_for(task, timeout=3.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        _ipc.cleanup_endpoint(cfg.name)
+        _ipc.cleanup_endpoint()
 
 
 async def _client(sock_path: Path, label: str):
@@ -205,7 +205,7 @@ async def test_two_clients_attach_same_target_second_gets_minus_32602(daemon, fa
     gets `-32602`, first unaffected, first's sessionId still works for
     subsequent commands.
     """
-    sock = _ipc.sock_path(daemon.name)
+    sock = _ipc.sock_path()
     async with await _client(sock, "alice") as alice, \
                await _client(sock, "bob") as bob:
         # Alice attaches.
@@ -241,7 +241,7 @@ async def test_event_isolation_per_session(daemon, fake_upstream):
     Y. A `Network.responseReceived` event on X's session reaches only A; on
     Y's session only B. A browser-level event broadcasts to both.
     """
-    sock = _ipc.sock_path(daemon.name)
+    sock = _ipc.sock_path()
     async with await _client(sock, "alice") as alice, \
                await _client(sock, "bob") as bob:
         # Alice attaches X.
@@ -322,7 +322,7 @@ async def test_shared_read_second_attacher_receives_events_but_not_commands(daem
     `flags.allowSecondaryReadOnly=true` gets a readonly session.
     Read-only client receives events; commands return -32602.
     """
-    sock = _ipc.sock_path(daemon.name)
+    sock = _ipc.sock_path()
     async with await _client(sock, "primary") as primary, \
                await _client(sock, "reader") as reader:
         # Primary attaches first.

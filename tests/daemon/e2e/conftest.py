@@ -31,19 +31,28 @@ import pytest
 # from common dev ports to reduce collisions.
 TEST_EXT_PORT = 29989
 TEST_RDP_PORT = 29990
-TEST_NAME = "bd-e2e"
-# Distinct daemon instance (socket name) for the rdp scenario: the extension
-# daemon (TEST_NAME) serves `extension`, so rdp must run its own Mode B serve
-# under a separate BD_NAME — both scenarios drive the browser *through* the
-# daemon, never via a direct ws (Mode A was removed).
-TEST_RDP_NAME = "bd-e2e-rdp"
+# Single-global-daemon model: BD_NAME / `--name` are gone. The e2e harness now
+# isolates the test daemon from the developer's real daemon by pointing
+# XDG_RUNTIME_DIR at a throwaway temp dir (→ a distinct fixed socket path) and
+# overriding the relay port (BD_EXTENSION_PORT=29989). One daemon serves both
+# backends, routing per session by the ledger's immutable per-session backend.
+
+
+def _isolated_runtime_dir() -> str:
+    """A fresh short temp dir for XDG_RUNTIME_DIR.
+
+    The daemon's fixed socket lives under XDG_RUNTIME_DIR, so a unique dir per
+    test run gives a unique socket — the e2e-isolation mechanism that replaced
+    BD_NAME. Kept short (/tmp) for the macOS AF_UNIX 104-byte sun_path budget.
+    """
+    return tempfile.mkdtemp(prefix="bd-e2e-", dir="/tmp")
 
 
 def scrubbed_env() -> dict[str, str]:
     """Return os.environ with BD_*/BS_*/BU_* vars stripped.
 
     Prevents the user's shell environment from leaking into test
-    subprocesses (e.g. BD_RDP_PORT, BD_BACKEND, BD_NAME).
+    subprocesses (e.g. BD_RDP_PORT, BD_BACKEND).
     Callers re-add only the vars they need for isolation.
     """
     return {k: v for k, v in os.environ.items()
@@ -107,7 +116,7 @@ def _opted_in_to_real_chrome(config) -> bool:
 class DaemonHandle:
     proc: subprocess.Popen
     ext_port: int
-    name: str
+    runtime_dir: str   # XDG_RUNTIME_DIR the daemon's fixed socket lives under
     log_path: Path
 
 
@@ -129,8 +138,10 @@ def e2e_artifacts_dir() -> Path:
 
 @pytest.fixture(scope="session")
 def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
-    """Spawn `browserwright-daemon serve --backend extension --extension-port N
-    --name bd-e2e` for the duration of the session. Yields a DaemonHandle.
+    """Spawn `browserwright-daemon serve --backend extension --extension-port N`
+    for the duration of the session, isolated from the developer's real daemon
+    via a throwaway XDG_RUNTIME_DIR (distinct fixed socket) + the test relay
+    port. No `--name` (single global daemon). Yields a DaemonHandle.
     """
     if not _port_free(TEST_EXT_PORT):
         pytest.fail(
@@ -141,8 +152,16 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     log_path = e2e_artifacts_dir / "daemon.log"
     log_fh = open(log_path, "wb")  # noqa: SIM115 — closed in teardown
 
+    runtime_dir = _isolated_runtime_dir()
     env = os.environ.copy()
-    env["BD_NAME"] = TEST_NAME
+    # Isolation: a unique XDG_RUNTIME_DIR → a unique fixed socket path, so the
+    # test daemon never collides with the developer's real daemon. (Replaces
+    # the old BD_NAME-suffixed socket.)
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
+    # Relay-port override (the harness already pins 29989) keeps the test relay
+    # off the production 19989.
+    env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
     # Neutralise any externally-set BD_CONFIG so the test daemon doesn't
     # inherit the user's toml (which may set relay_url, ports, etc.).
     # Empty string means "no config file" — the daemon falls through to
@@ -155,7 +174,6 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
             "serve",
             "--backend", "extension",
             "--extension-port", str(TEST_EXT_PORT),
-            "--name", TEST_NAME,
             "-v",
         ],
         stdout=log_fh,
@@ -189,7 +207,8 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
             f"see {log_path}"
         )
 
-    yield DaemonHandle(proc=proc, ext_port=TEST_EXT_PORT, name=TEST_NAME, log_path=log_path)
+    yield DaemonHandle(proc=proc, ext_port=TEST_EXT_PORT,
+                       runtime_dir=runtime_dir, log_path=log_path)
 
     # Teardown.
     proc.terminate()
@@ -199,6 +218,7 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
+    shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -459,25 +479,29 @@ def e2e_chrome_rdp(tmp_path_factory):
 
 @pytest.fixture
 def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
-    """Spawn `browserwright-daemon serve --backend rdp --name bd-e2e-rdp` against
-    the rdp Chrome, for the rdp scenario.
+    """Spawn `browserwright-daemon serve --backend rdp` against the rdp Chrome,
+    for the rdp scenario.
 
-    Mirrors `e2e_daemon` (the extension scenario) but for rdp: the skill drives
-    the browser *through* this Mode B daemon (no direct-ws / Mode A). The rdp
-    upstream is resolved lazily on the first client frame via `BD_RDP_PORT`.
-    Yields the daemon's BD_NAME.
+    Single-global-daemon: no `--name`. Isolated from the developer's daemon (and
+    from the extension `e2e_daemon`) via its own throwaway XDG_RUNTIME_DIR →
+    distinct fixed socket. The skill drives the browser *through* this Mode B
+    daemon (no direct-ws / Mode A); the rdp upstream is resolved lazily on the
+    first client frame via `BD_RDP_PORT`. Yields the daemon's XDG_RUNTIME_DIR so
+    callers can point `status`/`stop`/clients at the right fixed socket.
     """
     log_path = e2e_artifacts_dir / "daemon-rdp.log"
     log_fh = open(log_path, "wb")  # noqa: SIM115 — closed in teardown
 
+    runtime_dir = _isolated_runtime_dir()
     env = os.environ.copy()
-    env["BD_NAME"] = TEST_RDP_NAME
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
     env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
     # Don't inherit the user's toml (relay_url / ports / default_backend).
     env["BD_CONFIG"] = ""
 
-    # Clear any stale daemon under this name (leftover socket from a crash).
-    subprocess.run(["browserwright-daemon", "stop", "--name", TEST_RDP_NAME],
+    # Clear any stale daemon at this fixed socket (leftover from a crash).
+    subprocess.run(["browserwright-daemon", "stop"],
                    capture_output=True, env=env)
 
     proc = subprocess.Popen(
@@ -485,7 +509,6 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
             sys.executable, "-m", "browserwright.daemon.cli",
             "serve",
             "--backend", "rdp",
-            "--name", TEST_RDP_NAME,
             "-v",
         ],
         stdout=log_fh,
@@ -504,7 +527,7 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
                 f"see {log_path}"
             )
         status = subprocess.run(
-            ["browserwright-daemon", "status", "--name", TEST_RDP_NAME, "--json"],
+            ["browserwright-daemon", "status", "--json"],
             capture_output=True, text=True, env=env,
         )
         if status.returncode == 0 and status.stdout.strip():
@@ -522,10 +545,10 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
             f"see {log_path}"
         )
 
-    yield TEST_RDP_NAME
+    yield runtime_dir
 
     # Teardown.
-    subprocess.run(["browserwright-daemon", "stop", "--name", TEST_RDP_NAME],
+    subprocess.run(["browserwright-daemon", "stop"],
                    capture_output=True, env=env)
     proc.terminate()
     try:
@@ -534,3 +557,4 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
+    shutil.rmtree(runtime_dir, ignore_errors=True)

@@ -67,16 +67,16 @@ V2_BROWSER_DAEMON_METHODS = frozenset({
     "BrowserwrightDaemon.disconnect",
     "BrowserwrightDaemon.version",
     "BrowserwrightDaemon.stats",
-    # v0.5.4 — extension backend only; -32601 on other backends.
+    # Unified session verbs — same wire name + result shape on both backends;
+    # the daemon dispatches by the context's (immutable) backend, never -32601.
     "BrowserwrightDaemon.attachActiveTab",
-    # Phase B: extension-backend-only verbs.
     "BrowserwrightDaemon.openBackgroundTab",
     "BrowserwrightDaemon.closeTab",
-    # P5: per-session teardown (extension backend only).
+    # Single-global-daemon: session lifecycle (backend read from the ledger).
+    "BrowserwrightDaemon.ensureSession",
     "BrowserwrightDaemon.endSession",
-    # Session-reconnect-recovery (extension backend only).
     "BrowserwrightDaemon.recoverSession",
-    # Resident userscripts (extension backend only).
+    # Resident userscripts (extension native; rdp shim via CDP, never -32601).
     "BrowserwrightDaemon.userscript.install",
 })
 
@@ -201,7 +201,7 @@ async def test_browserwright_daemon_dispatch_uses_v2_lockable_methods_only(monke
     from browserwright.daemon.server.proxy import Router
     from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
-    state = DaemonState(name="t", backend_name="rdp")
+    state = DaemonState(backend_name="rdp")
     state.upstream_phase = UpstreamPhase.CONNECTED
     router = Router(state)
     captured: list[dict] = []

@@ -51,6 +51,7 @@ from .page import (  # noqa: F401
     iframe_target,
     list_tabs,
     new_tab,
+    open,
     open_background,
     reload,
     switch_tab,

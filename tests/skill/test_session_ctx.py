@@ -25,7 +25,7 @@ def test_resolve_session_unknown_id_raises(tmp_bs_home, monkeypatch):
 
 def test_resolve_session_returns_record_and_touches(tmp_bs_home, monkeypatch):
     from browserwright import session_registry as reg
-    sid = reg.allocate(backend="extension", daemon_endpoint="default", owner="attach")
+    sid = reg.allocate(backend="extension", owner="attach")
     monkeypatch.setattr(reg.time, "time", lambda: 5_000.0)
     monkeypatch.setenv("BD_SESSION", sid)
     rec = session_ctx.resolve_session()
@@ -36,7 +36,7 @@ def test_resolve_session_returns_record_and_touches(tmp_bs_home, monkeypatch):
 
 def test_resolve_session_explicit_arg_beats_env(tmp_bs_home, monkeypatch):
     from browserwright import session_registry as reg
-    sid = reg.allocate(backend="rdp", daemon_endpoint="d", owner="create")
+    sid = reg.allocate(backend="rdp", owner="create")
     monkeypatch.setenv("BD_SESSION", "999")  # bogus env
     rec = session_ctx.resolve_session(sid)
     assert rec["id"] == sid
@@ -59,7 +59,7 @@ def test_inline_run_allows_pure_python_with_session(tmp_bs_home, monkeypatch, ca
     from browserwright import session_registry as reg
     from browserwright.repl import inline
 
-    sid = reg.allocate(backend="extension", daemon_endpoint="default", owner="attach")
+    sid = reg.allocate(backend="extension", owner="attach")
     monkeypatch.setenv("BD_SESSION", sid)
     rc = inline.run(io.StringIO("print(2 + 3)\n"))
     assert rc == 0

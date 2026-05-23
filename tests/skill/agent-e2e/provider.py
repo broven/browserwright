@@ -15,14 +15,19 @@ import os
 from pathlib import Path
 
 from agent_runner import run_agent
-from hooks import WORKSPACE_ROOT, EXT_PORT, DAEMON_NAME, ARTIFACTS_DIR
+from hooks import WORKSPACE_ROOT, EXT_PORT, RUNTIME_DIR, ARTIFACTS_DIR
 
 
 def _build_env() -> dict[str, str]:
-    """Build environment for the sub-agent's browserwright calls."""
+    """Build environment for the sub-agent's browserwright calls.
+
+    Single-global-daemon: reach the test daemon's fixed socket via its
+    dedicated XDG_RUNTIME_DIR (no BD_NAME); the relay port is the upstream wall.
+    """
     return {
         "BS_HOME": str(WORKSPACE_ROOT / ".browserwright"),
-        "BD_NAME": DAEMON_NAME,
+        "XDG_RUNTIME_DIR": RUNTIME_DIR,
+        "TMPDIR": RUNTIME_DIR,
         "BD_EXTENSION_PORT": str(EXT_PORT),
         "BD_BACKEND": "extension",
         "no_proxy": "127.0.0.1,localhost",
