@@ -38,11 +38,35 @@ from ..resolver import resolve
 from ..observability import metrics, install_json_logging_if_requested
 from .state import CloseReason, DaemonState, UpstreamPhase
 from .proxy import Router
+from .daemon import Daemon, UpstreamContext
 from .upstream import UpstreamConnection
 from .relay import RelayServer
 from .extension_upstream import ExtensionUpstream
 
 logger = logging.getLogger(__name__)
+
+
+# ---- per-upstream context factory ------------------------------------------
+
+
+def make_context(*, backend: str, cfg: Config,
+                 session_id: str | None = None) -> UpstreamContext:
+    """Build one `UpstreamContext` — the `(state, router, holder)` triple for a
+    single upstream, wired exactly like `run_serve` wired the single triple
+    before Phase 2. Lives here (not in daemon.py) because it constructs the
+    `_UpstreamHolder`, which is a listener-module concern.
+
+    The relay is NOT started here (only the extension *shared* context gets a
+    relay, started eagerly in `run_serve`); for everything else the holder's
+    lazy-open path opens the upstream on first client frame.
+    """
+    state = DaemonState(backend_name=backend)
+    router = Router(state)
+    holder = _UpstreamHolder(state, router, cfg)
+    return UpstreamContext(
+        backend=backend, state=state, router=router, holder=holder,
+        session_id=session_id,
+    )
 
 
 # ---- top-level entry -------------------------------------------------------
@@ -74,11 +98,23 @@ async def run_serve(cfg: Config) -> int:
     # file/console handlers, swap formatters in place if BD_LOG_JSON=1.
     install_json_logging_if_requested()
     logger.info("browserwright-daemon %s starting (backend=%s)",
-                __version__, cfg.backend or "auto")
+                __version__, cfg.backend or "extension")
 
-    state = DaemonState(backend_name=cfg.backend or "auto")
-    router = Router(state)
-    upstream = _UpstreamHolder(state, router, cfg)
+    # Phase 2: one global daemon holding many upstream contexts. The shared
+    # context is the real-browser upstream (cfg.backend, default extension);
+    # rdp sessions get their own context lazily (Daemon.context_for). The
+    # routing engine (Router/DaemonState/_UpstreamHolder) is unchanged — we
+    # just instantiate it per context and dispatch in `_ClientHandler`.
+    shared_backend = cfg.backend or "extension"
+    # Pin the shared context's holder cfg to the resolved backend: serve now
+    # defaults a missing backend to extension (cli._cmd_serve), so the holder
+    # must see backend="extension" — not None — to take its extension-upstream
+    # open path. dataclasses.replace keeps the rest of cfg intact.
+    import dataclasses as _dc
+    shared_cfg = _dc.replace(cfg, backend=shared_backend)
+    shared_context = make_context(backend=shared_backend, cfg=shared_cfg)
+    daemon = Daemon(cfg=cfg, shared_context=shared_context,
+                    make_context=make_context)
 
     # SIGTERM / SIGINT → set the stop event. We don't tear down inline because
     # we still need to run the graceful shutdown sequence (close clients with
@@ -98,20 +134,21 @@ async def run_serve(cfg: Config) -> int:
     # PID file (best-effort).
     _ipc.write_pid(os.getpid())
 
-    handler = _ClientHandler(state, router, upstream, cfg)
+    handler = _ClientHandler(daemon, cfg)
     server = await _open_server(handler)
 
-    # v0.4: for `--backend extension`, start the relay ws server eagerly so
-    # `browserwright-daemon doctor` can probe `__status__` even before any Skill
-    # client connects.
-    if cfg.backend == "extension":
+    # v0.4: for the extension shared context, start the relay ws server eagerly
+    # so `browserwright-daemon doctor` can probe `__status__` even before any
+    # Skill client connects. The relay belongs to the shared context's holder
+    # (it is the always-on, real-browser upstream).
+    if shared_backend == "extension":
         try:
             # v0.5.3 F-5 / Task #24: bind at the configured host+port.
             # Precedence (CLI > env > toml port > toml relay_url > default)
             # is centralized in cfg.backends.extension.resolved_host_port().
             host, port = cfg.backends.extension.resolved_host_port()
-            upstream.relay = RelayServer(host=host, port=port)
-            port = await upstream.relay.start()
+            shared_context.holder.relay = RelayServer(host=host, port=port)
+            port = await shared_context.holder.relay.start()
             logger.info("extension relay started on port %d", port)
         except OSError as e:
             print(
@@ -128,19 +165,22 @@ async def run_serve(cfg: Config) -> int:
 
     idle_task: asyncio.Task | None = None
     if cfg.idle_close_after is not None and cfg.idle_close_after > 0:
-        idle_task = asyncio.create_task(_idle_watchdog(state, upstream, cfg.idle_close_after))
+        idle_task = asyncio.create_task(_idle_watchdog(daemon, cfg.idle_close_after))
     try:
         await stop.wait()
         logger.info("browserwright-daemon shutdown requested")
-        await _graceful_shutdown(state, router, upstream)
+        await _graceful_shutdown(daemon)
     finally:
         if idle_task is not None:
             idle_task.cancel()
             with contextlib.suppress(Exception):
                 await idle_task
-        if upstream.relay is not None:
-            with contextlib.suppress(Exception):
-                await upstream.relay.stop()
+        # Stop every context's relay (only the extension shared context has
+        # one today, but iterate so a future rdp-with-relay can't leak).
+        for ctx in daemon.all_contexts():
+            if ctx.holder.relay is not None:
+                with contextlib.suppress(Exception):
+                    await ctx.holder.relay.stop()
         server.close()
         try:
             await server.wait_closed()
@@ -259,27 +299,42 @@ def _parse_query(path: str) -> dict[str, str]:
 
 class _ClientHandler:
     """Stateless adapter object — websockets gives us a ServerConnection per
-    incoming client; we wire it through the Router."""
+    incoming client; we dispatch it to the right `UpstreamContext` and wire it
+    through THAT context's Router.
 
-    def __init__(self, state: DaemonState, router: Router,
-                 upstream: "_UpstreamHolder", cfg: Config):
-        self.state = state
-        self.router = router
-        self.upstream = upstream
+    Phase 2: the handler holds the global `Daemon`, not a single triple. The
+    client's `?session=<id>` query selects the context (via the ledger's
+    immutable backend); `?client=<label>` is kept for log-friendly labels.
+    """
+
+    def __init__(self, daemon: "Daemon", cfg: Config):
+        self.daemon = daemon
         self.cfg = cfg
         self.token: str | None = None
 
     async def serve_one(self, conn: ServerConnection) -> None:
         """v0.3: handler instance per client connection — many run concurrently.
 
-        Each gets its own ClientState in DaemonState.clients and its own
-        send-to-client closure registered with the router. On disconnect we
-        release the client's sessions (which also pops attachers it owned)
-        but leave upstream warm for surviving clients.
+        Phase 2 dispatch: parse `?session=<id>` (and keep `?client=<label>`),
+        resolve the `UpstreamContext` via `daemon.context_for(session_id)`, then
+        register/route/release entirely against THAT context's state + router.
+        Because a client is bound to one context for its whole life, each
+        context's `Router._broadcast` only ever reaches its own clients —
+        browser-level events cannot leak across contexts.
         """
         query = _parse_query(conn.request.path or "/")
         label = query.get("client", "anonymous")
-        client = self.state.allocate_client(label)
+        session_id = query.get("session") or None
+
+        ctx = self.daemon.context_for(session_id)
+        state = ctx.state
+        router = ctx.router
+        holder = ctx.holder
+
+        # Allocate with a globally-unique client id (unique across contexts)
+        # but register it in this context's own client table.
+        client = state.allocate_client(
+            label, client_id=next(self.daemon._next_client_id))
 
         async def send_to_client(text: str) -> None:
             try:
@@ -287,36 +342,37 @@ class _ClientHandler:
             except Exception as e:
                 logger.warning("client %d send failed: %r", client.client_id, e)
 
-        self.router.register_client(client.client_id, send_to_client)
-        self.router.bind_lifecycle(
-            ensure_upstream=self.upstream.ensure_open,
-            trigger_disconnect=self.upstream.trigger_close,
+        router.register_client(client.client_id, send_to_client)
+        router.bind_lifecycle(
+            ensure_upstream=holder.ensure_open,
+            trigger_disconnect=holder.trigger_close,
         )
 
         # If upstream is already open (warm from another client), make sure the
         # router has the send fn wired. (The first ensure_open call wires it
         # internally; subsequent client sessions inherit it.)
-        if self.upstream.is_open:
-            self.router.update_upstream_send(self.upstream.send_text)
+        if holder.is_open:
+            router.update_upstream_send(holder.send_text)
 
         metrics().client_connected_total += 1
-        logger.info("client %d connected (label=%s, total=%d)",
-                    client.client_id, label, len(self.state.clients))
+        logger.info("client %d connected (label=%s, session=%s, backend=%s, total=%d)",
+                    client.client_id, label, session_id or "-", ctx.backend,
+                    len(state.clients))
         try:
             async for raw in conn:
                 if not isinstance(raw, (str, bytes)):
                     continue
                 text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
                 metrics().client_frame_received_total += 1
-                await self.router.route_from_client(client, text)
+                await router.route_from_client(client, text)
         except websockets.exceptions.ConnectionClosed:
             logger.info("client %d disconnected", client.client_id)
         except Exception as e:
             logger.warning("client %d crashed: %r", client.client_id, e)
         finally:
             metrics().client_disconnected_total += 1
-            self.state.release_client(client.client_id)
-            self.router.unregister_client(client.client_id)
+            state.release_client(client.client_id)
+            router.unregister_client(client.client_id)
             # Upstream stays warm so other clients (or the next reconnect)
             # don't pay banner-flash for our churn.
 
@@ -658,10 +714,12 @@ class _UpstreamHolder:
 # ---- graceful shutdown -----------------------------------------------------
 
 
-async def _idle_watchdog(state: DaemonState, upstream: "_UpstreamHolder",
-                         idle_after: float) -> None:
-    """Spec §6.5/§6.6: when configured, close upstream after `idle_after`
+async def _idle_watchdog(daemon: "Daemon", idle_after: float) -> None:
+    """Spec §6.5/§6.6: when configured, close each upstream after `idle_after`
     seconds with no activity. The next client command lazy-opens it again.
+
+    Phase 2: iterate every context (shared + rdp) so per-upstream idle is
+    enforced independently — one busy upstream doesn't keep an idle one warm.
 
     Default is None (never) — the listener only schedules this task when
     `idle_close_after` is set. We poll at half the threshold so the wakeup
@@ -671,26 +729,29 @@ async def _idle_watchdog(state: DaemonState, upstream: "_UpstreamHolder",
     try:
         while True:
             await asyncio.sleep(poll)
-            if state.upstream_phase != UpstreamPhase.CONNECTED:
-                continue
-            idle_for = time.time() - state.last_activity_at
-            if idle_for >= idle_after:
-                logger.info("idle-watchdog: closing upstream after %.1fs", idle_for)
-                try:
-                    await upstream.trigger_close("idle_close")
-                except Exception as e:
-                    logger.warning("idle close failed: %r", e)
+            for ctx in daemon.all_contexts():
+                if ctx.state.upstream_phase != UpstreamPhase.CONNECTED:
+                    continue
+                idle_for = time.time() - ctx.state.last_activity_at
+                if idle_for >= idle_after:
+                    logger.info("idle-watchdog: closing %s upstream after %.1fs",
+                                ctx.backend, idle_for)
+                    try:
+                        await ctx.holder.trigger_close("idle_close")
+                    except Exception as e:
+                        logger.warning("idle close failed: %r", e)
     except asyncio.CancelledError:
         return
 
 
-async def _graceful_shutdown(state: DaemonState, router: Router,
-                             upstream: "_UpstreamHolder") -> None:
-    """Called on SIGTERM. Run close etiquette then close listener."""
-    try:
-        await upstream.trigger_close("daemon_shutdown")
-    except Exception as e:
-        logger.warning("shutdown close failed: %r", e)
+async def _graceful_shutdown(daemon: "Daemon") -> None:
+    """Called on SIGTERM. Run close etiquette on every context then close
+    the listener."""
+    for ctx in daemon.all_contexts():
+        try:
+            await ctx.holder.trigger_close("daemon_shutdown")
+        except Exception as e:
+            logger.warning("shutdown close failed for %s: %r", ctx.backend, e)
 
 
 # ---- helper for the cli serve dispatcher ----------------------------------

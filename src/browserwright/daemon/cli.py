@@ -380,20 +380,15 @@ def _cmd_url(args, cfg: Config) -> int:
 def _cmd_serve(args, cfg: Config) -> int:
     """Run the long-lived Mode B daemon (§5 v0.2).
 
-    Unlike the Mode A probes (`url`, `doctor`), `serve` refuses to start under
-    auto. The daemon binds its backend for its whole lifetime — an accidental
-    auto→rdp fallback (e.g. a version-coherence respawn that dropped --backend)
-    silently leaves the extension relay un-bound and the extension unable to
-    connect. So require an explicit backend from CLI --backend, BD_BACKEND, or
-    config.toml `default_backend` (all three feed cfg.backend); fail loud
-    otherwise instead of guessing.
+    Phase 2 (docs/refactor-single-daemon.md): there is exactly ONE global
+    daemon and it serves BOTH backends simultaneously, routing per session. So
+    `serve` no longer requires an explicit backend — a missing backend defaults
+    to `extension`, which becomes the daemon's shared (real-browser) upstream
+    with the always-on relay. rdp sessions get their own per-session upstream
+    on top, dispatched by the ledger's immutable per-session backend. The old
+    "fail loud on missing backend (to avoid a silent rdp fallback)" guard is
+    gone: there is no single-backend lifetime to protect anymore.
     """
-    if cfg.backend is None:
-        raise UserError(
-            "serve requires an explicit backend (auto-selection is disabled "
-            "for the long-lived daemon to avoid a silent rdp fallback). Pass "
-            "--backend {env|rdp|extension|cloud}, or set BD_BACKEND, or "
-            "`default_backend` in config.toml.")
     from .server.listener import run_serve
     return _run(run_serve(cfg))
 

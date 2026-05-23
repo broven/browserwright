@@ -170,8 +170,12 @@ class DaemonState:
 
     # ---- client lifecycle -------------------------------------------------
 
-    def allocate_client(self, label: str) -> ClientState:
-        cid = next(self._next_client_id)
+    def allocate_client(self, label: str, *, client_id: int | None = None) -> ClientState:
+        # Phase 2: the Daemon passes a globally-unique client_id (unique across
+        # all UpstreamContexts) so daemon logs never show two clients sharing a
+        # number. When omitted (single-context callers / tests), fall back to
+        # this state's own monotonic counter.
+        cid = client_id if client_id is not None else next(self._next_client_id)
         c = ClientState(client_id=cid, label=label or "anonymous")
         self.clients[cid] = c
         return c

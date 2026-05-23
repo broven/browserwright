@@ -91,6 +91,11 @@ class Router:
 
     def __init__(self, state: DaemonState):
         self.state = state
+        # Phase 2: back-reference to the global Daemon, set by Daemon.__init__
+        # / _ensure_rdp_context. Lets the session-verb handlers (ensureSession /
+        # endSession) create or drop an rdp UpstreamContext. None in unit tests
+        # that build a bare Router — those handlers degrade gracefully.
+        self.daemon: object | None = None
         self._upstream_send: Callable[[str], Awaitable[None]] | None = None
         self._client_sends: dict[int, Callable[[str], Awaitable[None]]] = {}
         self._ensure_upstream: Callable[[], Awaitable[None]] | None = None
@@ -847,6 +852,9 @@ class Router:
         if method == "BrowserwrightDaemon.closeTab":
             await self._handle_close_tab(client, msg, req_id)
             return
+        if method == "BrowserwrightDaemon.ensureSession":
+            await self._handle_ensure_session(client, msg, req_id)
+            return
         if method == "BrowserwrightDaemon.endSession":
             await self._handle_end_session(client, msg, req_id)
             return
@@ -1029,11 +1037,54 @@ class Router:
             "recovered": result.get("recovered", []),
         }))
 
+    async def _handle_ensure_session(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """Phase 2: backend-neutral session verb. Idempotent.
+
+        The backend is read from the ledger (NOT a param) by the dispatcher in
+        listener / Daemon, so by the time a client reaches this Router it is
+        ALREADY routed to the right context:
+          - extension/env/cloud → the shared context (this Router). The client
+            is attached; ensureSession is a no-op success.
+          - rdp → a per-session context. `Daemon.context_for(session_id)`
+            already created the context (its state/router/holder) when this
+            client connected with `?session=`; we re-invoke it here so a
+            client that connected sessionless and only later learned its id can
+            still materialize the context. Phase 3 makes the holder launch the
+            per-session Chrome — for now context creation is success enough.
+
+        Returns `{ "ok": true }`. Never `-32601`.
+        """
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        session = params.get("session_id") or params.get("session")
+        session = session if isinstance(session, str) and session else None
+        daemon = self.daemon
+        if session and daemon is not None:
+            try:
+                # Idempotent get-or-create of the session's context. For
+                # extension/env/cloud this returns the shared context (no-op);
+                # for rdp it ensures the per-session context exists.
+                daemon.context_for(session)  # type: ignore[attr-defined]
+            except Exception as e:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603, f"ensureSession failed: {e!r}"))
+                return
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, {"ok": True}))
+
     async def _handle_end_session(
         self, client: ClientState, msg: dict, req_id: int | None,
     ) -> None:
-        """P5.4: tear down a browserwright session's extension workspace —
-        close owned tabs, keep borrowed ones. Requires backend=extension."""
+        """P5.4 / Phase 2: tear down a browserwright session.
+
+        extension: close the session's extension workspace (owned tabs closed,
+        borrowed kept) via the wired `_end_session` callback.
+
+        rdp: the per-session context owns a dedicated Chrome. Phase 3 will close
+        that Chrome + drop the context here; for now we return a uniform,
+        non-`-32601` success after dropping the context registration so the
+        wire contract holds (docs §RPCs: same-shape, never -32601)."""
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = params.get("session")
         if not isinstance(session, str) or not session:
@@ -1041,6 +1092,21 @@ class Router:
                 req_id, -32602,
                 "BrowserwrightDaemon.endSession requires params.session"))
             return
+
+        # rdp branch: if this Router is an rdp per-session context (or the
+        # session resolves to one), drop the context. Phase-3 TODO: also kill
+        # the owned Chrome process + remove the bs-s{id} profile dir.
+        daemon = self.daemon
+        if daemon is not None and getattr(daemon, "contexts", None):
+            if session in daemon.contexts:  # type: ignore[attr-defined]
+                # TODO(Phase 3): close the per-session Chrome + upstream before
+                # dropping. For now drop the registration so a later
+                # ensureSession recreates a fresh context.
+                daemon.drop_rdp_context(session)  # type: ignore[attr-defined]
+                await self._send_to_client(client.client_id, _result_response(
+                    req_id, {"ok": True, "closed": [], "kept": [],
+                             "backend": "rdp", "deferred": "phase3-chrome-teardown"}))
+                return
         group_name = params.get("groupName")
         group_name = group_name if isinstance(group_name, str) and group_name else None
         if self._end_session is None:
