@@ -23,6 +23,7 @@ dependencies = [
     { name = "cdp-use" },
     { name = "httpx" },
     { name = "pillow" },
+    { name = "playwright" },
     { name = "websockets" },
 ]
 
@@ -34,7 +35,6 @@ ux = [
 [package.dev-dependencies]
 dev = [
     { name = "coverage" },
-    { name = "playwright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -44,6 +44,7 @@ requires-dist = [
     { name = "cdp-use", specifier = "==1.4.5" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pillow", specifier = "==12.2.0" },
+    { name = "playwright", specifier = ">=1.60.0" },
     { name = "rich", marker = "extra == 'ux'", specifier = ">=13" },
     { name = "websockets", specifier = "==15.0.1" },
 ]
@@ -52,7 +53,6 @@ provides-extras = ["ux"]
 [package.metadata.requires-dev]
 dev = [
     { name = "coverage", specifier = ">=7" },
-    { name = "playwright", specifier = ">=1.60.0" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
 ]

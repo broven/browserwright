@@ -81,6 +81,17 @@ def build_globals() -> dict[str, Any]:
     g["sys"] = sys
     g["__name__"] = "__skill__"
     g["__builtins__"] = __builtins__
+    # Phase C: a lazy Playwright `page` / `context` bound to the session's
+    # current tab. Both are transparent proxies that DON'T connect until first
+    # use, so a pure memory()/site-skill heredoc opens no browser connection.
+    # The owning handle is stashed under a private key so the heredoc runner
+    # can tear the connection down at heredoc end (see inline.py). It is NOT a
+    # core EXPORT — only entry points that drive a heredoc inject it here.
+    from .playwright_handle import PlaywrightHandle, _LazyHandleProxy
+    handle = PlaywrightHandle()
+    g["page"] = _LazyHandleProxy(handle, "page")
+    g["context"] = _LazyHandleProxy(handle, "context")
+    g["__bw_playwright_handle__"] = handle
     # Agent-editable layer last, so helpers can call core primitives.
     _load_agent_helpers(g)
     return g

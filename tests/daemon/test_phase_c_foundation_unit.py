@@ -1,0 +1,148 @@
+"""Unit coverage for the Phase C PR1 foundation (no real browser):
+
+  - `Config.resolved_facade_port()` tri-state (auto-enable / disable / override).
+  - the `_ipc` facade discovery file round-trip + cleanup.
+  - `browserwright-daemon status --json` surfaces the advertised facade ws.
+  - the lazy heredoc `page`/`context` proxies don't connect on construction.
+
+The connect+bind path itself (which needs the daemon facade + a browser) is
+covered by `tests/daemon/e2e/test_l2_heredoc_playwright_page.py`.
+"""
+from __future__ import annotations
+
+import json
+
+from browserwright.daemon import _ipc
+from browserwright.daemon.config import DEFAULT_FACADE_PORT, Config
+
+
+# ---- Config.resolved_facade_port() tri-state -------------------------------
+
+
+def test_facade_auto_enabled_when_unset():
+    # None (unset) → auto-enable on the default port.
+    assert Config().resolved_facade_port() == DEFAULT_FACADE_PORT
+
+
+def test_facade_disabled_when_zero():
+    # 0 → explicitly disabled (don't bind).
+    assert Config(facade_port=0).resolved_facade_port() is None
+
+
+def test_facade_explicit_port_override():
+    assert Config(facade_port=29991).resolved_facade_port() == 29991
+
+
+def test_facade_port_load_default_is_none(monkeypatch):
+    # `load()` with no flag/env/toml leaves facade_port None, which
+    # resolved_facade_port() then auto-enables — the opt-in override still works.
+    from browserwright.daemon.config import load
+    cfg = load(env={})
+    assert cfg.facade_port is None
+    assert cfg.resolved_facade_port() == DEFAULT_FACADE_PORT
+    cfg_off = load(env={"BD_FACADE_PORT": "0"})
+    assert cfg_off.resolved_facade_port() is None
+    cfg_ov = load(env={"BD_FACADE_PORT": "29991"})
+    assert cfg_ov.resolved_facade_port() == 29991
+
+
+# ---- _ipc facade discovery file --------------------------------------------
+
+
+def test_facade_file_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert _ipc.read_facade_file() == (None, None)  # absent
+    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+    assert _ipc.read_facade_file() == ("ws://127.0.0.1:19990/cdp", 19990)
+    assert _ipc.facade_path().exists()
+
+
+def test_facade_file_cleanup(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+    _ipc.cleanup_endpoint()
+    assert not _ipc.facade_path().exists()
+    assert _ipc.read_facade_file() == (None, None)
+
+
+def test_facade_file_bad_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    _ipc.facade_path().write_text("not json")
+    assert _ipc.read_facade_file() == (None, None)
+
+
+# ---- status --json surfaces facade -----------------------------------------
+
+
+def test_status_json_includes_facade(tmp_path, monkeypatch, capsys):
+    from browserwright.daemon import cli
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    # Pretend a daemon is alive and advertising a facade.
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: (4242, "0.6.0"))
+    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+
+    class _Args:
+        json = True
+
+    rc = cli._cmd_status(_Args(), Config())
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["alive"] is True
+    assert out["facade"] == {"ws": "ws://127.0.0.1:19990/cdp", "port": 19990}
+
+
+def test_status_json_facade_null_when_dead(tmp_path, monkeypatch, capsys):
+    from browserwright.daemon import cli
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: (None, None))
+    # Even if a stale facade file lingers, a dead daemon reports facade=None.
+    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+
+    class _Args:
+        json = True
+
+    rc = cli._cmd_status(_Args(), Config())
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["alive"] is False
+    assert out["facade"] is None
+
+
+# ---- lazy heredoc page/context: no connect on construction -----------------
+
+
+def test_lazy_proxies_do_not_connect_on_build_globals(monkeypatch):
+    """build_globals() injects lazy page/context proxies that must NOT open a
+    Playwright connection — a pure memory heredoc opens no browser."""
+    import browserwright.repl.playwright_handle as ph
+    from browserwright.repl import _namespace
+
+    called = {"connect": False}
+
+    def _boom(*a, **k):
+        called["connect"] = True
+        raise AssertionError("lazy proxy connected on construction")
+
+    # Any attempt to discover/connect the facade must be lazy.
+    monkeypatch.setattr(ph, "_facade_ws_url", _boom)
+
+    g = _namespace.build_globals()
+    assert "page" in g and "context" in g
+    assert "__bw_playwright_handle__" in g
+    # Constructing + having the proxies in scope must not connect.
+    assert called["connect"] is False
+    # repr is allowed (doesn't resolve the live object).
+    assert "lazy" in repr(g["page"])
+    assert called["connect"] is False
+    # Tear down cleanly (no connection was made → no-op).
+    g["__bw_playwright_handle__"].close()
+
+
+def test_handle_close_is_noop_without_connect():
+    from browserwright.repl.playwright_handle import PlaywrightHandle
+    h = PlaywrightHandle()
+    # close() before any access is a clean no-op (idempotent).
+    h.close()
+    h.close()

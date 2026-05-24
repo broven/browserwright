@@ -105,16 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
               "the default 19989. Only relevant when --backend extension. "
               "Equivalent to BD_EXTENSION_PORT env or "
               "[backends.extension].port in config.toml."))
-    # Phase A1 (Playwright facade, experimental): expose a Playwright-facing
+    # Playwright facade (Phase C: auto-enabled). Expose a Playwright-facing
     # CDP ws+HTTP endpoint a real `chromium.connect_over_cdp` can connect to.
-    # Opt-in: when omitted the facade does not bind. Equivalent to
-    # BD_FACADE_PORT env or `facade_port` in config.toml.
+    # ON by default (port 19990) — the skill layer's heredoc `page`/`context`
+    # depend on it. Pass an explicit port to override, or `--facade-port 0` to
+    # disable. Equivalent to BD_FACADE_PORT env or `facade_port` in config.toml.
     p_serve.add_argument(
         "--facade-port", type=int, default=None, metavar="N",
-        help=("EXPERIMENTAL: bind a Playwright-facing CDP facade on this port "
-              "(default 19990 if you pass 0-as-pick). Lets a real Playwright "
-              "client `connect_over_cdp(ws://127.0.0.1:N/cdp)` drive the "
-              "daemon-resolved Chrome (rdp backend, phase A1)."))
+        help=("bind the Playwright-facing CDP facade on this port "
+              "(default: ON at 19990; pass 0 to disable). Lets a real "
+              "Playwright client `connect_over_cdp(ws://127.0.0.1:N/cdp)` and "
+              "the skill heredoc `page`/`context` drive the resolved Chrome."))
 
     # stop (v0.2)
     p_stop = sub.add_parser("stop", help="stop the running daemon")
@@ -590,12 +591,20 @@ def _cmd_status(args, cfg: Config) -> int:
     from . import _ipc
     pid, version = _ipc.ping_status_sync(timeout=1.0)
     ep = _ipc.endpoint_describe()
+    facade_ws, facade_port = _ipc.read_facade_file()
     status = {
         "schema_version": 1,
         "alive": pid is not None,
         "pid": pid,
         "version": version,
         "endpoint": ep,
+        # Playwright facade discovery (Phase C). None when the facade is
+        # disabled or the daemon predates auto-enable. The skill layer reads
+        # this to `connect_over_cdp` the heredoc `page`/`context`.
+        "facade": (
+            {"ws": facade_ws, "port": facade_port}
+            if (pid is not None and facade_ws) else None
+        ),
     }
     if args.json:
         print(json.dumps(status, sort_keys=True))
@@ -608,6 +617,8 @@ def _cmd_status(args, cfg: Config) -> int:
                 print(f"  socket: {ep['path']}")
             else:
                 print(f"  tcp:    127.0.0.1:{ep['port']}  token={ep['token']}")
+            if facade_ws:
+                print(f"  facade: {facade_ws}")
     return 0 if pid is not None else 2
 
 

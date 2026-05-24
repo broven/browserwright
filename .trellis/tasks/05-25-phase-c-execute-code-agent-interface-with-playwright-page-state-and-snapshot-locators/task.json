@@ -3,7 +3,7 @@
   "name": "phase-c-execute-code-agent-interface-with-playwright-page-state-and-snapshot-locators",
   "title": "Phase C: execute(code) agent interface with Playwright page/state and snapshot locators",
   "description": "",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,

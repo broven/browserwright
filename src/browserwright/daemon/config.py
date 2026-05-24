@@ -23,6 +23,12 @@ from pathlib import Path
 # BD_NAME was removed — see docs/refactor-single-daemon.md.)
 _NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
+# Default port for the Playwright-facing CDP facade. Distinct from the
+# extension relay (19989) and playwriter's 19988 so all three can coexist on one
+# machine. Defined here (not facade.py) so config has no import cycle; facade.py
+# re-exports it for backwards compat.
+DEFAULT_FACADE_PORT = 19990
+
 
 def check_name(name: str) -> str:
     """Path-traversal guard for filesystem-bound names (e.g. `--profile`)."""
@@ -125,15 +131,35 @@ class Config:
     cdp_url: str | None = None             # BD_CDP_URL / BU_CDP_URL — env backend uses this
     chrome_binary: str | None = None       # BD_CHROME_BINARY — launch-chrome
     idle_close_after: float | None = None  # seconds; None = never (default)
-    # Playwright-facing CDP facade (Task #tab-handle-model, phase A1). When set
-    # (>0), `serve` binds an additional TCP ws+HTTP endpoint that a real
-    # Playwright client can `connect_over_cdp` to. None / 0 = disabled (the
-    # default; the facade is opt-in while experimental).
+    # Playwright-facing CDP facade. `serve` binds an additional TCP ws+HTTP
+    # endpoint that a real Playwright client can `connect_over_cdp` to.
+    #
+    # Phase C semantics (auto-enable): the facade is now ON by default — the
+    # skill layer's heredoc `page`/`context` depend on it. Tri-state:
+    #   - None (unset)  -> auto-enable on DEFAULT_FACADE_PORT (the new default).
+    #   - 0             -> explicitly DISABLED.
+    #   - >0            -> explicit override port (CLI/env/toml).
+    # Use `resolved_facade_port()` to collapse this to "bind / don't bind".
     facade_port: int | None = None
     backends: BackendsConfig = field(default_factory=BackendsConfig)
     # Provenance for `env`: which alias key actually fired. Diagnostic-only.
     cdp_ws_source: str | None = None       # "BD_CDP_WS" | "BU_CDP_WS" | None
     cdp_url_source: str | None = None      # "BD_CDP_URL" | "BU_CDP_URL" | None
+
+    def resolved_facade_port(self) -> int | None:
+        """Collapse the tri-state ``facade_port`` to a bind decision.
+
+        Returns the port to bind the Playwright facade on, or ``None`` when the
+        facade should NOT be bound:
+          - ``facade_port is None``  -> ``DEFAULT_FACADE_PORT`` (auto-enable).
+          - ``facade_port == 0``     -> ``None`` (explicitly disabled).
+          - ``facade_port > 0``      -> that port (explicit override).
+        """
+        if self.facade_port is None:
+            return DEFAULT_FACADE_PORT
+        if self.facade_port == 0:
+            return None
+        return self.facade_port
 
 
 def _read_toml(path: Path) -> dict:

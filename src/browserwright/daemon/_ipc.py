@@ -81,6 +81,37 @@ def pid_path() -> Path:
     return _runtime_dir() / f"{_PREFIX}.pid"
 
 
+def facade_path() -> Path:
+    """Discovery file for the Playwright CDP facade.
+
+    Holds JSON ``{"ws": "ws://host:port/cdp", "port": N}`` written by the daemon
+    when the facade binds (Phase C). The skill layer reads this to
+    ``connect_over_cdp`` without parsing daemon logs or guessing the port. Lives
+    beside the socket/pid under XDG_RUNTIME_DIR so e2e isolation (a throwaway
+    XDG_RUNTIME_DIR) gives each test daemon its own discovery file."""
+    return _runtime_dir() / f"{_PREFIX}.facade"
+
+
+def write_facade_file(ws_url: str, port: int) -> None:
+    """Atomic write of the facade discovery file (mirrors write_port_file)."""
+    fp = facade_path()
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fp.with_name(fp.name + ".tmp")
+    tmp.write_text(json.dumps({"ws": ws_url, "port": port}))
+    os.replace(tmp, fp)
+
+
+def read_facade_file() -> tuple[str | None, int | None]:
+    """Return ``(ws_url, port)`` of the running daemon's facade, or
+    ``(None, None)`` when the file is absent/unreadable (no daemon / facade off).
+    """
+    try:
+        d = json.loads(facade_path().read_text())
+        return str(d["ws"]), int(d["port"])
+    except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
+        return None, None
+
+
 def endpoint_describe() -> dict:
     """Public-facing description of the IPC endpoint for `status` / `url --mode-b-proxy`.
     Spec §6.1 --json shape."""
@@ -120,7 +151,7 @@ def cleanup_endpoint() -> None:
     """Best-effort: nuke socket / port file. Called on graceful shutdown and
     by `stop` before bind. Silent on missing files."""
     paths = [sock_path() if not IS_WINDOWS else port_path(),
-             pid_path()]
+             pid_path(), facade_path()]
     for p in paths:
         try:
             p.unlink()

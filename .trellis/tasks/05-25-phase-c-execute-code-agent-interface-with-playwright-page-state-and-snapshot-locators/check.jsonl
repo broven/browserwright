@@ -1,1 +1,4 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/05-25-phase-c-execute-code-agent-interface-with-playwright-page-state-and-snapshot-locators/prd.md", "reason": "核对验收(跨 heredoc 同 tab、aria-ref 可点、N URL 1 tab、双后端)与 out-of-scope(不做 state/Phase B)"}
+{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "核对 phase C 与 facade 契约一致、未回归 phase A 不变量(fan-out await-ordering 等)"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "代码质量基线 + uv/pytest 门禁"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "核对注入/删除原语的改动落在正确分层、未越界 daemon"}

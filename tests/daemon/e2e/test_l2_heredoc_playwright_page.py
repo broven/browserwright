@@ -1,0 +1,378 @@
+"""L2 -- Phase C PR1: the heredoc-injected Playwright `page` / `context`.
+
+Proves the Phase C foundation end to end through the REAL `browserwright`
+heredoc CLI (NOT a direct Playwright client):
+
+  1. cross-heredoc tab REUSE: heredoc #1 `page.goto(url1)` then a SEPARATE
+     heredoc #2 `page.goto(url2)` land on the SAME tab (same targetId, the tab
+     count did not grow) — the tab-explosion fix. Then `context.new_page()`
+     explicitly creates a second tab.
+  2. lazy: a memory-only heredoc that never touches `page`/`context` opens NO
+     browser connection (the facade sees no client).
+
+Run on BOTH backends: rdp (cheapest) + the extension CfT harness.
+
+The daemon AUTO-ENABLES the facade now (Phase C) — these fixtures spawn it
+WITHOUT `--facade-port`, then read the advertised ws from
+`browserwright-daemon status --json` to prove discovery works.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from contextlib import closing
+from pathlib import Path
+
+import pytest
+
+from .conftest import (
+    TEST_EXT_PORT,
+    TEST_RDP_PORT,
+    _isolated_runtime_dir,
+)
+from .helpers import run_skill
+
+
+def _port_free(port: int) -> bool:
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _status_facade_ws(env: dict, deadline_s: float = 10.0) -> str | None:
+    """Read the daemon's advertised facade ws via `status --json`."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        res = subprocess.run(
+            ["browserwright-daemon", "status", "--json"],
+            capture_output=True, text=True, env=env,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            try:
+                status = json.loads(res.stdout)
+            except json.JSONDecodeError:
+                status = {}
+            facade = status.get("facade")
+            if status.get("alive") and isinstance(facade, dict) and facade.get("ws"):
+                return facade["ws"]
+        time.sleep(0.2)
+    return None
+
+
+# ---------------------------------------------------------------------------
+#   rdp backend (auto-facade, no --facade-port)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rdp_autofacade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
+    """Spawn the rdp daemon WITHOUT --facade-port and prove the facade
+    auto-enabled (advertised via `status --json`). Yields (runtime_dir,
+    facade_ws)."""
+    import shutil
+
+    log_path = e2e_artifacts_dir / "daemon-rdp-autofacade.log"
+    log_fh = open(log_path, "wb")  # noqa: SIM115
+
+    runtime_dir = _isolated_runtime_dir()
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
+    env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "rdp")
+    env["BD_CONFIG"] = ""
+
+    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "browserwright.daemon.cli", "serve",
+         "--backend", "rdp", "-v"],
+        stdout=log_fh, stderr=subprocess.STDOUT, env=env,
+    )
+
+    facade_ws = _status_facade_ws(env)
+    if facade_ws is None:
+        log_fh.flush()
+        proc.terminate()
+        pytest.fail(f"rdp daemon never advertised a facade ws; see {log_path}")
+
+    yield runtime_dir, facade_ws
+
+    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+    log_fh.close()
+    shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def _seed_session(runtime_dir: str, backend: str) -> str:
+    """Create a persistent ledger session under the backend's BS_HOME and
+    return its id. Unlike helpers.run_skill's transient record, this one
+    survives across heredoc invocations so the SECOND heredoc resolves the same
+    bound tab from the ledger."""
+    bs_home = Path(__file__).resolve().parent / "_bs_home" / backend
+    sessions_dir = bs_home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = sessions_dir / "ledger.json"
+    sid = f"e2e-phasec-{uuid.uuid4().hex}"
+    now = time.time()
+    record = {
+        "id": sid, "backend": backend, "workspace": None, "owner": "attach",
+        "name": "e2e-phasec", "created_at": now, "last_seen": now,
+    }
+    # Merge into any existing ledger so we don't clobber other sessions.
+    try:
+        existing = json.loads(ledger_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing = {"next_id": 1, "sessions": {}}
+    existing.setdefault("sessions", {})[sid] = record
+    ledger_path.write_text(json.dumps(existing), encoding="utf-8")
+    return sid
+
+
+def _cleanup_session(backend: str, sid: str) -> None:
+    ledger_path = (Path(__file__).resolve().parent / "_bs_home" / backend
+                   / "sessions" / "ledger.json")
+    try:
+        data = json.loads(ledger_path.read_text())
+        data.get("sessions", {}).pop(sid, None)
+        ledger_path.write_text(json.dumps(data), encoding="utf-8")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+
+# The bound targetId is read from the LEDGER between heredocs (the handle
+# persists it). We avoid `context.new_cdp_session(page)` for the in-script
+# targetId because a per-page CDP session collides with the page's primary
+# session over the extension facade and crashes the driver — the production
+# handle maps via a browser-level Target.getTargets for the same reason.
+# rdp backend drives `data:` navigations fine (only the extension backend
+# aborts them over chrome.debugger — see the facade spec).
+_REUSE_SCRIPT_1 = (
+    "page.goto('data:text/html,<title>one</title>', wait_until='load')\n"
+    "print('TITLE1=' + page.title())\n"
+    "print('NPAGES1=' + str(len(context.pages)))\n"
+)
+
+_REUSE_SCRIPT_2 = (
+    "page.goto('data:text/html,<title>two</title>', wait_until='load')\n"
+    "print('TITLE2=' + page.title())\n"
+    "print('NPAGES2=' + str(len(context.pages)))\n"
+    "p2 = context.new_page()\n"
+    "print('NPAGES3=' + str(len(context.pages)))\n"
+)
+
+
+def _grep(out: str, key: str) -> str:
+    for line in out.splitlines():
+        if line.startswith(key + "="):
+            return line[len(key) + 1:]
+    raise AssertionError(f"{key}= not found in output:\n{out}")
+
+
+def _bound_target(backend: str, sid: str) -> str | None:
+    """The session's persisted `current_target_id` from the ledger (what the
+    handle binds + persists each heredoc)."""
+    ledger_path = (Path(__file__).resolve().parent / "_bs_home" / backend
+                   / "sessions" / "ledger.json")
+    try:
+        data = json.loads(ledger_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    rec = data.get("sessions", {}).get(sid, {})
+    return (rec.get("runtime") or {}).get("current_target_id")
+
+
+def test_cross_heredoc_tab_reuse_rdp(rdp_autofacade_daemon):
+    """ACCEPTANCE (rdp): two SEPARATE heredocs reuse the same tab; new_page()
+    explicitly opens a second one."""
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = rdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "rdp")
+    extra = {"BD_SESSION": sid}
+    try:
+        r1 = run_skill(_REUSE_SCRIPT_1,
+                       backend="rdp", runtime_dir=runtime_dir, extra_env=extra)
+        assert r1.returncode == 0, f"heredoc#1 failed: {r1.stderr}"
+        tid1 = _bound_target("rdp", sid)
+        assert tid1, "heredoc#1 did not bind/persist a target"
+
+        r2 = run_skill(_REUSE_SCRIPT_2,
+                       backend="rdp", runtime_dir=runtime_dir, extra_env=extra)
+        assert r2.returncode == 0, f"heredoc#2 failed: {r2.stderr}"
+        tid2 = _bound_target("rdp", sid)
+        assert _grep(r2.stdout, "TITLE2") == "two"
+        npages2 = int(_grep(r2.stdout, "NPAGES2"))
+        npages3 = int(_grep(r2.stdout, "NPAGES3"))
+
+        # Same tab across heredocs (the reuse acceptance): the bound targetId
+        # persisted by heredoc#1 is what heredoc#2 re-bound.
+        assert tid1 == tid2, f"tab NOT reused: {tid1} != {tid2}"
+        # new_page() explicitly grew the tab count by one.
+        assert npages3 == npages2 + 1, (
+            f"new_page() did not open a second tab: {npages2} -> {npages3}")
+    finally:
+        _cleanup_session("rdp", sid)
+
+
+def test_memory_only_heredoc_does_not_connect_rdp(rdp_autofacade_daemon):
+    """ACCEPTANCE (lazy): a heredoc that never touches page/context opens no
+    browser connection. We assert the script runs green WITHOUT requiring a
+    page bind, and (belt + suspenders) that no extra tab was created."""
+    runtime_dir, _facade_ws = rdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "rdp")
+    try:
+        # Count rdp tabs before.
+        before = run_skill("print('NTABS=' + str(len(list_tabs())))",
+                           backend="rdp", runtime_dir=runtime_dir,
+                           extra_env={"BD_SESSION": sid})
+        # A pure-Python heredoc: no page/context access at all.
+        r = run_skill("print('answer=' + str(6 * 7))",
+                      backend="rdp", runtime_dir=runtime_dir,
+                      extra_env={"BD_SESSION": sid})
+        assert r.returncode == 0, f"memory heredoc failed: {r.stderr}"
+        assert "answer=42" in r.stdout
+        after = run_skill("print('NTABS=' + str(len(list_tabs())))",
+                          backend="rdp", runtime_dir=runtime_dir,
+                          extra_env={"BD_SESSION": sid})
+        assert _grep(before.stdout, "NTABS") == _grep(after.stdout, "NTABS"), (
+            "memory-only heredoc opened a tab (not lazy)")
+    finally:
+        _cleanup_session("rdp", sid)
+
+
+# ---------------------------------------------------------------------------
+#   extension backend (auto-facade, CfT harness)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ext_autofacade_ready(e2e_artifacts_dir, e2e_chrome):
+    """Spawn the extension daemon WITHOUT --facade-port, wait for the CfT
+    extension SW to connect, and prove the facade auto-enabled. Yields
+    (runtime_dir, facade_ws)."""
+    import shutil
+
+    if not _port_free(TEST_EXT_PORT):
+        pytest.fail(f"port {TEST_EXT_PORT} already in use; another test daemon?")
+
+    log_path = e2e_artifacts_dir / "daemon-ext-autofacade.log"
+    log_fh = open(log_path, "wb")  # noqa: SIM115
+
+    runtime_dir = _isolated_runtime_dir()
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "extension")
+    env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
+    env["BD_CONFIG"] = ""
+
+    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "browserwright.daemon.cli", "serve",
+         "--backend", "extension", "--extension-port", str(TEST_EXT_PORT), "-v"],
+        stdout=log_fh, stderr=subprocess.STDOUT, env=env,
+    )
+
+    facade_ws = _status_facade_ws(env)
+    if facade_ws is None:
+        log_fh.flush()
+        proc.terminate()
+        pytest.fail(f"ext daemon never advertised a facade ws; see {log_path}")
+
+    # Wait for the CfT extension SW to connect to the relay.
+    deadline = time.monotonic() + 15.0
+    last = None
+    connected = False
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{TEST_EXT_PORT}/__status__", timeout=0.5
+            ) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            last = body
+            if int(body.get("extensions", 0)) >= 1:
+                connected = True
+                break
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            pass
+        time.sleep(0.2)
+    if not connected:
+        log_fh.flush()
+        proc.terminate()
+        pytest.fail(f"extension never connected within 15s; last status={last}")
+
+    yield runtime_dir, facade_ws
+
+    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+    log_fh.close()
+    shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+# Extension backend `page.goto("data:...")` is aborted by Chrome over
+# chrome.debugger (see the facade spec); use set_content for inline HTML. The
+# bound page is already on about:blank (new_page init), so we don't re-goto it
+# — re-navigating about:blank over chrome.debugger can stall.
+_EXT_SCRIPT_1 = (
+    "page.set_content('<title>one</title>', wait_until='load')\n"
+    "print('TITLE1=' + page.title())\n"
+)
+
+_EXT_SCRIPT_2 = (
+    "page.set_content('<title>two</title>', wait_until='load')\n"
+    "print('TITLE2=' + page.title())\n"
+    "n_before = len(context.pages)\n"
+    "p2 = context.new_page()\n"
+    "print('GREW=' + str(len(context.pages) == n_before + 1))\n"
+)
+
+
+def test_cross_heredoc_tab_reuse_extension(ext_autofacade_ready):
+    """ACCEPTANCE (extension): two SEPARATE heredocs reuse the same tab over the
+    CfT harness; new_page() explicitly opens a second one."""
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = ext_autofacade_ready
+    sid = _seed_session(runtime_dir, "extension")
+    extra = {"BD_SESSION": sid}
+    try:
+        r1 = run_skill(_EXT_SCRIPT_1, backend="extension",
+                       runtime_dir=runtime_dir, extra_env=extra, timeout=60)
+        assert r1.returncode == 0, f"ext heredoc#1 failed: {r1.stderr}"
+        assert _grep(r1.stdout, "TITLE1") == "one"
+        tid1 = _bound_target("extension", sid)
+        assert tid1, "ext heredoc#1 did not bind/persist a target"
+
+        r2 = run_skill(_EXT_SCRIPT_2, backend="extension",
+                       runtime_dir=runtime_dir, extra_env=extra, timeout=60)
+        assert r2.returncode == 0, f"ext heredoc#2 failed: {r2.stderr}"
+        tid2 = _bound_target("extension", sid)
+
+        # Same tab across heredocs: heredoc#2 re-bound the targetId heredoc#1
+        # persisted (no new tab), and set_content drove that same tab.
+        assert tid1 == tid2, f"ext tab NOT reused: {tid1} != {tid2}"
+        assert _grep(r2.stdout, "TITLE2") == "two"
+        assert _grep(r2.stdout, "GREW") == "True", "new_page() did not grow tabs"
+    finally:
+        _cleanup_session("extension", sid)

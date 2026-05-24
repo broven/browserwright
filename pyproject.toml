@@ -12,6 +12,12 @@ dependencies = [
     "websockets==15.0.1",
     "pillow==12.2.0",
     "httpx>=0.27",
+    # Phase C: the skill heredoc injects a real Playwright `page`/`context`
+    # bound to the daemon facade, so playwright is a runtime dependency now (it
+    # was previously dev-only). `playwright install chromium` is still needed
+    # for tests that launch a browser; the daemon-facade path drives the
+    # daemon-resolved Chrome and does not need Playwright's bundled browser.
+    "playwright>=1.60.0",
 ]
 
 [project.optional-dependencies]
@@ -20,7 +26,6 @@ ux = ["rich>=13"]
 [dependency-groups]
 dev = [
     "coverage>=7",
-    "playwright>=1.60.0",
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]

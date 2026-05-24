@@ -177,14 +177,18 @@ async def run_serve(cfg: Config) -> int:
             _ipc.cleanup_endpoint()
             return 2
 
-    # Phase A1 (Playwright facade, experimental, opt-in): when a facade port is
-    # configured, bind an ADDITIONAL Playwright-facing CDP ws+HTTP endpoint
-    # layered beside the agent unix socket. It resolves the daemon's upstream
-    # Chrome (rdp backend) and transparently bridges raw browser-level CDP —
-    # the existing client path is untouched. A bind failure here is non-fatal:
-    # we log + continue serving the agent path (the facade is experimental).
+    # Playwright facade (Phase C: auto-enabled by default). Bind an ADDITIONAL
+    # Playwright-facing CDP ws+HTTP endpoint layered beside the agent unix
+    # socket. It resolves the daemon's upstream Chrome (rdp backend) and
+    # transparently bridges raw browser-level CDP — the existing client path is
+    # untouched. The skill layer's heredoc `page`/`context` connect through it,
+    # so it is ON unless `facade_port == 0` (explicit disable). The bound ws is
+    # advertised via the `_ipc` facade discovery file so the skill layer can
+    # `connect_over_cdp` without parsing logs. A bind failure here is non-fatal:
+    # we log + continue serving the agent path.
     facade: PlaywrightFacade | None = None
-    if cfg.facade_port is not None and cfg.facade_port != 0:
+    facade_port = cfg.resolved_facade_port()
+    if facade_port is not None:
         try:
             # PR2: for the extension backend the facade bridges through the
             # daemon's shared relay (started just above). Pass a getter so the
@@ -193,14 +197,19 @@ async def run_serve(cfg: Config) -> int:
             def _shared_relay() -> RelayServer | None:
                 return shared_context.holder.relay
 
-            facade = PlaywrightFacade(cfg=cfg, port=cfg.facade_port,
+            facade = PlaywrightFacade(cfg=cfg, port=facade_port,
                                       relay_getter=_shared_relay)
             bound = await facade.start()
+            facade_ws = f"ws://127.0.0.1:{bound}/cdp"
+            # Advertise the bound ws so the skill layer can discover it (Phase C
+            # auto-enable). Best-effort: a write failure must not abort serving.
+            with contextlib.suppress(Exception):
+                _ipc.write_facade_file(facade_ws, bound)
             logger.info("playwright facade started on port %d "
-                        "(connect_over_cdp ws://127.0.0.1:%d/cdp)", bound, bound)
+                        "(connect_over_cdp %s)", bound, facade_ws)
         except OSError as e:
             logger.warning("playwright facade failed to bind port %d: %r; "
-                           "continuing without it", cfg.facade_port, e)
+                           "continuing without it", facade_port, e)
             facade = None
 
     idle_task: asyncio.Task | None = None

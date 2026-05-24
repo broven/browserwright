@@ -10,6 +10,18 @@ import os
 from pathlib import Path
 
 _CURATED_UNIT_TESTS = {
+    # Phase C PR1 foundation (facade auto-enable + lazy heredoc page/context).
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_auto_enabled_when_unset",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_disabled_when_zero",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_explicit_port_override",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_port_load_default_is_none",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_file_roundtrip",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_file_cleanup",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_facade_file_bad_json",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_status_json_includes_facade",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_status_json_facade_null_when_dead",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_lazy_proxies_do_not_connect_on_build_globals",
+    "tests/daemon/test_phase_c_foundation_unit.py::test_handle_close_is_noop_without_connect",
     "tests/daemon/test_coverage_proxy_dense.py::test_raw_frames_lifecycle_failure_and_broadcast_edges",
     "tests/daemon/test_coverage_proxy_dense.py::test_self_answer_focus_stats_version_and_backend_state",
     "tests/daemon/test_coverage_proxy_dense.py::test_extension_scoped_get_targets_success_error_and_fallback",

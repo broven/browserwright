@@ -50,7 +50,7 @@ import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
 from .. import __version__
-from ..config import Config
+from ..config import DEFAULT_FACADE_PORT, Config
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
 from .facade_extension import ExtensionFacadeBridge
@@ -60,9 +60,10 @@ from .upstream import _localhost_bypass_proxy
 logger = logging.getLogger(__name__)
 
 
-# Default facade port. Distinct from the extension relay (19989) and
-# playwriter's 19988 so all three can coexist on one machine.
-DEFAULT_FACADE_PORT = 19990
+# DEFAULT_FACADE_PORT now lives in ``config`` (no import cycle there) and is
+# re-exported here for the existing call sites / tests that import it from this
+# module.
+__all__ = ["DEFAULT_FACADE_PORT", "PlaywrightFacade", "FACADE_WS_PATH"]
 
 # The ws path a CDP client connects to once it has read /json/version. The
 # value is cosmetic (we passthrough regardless of path) but kept stable so the

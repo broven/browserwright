@@ -57,5 +57,17 @@ def run(stdin: IO[str]) -> int:
         sys.stdout.write(buf.getvalue())
         sys.stderr.write(traceback.format_exc())
         return 3
+    finally:
+        # Phase C: tear down the lazy Playwright connection at heredoc end. A
+        # no-op when `page`/`context` were never accessed (nothing connected).
+        # close() disconnects the CDP transport only — it never closes the
+        # user's real tabs/browser. Fully suppressed so cleanup can't change
+        # the heredoc's exit code.
+        handle = globals_.get("__bw_playwright_handle__")
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
     sys.stdout.write(buf.getvalue())
     return 0
