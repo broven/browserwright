@@ -19,6 +19,7 @@ ux = ["rich>=13"]
 
 [dependency-groups]
 dev = [
+    "coverage>=7",
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]
@@ -44,3 +45,14 @@ testpaths = ["tests"]
 markers = [
     "real_chrome: end-to-end test that launches a real Chrome + extension (skipped unless explicitly selected)",
 ]
+
+[tool.coverage.run]
+source = ["src/browserwright"]
+omit = [
+    "src/browserwright/__main__.py",
+    "src/browserwright/site_skills_starter/*",
+]
+
+[tool.coverage.report]
+skip_covered = true
+sort = "Cover"

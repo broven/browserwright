@@ -24,13 +24,17 @@ class _FakeCDP:
     def __init__(self, responses: dict | None = None):
         self.calls: list[tuple[str, dict]] = []
         self._responses = responses or {}
+        self._sessions: dict[str, str] = {}
+        self._events: dict[str, list[dict]] = {}
 
     def send(self, method: str, *, session: str | None = None, **params) -> Any:
         self.calls.append((method, {"session": session, **params}))
         return self._responses.get(method, {})
 
     def attach(self, target_id: str) -> str:
-        return f"sid-for-{target_id}"
+        sid = f"sid-for-{target_id}"
+        self._sessions[target_id] = sid
+        return sid
 
     def drain_events(self, *, session: str | None = None) -> list[dict]:
         # populated per-test via .events
@@ -257,6 +261,72 @@ def test_ensure_real_tab_picks_first_real_when_on_chrome_internal(
     out = ensure_real_tab()
     assert out is not None
     assert out["url"] == "https://example.com/"
+
+
+def test_page_tab_lifecycle_contracts(patched_session, monkeypatch):
+    from browserwright.errors import CDPError
+    from browserwright.primitives import page
+
+    sess, fake = patched_session
+    persisted = []
+    registered = []
+    monkeypatch.setattr(page, "_session_name_and_id", lambda sess: ("job", "42"))
+    monkeypatch.setattr(
+        "browserwright.session_runtime.persist_target",
+        lambda *args, **kwargs: persisted.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "browserwright.session_runtime.register_recovered",
+        lambda sess, payload: registered.append(payload),
+    )
+
+    assert [t["targetId"] for t in page.list_tabs(include_chrome=False)] == ["page-1"]
+    sess.current_target_id = "page-1"
+    assert page.current_tab()["targetId"] == "page-1"
+    assert page.iframe_target("embed.example") == "iframe-1"
+
+    switched = page.switch_tab({"targetId": "page-1"})
+    assert switched == {"targetId": "page-1"}
+    assert fake._sessions["page-1"] == "sid-for-page-1"
+    assert any(m == "Target.activateTarget" for m, _ in fake.calls)
+
+    fake._responses["BrowserwrightDaemon.openBackgroundTab"] = {
+        "targetId": "opened-1",
+        "sessionId": "sid-opened",
+        "tabId": 7,
+        "url": "https://example.org/",
+        "title": "Opened",
+        "groupId": 99,
+    }
+    opened = page.open("https://example.org/", background=False)
+    assert opened["targetId"] == "opened-1"
+    assert opened["groupId"] == 99
+    assert registered[-1]["sessionId"] == "sid-opened"
+
+    sess.current_target_id = "opened-1"
+    fake._sessions["opened-1"] = "sid-opened"
+    fake._events["sid-opened"] = [{"method": "Page.loadEventFired"}]
+    fake._responses["BrowserwrightDaemon.closeTab"] = {"ok": True, "tabId": 7}
+    closed = page.close_tab()
+    assert closed == {"ok": True, "tabId": 7}
+    assert "opened-1" not in fake._sessions
+    assert "sid-opened" not in fake._events
+    assert sess.current_target_id is None
+
+    try:
+        page.switch_tab("")
+    except ValueError as e:
+        assert "missing targetId" in str(e)
+    else:
+        raise AssertionError("switch_tab should reject an empty target")
+
+    def _broken_attach(target_id):
+        raise CDPError("Target.attachToTarget", {"targetId": target_id}, "gone")
+
+    fake.attach = _broken_attach
+    with pytest.raises(CDPError) as exc:
+        page.switch_tab("missing")
+    assert "target 'missing' no longer exists" in exc.value.cdp_message
 
 
 def test_iframe_target_matches_substring(patched_session):

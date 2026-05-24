@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -258,3 +259,105 @@ def test_list_tasks_query_space_form_should_not_crash(tmp_bs_home):
     `'bool' object has no attribute 'lower'` crash harvested from evals/feedback."""
     rc = _main(["list-tasks", "--query", "hacker news"])
     assert rc == 0
+
+
+def test_cli_core_command_contracts(monkeypatch, capsys, tmp_bs_home):
+    """Exercise the CLI dispatch layer without subprocess/daemon cost."""
+    from browserwright import cli
+    from browserwright import discovery, health, skill_doc, subscriptions, task_runner
+
+    monkeypatch.setattr(
+        health,
+        "doctor_checks",
+        lambda: {"schema_version": 1, "checks": [
+            {"name": "daemon", "status": "warn", "message": "off", "fix": "start it"}
+        ]},
+    )
+    assert cli._cmd_doctor(["--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["checks"][0]["fix"] == "start it"
+
+    seen = {}
+
+    def _run_task(site, name, **kwargs):
+        seen.update(site=site, name=name, kwargs=kwargs)
+        return {"ok": True, "count": kwargs["count"]}
+
+    monkeypatch.setattr(task_runner, "run_task", _run_task)
+    assert cli._cmd_task([
+        "news/smoke",
+        "--count=2",
+        "--json-args={\"mode\":\"fast\"}",
+        "--json-output",
+    ]) == 0
+    assert seen == {
+        "site": "news",
+        "name": "smoke",
+        "kwargs": {"count": 2, "mode": "fast", "json-output": True},
+    }
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "count": 2}
+
+    monkeypatch.setattr(
+        discovery,
+        "list_tasks",
+        lambda **kw: [{"site": kw["site"], "name": "read", "desc": kw["query"]}],
+    )
+    assert cli._cmd_list_tasks(["--site", "hn", "--query=frontpage", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0] == {
+        "site": "hn",
+        "name": "read",
+        "desc": "frontpage",
+    }
+
+    monkeypatch.setattr(discovery, "rebuild_index", lambda: {"sites": ["a", "b"]})
+    assert cli._cmd_index(["rebuild"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"sites": 2}
+
+    monkeypatch.setattr(skill_doc, "render", lambda: "SKILL DOC")
+    assert cli._cmd_print_skill([]) == 0
+    assert capsys.readouterr().out == "SKILL DOC"
+
+    monkeypatch.setattr(
+        subscriptions,
+        "add",
+        lambda url, name=None: {"status": "added", "name": name, "path": "/tmp/sub"},
+    )
+    monkeypatch.setattr(
+        subscriptions,
+        "list_all",
+        lambda: [{"name": "starter", "url": "https://example.test/repo.git", "exists": True}],
+    )
+    monkeypatch.setattr(
+        subscriptions,
+        "update",
+        lambda names=None: [{"name": names[0], "status": "updated", "detail": "ok"}],
+    )
+    removed = []
+    monkeypatch.setattr(subscriptions, "remove", lambda name: removed.append(name))
+    assert cli._cmd_sub(["add", "https://example.test/repo.git", "--name=starter", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "added"
+    assert cli._cmd_sub(["list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["name"] == "starter"
+    assert cli._cmd_sub(["update", "--name=starter"]) == 0
+    assert "updated" in capsys.readouterr().out
+    assert cli._cmd_sub(["remove", "--name=starter"]) == 0
+    assert removed == ["starter"]
+    assert "removed starter" in capsys.readouterr().out
+
+    assert cli._cmd_memory(["show", "--global"]) == 0
+    assert "frontmatter" in json.loads(capsys.readouterr().out)
+    assert cli._cmd_memory(["forget", "--pattern=missing", "--global"]) == 0
+    assert "(no matching bullets)" in capsys.readouterr().out
+
+    pushed = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda argv: pushed.append(argv) or SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setitem(sys.modules, "browserwright.api", SimpleNamespace(
+        reload=lambda: None,
+        capture_screenshot=lambda: "/tmp/shot.png",
+    ))
+    assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 0
+    assert pushed == [["browserwright-daemon", "userscript", "push", "script.js"]]
+    assert "/tmp/shot.png" in capsys.readouterr().out
