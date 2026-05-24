@@ -130,6 +130,14 @@ class RelayServer:
         # Hook: every event-frame from any extension gets called back here so
         # the daemon's CDP proxy can route it. Set by the listener.
         self._on_event: Callable[[dict], Awaitable[None]] | None = None
+        # Task #tab-handle-model PR2: the Playwright facade needs to observe the
+        # SAME extension event stream as the agent path (so it can translate
+        # `Page.frameNavigated` etc. into per-Playwright-session frames), but the
+        # single `_on_event` slot is already claimed by the agent's
+        # ExtensionUpstream. We keep a fan-out set of ADDITIONAL listeners that
+        # the relay calls alongside `_on_event` — the facade registers/removes
+        # itself here per connection without disturbing the agent handler.
+        self._event_listeners: set[Callable[[dict], Awaitable[None]]] = set()
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -188,11 +196,30 @@ class RelayServer:
     def set_event_handler(
         self, handler: Callable[[dict], Awaitable[None]] | None,
     ) -> None:
-        """Register a coroutine that receives every async event from the
-        extension (`Page.frameNavigated` etc). The daemon's router uses this
+        """Register THE primary coroutine that receives every async event from
+        the extension (`Page.frameNavigated` etc). The daemon's router uses this
         to translate extension events back into CDP frames for clients.
+
+        This is single-slot (the agent path). Secondary observers (the
+        Playwright facade) use `add_event_listener` / `remove_event_listener`.
         """
         self._on_event = handler
+
+    def add_event_listener(
+        self, handler: Callable[[dict], Awaitable[None]],
+    ) -> None:
+        """Register an ADDITIONAL fan-out observer of the extension event
+        stream (Task #tab-handle-model PR2). Called alongside the primary
+        `_on_event` handler — used by the Playwright facade so it sees the same
+        `attached`/`event` stream the agent path does without stealing the
+        single primary slot."""
+        self._event_listeners.add(handler)
+
+    def remove_event_listener(
+        self, handler: Callable[[dict], Awaitable[None]],
+    ) -> None:
+        """Drop a fan-out observer (facade disconnect/stop). Idempotent."""
+        self._event_listeners.discard(handler)
 
     # ---- public command API (used by extension upstream wrapper) ---------
 
@@ -659,6 +686,11 @@ class RelayServer:
                 title=str(info.get("title", "")),
                 install_id=ext.install_id,
             )
+            # PR2: notify fan-out observers (the Playwright facade) of new tab
+            # lifecycle so they can synthesize Target.targetCreated /
+            # attachedToTarget for a live `connect_over_cdp` client. The agent
+            # path ignores these (its `_on_event` only handles `event`).
+            await self._fanout_listeners(msg)
             return
 
         if kind == "detached":
@@ -666,6 +698,7 @@ class RelayServer:
             if tab_id < 0:
                 return
             ext.tabs.pop(tab_id, None)
+            await self._fanout_listeners(msg)
             return
 
         if kind == "response":
@@ -689,9 +722,20 @@ class RelayServer:
                     await self._on_event(msg)
                 except Exception as e:
                     logger.warning("relay event handler raised: %r", e)
+            await self._fanout_listeners(msg)
             return
 
         logger.debug("extension sent unknown type %r: %s", kind, str(msg)[:100])
+
+    async def _fanout_listeners(self, msg: dict) -> None:
+        """Call every additional fan-out observer with the raw extension
+        message (PR2). Isolated from the primary `_on_event` so one observer
+        raising can't drop the message for the others or the agent path."""
+        for listener in list(self._event_listeners):
+            try:
+                await listener(msg)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("relay fan-out listener raised: %r", e)
 
 
 class _CommandError(Exception):

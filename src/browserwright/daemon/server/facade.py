@@ -16,19 +16,23 @@ Why a new endpoint (not the existing unix-socket client path)?
     can bootstrap (`research/playwright-over-extension-bridge.md`). We mirror
     that bootstrap shape.
 
-Phase A1 scope (this module): **rdp backend only**. The daemon owns the rdp
-Chrome, which already speaks real browser-level CDP — so the facade is a
-transparent byte-for-byte passthrough: on each ws client connect we resolve the
-rdp Chrome's real CDP ws (via the daemon resolver / `backends/rdp.py`) and pump
-frames in both directions. No `Target.*`/`Browser.*` synthesis is needed
-because the real Chrome answers them natively.
+Two backends, two transports (the consumer is always a real Playwright client):
 
-Deliberately out of scope here (left for PR2 = phase A2+):
-  - extension backend (needs the `Target.attachedToTarget`/`targetCreated`
-    event synthesis described in the research delta; the relay only speaks a
-    restricted CDP subset).
-  - `Target.createTarget` → `openBackgroundTab` mapping, `Runtime.enable`
-    execution-context barrier — those harden the extension path, not rdp.
+  - **rdp** (PR1): the daemon owns the rdp Chrome, which already speaks real
+    browser-level CDP — so the facade is a transparent byte-for-byte
+    passthrough: on each ws client connect we resolve the rdp Chrome's real CDP
+    ws (via the daemon resolver / `backends/rdp.py`) and pump frames in both
+    directions. No `Target.*`/`Browser.*` synthesis is needed because the real
+    Chrome answers them natively.
+
+  - **extension** (PR2): there is NO resolvable upstream ws — the daemon IS the
+    relay. We hand the client to `ExtensionFacadeBridge`
+    (`facade_extension.py`), which reuses the existing `ExtensionUpstream`
+    emulation over the shared `RelayServer` and ADDS the
+    `Target.attachedToTarget`/`targetCreated` event synthesis,
+    `Target.createTarget`→background-tab mapping, and `Runtime.enable` barrier
+    that Playwright's `connect_over_cdp` discovery needs. The bridge needs the
+    daemon's shared relay, so the facade is constructed with a `relay_getter`.
 
 The facade NEVER touches the existing `DaemonState` / `Router` translation
 tables: it is a parallel transport. The unix-socket agent path is untouched.
@@ -40,7 +44,7 @@ import contextlib
 import http
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
@@ -49,6 +53,8 @@ from .. import __version__
 from ..config import Config
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
+from .facade_extension import ExtensionFacadeBridge
+from .relay import RelayServer
 from .upstream import _localhost_bypass_proxy
 
 logger = logging.getLogger(__name__)
@@ -73,12 +79,19 @@ class PlaywrightFacade:
     """
 
     def __init__(self, *, cfg: Config, port: int = DEFAULT_FACADE_PORT,
-                 host: str = "127.0.0.1"):
+                 host: str = "127.0.0.1",
+                 relay_getter: Callable[[], RelayServer | None] | None = None):
         self._cfg = cfg
         self._port = port
         self._host = host
         self._server: Any = None
-        # Track live passthrough tasks so stop() can cancel them.
+        # PR2: for the extension backend the facade has no resolvable upstream
+        # ws — it bridges through the daemon's shared RelayServer. The listener
+        # passes a getter (the relay is created during run_serve startup, and
+        # may be (re)bound across reconnects, so we resolve it lazily per
+        # client connection rather than capturing the instance now).
+        self._relay_getter = relay_getter
+        # Track live passthrough/bridge tasks so stop() can cancel them.
         self._sessions: set[asyncio.Task] = set()
 
     # ---- lifecycle -------------------------------------------------------
@@ -178,13 +191,49 @@ class PlaywrightFacade:
 
     # ---- ws passthrough --------------------------------------------------
 
+    def _backend_name(self) -> str:
+        """The effective shared backend. `run_serve` defaults a missing backend
+        to extension, so mirror that here."""
+        return self._cfg.backend or "extension"
+
     async def _handle_client(self, conn: ServerConnection) -> None:
-        """One Playwright client connected. Resolve the rdp Chrome's real CDP
-        ws and pump frames byte-for-byte in both directions for the life of the
-        connection."""
+        """One Playwright client connected. For the extension backend, bridge
+        through the shared relay with target-event synthesis (PR2); otherwise
+        resolve the rdp Chrome's real CDP ws and pump frames byte-for-byte."""
         task = asyncio.current_task()
         if task is not None:
             self._sessions.add(task)
+        try:
+            if self._backend_name() == "extension":
+                await self._handle_extension_client(conn)
+                return
+            await self._handle_rdp_client(conn)
+        finally:
+            if task is not None:
+                self._sessions.discard(task)
+
+    async def _handle_extension_client(self, conn: ServerConnection) -> None:
+        """Bridge a Playwright client to the extension backend via the shared
+        relay. Requires the relay to be up (it is started eagerly in run_serve
+        for the extension backend)."""
+        relay = self._relay_getter() if self._relay_getter is not None else None
+        if relay is None:
+            logger.warning("facade(ext): no relay available; refusing client")
+            with contextlib.suppress(Exception):
+                await conn.close(code=1011, reason="extension relay unavailable")
+            return
+        bridge = ExtensionFacadeBridge(client=conn, relay=relay)
+        try:
+            await bridge.run()
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("facade(ext): bridge crashed: %r", e)
+            with contextlib.suppress(Exception):
+                await bridge.aclose()
+
+    async def _handle_rdp_client(self, conn: ServerConnection) -> None:
+        """rdp backend (PR1): transparent byte-for-byte passthrough."""
         try:
             ws_url = await self._resolve_rdp_ws()
         except Unavailable as e:
@@ -204,9 +253,6 @@ class PlaywrightFacade:
             pass
         except Exception as e:  # noqa: BLE001
             logger.warning("facade: bridge crashed: %r", e)
-        finally:
-            if task is not None:
-                self._sessions.discard(task)
 
     async def _resolve_rdp_ws(self) -> str:
         """Resolve the upstream Chrome CDP ws URL via the daemon resolver.

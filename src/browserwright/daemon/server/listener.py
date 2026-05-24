@@ -186,7 +186,15 @@ async def run_serve(cfg: Config) -> int:
     facade: PlaywrightFacade | None = None
     if cfg.facade_port is not None and cfg.facade_port != 0:
         try:
-            facade = PlaywrightFacade(cfg=cfg, port=cfg.facade_port)
+            # PR2: for the extension backend the facade bridges through the
+            # daemon's shared relay (started just above). Pass a getter so the
+            # facade resolves the LIVE relay per client connection — it may be
+            # (re)bound across the daemon's lifetime.
+            def _shared_relay() -> RelayServer | None:
+                return shared_context.holder.relay
+
+            facade = PlaywrightFacade(cfg=cfg, port=cfg.facade_port,
+                                      relay_getter=_shared_relay)
             bound = await facade.start()
             logger.info("playwright facade started on port %d "
                         "(connect_over_cdp ws://127.0.0.1:%d/cdp)", bound, bound)
