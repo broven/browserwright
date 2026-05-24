@@ -159,6 +159,42 @@ class Router:
         # (asyncio warning), and so we can cancel them on shutdown.
         self._open_tasks: set[asyncio.Task] = set()
 
+    def _session_group_name(
+        self, client: ClientState, session_id: str,
+        explicit: str | None = None,
+    ) -> str:
+        """Human-visible tab group title for a browserwright session."""
+        if explicit:
+            return explicit
+        return client.session_name or session_id
+
+    def _request_session_param(self, params: dict) -> str | None:
+        session = params.get("bsSession") or params.get("session")
+        return session if isinstance(session, str) and session else None
+
+    async def _require_browser_session(
+        self, client: ClientState, req_id: int | None, op: str,
+        params: dict | None = None,
+    ) -> str | None:
+        """Enforce browserwright-session scoping at the daemon boundary.
+
+        The websocket's ``?session=<id>`` is the isolation key. Legacy request
+        params may repeat that id for mixed-version clients, but they may not
+        invent or switch sessions.
+        """
+        if not client.session_id:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602, f"{op} requires websocket ?session=<id>"))
+            return None
+        requested = self._request_session_param(params or {})
+        if requested is not None and requested != client.session_id:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                f"{op} session mismatch: connection is bound to "
+                f"{client.session_id!r}, request asked for {requested!r}"))
+            return None
+        return client.session_id
+
     # ---- listener wiring -------------------------------------------------
 
     def register_client(self, client_id: int,
@@ -220,6 +256,11 @@ class Router:
             # Garbage frame — best-effort forward, upstream will error if it
             # cares. We still gate on upstream readiness so the frame doesn't
             # vanish during the lazy-open window.
+            if client.session_id is None:
+                await self._send_to_client(client.client_id, _error_response(
+                    None, -32602,
+                    "browser CDP forwarding requires websocket ?session=<id>"))
+                return
             if not await self._gate_upstream_ready(client, text, msg=None):
                 return
             await self._forward_raw(text)
@@ -236,6 +277,12 @@ class Router:
         # Self-answered: doesn't need upstream, so no gate.
         if isinstance(method, str) and method.startswith("BrowserwrightDaemon."):
             await self._handle_browserdaemon(client, msg)
+            return
+
+        if client.session_id is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "browser CDP forwarding requires websocket ?session=<id>"))
             return
 
         # --- pre-open gate (Task #76) ---
@@ -767,6 +814,10 @@ class Router:
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         if isinstance(method, str) and method.startswith("BrowserwrightDaemon.userscript."):
+            session_id = await self._require_browser_session(
+                client, req_id, method, params)
+            if session_id is None:
+                return
             # The schema-lock test scans this file for `method == "..."` string
             # literals; this no-op registers the userscript.install verb literal
             # for that scan (userscript.* is otherwise dispatched by prefix).
@@ -805,7 +856,25 @@ class Router:
                 client.client_id, _result_response(req_id, result or {}))
             return
         if method == "BrowserwrightDaemon.getActiveTab":
+            session_id = await self._require_browser_session(
+                client, req_id, method, params)
+            if session_id is None:
+                return
             tab = self.state.best_active_tab()
+            if (tab is not None and self.state.backend_name == "extension"
+                    and self._scoped_targets is not None):
+                try:
+                    scoped = await self._scoped_targets(session_id)
+                except Exception as e:  # noqa: BLE001
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603, f"getActiveTab scoping failed: {e!r}"))
+                    return
+                scoped_ids = {
+                    info.get("targetId") for info in scoped
+                    if isinstance(info, dict)
+                }
+                if tab.get("targetId") not in scoped_ids:
+                    tab = None
             payload = tab if tab is not None else {
                 "targetId": None, "url": None, "title": None,
                 "accuracy": "unknown", "since_seconds": None,
@@ -835,16 +904,22 @@ class Router:
             }))
             return
         if method == "BrowserwrightDaemon.subscribeFocus":
+            if await self._require_browser_session(client, req_id, method, params) is None:
+                return
             client.subscribed_focus = True
             await self._send_to_client(client.client_id,
                                        _result_response(req_id, {"ok": True}))
             return
         if method == "BrowserwrightDaemon.unsubscribeFocus":
+            if await self._require_browser_session(client, req_id, method, params) is None:
+                return
             client.subscribed_focus = False
             await self._send_to_client(client.client_id,
                                        _result_response(req_id, {"ok": True}))
             return
         if method == "BrowserwrightDaemon.disconnect":
+            if await self._require_browser_session(client, req_id, method, params) is None:
+                return
             await self._send_to_client(client.client_id,
                                        _result_response(req_id, {"ok": True}))
             if self._trigger_disconnect is not None:
@@ -865,7 +940,20 @@ class Router:
             # -32601 (docs §C1). Either path registers the resulting session
             # in the binding tables so subsequent CDP commands route the same
             # way an explicit attach would.
+            attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            attach_session = await self._require_browser_session(
+                client, req_id, method, attach_params)
+            if attach_session is None:
+                return
             if self.state.backend_name == "rdp":
+                if (self._upstream_command is None and self._ensure_upstream is not None):
+                    try:
+                        await self._ensure_upstream()
+                    except Exception as e:
+                        await self._send_to_client(client.client_id, _error_response(
+                            req_id, -32603,
+                            f"attach active failed (upstream open): {e!r}"))
+                        return
                 await self._rdp_attach_active(client, req_id)
                 return
             if self._attach_active_tab is None:
@@ -887,11 +975,6 @@ class Router:
                     req_id, -32601,
                     "BrowserwrightDaemon.attachActiveTab requires the extension backend"))
                 return
-            attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-            # The session is already known from the connection's ?session=<id>;
-            # fall back to a legacy param only if a client predates that wiring.
-            attach_session = client.session_id or attach_params.get("session")
-            attach_session = attach_session if isinstance(attach_session, str) and attach_session else None
             try:
                 # Adopt into THIS session's tab group. The title is cosmetic:
                 # prefer the ledger name when the daemon can see it, otherwise
@@ -899,7 +982,7 @@ class Router:
                 # still the returned numeric groupId.
                 info = await self._attach_active_tab(
                     session_id=attach_session,
-                    group_name=client.session_name or client.session_id)
+                    group_name=self._session_group_name(client, attach_session))
             except Exception as e:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32000, f"attach active failed: {e!r}"))
@@ -1004,11 +1087,23 @@ class Router:
                 req_id, -32602,
                 "BrowserwrightDaemon.openBackgroundTab params.groupName must be a string"))
             return
+        session = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.openBackgroundTab", params)
+        if session is None:
+            return
         # rdp dispatch: on an rdp context there is no extension callback —
         # implement the verb with raw CDP (Target.createTarget + attach). Every
         # rdp tab is "background" (no human focus to protect), so `background`
         # is a no-op and `groupId` is -1 (tab groups are an extension concept).
         if self.state.backend_name == "rdp":
+            if self._upstream_command is None and self._ensure_upstream is not None:
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"openBackgroundTab failed (upstream open): {e!r}"))
+                    return
             await self._rdp_open_tab(client, req_id, url)
             return
         if self._open_background_tab is None:
@@ -1029,18 +1124,12 @@ class Router:
                 req_id, -32601,
                 "BrowserwrightDaemon.openBackgroundTab requires the extension backend"))
             return
-        # The browserwright session id now arrives as `bsSession` (the skill
-        # stopped using a reserved kwarg). Keep accepting the legacy `session`
-        # param so a mixed-version skill still binds ownership correctly.
-        session = params.get("bsSession") or params.get("session")
-        session = session if isinstance(session, str) and session else None
         # The group identity is the session's NAME, fixed (and required +
         # unique) at `session new` and stored in the ledger — the daemon reads
         # it off the connection (client.session_name) rather than the caller
         # re-passing it on every open. This is an authoritative lookup, NOT a
         # fallback: the session IS the tab group (decision 6).
-        if group_name is None:
-            group_name = client.session_name or client.session_id
+        group_name = self._session_group_name(client, session, group_name)
         # `background` (default True) protects the user's focus on the
         # extension backend; background=False opens the tab in the foreground.
         background = params.get("background")
@@ -1120,6 +1209,10 @@ class Router:
                 req_id, -32602,
                 "BrowserwrightDaemon.recoverSession requires params.groupId"))
             return
+        bs_session = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.recoverSession", params)
+        if bs_session is None:
+            return
         if self._recover_session is None:
             # Lazy-open mirror of openBackgroundTab.
             if (self._ensure_upstream is not None
@@ -1136,8 +1229,6 @@ class Router:
                 req_id, -32601,
                 "BrowserwrightDaemon.recoverSession requires the extension backend"))
             return
-        bs_session = params.get("bsSession")
-        bs_session = bs_session if isinstance(bs_session, str) and bs_session else None
         try:
             result = await self._recover_session(bs_session, group_id=group_id)
         except Exception as e:
@@ -1242,6 +1333,10 @@ class Router:
                 req_id, -32602,
                 "BrowserwrightDaemon.endSession requires params.session"))
             return
+        if await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.endSession", params,
+        ) is None:
+            return
 
         # rdp branch: if this session has a live per-session context, tear it
         # down — close the upstream + SIGTERM the daemon-owned Chrome + drop the
@@ -1316,9 +1411,21 @@ class Router:
                 req_id, -32602,
                 "BrowserwrightDaemon.closeTab requires params.sessionId or params.targetId"))
             return
+        if await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.closeTab", params,
+        ) is None:
+            return
         # rdp dispatch: close via Target.closeTarget. Resolve the targetId from
         # the local sessionId binding when only a sessionId was given.
         if self.state.backend_name == "rdp":
+            if self._upstream_command is None and self._ensure_upstream is not None:
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"closeTab failed (upstream open): {e!r}"))
+                    return
             await self._rdp_close_tab(
                 client, req_id,
                 local_sid=local_sid if has_sid else None,
@@ -1738,7 +1845,20 @@ class Router:
             "reason": reason,
         }
         for client in self.state.clients.values():
-            if client.subscribed_focus:
-                await self._send_to_client(
-                    client.client_id,
-                    _event("BrowserwrightDaemon.activeTabChanged", params))
+            if not client.subscribed_focus or not client.session_id:
+                continue
+            if (self.state.backend_name == "extension"
+                    and self._scoped_targets is not None):
+                try:
+                    scoped = await self._scoped_targets(client.session_id)
+                except Exception:
+                    continue
+                scoped_ids = {
+                    info.get("targetId") for info in scoped
+                    if isinstance(info, dict)
+                }
+                if target_id not in scoped_ids:
+                    continue
+            await self._send_to_client(
+                client.client_id,
+                _event("BrowserwrightDaemon.activeTabChanged", params))

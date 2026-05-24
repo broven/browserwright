@@ -33,58 +33,21 @@ _INTERNAL_URL_PREFIXES = (
 )
 
 
-async def active_tab(cfg: Config) -> dict[str, Any] | None:
+async def active_tab(cfg: Config, session_id: str | None = None) -> dict[str, Any] | None:
     """Return the active-tab dict, or None when no eligible page exists.
 
     Shape (spec §5.4 --json):
         {targetId, url, title, accuracy, since_seconds}
     """
-    # The extension backend is a LOCAL_RELAY — there's no externally-resolvable
-    # browser ws (resolve() raises Unavailable). Route through the running
-    # daemon's BrowserwrightDaemon.getActiveTab RPC instead (P4b).
-    if cfg.backend == "extension":
-        return await _active_tab_via_relay(cfg)
+    if not session_id:
+        raise Unavailable("active-tab requires a browserwright session id")
 
-    rr = await resolve(cfg)
-    targets = await _fetch_targets(rr.ws_url, cfg.timeout)
-    eligible = [
-        t for t in targets
-        if isinstance(t, dict)
-        and t.get("type") == _REAL_PAGE_TYPE
-        and isinstance(t.get("url"), str)
-        and not t["url"].startswith(_INTERNAL_URL_PREFIXES)
-    ]
-    if not eligible:
-        return None
-
-    # Pick by `lastAccessed` (CDP field, milliseconds since epoch) when present.
-    # Some older Chrome builds omit it — fall back to attached==True or the
-    # registry-order first one. The accuracy stays "heuristic-recent-activate"
-    # either way; the field doc says so.
-    now_ms = time.time() * 1000.0
-
-    def sort_key(t):
-        # Higher = more recent. Missing field sorts to the bottom.
-        return t.get("lastAccessed") or 0
-
-    eligible.sort(key=sort_key, reverse=True)
-    pick = eligible[0]
-    last_accessed = pick.get("lastAccessed")
-    since_seconds = (
-        (now_ms - float(last_accessed)) / 1000.0
-        if isinstance(last_accessed, (int, float)) and last_accessed > 0
-        else None
-    )
-    return {
-        "targetId": pick.get("targetId"),
-        "url": pick.get("url"),
-        "title": pick.get("title", ""),
-        "accuracy": "heuristic-recent-activate",
-        "since_seconds": since_seconds,
-    }
+    return await _active_tab_via_relay(cfg, session_id)
 
 
-async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
+async def _active_tab_via_relay(
+    cfg: Config, session_id: str,
+) -> dict[str, Any] | None:
     """Ask the running daemon for the active tab over its Mode B socket.
 
     The extension backend answers ``BrowserwrightDaemon.getActiveTab`` from relay
@@ -97,6 +60,9 @@ async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
     import websockets
 
     from . import _ipc
+    from urllib.parse import quote
+
+    session_q = f"&session={quote(str(session_id), safe='')}"
 
     async def _drain(ws) -> dict:
         for _ in range(20):
@@ -110,18 +76,24 @@ async def _active_tab_via_relay(cfg: Config) -> dict[str, Any] | None:
         port, token = _ipc.read_port_file()
         if port is None:
             raise Unavailable("active-tab: no daemon running (extension relay)")
-        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-active-tab"
+        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-active-tab{session_q}"
         async with websockets.connect(url, compression=None) as ws:
-            await ws.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.getActiveTab"}))
+            await ws.send(json.dumps({
+                "id": 1, "method": "BrowserwrightDaemon.getActiveTab",
+                "params": {"bsSession": session_id},
+            }))
             msg = await _drain(ws)
     else:
         path = _ipc.sock_path()
         if not path.exists():
             raise Unavailable("active-tab: no daemon running (extension relay)")
         async with websockets.unix_connect(
-                str(path), uri="ws://localhost/?client=cli-active-tab",
+                str(path), uri=f"ws://localhost/?client=cli-active-tab{session_q}",
                 compression=None) as ws:
-            await ws.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.getActiveTab"}))
+            await ws.send(json.dumps({
+                "id": 1, "method": "BrowserwrightDaemon.getActiveTab",
+                "params": {"bsSession": session_id},
+            }))
             msg = await _drain(ws)
 
     result = msg.get("result") or {}

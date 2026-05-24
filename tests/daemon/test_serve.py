@@ -201,7 +201,7 @@ async def _client_connect(sock_path: Path, *, label: str = "test-client"):
     """Open a ws to the daemon's unix socket."""
     return await websockets.unix_connect(
         str(sock_path),
-        uri=f"ws://localhost/?client={label}",
+        uri=f"ws://localhost/?client={label}&session=bw-{label}",
         compression=None,
         open_timeout=3.0,
     )

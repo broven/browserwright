@@ -178,7 +178,7 @@ async def daemon(short_runtime, patched_resolver):
 async def _client(sock_path: Path, label: str):
     return await websockets.unix_connect(
         str(sock_path),
-        uri=f"ws://localhost/?client={label}",
+        uri=f"ws://localhost/?client={label}&session=bw-{label}",
         compression=None,
         open_timeout=3.0,
     )

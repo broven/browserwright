@@ -141,6 +141,13 @@ class Daemon:
             return ctx
         cfg = self._rdp_cfg_for(record)
         ctx = self._make_context(backend="rdp", cfg=cfg, session_id=session_id)
+        # Preserve ownership semantics past the ledger→context boundary:
+        # create-owned sessions launch/kill daemon-owned Chrome; attach
+        # sessions only connect to the caller-provided port.
+        try:
+            ctx.holder.rdp_owns_browser = record.get("owner") == "create"  # type: ignore[attr-defined]
+        except Exception:
+            pass
         # Same daemon back-reference the shared context got, so the rdp
         # context's RPC handlers can drop themselves on endSession.
         ctx.router.daemon = self  # type: ignore[attr-defined]

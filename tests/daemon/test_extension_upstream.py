@@ -414,6 +414,31 @@ async def test_open_background_passes_bound_group_id():
 
 
 @pytest.mark.asyncio
+async def test_open_background_requires_group_when_session_scoped():
+    """If an extension session asks for a grouped tab, groupId:-1 is a failed
+    invariant, not a successful ungrouped open."""
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "createTab"
+            assert cmd["groupName"] == "Agent"
+            await ext.respond(cmd["id"], result={
+                "tabId": 12,
+                "url": "https://example.com/",
+                "title": "Example",
+                "groupId": -1,
+            })
+
+        r = asyncio.create_task(respond())
+        with pytest.raises(RuntimeError, match="tab group id"):
+            await upstream.open_background_tab(
+                "https://example.com/", group_name="Agent", session_id="A")
+        await r
+        assert upstream._sessions == {}
+        assert "A" not in upstream._groups
+
+
+@pytest.mark.asyncio
 async def test_attach_active_adopts_into_group():
     """attach_active = adopt: the focused tab is moved into the session's group
     and the returned groupId is bound to the session (no borrowed flag)."""

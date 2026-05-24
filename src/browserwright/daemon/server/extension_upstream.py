@@ -148,6 +148,21 @@ class ExtensionUpstream:
         if isinstance(group_id, int) and group_id >= 0:
             self._groups[session_id] = group_id
 
+    @staticmethod
+    def _group_required(*, group_name: str | None,
+                        group_id: int | None,
+                        session_id: str | None) -> bool:
+        """Whether this operation promised to land the tab in a session group."""
+        return bool(group_name) or bool(session_id) or (
+            isinstance(group_id, int) and group_id >= 0)
+
+    @staticmethod
+    def _require_group_result(group_id: int, *, op: str) -> None:
+        if group_id < 0:
+            raise RuntimeError(
+                f"{op} did not return a tab group id; the extension failed to "
+                "place the tab in the session tab group")
+
     async def _group_member_tabs(self, session_id: str | None,
                                  group_id: int | None = None) -> tuple[int, list[int]]:
         """Resolve the session's live group membership = the source of truth.
@@ -448,10 +463,13 @@ class ExtensionUpstream:
         gid = self._groups.get(session_id) if session_id else None
         ghost = await self._relay.attach_active_tab(
             group_name=group_name, group_id=gid, timeout=10.0)
-        sid = _new_upstream_session_id(ghost.tab_id)
-        self._sessions[sid] = ghost.tab_id
         group_id = getattr(ghost, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
+        if self._group_required(
+            group_name=group_name, group_id=gid, session_id=session_id):
+            self._require_group_result(group_id, op="attachActive")
+        sid = _new_upstream_session_id(ghost.tab_id)
+        self._sessions[sid] = ghost.tab_id
         if session_id is not None:
             self._bind_group(session_id, group_id)
             if ghost.url:
@@ -484,10 +502,13 @@ class ExtensionUpstream:
         gid = self._groups.get(session_id) if session_id else None
         gt = await self._relay.create_background_tab(
             url, group_name=group_name, group_id=gid, background=background)
-        sid = _new_upstream_session_id(gt.tab_id)
-        self._sessions[sid] = gt.tab_id
         group_id = getattr(gt, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
+        if self._group_required(
+            group_name=group_name, group_id=gid, session_id=session_id):
+            self._require_group_result(group_id, op="createTab")
+        sid = _new_upstream_session_id(gt.tab_id)
+        self._sessions[sid] = gt.tab_id
         if session_id is not None:
             self._bind_group(session_id, group_id)
             if gt.url:

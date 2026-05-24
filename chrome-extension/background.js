@@ -532,13 +532,7 @@ async function doAttachActive(id, groupId, groupName) {
     // Move the tab into our group (idempotent if already a member). When we
     // had no live group, chrome.tabs.group({tabIds}) creates one and we name
     // it with the session name for human-readable Chrome UI.
-    let finalGroupId = ourGroupId;
-    try {
-      finalGroupId = await _ensureTabInGroup(tab.id, groupName, ourGroupId);
-    } catch (ge) {
-      console.warn("[bd-relay] adopt grouping failed:", ge);
-      finalGroupId = ourGroupId;
-    }
+    const finalGroupId = await _ensureTabInGroup(tab.id, groupName, ourGroupId);
     if (!attachedTabs.has(tab.id)) {
       await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
       attachedTabs.add(tab.id);
@@ -597,13 +591,8 @@ async function doCreateTab(id, url, groupName, sessionGroupId, background) {
     // no live id is available.
     if ((typeof sessionGroupId === "number" && sessionGroupId >= 0) ||
         (typeof groupName === "string" && groupName)) {
-      try {
-        const resolved = await _resolveSessionGroup(sessionGroupId, groupName);
-        groupId = await _ensureTabInGroup(tab.id, groupName, resolved);
-      } catch (ge) {
-        console.warn("[bd-relay] grouping failed:", ge);
-        groupId = -1;
-      }
+      const resolved = await _resolveSessionGroup(sessionGroupId, groupName);
+      groupId = await _ensureTabInGroup(tab.id, groupName, resolved);
     }
     await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
     attachedTabs.add(tab.id);

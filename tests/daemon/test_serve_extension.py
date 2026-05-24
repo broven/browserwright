@@ -105,7 +105,7 @@ async def ext_daemon(short_runtime, patch_relay_port):
 async def _client_connect(sock_path: Path, *, label: str = "test-client"):
     return await websockets.unix_connect(
         str(sock_path),
-        uri=f"ws://localhost/?client={label}",
+        uri=f"ws://localhost/?client={label}&session=bw-{label}",
         compression=None,
         open_timeout=3.0,
     )
@@ -175,10 +175,20 @@ async def test_end_to_end_target_get_targets_via_extension(ext_daemon):
 
     try:
         async with await _client_connect(sock, label="skill") as ws:
+            async def answer_group_query():
+                cmd = await ext.next_command(timeout=5.0)
+                assert cmd["type"] == "queryGroup"
+                await ext.respond(cmd["id"], result={
+                    "groupId": 7,
+                    "tabs": [{"tabId": 42, "url": "https://e2e/", "title": "e2e"}],
+                })
+
+            responder = asyncio.create_task(answer_group_query())
             await ws.send(json.dumps({
                 "id": 1, "method": "Target.getTargets",
             }))
             resp = await _recv_response(ws, 1, timeout=5.0)
+            await responder
             target_infos = resp["result"]["targetInfos"]
             assert any(ti["targetId"] == "ext-tab-42"
                        and ti["url"] == "https://e2e/"

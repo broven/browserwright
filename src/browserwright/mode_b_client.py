@@ -17,7 +17,7 @@ removed; the skill always talks to a running daemon over its socket).
 Discovery:
   - Endpoint path comes from ``browserwright-daemon status --json`` (or directly
     ``${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock``).
-  - On connect, the client appends ``?client=skill-repl`` to the URL.
+  - On connect, the client appends ``?client=skill-repl&session=<id>`` to the URL.
 
 The CDPSession transport connects to our Mode B unix endpoint (translated to
 ``ws+unix://``). :func:`client_for_session` builds the client from a resolved
@@ -245,9 +245,12 @@ class ModeBClient:
         """Best-guess user-active tab via the ``browserwright-daemon active-tab``
         CLI subcommand; the ws-based ``BrowserwrightDaemon.getActiveTab`` RPC is
         wired into ``Session`` when a CDP connection is up."""
+        if not self._session_id:
+            return None
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "active-tab", "--json"],
+                ["browserwright-daemon", "active-tab", "--json",
+                 "--session", self._session_id],
                 capture_output=True, text=True, timeout=8,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -276,9 +279,12 @@ class ModeBClient:
         the daemon returns the session's current front tab. It never returns
         -32601 to the agent.
         """
+        if not self._session_id:
+            return None
         try:
             proc = subprocess.run(
-                ["browserwright-daemon", "attach-active", "--json"],
+                ["browserwright-daemon", "attach-active", "--json",
+                 "--session", self._session_id],
                 capture_output=True, text=True, timeout=20,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -293,10 +299,12 @@ class ModeBClient:
     def disconnect_upstream(self, reason: str = "skill_idle") -> bool:
         """Ask the daemon to close its upstream ws (banner disappears) but
         keep our socket alive. Used by REPL idle policy."""
+        if not self._session_id:
+            return False
         try:
             proc = subprocess.run(
                 ["browserwright-daemon", "disconnect",
-                 "--reason", reason],
+                 "--reason", reason, "--session", self._session_id],
                 capture_output=True, text=True, timeout=5,
             )
             return proc.returncode == 0

@@ -121,6 +121,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_disc = sub.add_parser("disconnect",
         help="ask the running daemon to close its upstream ws (banner goes away)")
     _add_name(p_disc)
+    p_disc.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                        help="browserwright session id (defaults to BD_SESSION)")
     p_disc.add_argument("--reason", default="skill_disconnect",
                         help="reason string surfaced in upstreamClosed event")
 
@@ -145,6 +147,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_at = sub.add_parser("active-tab", help="best-guess user-active tab (heuristic, opens ws)")
     _add_common(p_at)
     _add_port(p_at)
+    p_at.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                      help="browserwright session id (defaults to BD_SESSION)")
     p_at.add_argument("--json", action="store_true")
 
     # backend-info — what backend is the running daemon serving?
@@ -163,6 +167,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "attach-active",
         help="(extension backend) attach the focused-window active tab without a popup click")
     _add_name(p_aa)
+    p_aa.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                      help="browserwright session id (defaults to BD_SESSION)")
     p_aa.add_argument("--json", action="store_true")
 
     # launch-chrome
@@ -213,6 +219,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ob.add_argument("--url", required=True, help="URL to open in the background tab")
     p_ob.add_argument("--group", default="Agent",
                       help="Chrome tab-group title to place the new tab in (default: Agent)")
+    p_ob.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                      help="browserwright session id (defaults to BD_SESSION)")
     # Output is always JSON (spec §5.1 single-line discipline); no --json flag.
 
     # close-tab (Phase B — extension backend only)
@@ -221,6 +229,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close a tab by sessionId (persistent ws) or targetId (CLI)",
     )
     _add_name(p_ct)
+    p_ct.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                      help="browserwright session id (defaults to BD_SESSION)")
     p_ct.add_argument("--session-id", default=None,
                       help="local sessionId from a persistent ws (Skill REPL)")
     p_ct.add_argument("--target-id", default=None,
@@ -248,6 +258,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # userscript — resident extension userscripts
     p_us = sub.add_parser("userscript", help="manage resident extension userscripts")
     _add_name(p_us)
+    p_us.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                      help="browserwright session id (defaults to BD_SESSION)")
     us_sub = p_us.add_subparsers(dest="userscript_cmd", metavar="<action>")
     p_us_push = us_sub.add_parser("push", help="install or update a .user.js file")
     p_us_push.add_argument("file", help=".user.js path, or - for stdin")
@@ -584,28 +596,33 @@ def _cmd_disconnect(args, cfg: Config) -> int:
 
     Equivalent to the RPC over an established connection — Skill can use either.
     """
-    from . import _ipc
-    return _run(_disconnect_via_ws(cfg, args.reason))
+    if not args.session:
+        print("error: provide --session or set BD_SESSION", file=sys.stderr)
+        return 2
+    return _run(_disconnect_via_ws(cfg, args.reason, args.session))
 
 
-async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
+async def _disconnect_via_ws(cfg: Config, reason: str, session: str) -> int:
     """Lightweight ws client that says BrowserwrightDaemon.disconnect and reads the
     ack. We bypass cdp-use intentionally — we don't need framing, just one
     request + one response."""
     import websockets
     from . import _ipc
+    from urllib.parse import quote
+
+    session_q = f"&session={quote(str(session), safe='')}"
 
     if _ipc.IS_WINDOWS:
         port, token = _ipc.read_port_file()
         if port is None:
             print("no daemon running", file=sys.stderr)
             return 2
-        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-disconnect"
+        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-disconnect{session_q}"
         try:
             async with websockets.connect(url, compression=None) as ws:
                 await ws.send(json.dumps({
                     "id": 1, "method": "BrowserwrightDaemon.disconnect",
-                    "params": {"reason": reason},
+                    "params": {"reason": reason, "bsSession": session},
                 }))
                 await asyncio.wait_for(ws.recv(), timeout=2.0)
         except Exception as e:
@@ -618,11 +635,13 @@ async def _disconnect_via_ws(cfg: Config, reason: str) -> int:
             return 2
         # `ws+unix:` URL scheme + path: websockets accepts unix= kwarg.
         try:
-            async with websockets.unix_connect(str(path), uri="ws://localhost/?client=cli-disconnect",
-                                               compression=None) as ws:
+            async with websockets.unix_connect(
+                str(path), uri=f"ws://localhost/?client=cli-disconnect{session_q}",
+                compression=None,
+            ) as ws:
                 await ws.send(json.dumps({
                     "id": 1, "method": "BrowserwrightDaemon.disconnect",
-                    "params": {"reason": reason},
+                    "params": {"reason": reason, "bsSession": session},
                 }))
                 await asyncio.wait_for(ws.recv(), timeout=2.0)
         except Exception as e:
@@ -636,19 +655,26 @@ def _cmd_attach_active(args, cfg: Config) -> int:
     currently-focused-window active tab. Prints the result as JSON or as
     `targetId<TAB>url<TAB>title`. Exits 1 if the daemon errored.
     """
+    if not args.session:
+        print("error: provide --session or set BD_SESSION", file=sys.stderr)
+        return 2
     return _run(_attach_active_via_ws(cfg, args))
 
 
 async def _attach_active_via_ws(cfg: Config, args) -> int:
     import websockets
     from . import _ipc
+    from urllib.parse import quote
+
+    session = getattr(args, "session", None)
+    session_q = f"&session={quote(str(session), safe='')}" if session else ""
 
     if _ipc.IS_WINDOWS:
         port, token = _ipc.read_port_file()
         if port is None:
             print("no daemon running", file=sys.stderr)
             return 2
-        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-attach-active"
+        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-attach-active{session_q}"
         try:
             async with websockets.connect(url, compression=None) as ws:
                 return await _attach_active_roundtrip(ws, args)
@@ -661,7 +687,7 @@ async def _attach_active_via_ws(cfg: Config, args) -> int:
         return 2
     try:
         async with websockets.unix_connect(
-                str(path), uri="ws://localhost/?client=cli-attach-active",
+                str(path), uri=f"ws://localhost/?client=cli-attach-active{session_q}",
                 compression=None) as ws:
             return await _attach_active_roundtrip(ws, args)
     except Exception as e:
@@ -670,8 +696,12 @@ async def _attach_active_via_ws(cfg: Config, args) -> int:
 
 
 async def _attach_active_roundtrip(ws, args) -> int:
+    params = {}
+    if getattr(args, "session", None):
+        params["bsSession"] = args.session
     await ws.send(json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.attachActiveTab",
+        "params": params,
     }))
     # Drain until we see id=1 — lifecycle events (upstreamConnecting,
     # upstreamReady) can arrive ahead of the response.
@@ -739,10 +769,25 @@ def _cmd_list_backends(args, cfg: Config) -> int:
 
 
 def _cmd_active_tab(args, cfg: Config) -> int:
-    from .active_tab import active_tab
-
-    info = _run(active_tab(cfg))
-    if info is None:
+    if not args.session:
+        print("error: provide --session or set BD_SESSION", file=sys.stderr)
+        return 2
+    try:
+        info = _run(_rpc_via_ws(
+            cfg,
+            "BrowserwrightDaemon.getActiveTab",
+            {"bsSession": args.session},
+            client_label="cli-active-tab",
+            timeout=8.0,
+            browser_session=args.session,
+        ))
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    if not info or not info.get("targetId"):
         if args.json:
             print(json.dumps({
                 "schema_version": 1,
@@ -787,7 +832,8 @@ def _cmd_version(args, cfg: Config) -> int:
 
 
 async def _rpc_via_ws(cfg: Config, method: str, params: dict,
-                      *, client_label: str, timeout: float = 10.0) -> dict:
+                      *, client_label: str, timeout: float = 10.0,
+                      browser_session: str | None = None) -> dict:
     """Open a transient ws to the running daemon, send one BrowserwrightDaemon.*
     RPC, read the response, close. Mirrors `_disconnect_via_ws` but returns
     the parsed result (or raises with the daemon's error message).
@@ -796,6 +842,11 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
     """
     import websockets
     from . import _ipc
+    from urllib.parse import quote
+
+    session_q = (
+        f"&session={quote(str(browser_session), safe='')}"
+        if browser_session else "")
 
     async def _drain_until_response(ws) -> dict:
         # Lifecycle events (upstreamConnecting/Ready) can arrive ahead of the
@@ -812,7 +863,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
         port, token = _ipc.read_port_file()
         if port is None:
             raise Unavailable("no daemon running")
-        url = f"ws://127.0.0.1:{port}/?token={token}&client={client_label}"
+        url = f"ws://127.0.0.1:{port}/?token={token}&client={client_label}{session_q}"
         async with websockets.connect(url, compression=None) as ws:
             await ws.send(json.dumps({
                 "id": 1, "method": method, "params": params,
@@ -824,7 +875,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
             raise Unavailable("no daemon running")
         async with websockets.unix_connect(
             str(path),
-            uri=f"ws://localhost/?client={client_label}",
+            uri=f"ws://localhost/?client={client_label}{session_q}",
             compression=None,
         ) as ws:
             await ws.send(json.dumps({
@@ -843,9 +894,11 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
 
 
 async def _userscript_call_ws(cfg: Config, method: str, params: dict,
-                                timeout: float = 5.0) -> dict:
+                              *, session: str, timeout: float = 5.0) -> dict:
+    params = {**params, "bsSession": session}
     return await _rpc_via_ws(
-        cfg, method, params, client_label="cli-userscript", timeout=timeout)
+        cfg, method, params, client_label="cli-userscript", timeout=timeout,
+        browser_session=session)
 
 
 def _cmd_userscript(args, cfg: Config | None = None) -> int:
@@ -861,6 +914,9 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
         print("usage: browserwright-daemon userscript {push,list,remove,toggle,logs} ...",
               file=sys.stderr)
         return 1
+    if not getattr(ns, "session", None):
+        print("error: provide --session or set BD_SESSION", file=sys.stderr)
+        return 2
 
     try:
         if action in {"push", "install"}:
@@ -872,7 +928,8 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
                     text = f.read()
             us = parse_userscript(text)
             result = _run(_userscript_call_ws(
-                cfg, "BrowserwrightDaemon.userscript.install", {"script": us.to_payload()}))
+                cfg, "BrowserwrightDaemon.userscript.install",
+                {"script": us.to_payload()}, session=ns.session))
             sync = result.get("sync", {}) or {}
             print(json.dumps({
                 "id": result.get("id", us.id),
@@ -902,15 +959,17 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
         if action == "list":
             params = {"site": ns.site} if ns.site else {}
             result = _run(_userscript_call_ws(
-                cfg, "BrowserwrightDaemon.userscript.list", params))
+                cfg, "BrowserwrightDaemon.userscript.list", params,
+                session=ns.session))
         elif action == "remove":
             result = _run(_userscript_call_ws(
-                cfg, "BrowserwrightDaemon.userscript.remove", {"key": ns.key}))
+                cfg, "BrowserwrightDaemon.userscript.remove", {"key": ns.key},
+                session=ns.session))
         elif action == "toggle":
             enabled = str(ns.enabled).lower() in {"1", "true", "yes", "on"}
             result = _run(_userscript_call_ws(
                 cfg, "BrowserwrightDaemon.userscript.toggle",
-                {"key": ns.key, "enabled": enabled}))
+                {"key": ns.key, "enabled": enabled}, session=ns.session))
         elif action == "logs":
             # NB: the relay envelope reserves the "id" key for the RPC
             # request id (relay._request overwrites it), so the script-id
@@ -919,7 +978,8 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
             if ns.id:
                 params["scriptId"] = ns.id
             result = _run(_userscript_call_ws(
-                cfg, "BrowserwrightDaemon.userscript.logs", params))
+                cfg, "BrowserwrightDaemon.userscript.logs", params,
+                session=ns.session))
         else:
             print(f"unknown userscript action: {action}", file=sys.stderr)
             return 1
@@ -938,13 +998,17 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
 
 
 def _cmd_open_background(args, cfg: Config) -> int:
+    if not args.session:
+        print("error: provide --session or set BD_SESSION", file=sys.stderr)
+        return 2
     try:
         result = _run(_rpc_via_ws(
             cfg,
             "BrowserwrightDaemon.openBackgroundTab",
-            {"url": args.url, "groupName": args.group},
+            {"url": args.url, "groupName": args.group, "bsSession": args.session},
             client_label="cli-open-background",
             timeout=15.0,
+            browser_session=args.session,
         ))
     except Unavailable as e:
         print(f"error: {e}", file=sys.stderr)
@@ -959,10 +1023,13 @@ def _cmd_open_background(args, cfg: Config) -> int:
 
 
 def _cmd_close_tab(args, cfg: Config) -> int:
+    if not args.session:
+        print("error: provide --session or set BD_SESSION", file=sys.stderr)
+        return 2
     if not args.session_id and not args.target_id:
         print("error: provide --session-id or --target-id", file=sys.stderr)
         return 2
-    params: dict = {}
+    params: dict = {"bsSession": args.session}
     if args.session_id:
         params["sessionId"] = args.session_id
     if args.target_id:
@@ -974,6 +1041,7 @@ def _cmd_close_tab(args, cfg: Config) -> int:
             params,
             client_label="cli-close-tab",
             timeout=10.0,
+            browser_session=args.session,
         ))
     except Unavailable as e:
         print(f"error: {e}", file=sys.stderr)

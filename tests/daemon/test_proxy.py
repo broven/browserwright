@@ -66,6 +66,8 @@ def _setup(*labels: str, phase=UpstreamPhase.CONNECTED, wire_upstream: bool = Tr
     clients = []
     for label in labels or ("skill-repl",):
         c = state.allocate_client(label)
+        c.session_id = f"bw-{label}"
+        c.session_name = f"bw-{label}"
         router.register_client(c.client_id, cap.client_send_for(c.client_id))
         clients.append(c)
     return state, router, cap, clients
@@ -371,6 +373,39 @@ async def test_attach_active_on_rdp_creates_tab_when_none_exists():
     assert resp["result"]["targetId"] == "rdp-new"
     assert resp["result"]["tabId"] is None
     assert resp["result"]["groupId"] == -1  # created via the open path
+
+
+@pytest.mark.asyncio
+async def test_attach_active_on_rdp_ensures_upstream_before_raw_cdp():
+    state, router, cap, (client,) = _setup(backend="rdp", wire_upstream=False)
+    client.session_id = "rdp-session"
+    state.upstream_phase = UpstreamPhase.DISCONNECTED
+    calls: list[str] = []
+
+    async def ensure() -> None:
+        cap.ensure_calls += 1
+        state.upstream_phase = UpstreamPhase.CONNECTED
+
+        async def rdp_cmd(method: str, params=None, session_id=None):
+            calls.append(method)
+            if method == "Target.getTargets":
+                return {"id": -1, "result": {"targetInfos": []}}
+            if method == "Target.createTarget":
+                return {"id": -1, "result": {"targetId": "rdp-new"}}
+            if method == "Target.attachToTarget":
+                return {"id": -1, "result": {"sessionId": "UP-RDP"}}
+            raise AssertionError(method)
+
+        router._upstream_command = rdp_cmd
+
+    router.bind_lifecycle(ensure, cap.trigger_disconnect)
+    await router.route_from_client(client, json.dumps({
+        "id": 23, "method": "BrowserwrightDaemon.attachActiveTab",
+    }))
+
+    assert cap.ensure_calls == 1
+    assert calls == ["Target.getTargets", "Target.createTarget", "Target.attachToTarget"]
+    assert cap.per_client[client.client_id][-1]["result"]["targetId"] == "rdp-new"
 
 
 # ---- v0.3 multi-client: single-attacher rule -----------------------------
@@ -754,6 +789,43 @@ async def test_open_background_with_callback_binds_session_and_attacher():
 
 
 @pytest.mark.asyncio
+async def test_open_background_on_rdp_ensures_upstream_before_raw_cdp():
+    """RDP uses the same BrowserwrightDaemon.openBackgroundTab verb, but its
+    raw-CDP command channel is only wired after the upstream has been opened."""
+    state, router, cap, (client,) = _setup(backend="rdp", wire_upstream=False)
+    client.session_id = "rdp-session"
+    state.upstream_phase = UpstreamPhase.DISCONNECTED
+    calls: list[str] = []
+
+    async def ensure() -> None:
+        cap.ensure_calls += 1
+        state.upstream_phase = UpstreamPhase.CONNECTED
+
+        async def rdp_cmd(method: str, params=None, session_id=None):
+            calls.append(method)
+            if method == "Target.createTarget":
+                return {"id": -1, "result": {"targetId": "rdp-tab"}}
+            if method == "Target.attachToTarget":
+                return {"id": -1, "result": {"sessionId": "rdp-session"}}
+            raise AssertionError(method)
+
+        router._upstream_command = rdp_cmd
+
+    router.bind_lifecycle(ensure, cap.trigger_disconnect)
+    await router.route_from_client(client, json.dumps({
+        "id": 6,
+        "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://rdp.example/"},
+    }))
+
+    assert cap.ensure_calls == 1
+    assert calls == ["Target.createTarget", "Target.attachToTarget"]
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["targetId"] == "rdp-tab"
+    assert result["groupId"] == -1
+
+
+@pytest.mark.asyncio
 async def test_open_background_missing_url_returns_invalid_params():
     """params.url is required; absence → -32602."""
     state, router, cap, (client,) = _setup(backend="extension")
@@ -763,6 +835,39 @@ async def test_open_background_missing_url_returns_invalid_params():
     err = cap.per_client[client.client_id][-1]["error"]
     assert err["code"] == -32602
     assert "url" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_browser_operations_require_browserwright_session_id():
+    state, router, cap, (client,) = _setup(backend="extension")
+    client.session_id = None
+    client.session_name = None
+    await router.route_from_client(client, json.dumps({
+        "id": 10,
+        "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://x/"},
+    }))
+    assert cap.per_client[client.client_id][-1]["error"]["code"] == -32602
+
+    await router.route_from_client(client, json.dumps({
+        "id": 11,
+        "method": "Browser.getVersion",
+    }))
+    msg = cap.per_client[client.client_id][-1]["error"]["message"]
+    assert "requires websocket ?session" in msg
+
+
+@pytest.mark.asyncio
+async def test_browser_operation_rejects_session_mismatch():
+    state, router, cap, (client,) = _setup(backend="extension")
+    await router.route_from_client(client, json.dumps({
+        "id": 12,
+        "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://x/", "bsSession": "different-session"},
+    }))
+    err = cap.per_client[client.client_id][-1]["error"]
+    assert err["code"] == -32602
+    assert "session mismatch" in err["message"]
 
 
 @pytest.mark.asyncio
@@ -791,7 +896,7 @@ async def test_close_tab_with_callback_cleans_session_state():
             "tabId": 99,
             "url": "https://x/",
             "title": "x",
-            "groupId": -1,
+            "groupId": 9,
         }
 
     captured_close: list[str] = []
@@ -851,7 +956,7 @@ async def test_close_tab_by_target_id_works_across_client_boundary():
             "sessionId": "UPSTREAM-SID-77",
             "targetId": "ext-tab-77",
             "tabId": 77,
-            "url": "https://x/", "title": "x", "groupId": -1,
+            "url": "https://x/", "title": "x", "groupId": 9,
         }
     captured_close: list[str] = []
     async def _fake_close(sid: str) -> dict:
@@ -900,7 +1005,7 @@ async def test_close_tab_falls_back_to_by_target_id_when_opener_disconnected():
             "sessionId": "UPSTREAM-SID-88",
             "targetId": "ext-tab-88",
             "tabId": 88,
-            "url": "https://y/", "title": "y", "groupId": -1,
+            "url": "https://y/", "title": "y", "groupId": 9,
         }
     by_sid_calls: list[str] = []
     by_tid_calls: list[str] = []
@@ -1112,6 +1217,8 @@ async def test_recover_session_with_callback_binds_and_returns_payload():
 @pytest.mark.asyncio
 async def test_ensure_session_requires_session_bound_websocket():
     state, router, cap, (client,) = _setup()
+    client.session_id = None
+    client.session_name = None
     await router.route_from_client(client, json.dumps({
         "id": 10, "method": "BrowserwrightDaemon.ensureSession",
         "params": {"session": "7"},
@@ -1259,3 +1366,31 @@ async def test_open_background_falls_back_to_session_id_group_title():
     }))
     assert seen["group_name"] == "7"
     assert seen["session_id"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_open_background_rejects_bssession_on_sessionless_client(tmp_home, monkeypatch):
+    """The websocket session id is the isolation key. ``bsSession`` may only
+    repeat the bound session; it cannot substitute for a missing ``?session``."""
+    from browserwright import session_registry as reg
+
+    monkeypatch.setenv("BS_HOME", str(tmp_home / "bs-home"))
+    sid = reg.allocate(backend="extension", owner="attach", name="ledger-name")
+    state, router, cap, (client,) = _setup(backend="extension")
+    client.session_id = None
+    client.session_name = None
+
+    async def _fake_open(url, group_name=None, *, session_id=None, background=True):
+        raise AssertionError("sessionless open must not reach extension upstream")
+        return {"sessionId": "U-1", "targetId": "ext-tab-1", "tabId": 1,
+                "url": url, "title": "t", "groupId": 9}
+
+    router._open_background_tab = _fake_open
+    await router.route_from_client(client, json.dumps({
+        "id": 4,
+        "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://x/", "bsSession": sid},
+    }))
+    msg = cap.per_client[client.client_id][-1]
+    assert msg["error"]["code"] == -32602
+    assert "requires websocket ?session" in msg["error"]["message"]
