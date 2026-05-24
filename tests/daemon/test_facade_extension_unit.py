@@ -41,6 +41,9 @@ class _MockExtension:
         # 'createTab' / 'attach' / 'command' we provide sane defaults.
         self.tabs_meta: dict[int, dict] = {}
         self._next_created_tab = 100
+        # Every chrome.debugger.sendCommand the relay forwarded, as
+        # (tabId, method) tuples — lets tests assert what reached the extension.
+        self.commands_seen: list[tuple] = []
 
     async def connect(self, port: int) -> None:
         self.ws = await websockets.connect(
@@ -87,7 +90,23 @@ class _MockExtension:
                                          "title": "new", "groupId": -1})
             return
         if kind == "command":
-            # chrome.debugger.sendCommand — answer with an empty result.
+            method = msg.get("method")
+            tab = msg.get("tabId")
+            self.commands_seen.append((tab, method))
+            # chrome.debugger.sendCommand — answer with an empty result, then
+            # (like real Chrome) emit Runtime.executionContextCreated for the
+            # default context after a Runtime.enable so the facade's event-gated
+            # barrier (PR3) releases.
+            await self._respond(cmd_id, {})
+            if method == "Runtime.enable" and isinstance(tab, int):
+                await self.push_event(
+                    tab_id=tab, method="Runtime.executionContextCreated",
+                    params={"context": {"id": 1, "auxData": {
+                        "isDefault": True, "type": "default"}}})
+            return
+        if kind == "closeTab":
+            tab = int(msg.get("tabId", -1))
+            self.tabs_meta.pop(tab, None)
             await self._respond(cmd_id, {})
             return
         if kind == "ping":
@@ -352,3 +371,206 @@ async def test_bridge_does_not_clobber_agent_event_handler():
         await ext.close()
     finally:
         await relay.stop()
+
+
+# ---- PR3: CRPage high-level fidelity ---------------------------------------
+
+
+async def _attach_one(ext: _MockExtension, client: _FakeClient, *,
+                      tab_id: int) -> str:
+    """Announce a tab and run the discovery handshake; return its sessionId."""
+    await ext.announce_attached(tab_id=tab_id)
+    await asyncio.sleep(0.05)
+    client.feed({"id": 1, "method": "Target.setAutoAttach",
+                 "params": {"autoAttach": True}})
+    attached = await client.wait_for(
+        lambda f: f.get("method") == "Target.attachedToTarget"
+        and f["params"]["targetInfo"]["targetId"] == f"ext-tab-{tab_id}")
+    return attached["params"]["sessionId"]
+
+
+async def test_attached_target_carries_browser_context_id():
+    """PR3 fix #1: Playwright's crBrowser asserts a truthy browserContextId on
+    attachedToTarget before building CRPage. The synthesized targetInfo must
+    carry a stable non-empty id + type=page + waitingForDebugger:false."""
+    async with _wired() as (relay, ext, client, bridge):
+        await _attach_one(ext, client, tab_id=42)
+        att = client.result_for  # noqa: F841 — readability only
+        attached = next(f for f in client.sent
+                        if f.get("method") == "Target.attachedToTarget")
+        ti = attached["params"]["targetInfo"]
+        assert ti["browserContextId"], "browserContextId must be truthy"
+        assert ti["type"] == "page"
+        assert attached["params"]["waitingForDebugger"] is False
+
+
+async def test_page_session_set_auto_attach_is_forwarded():
+    """PR3 fix #4: a SESSION-scoped Target.setAutoAttach (CRPage init id 13)
+    must be FORWARDED to the extension's chrome.debugger, not silent-acked, so
+    the page session's auto-attach contract resolves against real Chrome."""
+    async with _wired() as (relay, ext, client, bridge):
+        sid = await _attach_one(ext, client, tab_id=8)
+        client.feed({"id": 30, "sessionId": sid,
+                     "method": "Target.setAutoAttach",
+                     "params": {"autoAttach": True, "flatten": True,
+                                "waitForDebuggerOnStart": True}})
+        await client.wait_for(lambda f: f.get("id") == 30 and "result" in f)
+        assert (8, "Target.setAutoAttach") in ext.commands_seen, (
+            f"page-session setAutoAttach not forwarded; "
+            f"seen={ext.commands_seen}")
+
+
+async def test_runtime_enable_does_disable_enable_dance_and_gates_on_event():
+    """PR3 fix #2: Runtime.enable issues Runtime.disable→enable to force a
+    re-emit, and gates its response on the default executionContextCreated."""
+    async with _wired() as (relay, ext, client, bridge):
+        sid = await _attach_one(ext, client, tab_id=8)
+        ext.commands_seen.clear()
+        client.feed({"id": 20, "sessionId": sid, "method": "Runtime.enable",
+                     "params": {}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 20 and "result" in f)
+        assert res["result"] == {}
+        methods = [m for (t, m) in ext.commands_seen if t == 8]
+        assert "Runtime.disable" in methods, f"no disable in {methods}"
+        assert "Runtime.enable" in methods, f"no enable in {methods}"
+        assert methods.index("Runtime.disable") < methods.index(
+            "Runtime.enable"), "disable must precede enable"
+
+
+async def test_created_blank_target_reports_initial_empty_url():
+    """PR3 fix #3: a freshly-created about:blank target is reported with the
+    initial-empty-document url ':' (so CRPage's isInitialEmptyPage heuristic
+    matches real Chrome); a real frameNavigated then refreshes it."""
+    async with _wired() as (relay, ext, client, bridge):
+        client.feed({"id": 3, "method": "Target.createTarget",
+                     "params": {"url": "about:blank"}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 3 and "result" in f)
+        tid = res["result"]["targetId"]
+        created = await client.wait_for(
+            lambda f: f.get("method") == "Target.targetCreated"
+            and f["params"]["targetInfo"]["targetId"] == tid)
+        assert created["params"]["targetInfo"]["url"] == ":", (
+            "fresh blank tab must report ':' (initial empty document)")
+        # A real navigation refreshes the tracked url.
+        tab_id = int(tid[len("ext-tab-"):])
+        await ext.push_event(tab_id=tab_id, method="Page.frameNavigated",
+                             params={"frame": {"id": "F", "url": "https://z/"}})
+        await asyncio.sleep(0.05)
+        info = bridge._target_info(tab_id)  # noqa: SLF001
+        assert info["url"] == "https://z/", (
+            f"frameNavigated did not refresh url; got {info['url']!r}")
+
+
+async def test_close_target_emits_detach_and_destroy_events():
+    """PR3 follow-up: a successful browser-level Target.closeTarget must emit
+    Target.detachedFromTarget + Target.targetDestroyed AFTER the success
+    response (real Chrome always does; Playwright's page teardown AWAITS the
+    destroy — without it new_page() cleanup hangs forever)."""
+    async with _wired() as (relay, ext, client, bridge):
+        sid = await _attach_one(ext, client, tab_id=8)
+        assert sid
+        client.feed({"id": 50, "method": "Target.closeTarget",
+                     "params": {"targetId": "ext-tab-8"}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 50 and "result" in f)
+        assert res["result"]["success"] is True
+        detached = await client.wait_for(
+            lambda f: f.get("method") == "Target.detachedFromTarget"
+            and f["params"]["targetId"] == "ext-tab-8")
+        assert detached["params"]["sessionId"] == sid
+        destroyed = await client.wait_for(
+            lambda f: f.get("method") == "Target.targetDestroyed"
+            and f["params"]["targetId"] == "ext-tab-8")
+        assert destroyed
+        # Order: success response precedes the destroy event.
+        ids = [i for i, f in enumerate(client.sent)
+               if f.get("id") == 50 and "result" in f]
+        destroy_idx = [i for i, f in enumerate(client.sent)
+                       if f.get("method") == "Target.targetDestroyed"]
+        assert ids and destroy_idx and ids[0] < destroy_idx[0], (
+            "success response must precede targetDestroyed")
+        # Per-tab state is evicted on close (no leak).
+        assert 8 not in bridge._tab_sessions  # noqa: SLF001
+        assert 8 not in bridge._tab_main_frame  # noqa: SLF001
+
+
+async def test_main_frame_id_rewrite_round_trip_and_agent_path_isolation():
+    """PR3 follow-up (highest-scrutiny): the bridge rewrites the REAL Chrome
+    main-frame id to the synthetic targetId (ext-tab-<id>) in the getFrameTree
+    response AND in forwarded page events, and rewrites it BACK on inbound
+    commands. The rewrite must NOT corrupt the shared relay event dict that the
+    agent path's primary _on_event also consumes."""
+    async with _wired() as (relay, ext, client, bridge):
+        sid = await _attach_one(ext, client, tab_id=8)
+        # Teach the mock to answer Page.getFrameTree with a REAL main-frame id.
+        real_frame_id = "REALFRAME123"
+
+        async def _frame_tree_handler(msg: dict) -> None:
+            if msg.get("type") == "command" and (
+                    msg.get("method") == "Page.getFrameTree"):
+                await ext._respond(msg.get("id"), {"frameTree": {"frame": {
+                    "id": real_frame_id, "url": "about:blank"}}})
+
+        # Drive getFrameTree through the bridge; intercept via a one-shot patch.
+        orig_handle = ext._handle
+
+        async def _patched(msg: dict) -> None:
+            if (msg.get("type") == "command"
+                    and msg.get("method") == "Page.getFrameTree"):
+                await _frame_tree_handler(msg)
+                return
+            await orig_handle(msg)
+
+        ext._handle = _patched  # type: ignore[method-assign]
+        client.feed({"id": 60, "sessionId": sid,
+                     "method": "Page.getFrameTree", "params": {}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 60 and "result" in f)
+        # Response carries the SYNTHETIC main-frame id, not the real one.
+        assert res["result"]["frameTree"]["frame"]["id"] == "ext-tab-8"
+        assert bridge._tab_main_frame[8] == real_frame_id  # noqa: SLF001
+
+        # A forwarded event with the REAL frame id is rewritten to synthetic.
+        ext._handle = orig_handle  # type: ignore[method-assign]
+        agent_seen: list[dict] = []
+
+        async def _agent_handler(ext_msg: dict) -> None:
+            # Mimic the agent path: capture what it would serialize.
+            agent_seen.append(json.loads(json.dumps(ext_msg)))
+
+        relay.set_event_handler(_agent_handler)
+        await ext.push_event(
+            tab_id=8, method="Page.lifecycleEvent",
+            params={"frameId": real_frame_id, "name": "load"})
+        evt = await client.wait_for(
+            lambda f: f.get("method") == "Page.lifecycleEvent")
+        # Facade rewrote the top-frame id to synthetic for Playwright.
+        assert evt["params"]["frameId"] == "ext-tab-8"
+        # The agent path saw the ORIGINAL real frame id (ordering: _on_event
+        # runs+serializes before the facade fan-out mutates) — no corruption.
+        assert agent_seen, "agent handler must have observed the event"
+        assert agent_seen[-1]["params"]["frameId"] == real_frame_id, (
+            "agent path's event was corrupted by the facade rewrite")
+
+        # Inbound command scoped to the synthetic frame id is rewritten back.
+        ext.commands_seen.clear()
+        captured: list[dict] = []
+        orig_handle2 = ext._handle
+
+        async def _capture(msg: dict) -> None:
+            if (msg.get("type") == "command"
+                    and msg.get("method") == "Page.createIsolatedWorld"):
+                captured.append(msg.get("params") or {})
+                await ext._respond(msg.get("id"), {})
+                return
+            await orig_handle2(msg)
+
+        ext._handle = _capture  # type: ignore[method-assign]
+        client.feed({"id": 61, "sessionId": sid,
+                     "method": "Page.createIsolatedWorld",
+                     "params": {"frameId": "ext-tab-8"}})
+        await client.wait_for(lambda f: f.get("id") == 61 and "result" in f)
+        assert captured and captured[0]["frameId"] == real_frame_id, (
+            f"inbound command frameId not rewritten back; got {captured}")

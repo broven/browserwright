@@ -65,10 +65,17 @@ logger = logging.getLogger(__name__)
 
 
 # Bounded wait for the main-frame execution context after `Runtime.enable`
-# (A4). playwriter waits ~3s; we match that order of magnitude. On timeout we
-# still return the enable result — the barrier is best-effort robustness, not a
-# correctness gate.
+# (A4 / PR3). playwriter waits ~3s; we match that order of magnitude. On timeout
+# we still return the enable result — the barrier is best-effort robustness, not
+# a correctness gate.
 _RUNTIME_ENABLE_BARRIER_TIMEOUT = 3.0
+
+# After `Runtime.disable`, pause briefly before `Runtime.enable` so Chrome
+# treats the re-enable as a fresh subscription and re-emits
+# `executionContextCreated` for the existing default context to this
+# late-joining client (playwriter's relay does the same disable→sleep→enable
+# dance: cdp-relay.ts:792-829).
+_RUNTIME_REENABLE_PAUSE = 0.05
 
 
 # Synthetic browserContextId for synthesized page targets. The extension backend
@@ -137,6 +144,35 @@ class ExtensionFacadeBridge:
         # arrived on the synthetic browser CDP session (Target.attachToBrowser-
         # Target). None for ordinary frames.
         self._echo_sid: str | None = None
+        # PR3: last-known top-frame url per tab, fed from `Page.frameNavigated`
+        # (and seeded from the relay ghost). Used to keep synthesized targetInfo
+        # url fresh so Playwright isn't stranded on a stale value. A freshly-
+        # created, not-yet-navigated tab is normalized to ":" (Chrome's initial
+        # empty document) so CRPage's `isInitialEmptyPage` heuristic matches.
+        self._tab_url: dict[int, str] = {}
+        # PR3: tabs we created via Target.createTarget that have NOT yet seen a
+        # real navigation — their targetInfo.url is reported as ":" (the initial
+        # empty document) until the first frameNavigated lands. This is what
+        # flips Playwright's `crPage.ts` init onto the benign initial-empty-page
+        # branch instead of the "already navigated" one (research delta #2).
+        self._fresh_blank_tabs: set[int] = set()
+        # PR3: tab_id → the REAL Chrome main-frame id (from Page.getFrameTree).
+        # Real Chrome makes a page's top-level frame id === its targetId, and
+        # Playwright's CRPage keys its frame→session map on the targetId
+        # (`_sessions.set(targetId, mainFrameSession)`), then looks the main
+        # frame up by `frame.id` (`_sessionForFrame`). The extension backend's
+        # targetId is the SYNTHETIC `ext-tab-<tabid>`, which never equals
+        # Chrome's internal main-frame id — so the lookup throws "Frame has been
+        # detached" and init rejects. We bridge by rewriting the main frame's id
+        # to the synthetic targetId in everything we hand Playwright (frame tree
+        # + page-domain events), and rewriting it back to the real id on
+        # commands Playwright sends scoped to that frame.
+        self._tab_main_frame: dict[int, str] = {}
+        # PR3: per-(tab) futures awaiting the main-frame default
+        # `Runtime.executionContextCreated` event, resolved by `_on_relay_event`
+        # so `_handle_runtime_enable` can gate its response on the real event
+        # rather than a blind sleep.
+        self._ctx_waiters: dict[int, list[asyncio.Future]] = {}
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -167,6 +203,13 @@ class ExtensionFacadeBridge:
         # send_text emulation + session table. Tearing down our relay fan-out
         # listener above is the only relay-side cleanup we own.
         self._ext._open = False  # noqa: SLF001 — mark our adapter inert
+        # Cancel any in-flight Runtime.enable barriers so a closing connection
+        # never leaves awaiters hanging (CancelledError is BaseException; the
+        # awaiters catch TimeoutError/CancelledError and proceed).
+        for tab_id in list(self._ctx_waiters.keys()):
+            for fut in self._ctx_waiters.pop(tab_id, []):
+                if not fut.done():
+                    fut.cancel()
 
     # ---- client frame handling ------------------------------------------
 
@@ -291,14 +334,49 @@ class ExtensionFacadeBridge:
                               f"unknown sessionId {session_id!r}",
                               session_id=session_id)
             return
-        # A few session-scoped browser-discovery methods are silent-acked the
-        # same way the agent path does (the extension can't honor child
-        # auto-attach), so Playwright's per-page setup doesn't stall.
-        if method in ("Target.setAutoAttach", "Target.setDiscoverTargets"):
-            await self._respond(req_id, {}, session_id=session_id)
-            return
+        # PR3: page-session `Target.setAutoAttach` (id 13 in the CRPage init
+        # batch) is part of CRPage `_initialize`'s `Promise.all`; the agent path
+        # silent-acks it (it never drives child auto-attach), but for the
+        # Playwright high-level path we FORWARD it to the extension's
+        # chrome.debugger so the page session's auto-attach contract is honored.
+        # A plain about:blank page has no OOPIF children, so the forward
+        # resolves with `{}` either way — but forwarding (vs faking) means the
+        # init promise resolves against real Chrome state rather than a
+        # synthesized lie, which is the fidelity CRPage init depends on. Child
+        # `attachedToTarget` for real OOPIFs is out of scope here (phase A); the
+        # forward just must not error.
+        # PR3: a command scoped to the synthetic main-frame id (which equals the
+        # targetId we handed Playwright) must target the REAL Chrome frame id.
+        self._rewrite_command_frame_id(tab_id, params)
         try:
             result = await self._relay.send_cdp(tab_id, method or "", params)
+            # PR3: real Chrome makes a page's TOP frame id === its targetId, and
+            # CRPage keys its frame→session map on the targetId
+            # (`_sessions.set(targetId, mainFrameSession)`) then resolves the
+            # main frame by `frame.id` (`_sessionForFrame`). Our targetId is the
+            # SYNTHETIC `ext-tab-<tabid>`, never Chrome's internal main-frame id,
+            # so that lookup throws "Frame has been detached" and `new_page()`
+            # init rejects. Remember the real↔synthetic mapping and present the
+            # synthetic targetId as the main frame id in the frame tree (the same
+            # rewrite is mirrored on forwarded events + inbound commands), making
+            # the page look exactly like a real-Chrome top-level target.
+            #
+            # NOTE: we deliberately do NOT rewrite the frame url to ":" here.
+            # CRPage init computes `isInitialEmptyPage = mainFrame().url() === ":"`;
+            # when TRUE it withholds `_firstNonInitialNavigationCommittedFulfill()`
+            # (waiting for a real navigation), and since init awaits
+            # `_firstNonInitialNavigationCommittedPromise`, a fresh `new_page()`
+            # that never navigates would hang. Leaving the real `about:blank` url
+            # makes `isInitialEmptyPage` FALSE → init fulfills immediately, which
+            # is exactly how a real-Chrome `context.new_page()` settles.
+            if (method == "Page.getFrameTree"
+                    and isinstance(result, dict)):
+                frame = (result.get("frameTree") or {}).get("frame")
+                if isinstance(frame, dict):
+                    real_id = frame.get("id")
+                    if isinstance(real_id, str) and real_id:
+                        self._tab_main_frame[tab_id] = real_id
+                        frame["id"] = f"ext-tab-{tab_id}"
             await self._respond(req_id, result, session_id=session_id)
         except _CommandError as e:
             await self._error(req_id, e.code, e.message, session_id=session_id)
@@ -367,6 +445,18 @@ class ExtensionFacadeBridge:
             # Same primitive shape the agent `open_background` verb uses.
             gt = await self._relay.create_background_tab(
                 url, group_name="Agent", group_id=None, background=True)
+            # PR3 (research delta #2): a brand-new, not-yet-navigated tab must be
+            # reported to Playwright with the initial-empty-document url ":" (NOT
+            # "about:blank"), so CRPage's `isInitialEmptyPage = mainFrame().url()
+            # === ":"` heuristic takes the benign branch instead of treating the
+            # page as already-navigated (which flips init onto the path that
+            # rejects → close). Real Chrome reports ":" for createTarget targets;
+            # the extension's tab has already committed about:blank by attach
+            # time, so we normalize it here until the first real frameNavigated.
+            if url in ("", "about:blank"):
+                self._fresh_blank_tabs.add(gt.tab_id)
+            else:
+                self._tab_url[gt.tab_id] = url
             # Announce BEFORE the response (Chrome ordering Playwright relies on).
             await self._announce_target(gt.tab_id, send_created=True)
         except Exception as e:  # noqa: BLE001
@@ -388,28 +478,63 @@ class ExtensionFacadeBridge:
             # CDP returns success:false for an unknown target rather than erroring.
             await self._respond(req_id, {"success": False})
             return
+        sid = self._tab_sessions.get(tab_id)
         try:
             await self._relay.close_tab(tab_id)
         except Exception as e:  # noqa: BLE001
             logger.debug("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
         # Evict local + upstream session state for the closed tab.
-        sid = self._tab_sessions.pop(tab_id, None)
-        if sid:
-            self._ext._sessions.pop(sid, None)  # noqa: SLF001
+        self._evict_tab(tab_id)
         await self._respond(req_id, {"success": True})
+        # Real Chrome ALWAYS emits detachedFromTarget + targetDestroyed after a
+        # successful closeTarget; Playwright's page-creation/teardown path AWAITS
+        # targetDestroyed to settle the CRPage. The relay only surfaces a
+        # `detached` event for a USER-driven tab close, not for this
+        # daemon-initiated `close_tab`, so the events must be synthesized here —
+        # otherwise (e.g. when CRPage `_initialize` rejects and Playwright closes
+        # the freshly-created target) `new_page()` hangs forever waiting for the
+        # destroy that never arrives. Mirrors the `detached` relay-event path.
+        await self._send_to_client(json.dumps({
+            "method": "Target.detachedFromTarget",
+            "params": {
+                "sessionId": sid or "",
+                "targetId": f"ext-tab-{tab_id}",
+            },
+        }))
+        await self._send_to_client(json.dumps({
+            "method": "Target.targetDestroyed",
+            "params": {"targetId": f"ext-tab-{tab_id}"},
+        }))
 
     async def _handle_runtime_enable(self, req_id: int | None,
                                      session_id: str, params: dict) -> None:
-        """A4: forward Runtime.enable for the session's tab, then wait (bounded)
-        for the main-frame `Runtime.executionContextCreated` before returning,
-        so Playwright doesn't race ahead of the default execution context.
+        """A4 / PR3: event-gated `Runtime.enable` barrier — the single most
+        important CRPage-init fidelity fix per playwriter.
 
-        We can't intercept the event stream cheaply here (events flow async via
-        the relay fan-out → _on_relay_event), so we forward the command and add
-        a small settle delay bounded by the barrier timeout. The extension's
-        `Runtime.enable` itself replays `executionContextCreated` for existing
-        contexts, which _on_relay_event forwards to the client; the bounded wait
-        just gives that replay a beat to land before Playwright's next call."""
+        CRPage `_initialize` issues `Runtime.enable` and expects the default
+        execution context to materialize before init completes; if the
+        late-joining Playwright client never sees the main-frame
+        `executionContextCreated`, init's promise chain settles as an error and
+        Playwright closes the freshly-created target. The extension's
+        `chrome.debugger` session is shared/long-lived, so a plain
+        `Runtime.enable` may NOT re-emit `executionContextCreated` for a context
+        that already existed before this client subscribed.
+
+        We mirror playwriter's relay dance (cdp-relay.ts:792-829):
+          1. `Runtime.disable` → short pause → `Runtime.enable` so Chrome treats
+             it as a fresh subscription and re-emits `executionContextCreated`
+             for the existing default context.
+          2. HOLD this `Runtime.enable` response until we OBSERVE the default
+             (`auxData.isDefault == true`) `executionContextCreated` for this
+             tab (forwarded via `_on_relay_event`), bounded by ~3s. On timeout
+             we still return the enable result (best-effort, not a hard gate).
+
+        The architectural choice: the disable/enable round-trip is issued HERE
+        in the bridge over its relay upstream (not pushed down to the
+        extension), because the bridge owns the Playwright-facing flat session
+        AND already observes the extension event fan-out via `_on_relay_event` —
+        so it is the one place that can both drive the re-subscribe and watch
+        for the resulting event without a second transport hop."""
         tab_id = self._ext._sessions.get(session_id)  # noqa: SLF001
         if tab_id is None:
             from .extension_upstream import _tab_id_from_session_id
@@ -419,32 +544,57 @@ class ExtensionFacadeBridge:
                               f"unknown sessionId {session_id!r}",
                               session_id=session_id)
             return
+        # Arm the waiter BEFORE issuing enable so we can't miss the event
+        # between the enable round-trip and registering the future.
+        waiter = self._arm_context_waiter(tab_id)
         try:
-            result = await self._relay.send_cdp(
-                tab_id, "Runtime.enable", params)
+            # Force re-emission of executionContextCreated for the existing
+            # default context: disable → pause → enable.
+            with contextlib.suppress(_CommandError, Exception):
+                await self._relay.send_cdp(tab_id, "Runtime.disable", {})
+            await asyncio.sleep(_RUNTIME_REENABLE_PAUSE)
+            result = await self._relay.send_cdp(tab_id, "Runtime.enable", params)
         except _CommandError as e:
+            self._disarm_context_waiter(tab_id, waiter)
             await self._error(req_id, e.code, e.message, session_id=session_id)
             return
         except Exception as e:  # noqa: BLE001
+            self._disarm_context_waiter(tab_id, waiter)
             await self._error(req_id, -32603, f"Runtime.enable failed: {e!r}",
                               session_id=session_id)
             return
-        # Bounded settle so the extension's executionContextCreated replay
-        # (forwarded via _on_relay_event) reaches the client before we ack.
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                self._await_default_context(tab_id),
-                timeout=_RUNTIME_ENABLE_BARRIER_TIMEOUT,
-            )
+        # Gate the response on the real default-context event (bounded).
+        try:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    waiter, timeout=_RUNTIME_ENABLE_BARRIER_TIMEOUT)
+        finally:
+            self._disarm_context_waiter(tab_id, waiter)
         await self._respond(req_id, result, session_id=session_id)
 
-    async def _await_default_context(self, tab_id: int) -> None:
-        """Best-effort barrier: a short sleep that yields control so any
-        in-flight executionContextCreated frames get pumped. Kept trivial — the
-        true correctness comes from the extension replaying the context on
-        Runtime.enable; this only avoids returning the ack on the very same
-        tick the command was sent."""
-        await asyncio.sleep(0.05)
+    def _arm_context_waiter(self, tab_id: int) -> asyncio.Future:
+        """Register a future resolved when the next default
+        `Runtime.executionContextCreated` for `tab_id` is observed."""
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._ctx_waiters.setdefault(tab_id, []).append(fut)
+        return fut
+
+    def _disarm_context_waiter(self, tab_id: int,
+                               fut: asyncio.Future) -> None:
+        waiters = self._ctx_waiters.get(tab_id)
+        if waiters and fut in waiters:
+            waiters.remove(fut)
+            if not waiters:
+                self._ctx_waiters.pop(tab_id, None)
+        if not fut.done():
+            fut.cancel()
+
+    def _resolve_context_waiters(self, tab_id: int) -> None:
+        """Wake every waiter for `tab_id` (the default execution context just
+        landed)."""
+        for fut in self._ctx_waiters.pop(tab_id, []):
+            if not fut.done():
+                fut.set_result(None)
 
     # ---- target event synthesis (A2) ------------------------------------
 
@@ -508,7 +658,8 @@ class ExtensionFacadeBridge:
         }
 
     def _target_info(self, tab_id: int) -> dict:
-        """Build a CDP targetInfo from the relay's current ghost view."""
+        """Build a CDP targetInfo from the relay's current ghost view, kept
+        fresh from `Page.frameNavigated` (PR3)."""
         url = ""
         title = ""
         for g in self._relay.list_ghost_targets():
@@ -516,6 +667,14 @@ class ExtensionFacadeBridge:
                 url = g.url
                 title = g.title
                 break
+        # PR3: prefer the live top-frame url we track from frameNavigated so
+        # getTargetInfo/attachedToTarget never strand Playwright on a stale
+        # value; a freshly-created blank tab is reported as the initial empty
+        # document ":" (research delta #2 / #3).
+        if tab_id in self._fresh_blank_tabs:
+            url = ":"
+        elif tab_id in self._tab_url:
+            url = self._tab_url[tab_id]
         return {
             "targetId": f"ext-tab-{tab_id}",
             "type": "page",
@@ -556,9 +715,8 @@ class ExtensionFacadeBridge:
             return
 
         if kind == "detached":
-            sid = self._tab_sessions.pop(tab_id, None)
-            if sid:
-                self._ext._sessions.pop(sid, None)  # noqa: SLF001
+            sid = self._tab_sessions.get(tab_id)
+            self._evict_tab(tab_id)
             await self._send_to_client(json.dumps({
                 "method": "Target.detachedFromTarget",
                 "params": {
@@ -577,6 +735,28 @@ class ExtensionFacadeBridge:
             params = ext_msg.get("params") or {}
             if not isinstance(method, str):
                 return
+            # PR3: keep the live top-frame url fresh and release the fresh-blank
+            # normalization once the page actually navigates, so getTargetInfo
+            # stops reporting ":" after the first real navigation.
+            if method == "Page.frameNavigated":
+                frame = params.get("frame") or {}
+                # Top frame only: no parentId.
+                if isinstance(frame, dict) and not frame.get("parentId"):
+                    new_url = frame.get("url")
+                    if isinstance(new_url, str) and new_url and new_url != ":":
+                        self._tab_url[tab_id] = new_url
+                        self._fresh_blank_tabs.discard(tab_id)
+            # PR3: a default-context creation releases the Runtime.enable barrier.
+            elif method == "Runtime.executionContextCreated":
+                ctx = params.get("context") or {}
+                aux = ctx.get("auxData") or {} if isinstance(ctx, dict) else {}
+                if isinstance(aux, dict) and aux.get("isDefault"):
+                    self._resolve_context_waiters(tab_id)
+            # PR3: rewrite the REAL Chrome main-frame id → the synthetic
+            # targetId in events we forward, matching the rewrite applied to the
+            # getFrameTree response (so Playwright's frame→session map stays
+            # consistent and never throws "Frame has been detached").
+            self._rewrite_event_frame_id(tab_id, method, params)
             sid = self._tab_sessions.get(tab_id)
             out: dict[str, Any] = {"method": method, "params": params}
             if sid is not None:
@@ -585,6 +765,59 @@ class ExtensionFacadeBridge:
             return
 
     # ---- helpers ---------------------------------------------------------
+
+    def _rewrite_event_frame_id(self, tab_id: int, method: str,
+                                params: dict) -> None:
+        """In-place: swap the REAL Chrome main-frame id for the synthetic
+        targetId (`ext-tab-<tab_id>`) in a forwarded page-domain event, so it
+        agrees with the frame id we presented in `Page.getFrameTree`. Only the
+        TOP frame is remapped; child/OOPIF frames keep their real ids."""
+        real = self._tab_main_frame.get(tab_id)
+        if not real:
+            return
+        synthetic = f"ext-tab-{tab_id}"
+        # `params.frameId` (lifecycleEvent, frameStartedLoading, navigatedWithin
+        # Document, …) and `params.frame.id`/`parentId` (frameNavigated,
+        # frameAttached) and `params.context.auxData.frameId`
+        # (executionContextCreated) are the carriers of the top-frame id.
+        if params.get("frameId") == real:
+            params["frameId"] = synthetic
+        frame = params.get("frame")
+        if isinstance(frame, dict):
+            if frame.get("id") == real:
+                frame["id"] = synthetic
+            if frame.get("parentId") == real:
+                frame["parentId"] = synthetic
+        ctx = params.get("context")
+        if isinstance(ctx, dict):
+            aux = ctx.get("auxData")
+            if isinstance(aux, dict) and aux.get("frameId") == real:
+                aux["frameId"] = synthetic
+
+    def _rewrite_command_frame_id(self, tab_id: int, params: dict) -> None:
+        """In-place inverse of `_rewrite_event_frame_id`: a command Playwright
+        sends scoped to the (synthetic) main frame id must be rewritten back to
+        the REAL Chrome frame id before forwarding to chrome.debugger (e.g.
+        `Page.createIsolatedWorld {frameId}`)."""
+        real = self._tab_main_frame.get(tab_id)
+        if not real:
+            return
+        synthetic = f"ext-tab-{tab_id}"
+        if params.get("frameId") == synthetic:
+            params["frameId"] = real
+
+    def _evict_tab(self, tab_id: int) -> None:
+        """Drop all per-tab state for a closed/detached tab and wake any
+        outstanding Runtime.enable barrier so it doesn't hang on a dead tab."""
+        sid = self._tab_sessions.pop(tab_id, None)
+        if sid:
+            self._ext._sessions.pop(sid, None)  # noqa: SLF001
+        self._tab_url.pop(tab_id, None)
+        self._fresh_blank_tabs.discard(tab_id)
+        self._tab_main_frame.pop(tab_id, None)
+        for fut in self._ctx_waiters.pop(tab_id, []):
+            if not fut.done():
+                fut.cancel()
 
     async def _send_to_client(self, frame: str) -> None:
         if self._closed:

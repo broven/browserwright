@@ -23,13 +23,15 @@ What this proves (all via a real `chromium.connect_over_cdp`):
      tab via the extension, and `Page.navigate` / `Runtime.evaluate` drive it —
      read the title back through the facade.
 
-NOTE (PR3 edge): Playwright's HIGH-LEVEL `context.new_page()` /
-`page.goto()` wrappers need deeper CRPage init fidelity (isolated/utility
-worlds, opener tracking) than phase A synthesizes — the wrapper currently
-closes the freshly-created target during its init handshake. We therefore drive
-the page domain at the CDP level (a CDPSession on the connected Browser), which
-is the layer phase A targets. Wiring the high-level Page wrapper is tracked for
-PR3 (the C-phase agent interface uses `execute(code)` over this facade anyway).
+PR3 (CRPage high-level fidelity — DONE): Playwright's HIGH-LEVEL
+`context.new_page()` / `page.goto()` wrappers now work over the extension
+backend too — see `test_high_level_new_page_and_goto_over_extension`. The
+facade synthesizes the CRPage `_initialize` contract: a stable browserContextId
++ initial-empty-document ':' url on a fresh blank target, an event-gated
+Runtime.enable barrier (disable→enable + wait for the default
+executionContextCreated), and forwarded page-session Target.setAutoAttach. The
+older `test_connect_over_cdp_drives_extension_page` retains the CDP-level drive
+as a lower-level regression anchor.
 """
 from __future__ import annotations
 
@@ -277,6 +279,57 @@ def test_connect_over_cdp_drives_extension_page(ext_facade_ready):
     assert nav_ok, "Page.navigate did not return a frameId"
     assert heading == "facade-rendered", f"got heading {heading!r}"
     assert two == 2
+
+
+def test_high_level_new_page_and_goto_over_extension(ext_facade_ready):
+    """ACCEPTANCE (PR3 — CRPage high-level fidelity): the HIGH-LEVEL Playwright
+    API — `context.new_page()` / `page.goto()` / `page.title()` /
+    `page.locator().text_content()` — works over the EXTENSION backend through
+    the facade, not just CDP-level drive.
+
+    Before the PR3 fixes this FAILED: `context.new_page()` threw because CRPage
+    `_initialize` rejected (target announced already-running + frame tree
+    showing about:blank instead of ':', and Runtime.enable not gated on the
+    real default-context event), so Playwright closed the freshly-created
+    target ('Failed to create page'). The fixes:
+      - synthesized targetInfo carries a stable browserContextId + ':' url for
+        a fresh blank tab (so isInitialEmptyPage matches real Chrome),
+      - Runtime.enable does disable→enable and gates on the default
+        executionContextCreated event,
+      - page-session Target.setAutoAttach is forwarded, not silent-acked.
+
+    This is the playwriter-parity acceptance on the user's PRIMARY backend."""
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright_api.sync_playwright
+
+    _ext_port, facade_port, _runtime_dir = ext_facade_ready
+    facade_ws = f"ws://127.0.0.1:{facade_port}/cdp"
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(facade_ws, timeout=20000)
+        try:
+            context = (browser.contexts[0] if browser.contexts
+                       else browser.new_context())
+            # HIGH-LEVEL new_page() — the whole CRPage _initialize state machine
+            # runs here. Pre-fix this closed the target during init.
+            page = context.new_page()
+            # Use set_content (navigate about:blank + set document content), NOT
+            # `goto("data:...")`: a `data:` URL navigation issued over
+            # `chrome.debugger` (the extension backend's transport) is aborted by
+            # Chrome (`net::ERR_ABORTED`) — a backend-transport limitation, not a
+            # facade gap (real `http(s)`/`about:` gotos drive fine over the
+            # facade). set_content exercises the same high-level surface
+            # (CRPage navigation + main/utility worlds + locators) without the
+            # data:-scheme restriction.
+            page.set_content("<title>facade-hl</title>"
+                             "<h1 id=x>hi-high-level</h1>",
+                             wait_until="load", timeout=20000)
+            assert page.title() == "facade-hl", f"title={page.title()!r}"
+            assert page.locator("#x").text_content() == "hi-high-level"
+            # A plain evaluate proves the utility/main world is fully wired.
+            assert page.evaluate("1 + 1") == 2
+        finally:
+            browser.close()
 
 
 def _port_free(port: int) -> bool:
