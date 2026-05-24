@@ -1,0 +1,5 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": "tests/daemon/e2e/test_l2_recovery.py", "reason": "stable ledger session seeding helper pattern"}
+{"file": "tests/daemon/e2e/test_l2_multisession.py", "reason": "existing extension multisession e2e pattern"}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend/test conventions entrypoint"}
+{"file": "src/browserwright/daemon/server/extension_upstream.py", "reason": "session group isolation behavior under test"}

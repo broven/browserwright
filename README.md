@@ -65,6 +65,38 @@ The skill bundle is intentionally a thin shell. The authoritative agent instruct
 
 For development only, `mise run dev-link` links the current checkout into global PATH and skill dirs. That is convenient for debugging but can break global agents if the checkout is broken.
 
+## Update the local global install
+
+Use this flow when you want the global Code Agent install on this machine to pick up the current repo state:
+
+```bash
+# 1. Build a non-editable release and atomically update global symlinks.
+mise run install-release
+
+# 2. Verify the active release, CLI, daemon, generated skill, and extension metadata.
+browserwright release status
+browserwright version check
+browserwright-daemon version check
+
+# 3. Restart the daemon if release status says the running daemon is stale.
+browserwright-daemon restart
+```
+
+If the daemon is running manually instead of as the macOS LaunchAgent, restart it manually:
+
+```bash
+browserwright-daemon stop
+browserwright-daemon serve
+```
+
+The release installer also copies the unpacked Chrome extension into the stable local load path:
+
+```bash
+/Users/metajs/Library/Mobile Documents/com~apple~CloudDocs/etc/chrome-extension/browserwright
+```
+
+If `install-release` reports `reload_chrome_extension: true`, open `chrome://extensions/` and reload the `browserwright` unpacked extension from that stable path. The path does not change across releases; the installer overwrites its contents.
+
 ## Local release discipline
 
 `pyproject.toml` is the semver source of truth. The Python runtime, daemon runtime, generated skill document, and extension checks all read or compare against that package version.

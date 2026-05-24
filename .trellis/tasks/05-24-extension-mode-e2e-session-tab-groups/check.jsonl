@@ -1,0 +1,4 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": "tests/daemon/e2e/test_l2_multisession.py", "reason": "compare new coverage with existing concurrent session expectations"}
+{"file": "tests/daemon/e2e/test_l2_recovery.py", "reason": "runtime/group id recovery assertions remain compatible"}
+{"file": "tests/daemon/e2e/conftest.py", "reason": "real Chrome extension fixtures and cleanup"}
