@@ -46,25 +46,34 @@ A **session** is the isolation key that lets multiple agents drive browsers with
 
 **A session is a logical browser.** One global daemon serves every session. On `rdp` the session's browser is a dedicated, isolated Chrome the daemon launches and owns (its own profile — separate cookies/storage; it dies when the session ends). On `extension` the session's browser is a **Chrome tab group** (named after the session) inside the user's real Chrome — `session end` closes the whole group. **Isolation caveat (extension):** a tab group isolates only the *tab set*, NOT cookies/storage — every extension session shares the user's one profile, so two extension sessions on the same origin share that origin's cookies/login. (That sharing is the point of the extension backend: reuse the user's logged-in state.) rdp sessions do not share storage. The backend is fixed at `session new` and never changes.
 
-**Your FIRST command of any browser task is `session new` — never a bare heredoc.** A bare `browserwright <<'PY'` with no `BD_SESSION` exits 2 (no session). Create one session, reuse its id for every later call. Pick the backend from [memory.md](./memory.md) (`default_backend`); for "use my browser" / logged-in / personal work that's `extension`:
+**Your FIRST command of any browser task is `session new` — never a bare heredoc.** A bare `browserwright <<'PY'` with no `BD_SESSION` exits 2 (no session). Create one session, reuse its id for every later call. Pick the backend from [memory.md](./memory.md) (`default_backend`); for "use my browser" / logged-in / personal work that's `extension`.
+
+There is one standard agent workflow. The backend is only a parameter chosen at session creation:
 
 ```bash
-sid=$(browserwright session new --backend=extension)
+sid=$(browserwright session new --backend=<extension|rdp> --name=<short-label> [--create | --attach=PORT])
 BD_SESSION=$sid browserwright <<'PY'
 open("https://example.com")
 print(page_info())
 PY
 ```
 
+Backend choices:
+
+- `--backend=extension --name=personal` — use the user's daily Chrome via the extension backend.
+- `--backend=rdp --create --name=smoke` — create an isolated Chrome owned by this session.
+- `--backend=rdp --attach=9222 --name=fp-account` — attach to an existing browser, such as a fingerprint profile exposing CDP.
+
 Full form below:
 
 ```bash
 # Create a session (pick the backend/mode — see the decision rule below). Prints a short id.
-# The backend is fixed at creation and immutable for the session's life. No --name:
-# one global daemon serves every session, and the session's id is its only handle.
-sid=$(browserwright session new --backend=extension)
-# OR: browserwright session new --backend=rdp --create      # daemon launches+owns a fresh isolated Chrome
-# OR: browserwright session new --backend=rdp --attach=9222  # attaches to a running browser
+# The backend is fixed at creation and immutable for the session's life.
+# --name is required: it becomes the Chrome tab-group title on extension and a
+# human-readable ledger label on every backend. The session id is still the handle.
+sid=$(browserwright session new --backend=extension --name=personal)
+# OR: browserwright session new --backend=rdp --create --name=smoke       # daemon launches+owns a fresh isolated Chrome
+# OR: browserwright session new --backend=rdp --attach=9222 --name=fp-1   # attaches to a running browser
 
 # Then every call carries the id — via --session or BD_SESSION.
 BD_SESSION=$sid browserwright <<'PY'
@@ -197,8 +206,8 @@ PY
 ### Screenshot a page
 
 ```bash
-browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent &
-BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
+sid=$(browserwright session new --backend=rdp --create --name=screenshot)
+BD_SESSION=$sid browserwright <<'PY'
 open("https://example.com")
 wait_for_load()
 path = capture_screenshot()         # returns the absolute PNG path (str)
@@ -211,7 +220,8 @@ PY
 ### Click flow (coordinate-first, not selector-first)
 
 ```bash
-BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
+sid=$(browserwright session new --backend=rdp --create --name=click-flow)
+BD_SESSION=$sid browserwright <<'PY'
 open("https://news.ycombinator.com")
 wait_for_load()
 capture_screenshot()             # look at pixel coords
@@ -226,7 +236,8 @@ Drop to `js(...)` only when coordinates are the wrong tool (hidden inputs, 0×0 
 ### Bulk-fetch many URLs (no browser)
 
 ```bash
-BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
+sid=$(browserwright session new --backend=rdp --create --name=bulk-fetch)
+BD_SESSION=$sid browserwright <<'PY'
 from concurrent.futures import ThreadPoolExecutor
 urls = [f"https://example.com/page/{i}" for i in range(1, 50)]
 with ThreadPoolExecutor(max_workers=10) as ex:
@@ -241,7 +252,8 @@ Every heredoc runs in a fresh Python process — `current_target_id` is lost whe
 
 ```bash
 # Heredoc 1 — open the tab, print its handle so the agent captures it.
-browserwright <<'PY'
+sid=$(browserwright session new --backend=extension --name=tab-continuity)
+BD_SESSION=$sid browserwright <<'PY'
 r = open("https://example.com")
 print("TAB:", r["targetId"])         # agent stores this string
 wait_for_load()
@@ -252,7 +264,7 @@ PY
 # Heredoc 2 — re-bind to the same tab. No popup, no re-attach dance,
 # and immune to the user clicking another window between calls
 # (which is the failure mode of "always grab the focused tab").
-browserwright <<'PY'
+BD_SESSION=$sid browserwright <<'PY'
 switch_tab("<targetId from heredoc 1>")
 type_text("hello")
 PY
@@ -261,7 +273,7 @@ PY
 ```bash
 # Heredoc 3 — same handle still works as long as the tab is open
 # and the daemon is alive.
-browserwright <<'PY'
+BD_SESSION=$sid browserwright <<'PY'
 switch_tab("<same targetId>")
 print(page_info())
 PY
