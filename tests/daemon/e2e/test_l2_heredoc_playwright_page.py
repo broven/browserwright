@@ -257,6 +257,63 @@ def test_memory_only_heredoc_does_not_connect_rdp(rdp_autofacade_daemon):
 
 
 # ---------------------------------------------------------------------------
+#   PR2: snapshot() ref → locator round-trip (rdp)
+# ---------------------------------------------------------------------------
+
+
+# A page with known interactive elements; click the snapshot's ref for the
+# button, then assert the click handler ran (sets <title>). Proves the
+# snapshot -> page.locator("aria-ref=eN") round-trip end to end through the
+# real heredoc CLI. rdp drives data: navigations fine (the extension backend
+# does not — see the facade spec).
+_SNAPSHOT_SCRIPT_RDP = (
+    "import re\n"
+    "page.goto('data:text/html,"
+    "<button onclick=%22document.title=%27clicked%27%22>Press me</button>"
+    "<input placeholder=Search>', wait_until='load')\n"
+    "snap = snapshot()\n"
+    "print('SNAP_START')\n"
+    "print(snap)\n"
+    "print('SNAP_END')\n"
+    "btn = [l for l in snap.splitlines() if 'Press me' in l][0]\n"
+    "ref = re.search(r'\\[ref=(\\w+)\\]', btn).group(1)\n"
+    "print('BTNREF=' + ref)\n"
+    "page.locator('aria-ref=' + ref).click()\n"
+    "print('TITLE=' + page.title())\n"
+    "box = [l for l in snap.splitlines() if 'Search' in l][0]\n"
+    "bref = re.search(r'\\[ref=(\\w+)\\]', box).group(1)\n"
+    "page.locator('aria-ref=' + bref).fill('hello')\n"
+    "print('INPUT=' + page.locator('aria-ref=' + bref).input_value())\n"
+)
+
+
+def test_snapshot_ref_roundtrip_rdp(rdp_autofacade_daemon):
+    """PR2 ACCEPTANCE (rdp): snapshot() yields [ref=eN] lines for the page's
+    interactive elements, and page.locator("aria-ref=eN") resolves each ref to
+    a clickable / fillable locator."""
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = rdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "rdp")
+    try:
+        r = run_skill(_SNAPSHOT_SCRIPT_RDP, backend="rdp",
+                      runtime_dir=runtime_dir, extra_env={"BD_SESSION": sid})
+        assert r.returncode == 0, f"snapshot heredoc failed: {r.stderr}"
+        snap = r.stdout.split("SNAP_START\n", 1)[1].split("\nSNAP_END", 1)[0]
+        # The snapshot carries refs for the interactive elements.
+        assert "[ref=" in snap, f"no refs in snapshot:\n{snap}"
+        assert "Press me" in snap and "button" in snap
+        assert "Search" in snap and "textbox" in snap
+        # The button ref clicked (its onclick set the title)...
+        assert _grep(r.stdout, "TITLE") == "clicked", (
+            f"aria-ref click did not run the handler:\n{r.stdout}")
+        # ...and the textbox ref filled.
+        assert _grep(r.stdout, "INPUT") == "hello", (
+            f"aria-ref fill did not take:\n{r.stdout}")
+    finally:
+        _cleanup_session("rdp", sid)
+
+
+# ---------------------------------------------------------------------------
 #   extension backend (auto-facade, CfT harness)
 # ---------------------------------------------------------------------------
 
@@ -347,6 +404,45 @@ _EXT_SCRIPT_2 = (
     "p2 = context.new_page()\n"
     "print('GREW=' + str(len(context.pages) == n_before + 1))\n"
 )
+
+
+# Extension backend: data: navigations abort over chrome.debugger, so seed the
+# page with set_content. Then snapshot() and round-trip a ref to a click.
+_SNAPSHOT_SCRIPT_EXT = (
+    "import re\n"
+    "page.set_content("
+    "'<button onclick=\"document.title=\\'clicked\\'\">Press me</button>"
+    "<input placeholder=Search>', wait_until='load')\n"
+    "snap = snapshot()\n"
+    "print('SNAP_START')\n"
+    "print(snap)\n"
+    "print('SNAP_END')\n"
+    "btn = [l for l in snap.splitlines() if 'Press me' in l][0]\n"
+    "ref = re.search(r'\\[ref=(\\w+)\\]', btn).group(1)\n"
+    "print('BTNREF=' + ref)\n"
+    "page.locator('aria-ref=' + ref).click()\n"
+    "print('TITLE=' + page.title())\n"
+)
+
+
+def test_snapshot_ref_roundtrip_extension(ext_autofacade_ready):
+    """PR2 ACCEPTANCE (extension/CfT): snapshot() refs round-trip to a clickable
+    locator over the extension facade."""
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = ext_autofacade_ready
+    sid = _seed_session(runtime_dir, "extension")
+    try:
+        r = run_skill(_SNAPSHOT_SCRIPT_EXT, backend="extension",
+                      runtime_dir=runtime_dir, extra_env={"BD_SESSION": sid},
+                      timeout=60)
+        assert r.returncode == 0, f"ext snapshot heredoc failed: {r.stderr}"
+        snap = r.stdout.split("SNAP_START\n", 1)[1].split("\nSNAP_END", 1)[0]
+        assert "[ref=" in snap, f"no refs in ext snapshot:\n{snap}"
+        assert "Press me" in snap and "button" in snap
+        assert _grep(r.stdout, "TITLE") == "clicked", (
+            f"ext aria-ref click did not run the handler:\n{r.stdout}")
+    finally:
+        _cleanup_session("extension", sid)
 
 
 def test_cross_heredoc_tab_reuse_extension(ext_autofacade_ready):

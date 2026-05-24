@@ -146,3 +146,93 @@ def test_handle_close_is_noop_without_connect():
     # close() before any access is a clean no-op (idempotent).
     h.close()
     h.close()
+
+
+# ---- PR2: snapshot() injection, filter, truncation ------------------------
+
+
+def test_snapshot_injected_and_lazy(monkeypatch):
+    """build_globals() injects a callable `snapshot` that OVERRIDES the legacy
+    coordinate snapshot, and calling nothing leaves the page unconnected."""
+    import browserwright.repl.playwright_handle as ph
+    from browserwright.repl import _namespace
+
+    def _boom(*a, **k):
+        raise AssertionError("snapshot injection triggered a facade connect")
+
+    monkeypatch.setattr(ph, "_facade_ws_url", _boom)
+    g = _namespace.build_globals()
+    assert callable(g["snapshot"])
+    # The injected snapshot is the PR2 one (bound to the heredoc handle), not
+    # the legacy EXPORT.
+    assert g["snapshot"].__module__ == "browserwright.repl.snapshot"
+    # Merely having it in scope must not connect.
+    g["__bw_playwright_handle__"].close()
+
+
+def test_filter_interactive_keeps_refs_and_ancestors():
+    from browserwright.repl.snapshot import _filter_interactive
+
+    snap = (
+        "- generic [ref=e1]:\n"
+        "  - wrapper-no-ref:\n"
+        "    - deeper-no-ref:\n"
+        "      - button \"A\" [ref=e2]\n"
+        "  - junk-subtree:\n"
+        "    - text: nothing\n"
+        "  - link \"B\" [ref=e3]"
+    )
+    out = _filter_interactive(snap)
+    # Every ref'd line survives.
+    assert "[ref=e1]" in out and "[ref=e2]" in out and "[ref=e3]" in out
+    # Ancestors of a ref'd node survive so the tree stays coherent.
+    assert "wrapper-no-ref" in out and "deeper-no-ref" in out
+    # A subtree with NO ref is dropped entirely.
+    assert "junk-subtree" not in out and "nothing" not in out
+    # No kept line that carries a ref is ever dropped.
+    for ln in snap.splitlines():
+        if "[ref=" in ln:
+            assert ln in out.splitlines()
+
+
+def test_truncate_never_splits_a_ref():
+    """max_chars must cut on a LINE boundary — a severed `[ref=eN]` token would
+    be a corrupt ref the agent could act on."""
+    from browserwright.repl.snapshot import make_snapshot
+
+    class _Page:
+        def __init__(self, t: str) -> None:
+            self._t = t
+
+        def aria_snapshot(self, *, mode: str) -> str:
+            return self._t
+
+    class _Handle:
+        def __init__(self, t: str) -> None:
+            self._t = t
+
+        @property
+        def page(self):  # type: ignore[no-untyped-def]
+            return _Page(self._t)
+
+    # A long line whose [ref=] sits past a naive byte cut.
+    text = "A" * 90 + " [ref=e12345]\nnext"
+    out = make_snapshot(_Handle(text))(interactive_only=False, max_chars=98)
+    assert out.endswith("… [truncated]")
+    body = out.rsplit("\n… [truncated]", 1)[0]
+    # No partial ref leaked; every surviving ref is intact.
+    assert "[ref=e1\n" not in out
+    for ln in body.splitlines():
+        if "[ref=" in ln:
+            assert ln.rstrip().endswith("]")
+
+    # Multi-line: each kept line is whole.
+    many = "\n".join(f"  - button [ref=e{i}]" for i in range(1, 60))
+    out2 = make_snapshot(_Handle(many))(interactive_only=False, max_chars=200)
+    for ln in out2.rsplit("\n… [truncated]", 1)[0].splitlines():
+        assert ln.endswith("]")
+
+    # Under budget → no marker.
+    out3 = make_snapshot(_Handle("- a [ref=e1]"))(
+        interactive_only=False, max_chars=6000)
+    assert "truncated" not in out3

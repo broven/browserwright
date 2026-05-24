@@ -92,6 +92,14 @@ def build_globals() -> dict[str, Any]:
     g["page"] = _LazyHandleProxy(handle, "page")
     g["context"] = _LazyHandleProxy(handle, "context")
     g["__bw_playwright_handle__"] = handle
+    # Phase C PR2: `snapshot()` becomes the Playwright first-party AI aria
+    # snapshot bound to THIS heredoc's `page` (refs → `page.locator("aria-ref=
+    # eN")`). It deliberately OVERRIDES the legacy coordinate `snapshot` placed
+    # by EXPORTS above — the old coordinate-snapshot is part of the legacy CDP
+    # primitive surface being removed in PR3; replacing its behaviour now keeps
+    # the agent on one (ref-based) observation verb.
+    from .snapshot import make_snapshot
+    g["snapshot"] = make_snapshot(handle)
     # Agent-editable layer last, so helpers can call core primitives.
     _load_agent_helpers(g)
     return g
