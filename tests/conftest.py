@@ -1,9 +1,8 @@
-"""Default curated unit-test collection.
+"""Curated unit-test collection.
 
-The historical unit suite is large and slow. By default we run a minimized,
-coverage-focused unit/contract set that keeps total coverage at roughly 70%+
-while avoiding the full legacy test count. Set BROWSERWRIGHT_FULL_UNIT=1 to run
-all legacy unit tests.
+The historical unit suite was pruned to this coverage-focused unit/contract set.
+The hook keeps broad pytest invocations pinned to the curated list while still
+allowing explicit file/nodeid runs during local development.
 """
 from __future__ import annotations
 
@@ -52,8 +51,8 @@ _CURATED_UNIT_TESTS = {
     "tests/skill/test_coverage_mode_b_dense.py::test_open_unix_websocket_uses_synthetic_http_upgrade",
     "tests/skill/test_coverage_mode_b_dense.py::test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors",
     "tests/daemon/test_coverage_daemon_core.py::test_cli_main_without_subcommand_prints_help",
-    "tests/daemon/test_coverage_daemon_core.py::test_cli_main_maps_exceptions_to_exit_codes[exc3-130-]",
-    "tests/daemon/test_coverage_daemon_core.py::test_cli_main_maps_exceptions_to_exit_codes[exc4-3-internal error: RuntimeError: surprise]",
+    "tests/daemon/test_coverage_daemon_core.py::test_cli_main_maps_exceptions_to_exit_codes[exc0-130-]",
+    "tests/daemon/test_coverage_daemon_core.py::test_cli_main_maps_exceptions_to_exit_codes[exc1-3-internal error: RuntimeError: surprise]",
     "tests/daemon/test_coverage_daemon_core.py::test_cli_main_unavailable_verbose_prints_attempts",
     "tests/daemon/test_coverage_daemon_core.py::test_cmd_url_mode_b_proxy_unix_text",
     "tests/daemon/test_coverage_daemon_core.py::test_cmd_url_mode_b_proxy_tcp_without_port_exits_unavailable",

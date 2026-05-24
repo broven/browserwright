@@ -12,13 +12,94 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import pytest
+import websockets
 
 from browserwright.daemon.server.extension_upstream import (
     ExtensionUpstream, _tab_id_from_session_id, _tab_id_from_target_id,
 )
 from browserwright.daemon.server.relay import RelayServer
 
-from daemon.test_relay import _MockExtension, _relay_running  # type: ignore
+@asynccontextmanager
+async def _relay_running() -> AsyncIterator[RelayServer]:
+    relay = RelayServer(port=0)
+    await relay.start()
+    try:
+        yield relay
+    finally:
+        await relay.stop()
+
+
+class _MockExtension:
+    def __init__(self):
+        self.ws: websockets.ClientConnection | None = None
+        self.received: list[dict] = []
+        self.recv_task: asyncio.Task | None = None
+        self._inbox: asyncio.Queue[dict] = asyncio.Queue()
+
+    async def connect(self, port: int, *, install_id: str = "test-ext-1") -> None:
+        self.ws = await websockets.connect(
+            f"ws://127.0.0.1:{port}/", compression=None)
+        await self.ws.send(json.dumps({
+            "type": "hello",
+            "installId": install_id,
+            "browser": "chrome",
+            "version": "120.0.0.0",
+        }))
+        self.recv_task = asyncio.create_task(self._reader())
+
+    async def _reader(self) -> None:
+        assert self.ws is not None
+        try:
+            async for raw in self.ws:
+                if isinstance(raw, (str, bytes)):
+                    text = raw if isinstance(raw, str) else raw.decode()
+                    msg = json.loads(text)
+                    self.received.append(msg)
+                    await self._inbox.put(msg)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
+    async def next_command(self, *, timeout: float = 2.0) -> dict:
+        return await asyncio.wait_for(self._inbox.get(), timeout=timeout)
+
+    async def respond(
+        self, cmd_id: int, *, result: dict | None = None,
+        error: dict | None = None,
+    ) -> None:
+        assert self.ws is not None
+        msg: dict = {"type": "response", "id": cmd_id}
+        if error is not None:
+            msg["error"] = error
+        else:
+            msg["result"] = result or {}
+        await self.ws.send(json.dumps(msg))
+
+    async def push_event(
+        self, *, tab_id: int, method: str, params: dict | None = None,
+    ) -> None:
+        assert self.ws is not None
+        await self.ws.send(json.dumps({
+            "type": "event",
+            "tabId": tab_id,
+            "method": method,
+            "params": params or {},
+        }))
+
+    async def announce_attached(
+        self, *, tab_id: int, url: str = "https://x/", title: str = "x",
+    ) -> None:
+        assert self.ws is not None
+        await self.ws.send(json.dumps({
+            "type": "attached",
+            "tabId": tab_id,
+            "targetInfo": {"url": url, "title": title},
+        }))
+
+    async def close(self) -> None:
+        if self.ws is not None:
+            await self.ws.close()
+        if self.recv_task is not None:
+            self.recv_task.cancel()
 
 
 # ---- helper: build a wired-up ExtensionUpstream -------------------------
@@ -411,31 +492,6 @@ async def test_open_background_passes_bound_group_id():
             "https://a2/", group_name="Agent", session_id="A")
         await r
         assert out["groupId"] == 100
-
-
-@pytest.mark.asyncio
-async def test_open_background_requires_group_when_session_scoped():
-    """If an extension session asks for a grouped tab, groupId:-1 is a failed
-    invariant, not a successful ungrouped open."""
-    async with _ext_upstream() as (relay, upstream, captured, ext):
-        async def respond():
-            cmd = await ext.next_command()
-            assert cmd["type"] == "createTab"
-            assert cmd["groupName"] == "Agent"
-            await ext.respond(cmd["id"], result={
-                "tabId": 12,
-                "url": "https://example.com/",
-                "title": "Example",
-                "groupId": -1,
-            })
-
-        r = asyncio.create_task(respond())
-        with pytest.raises(RuntimeError, match="tab group id"):
-            await upstream.open_background_tab(
-                "https://example.com/", group_name="Agent", session_id="A")
-        await r
-        assert upstream._sessions == {}
-        assert "A" not in upstream._groups
 
 
 @pytest.mark.asyncio

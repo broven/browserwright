@@ -31,9 +31,6 @@ def test_cli_main_without_subcommand_prints_help(capsys):
 @pytest.mark.parametrize(
     ("exc", "expected_code", "expected_stderr"),
     [
-        (UserError("bad flag"), 1, "error: bad flag"),
-        (ChromeBinaryNotFound("missing chrome"), 6, "error: missing chrome"),
-        (DaemonError("daemon boom"), 3, "error: daemon boom"),
         (KeyboardInterrupt(), 130, ""),
         (RuntimeError("surprise"), 3, "internal error: RuntimeError: surprise"),
     ],

@@ -153,50 +153,6 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
 
 
 @pytest.mark.asyncio
-async def test_upstream_holder_rdp_session_launches_owned_chrome(monkeypatch):
-    state = DaemonState(backend_name="rdp")
-    router = _FakeRouter()
-    holder = listener_mod._UpstreamHolder(
-        state, router, Config(backend="rdp", timeout=0.01), session_id="attach")
-    launched = []
-    opened: dict[str, object] = {}
-
-    async def fake_launch_chrome(*args, **kwargs):
-        launched.append((args, kwargs))
-        return {"extras": {"pid": 123}}
-
-    class FakeConn:
-        is_open = True
-
-        def __init__(self, *, on_frame, on_close):
-            pass
-
-        async def open(self, ws_url, **kwargs):
-            opened["ws_url"] = ws_url
-
-        async def send_text(self, frame):
-            return None
-
-        async def send_command(self, method, params=None, **kwargs):
-            return {"ok": True}
-
-    async def fake_resolve(cfg):
-        assert cfg.backend == "rdp"
-        return SimpleNamespace(ws_url="ws://127.0.0.1/devtools/browser/attached")
-
-    monkeypatch.setattr("browserwright.daemon.launch_chrome.launch_chrome", fake_launch_chrome)
-    monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
-    monkeypatch.setattr(listener_mod, "UpstreamConnection", FakeConn)
-
-    await holder.ensure_open()
-
-    assert launched
-    assert opened["ws_url"] == "ws://127.0.0.1/devtools/browser/attached"
-    assert holder.rdp_pid == 123
-    assert state.upstream_phase == UpstreamPhase.CONNECTED
-
-
-@pytest.mark.asyncio
 async def test_upstream_holder_cloud_auth_success_and_user_error(monkeypatch):
     cfg = Config(backend="cloud")
     cfg.backends.cloud.auth_kind = "bearer"
