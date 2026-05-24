@@ -20,6 +20,7 @@ ux = ["rich>=13"]
 [dependency-groups]
 dev = [
     "coverage>=7",
+    "playwright>=1.60.0",
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]

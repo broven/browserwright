@@ -42,6 +42,7 @@ from .daemon import Daemon, UpstreamContext
 from .upstream import UpstreamConnection
 from .relay import RelayServer
 from .extension_upstream import ExtensionUpstream
+from .facade import PlaywrightFacade
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,24 @@ async def run_serve(cfg: Config) -> int:
             _ipc.cleanup_endpoint()
             return 2
 
+    # Phase A1 (Playwright facade, experimental, opt-in): when a facade port is
+    # configured, bind an ADDITIONAL Playwright-facing CDP ws+HTTP endpoint
+    # layered beside the agent unix socket. It resolves the daemon's upstream
+    # Chrome (rdp backend) and transparently bridges raw browser-level CDP —
+    # the existing client path is untouched. A bind failure here is non-fatal:
+    # we log + continue serving the agent path (the facade is experimental).
+    facade: PlaywrightFacade | None = None
+    if cfg.facade_port is not None and cfg.facade_port != 0:
+        try:
+            facade = PlaywrightFacade(cfg=cfg, port=cfg.facade_port)
+            bound = await facade.start()
+            logger.info("playwright facade started on port %d "
+                        "(connect_over_cdp ws://127.0.0.1:%d/cdp)", bound, bound)
+        except OSError as e:
+            logger.warning("playwright facade failed to bind port %d: %r; "
+                           "continuing without it", cfg.facade_port, e)
+            facade = None
+
     idle_task: asyncio.Task | None = None
     if cfg.idle_close_after is not None and cfg.idle_close_after > 0:
         idle_task = asyncio.create_task(_idle_watchdog(daemon, cfg.idle_close_after))
@@ -188,6 +207,10 @@ async def run_serve(cfg: Config) -> int:
             idle_task.cancel()
             with contextlib.suppress(Exception):
                 await idle_task
+        # Phase A1: stop the Playwright facade if it bound.
+        if facade is not None:
+            with contextlib.suppress(Exception):
+                await facade.stop()
         # Stop every context's relay (only the extension shared context has
         # one today, but iterate so a future rdp-with-relay can't leak).
         for ctx in daemon.all_contexts():

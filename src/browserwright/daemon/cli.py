@@ -105,6 +105,16 @@ def _build_parser() -> argparse.ArgumentParser:
               "the default 19989. Only relevant when --backend extension. "
               "Equivalent to BD_EXTENSION_PORT env or "
               "[backends.extension].port in config.toml."))
+    # Phase A1 (Playwright facade, experimental): expose a Playwright-facing
+    # CDP ws+HTTP endpoint a real `chromium.connect_over_cdp` can connect to.
+    # Opt-in: when omitted the facade does not bind. Equivalent to
+    # BD_FACADE_PORT env or `facade_port` in config.toml.
+    p_serve.add_argument(
+        "--facade-port", type=int, default=None, metavar="N",
+        help=("EXPERIMENTAL: bind a Playwright-facing CDP facade on this port "
+              "(default 19990 if you pass 0-as-pick). Lets a real Playwright "
+              "client `connect_over_cdp(ws://127.0.0.1:N/cdp)` drive the "
+              "daemon-resolved Chrome (rdp backend, phase A1)."))
 
     # stop (v0.2)
     p_stop = sub.add_parser("stop", help="stop the running daemon")
@@ -352,6 +362,7 @@ def _cfg_from_args(args) -> Config:
         # v0.5.3 Task #24: serve-only flag; argparse Namespace shape varies
         # per subcommand, so getattr-with-default keeps non-serve calls clean.
         cli_extension_port=getattr(args, "extension_port", None),
+        cli_facade_port=getattr(args, "facade_port", None),
     )
 
 

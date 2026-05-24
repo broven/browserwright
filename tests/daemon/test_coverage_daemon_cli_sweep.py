@@ -81,6 +81,7 @@ def test_main_parses_config_and_dispatches_core_commands(monkeypatch, capsys):
                 "cli_chrome_binary": None,
                 "cli_config_path": "daemon.toml",
                 "cli_extension_port": 29999,
+                "cli_facade_port": None,
             },
         ),
         ("handler", "serve", "extension", 29999),

@@ -125,6 +125,11 @@ class Config:
     cdp_url: str | None = None             # BD_CDP_URL / BU_CDP_URL — env backend uses this
     chrome_binary: str | None = None       # BD_CHROME_BINARY — launch-chrome
     idle_close_after: float | None = None  # seconds; None = never (default)
+    # Playwright-facing CDP facade (Task #tab-handle-model, phase A1). When set
+    # (>0), `serve` binds an additional TCP ws+HTTP endpoint that a real
+    # Playwright client can `connect_over_cdp` to. None / 0 = disabled (the
+    # default; the facade is opt-in while experimental).
+    facade_port: int | None = None
     backends: BackendsConfig = field(default_factory=BackendsConfig)
     # Provenance for `env`: which alias key actually fired. Diagnostic-only.
     cdp_ws_source: str | None = None       # "BD_CDP_WS" | "BU_CDP_WS" | None
@@ -149,6 +154,7 @@ def load(
     cli_chrome_binary: str | None = None,
     cli_config_path: str | None = None,
     cli_extension_port: int | None = None,
+    cli_facade_port: int | None = None,
     env: dict[str, str] | None = None,
 ) -> Config:
     """Build a Config from CLI flags + env + optional toml file.
@@ -214,6 +220,9 @@ def load(
         cfg.backends.cloud.auth = dict(auth_subtables[cfg.backends.cloud.auth_kind])
     if "idle_close_after" in toml and isinstance(toml["idle_close_after"], (int, float)):
         cfg.idle_close_after = float(toml["idle_close_after"])
+    # Playwright facade port (phase A1). toml key `facade_port`.
+    if "facade_port" in toml and isinstance(toml["facade_port"], int):
+        cfg.facade_port = toml["facade_port"]
 
     # env level — BD_* wins over BU_*
     if "BD_TIMEOUT" in e:
@@ -308,6 +317,15 @@ def load(
             raise UserError(
                 f"BD_EXTENSION_PORT must be an integer, got "
                 f"{e['BD_EXTENSION_PORT']!r}")
+    # Playwright facade port via env (phase A1). Symmetric to BD_EXTENSION_PORT
+    # — set BD_FACADE_PORT=19990 (or any free port) to enable the facade.
+    if "BD_FACADE_PORT" in e:
+        try:
+            cfg.facade_port = int(e["BD_FACADE_PORT"])
+        except ValueError:
+            from .errors import UserError
+            raise UserError(
+                f"BD_FACADE_PORT must be an integer, got {e['BD_FACADE_PORT']!r}")
     # The auth payload itself is read from kind-specific env vars that the
     # AuthProvider already knows about (`token_env`, `cert_file`, etc).
     # The env-override layer here is just for endpoint/kind selection; we
@@ -329,5 +347,8 @@ def load(
     if cli_extension_port is not None:
         # v0.5.3 Task #24: CLI tops env / toml for the extension relay port.
         cfg.backends.extension.port = cli_extension_port
+    if cli_facade_port is not None:
+        # Phase A1: CLI `--facade-port` tops env / toml.
+        cfg.facade_port = cli_facade_port
 
     return cfg
