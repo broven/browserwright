@@ -31,6 +31,16 @@ import pytest
 # from common dev ports to reduce collisions.
 TEST_EXT_PORT = 29989
 TEST_RDP_PORT = 29990
+# Phase C: the Playwright facade is auto-enabled on a fixed default port
+# (DEFAULT_FACADE_PORT = 19990). Both the extension and the rdp e2e daemons are
+# session-scoped and run concurrently, so they MUST bind the facade on distinct
+# ports — otherwise the second daemon's facade bind silently fails (logged
+# non-fatal) and its heredoc `page` raises FacadeUnavailable. Give each its own,
+# and keep them clear of the dedicated facade-test daemons' ports (29991 in
+# test_l1_playwright_facade.py, 29992 in test_l1_playwright_facade_extension.py)
+# and the default 19990 used by the heredoc tests' own daemons.
+TEST_EXT_FACADE_PORT = 29993
+TEST_RDP_FACADE_PORT = 29994
 # Single-global-daemon model: BD_NAME / `--name` are gone. The e2e harness now
 # isolates the test daemon from the developer's real daemon by pointing
 # XDG_RUNTIME_DIR at a throwaway temp dir (→ a distinct fixed socket path) and
@@ -178,6 +188,7 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
             "serve",
             "--backend", "extension",
             "--extension-port", str(TEST_EXT_PORT),
+            "--facade-port", str(TEST_EXT_FACADE_PORT),
             "-v",
         ],
         stdout=log_fh,
@@ -516,6 +527,7 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
             sys.executable, "-m", "browserwright.daemon.cli",
             "serve",
             "--backend", "rdp",
+            "--facade-port", str(TEST_RDP_FACADE_PORT),
             "-v",
         ],
         stdout=log_fh,

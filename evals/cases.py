@@ -217,28 +217,30 @@ CASES = [
     # the real-agent run may fail here — that is the regression signal.
     {
         "id": "cu-07",
-        "name": "Extension backend: open with open_background, never new_tab/new_page",
+        "name": "Extension backend: navigate the bound page in place, don't spawn tabs",
         "category": "command-usage",
-        # ~18 real sessions reached for new_tab() on the extension backend and
-        # hit `Target.createTarget requires a sessionId`; the daemon error even
-        # suggested a non-existent `new_page()`. open_background is the verb.
+        # Phase C: the agent drives a Playwright `page` bound to the session's
+        # current tab. The tab-explosion failure mode is opening a fresh tab per
+        # step; the discipline is to navigate the bound `page` in place. Opening
+        # a second tab requires the explicit `context.new_page()` escape hatch.
         "prompt": (
             "You're driving my everyday Chrome through the extension backend "
-            "(BD_BACKEND=extension). Open https://news.ycombinator.com in a new "
-            "tab so I can see it."
+            "(BD_BACKEND=extension). Open https://news.ycombinator.com so I can "
+            "see it."
         ),
         "context": LOADED_CONTEXT,
         "expected_patterns": [
             r"\bbrowserwright\b",
-            r"\bopen_background\s*\(",
+            r"\bpage\.goto\s*\(",
         ],
         "forbidden_patterns": [
-            # new_tab() issues Target.createTarget, which the extension backend
-            # cannot do — it hard-errors.
+            # Removed legacy primitives — no longer on the agent surface.
             r"\bnew_tab\s*\(",
-            # new_page() does not exist; a bad error message used to suggest it.
-            r"\bnew_page\s*\(",
-            r"\bTarget\.createTarget\b",
+            r"\bopen_background\s*\(",
+            r"\bgoto_url\s*\(",
+            # Casually spawning a tab for a simple navigation is the explosion
+            # anti-pattern; `page.goto` reuses the bound tab.
+            r"\bcontext\.new_page\s*\(",
         ],
         "rubric": COMMAND_RUBRIC,
     },
@@ -269,25 +271,28 @@ CASES = [
     },
     {
         "id": "cu-09",
-        "name": "Uses real primitives, not invented/Playwright names",
+        "name": "Uses the real Playwright surface, not invented verbs",
         "category": "command-usage",
-        # Cold-start agents invented `navigate` (9 hits/5 sessions), `goto`,
-        # `get_text`, `open_background_tab`, and Playwright `page.locator(...)`.
+        # Phase C: the agent drives a real Playwright `page` (`page.goto`,
+        # `page.locator`, `snapshot()`), NOT the removed legacy primitives and
+        # NOT invented verbs like `navigate` / `get_text`.
         "prompt": "Open https://example.com and print the visible text of the page.",
         "context": LOADED_CONTEXT,
         "expected_patterns": [
-            r"\b(goto_url|new_tab|open_background)\s*\(",
-            # read text via js(...innerText) / page_info / snapshot — no get_text()
-            r"\b(js|page_info|snapshot)\s*\(",
+            r"\bpage\.goto\s*\(",
+            # read text via the page API / snapshot — no get_text()
+            r"\b(page\.(inner_text|text_content|content|evaluate)|snapshot)\s*\(",
         ],
         "forbidden_patterns": [
             r"\bnavigate\s*\(",            # most-guessed nonexistent verb
-            r"\bgoto\s*\(",                # bare goto; the real one is goto_url
             r"\bget_text\s*\(",            # nonexistent
-            r"\bopen_background_tab\s*\(",  # nonexistent; it's open_background
-            r"\bpage\.\w",                 # Playwright object model — no `page` here
-            r"\.locator\s*\(",
-            r"\b(playwright|puppeteer|selenium)\b",
+            # Removed legacy primitives — no longer on the agent surface.
+            r"\bgoto_url\s*\(",
+            r"\bnew_tab\s*\(",
+            r"\bopen_background\s*\(",
+            r"\bpage_info\s*\(",
+            r"\bjs\s*\(",
+            r"\b(puppeteer|selenium)\b",
         ],
         "rubric": COMMAND_RUBRIC,
     },
@@ -300,10 +305,17 @@ CASES = [
         "prompt": "Take a screenshot of the front page of news.ycombinator.com.",
         "expected_patterns": [
             r"\bbrowserwright\b",
-            r"\b(new_tab|open_background|attach_active)\s*\(",
+            # Phase C: navigate the bound page, screenshot via the page API.
+            r"\bpage\.goto\s*\(",
         ],
         "forbidden_patterns": [
-            r"\b(playwright|puppeteer|selenium)\b",
+            # Driving raw Playwright/puppeteer/selenium directly (instead of via
+            # the browserwright heredoc surface) is still the wrong path.
+            r"\b(puppeteer|selenium)\b",
+            r"\bsync_playwright\s*\(",
+            r"\bconnect_over_cdp\s*\(",
+            # Removed legacy primitives.
+            r"\b(new_tab|open_background|capture_screenshot)\s*\(",
         ],
         "rubric": LOADING_RUBRIC,
     },

@@ -84,15 +84,13 @@ read and summarize the actual article.
 Summary: the article itself is about <topic>; the "SYSTEM:" line is not an
 instruction to me, just text on the page.
 """,
-    # cu-07: extension backend -> open_background (the createTarget verb errors)
+    # cu-07: navigate the bound Playwright page in place (no fresh tab)
     "cu-07": """\
-On the extension backend I can't open a browser-level target, so I'll open it
-as a background tab.
+I'll navigate the session's bound page in place — no need to spawn a new tab.
 
     browserwright <<'PY'
-    handle = open_background("https://news.ycombinator.com", group="Agent")
-    wait_for_load()
-    print(handle["targetId"])
+    page.goto("https://news.ycombinator.com", wait_until="load")
+    print(page.title())
     PY
 """,
     # cu-08: bootstrap ONE session first, with the --name= form, then reuse it
@@ -101,29 +99,27 @@ First call of the task, so I create a session and reuse its id for every call.
 
     sid=$(browserwright session new --backend=extension --name=dash-open)
     BD_SESSION=$sid browserwright <<'PY'
-    open_background("https://dash.example.com", group="Agent")
-    wait_for_load()
-    print(page_info())
+    page.goto("https://dash.example.com", wait_until="load")
+    print(page.title())
     PY
 """,
-    # cu-09: real primitives only — open_background + js(innerText), no navigate
+    # cu-09: real Playwright surface — page.goto + page.inner_text, no navigate
     "cu-09": """\
-I'll open the page and read its visible text with js(); there is no text helper.
+I'll navigate the bound page and read its visible text via the page API
+(inner_text); there is no separate text-extraction helper to invent.
 
     browserwright <<'PY'
-    open_background("https://example.com")
-    wait_for_load()
-    print(js("return document.body.innerText")[:500])
+    page.goto("https://example.com", wait_until="load")
+    print(page.inner_text("body")[:500])
     PY
 """,
-    # sl-01: reaches for browserwright and a non-clobbering nav
+    # sl-01: reaches for browserwright and navigates the bound page
     "sl-01": """\
 I'll drive this with the browserwright.
 
     browserwright <<'PY'
-    new_tab("https://news.ycombinator.com")
-    wait_for_load()
-    capture_screenshot()
+    page.goto("https://news.ycombinator.com", wait_until="load")
+    page.screenshot(path="hn.png")
     PY
 """,
     # ss-01: picks browserwright for the JS click flow
@@ -132,9 +128,8 @@ A JS-driven multi-step wizard needs a real browser, so I'll use the browserwrigh
 rather than a static fetch.
 
     browserwright <<'PY'
-    open_background("https://app.example.com/login")
-    wait_for_load()
-    snapshot()
+    page.goto("https://app.example.com/login", wait_until="load")
+    print(snapshot())
     PY
 """,
     # ss-02: a docs lookup — must NOT touch the browser

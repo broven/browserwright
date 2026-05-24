@@ -1,5 +1,8 @@
-"""Pull top stories from Hacker News (top/new/best)."""
-from browserwright import *  # noqa: F401, F403
+"""Pull top stories from Hacker News (top/new/best).
+
+Phase C surface: drives the injected Playwright ``page`` (reused, navigated in
+place); reads the story list with ``page.evaluate``.
+"""
 
 ARGS = {
     "kind": {"type": "str", "required": False, "default": "top",
@@ -11,7 +14,7 @@ OUTPUT = "list[{rank: int, id: int, title: str, url: str, score: int, comments: 
 TAGS = ["hn", "news", "feed"]
 REQUIRES_LOGIN = False
 ESTIMATED_DURATION_SEC = 5
-LAST_VERIFIED = "2026-05-18"
+LAST_VERIFIED = "2026-05-25"
 
 _KINDS = {
     "top": "https://news.ycombinator.com/",
@@ -21,40 +24,40 @@ _KINDS = {
 
 
 def selftest():
-    new_tab("https://news.ycombinator.com/")
-    if not wait_for_load(timeout=10):
-        return False
-    assert wait_for_load() or True  # noop, just to demo the API
-    return True
+    page.goto("https://news.ycombinator.com/", wait_until="load")
+    return "ycombinator.com" in page.url
 
 
 def run(args, ctx=None):
+    pg = ctx.page if ctx is not None and getattr(ctx, "page", None) else page
+
     kind = args.get("kind", "top")
     limit = int(args.get("limit", 30))
     url = _KINDS.get(kind, _KINDS["top"])
-    new_tab(url)
-    wait_for_load(timeout=15)
-    rows = js(
+    pg.goto(url, wait_until="load")
+    rows = pg.evaluate(
         """
-        const out = [];
-        const stories = document.querySelectorAll('tr.athing');
-        stories.forEach((row, i) => {
-          const a = row.querySelector('span.titleline > a');
-          if (!a) return;
-          const sub = row.nextElementSibling;
-          const score = sub ? sub.querySelector('span.score') : null;
-          const links = sub ? sub.querySelectorAll('a') : [];
-          const commentLink = links.length ? links[links.length - 1] : null;
-          out.push({
-            rank: i + 1,
-            id: parseInt(row.id, 10),
-            title: a.innerText.trim(),
-            url: a.href,
-            score: score ? parseInt(score.innerText, 10) : 0,
-            comments: commentLink ? parseInt(commentLink.innerText, 10) || 0 : 0,
+        () => {
+          const out = [];
+          const stories = document.querySelectorAll('tr.athing');
+          stories.forEach((row, i) => {
+            const a = row.querySelector('span.titleline > a');
+            if (!a) return;
+            const sub = row.nextElementSibling;
+            const score = sub ? sub.querySelector('span.score') : null;
+            const links = sub ? sub.querySelectorAll('a') : [];
+            const commentLink = links.length ? links[links.length - 1] : null;
+            out.push({
+              rank: i + 1,
+              id: parseInt(row.id, 10),
+              title: a.innerText.trim(),
+              url: a.href,
+              score: score ? parseInt(score.innerText, 10) : 0,
+              comments: commentLink ? parseInt(commentLink.innerText, 10) || 0 : 0,
+            });
           });
-        });
-        return out;
+          return out;
+        }
         """
     )
     return (rows or [])[:limit]

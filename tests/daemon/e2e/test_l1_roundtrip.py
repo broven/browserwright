@@ -7,15 +7,13 @@ from .helpers import run_skill
 
 
 def test_extension_backend_page_info(ext_ready, e2e_daemon):
-    """`browserwright` returns page_info() via extension backend. The unified
-    open() gives the session a working tab (current_page() would auto-open one
-    too, but we open explicitly here)."""
+    """`browserwright` drives the injected Playwright `page` via the extension
+    backend. The lazy `page` auto-binds the session's current tab (auto-opening
+    one if needed), so we just read its url/title."""
     result = run_skill(
         script=(
             "import json\n"
-            "open('about:blank')\n"
-            "wait_for_load()\n"
-            "info = page_info()\n"
+            "info = {'url': page.url, 'title': page.title()}\n"
             "print(json.dumps(info))\n"
         ),
         backend="extension",
@@ -41,7 +39,7 @@ def test_rdp_backend_page_info(e2e_rdp_daemon):
     result = run_skill(
         script=(
             "import json\n"
-            "info = page_info()\n"
+            "info = {'url': page.url, 'title': page.title()}\n"
             "print(json.dumps(info))\n"
         ),
         backend="rdp",

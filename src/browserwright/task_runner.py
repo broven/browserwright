@@ -1,4 +1,13 @@
-"""Loader + runner for ``site-skills/<site>/tasks/<name>.py`` modules."""
+"""Loader + runner for ``site-skills/<site>/tasks/<name>.py`` modules.
+
+Phase C PR3: a site-skill task drives the browser with the SAME surface a
+heredoc gets — real Playwright ``page`` / ``context`` bound to the session's
+current tab, plus ``snapshot()``. ``run()`` reads those as free globals
+(``page.goto(...)``), so the runner injects them into the loaded module's
+namespace before calling ``run`` and tears the lazy connection down after.
+Like the heredoc, the connection is LAZY: a task that never touches the
+browser opens no connection.
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -9,10 +18,19 @@ from .discovery import find_task_path
 
 
 class _Ctx:
-    """Minimal context object passed to ``run(args, ctx=...)``."""
+    """Minimal context object passed to ``run(args, ctx=...)``.
 
-    def __init__(self, *, memory: dict):
+    Carries the per-run site memory plus the live browser handles so a task
+    can use either ``ctx.page`` / ``ctx.context`` / ``ctx.snapshot`` or the
+    free-global ``page`` / ``context`` / ``snapshot`` the runner injects.
+    """
+
+    def __init__(self, *, memory: dict, page: Any = None,
+                 context: Any = None, snapshot: Any = None):
         self.memory = memory
+        self.page = page
+        self.context = context
+        self.snapshot = snapshot
 
 
 def _validate_args(args: dict, schema: dict) -> dict:
@@ -57,15 +75,38 @@ def run_task(site: str, name: str, *, isolated: bool = False, **kwargs) -> Any:
 
     def _run_inner() -> Any:
         from .memory import site_memory
+        from .repl.playwright_handle import PlaywrightHandle, _LazyHandleProxy
+        from .repl.snapshot import make_snapshot
         try:
             mem = site_memory(site).read()
         except Exception:
             mem = {"frontmatter": {}, "body": ""}
-        ctx = _Ctx(memory=mem.get("frontmatter", {}))
+
+        # Phase C: give the task the Playwright surface, lazily (no connection
+        # until first `page`/`context`/`snapshot` use). The proxies bind to the
+        # session's current tab — same discipline as the heredoc namespace.
+        handle = PlaywrightHandle()
+        page = _LazyHandleProxy(handle, "page")
+        context = _LazyHandleProxy(handle, "context")
+        snapshot = make_snapshot(handle)
+        ctx = _Ctx(memory=mem.get("frontmatter", {}),
+                   page=page, context=context, snapshot=snapshot)
+        # Inject as free globals so `run()` can call `page.goto(...)` directly.
+        mod.page = page
+        mod.context = context
+        mod.snapshot = snapshot
+
         run = getattr(mod, "run", None)
         if not callable(run):
             raise ValueError(f"task module has no run(): {path}")
-        result = run(args, ctx=ctx)
+        try:
+            result = run(args, ctx=ctx)
+        finally:
+            # Tear down the lazy Playwright connection (no-op if never used).
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
         schema = getattr(mod, "OUTPUT_SCHEMA", None)
         if schema:
             _validate_output(result, schema, site=site, task=name)

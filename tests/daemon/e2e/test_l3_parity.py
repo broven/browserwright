@@ -59,9 +59,18 @@ def _remove_session(ledger: Path, session_id: str) -> None:
     ledger.write_text(json.dumps(data), encoding="utf-8")
 
 
+# Phase C PR3 removed the page/tab primitives from the agent EXPORTS surface
+# (Playwright `page`/`context` now). This test still verifies the DAEMON's
+# cross-backend bookkeeping parity (targetId/groupId/tabId, current_tab,
+# list_tabs, close_tab), so it drives those via the internal primitive modules.
 PARITY_SCRIPT = (
     "import json\n"
     "from browserwright.session import current_session\n"
+    "from browserwright.primitives.interact import js\n"
+    "from browserwright.primitives.page import (\n"
+    "    close_tab, current_tab, list_tabs, open, wait_for_load,\n"
+    ")\n"
+    "from browserwright.primitives.inspect import page_info\n"
     f"tab = open({PAGE!r})\n"
     "wait_for_load()\n"
     "before = js(\"document.getElementById('h').textContent\")\n"

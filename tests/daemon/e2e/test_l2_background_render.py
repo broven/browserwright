@@ -23,8 +23,14 @@ def _last_json(stdout: str) -> dict:
 
 def test_background_tab_reports_visible_and_focused(ext_ready, e2e_daemon):
     """A backgrounded tab we never switch to should still look focused+visible."""
+    # `open_background` is a daemon/extension feature (chrome.debugger attaches a
+    # never-focused tab); it has no agent-surface Playwright equivalent and was
+    # removed from EXPORTS in Phase C PR3. Drive it via the internal primitive
+    # module to keep covering the extension's keepTabRendered behavior.
     script = (
         "import json\n"
+        "from browserwright.primitives.page import open_background, wait_for_load\n"
+        "from browserwright.primitives.interact import js\n"
         "open_background('about:blank')\n"
         "wait_for_load()\n"
         "state = js('''return {\n"
@@ -60,6 +66,8 @@ def test_background_tab_raf_keeps_advancing(ext_ready, e2e_daemon):
     )
     script = (
         "import json, time\n"
+        "from browserwright.primitives.page import open_background, wait_for_load\n"
+        "from browserwright.primitives.interact import js\n"
         f"open_background('data:text/html,{html}')\n"
         "wait_for_load()\n"
         "first = int(js(\"document.getElementById('n').textContent\"))\n"

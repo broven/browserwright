@@ -5,10 +5,23 @@ this module. Keeping the list in one place means an agent who imports
 ``browserwright`` directly from a saved task gets the same names the REPL
 gave them.
 
-v0.5.1 (F-4 catch-up): EXPORTS grew from 23 → 36 with 13 primitives ported
-from ``browser-harness`` (input / waiting / iframe / http) plus three
-Layer-3 re-exports. design.md §A.2 footnotes 3 still-deferred primitives
-for v0.6.
+Phase C PR3 (terminal state): the legacy CDP browser-driving primitives
+(``open``/``goto_url``/``click_at_xy``/``js``/``cdp``/``capture_screenshot``/
+``snapshot``/… — the whole page/tab interaction surface) are GONE from the
+agent surface. The agent now drives the browser with **real Playwright** via
+the injected ``page`` / ``context`` (bound to the session's current tab,
+reused across heredocs) and observes with ``snapshot()`` (a first-party AI
+aria snapshot whose ``[ref=eN]`` refs feed ``page.locator("aria-ref=eN")``).
+Those three names are injected per-heredoc by ``repl/_namespace.build_globals``,
+NOT exported here.
+
+What remains in EXPORTS is the set of NON-browser-driving helpers that do not
+overlap Playwright: ``http_get`` (no-browser escape hatch), the memory verbs,
+and the site-skill / task layer. The implementation modules under
+``primitives/`` still define the old functions (``current_page``, ``list_tabs``,
+the daemon-driving glue, …); they are kept as INTERNAL functions the Phase C
+binding glue (``repl/playwright_handle.py``) and the memory/site helpers rely
+on — they are simply no longer part of the agent-callable surface.
 """
 from .errors import (
     AuthWall,
@@ -23,74 +36,25 @@ from .errors import (
 )
 from .multitask import run_tasks_concurrent
 from .primitives import (
-    attach_active,
-    attach_readonly,
     bootstrap_site,
-    capture_screenshot,
-    cdp,
-    click_at_xy,
-    close_tab,
-    current_page,
-    current_tab,
-    describe_page,
-    diff_snapshot,
-    dispatch_key,
-    drain_events,
-    ensure_real_tab,
-    fill_input,
-    goto_url,
     http_get,
-    iframe_target,
-    js,
     list_site_skills,
-    list_tabs,
     load_site_skill,
     memory_read,
-    new_tab,
-    open,
-    open_background,
-    page_info,
-    reload,
-    press_key,
     remember,
     remember_global,
     remember_preference,
     run_task,
-    scroll,
-    snapshot,
-    switch_tab,
-    type_text,
-    upload_file,
-    wait,
-    wait_for_element,
-    wait_for_load,
-    wait_for_network_idle,
 )
 
 EXPORTS = [
-    # navigation / tabs
-    "goto_url", "open", "new_tab", "reload", "switch_tab", "list_tabs",
-    "current_tab", "current_page", "ensure_real_tab", "iframe_target",
-    "attach_readonly", "attach_active",
-    "open_background", "close_tab",
-    # input
-    "click_at_xy", "type_text", "press_key", "fill_input", "scroll",
-    "dispatch_key", "upload_file",
-    # JS + visual + raw CDP
-    "js", "cdp", "page_info", "capture_screenshot",
-    # perception (read-only: what can I act on + where / what paints this page)
-    "snapshot", "describe_page",
-    # verification (did my action change the page? — diff two snapshots)
-    "diff_snapshot",
-    # waiting + events
-    "wait", "wait_for_load", "wait_for_element", "wait_for_network_idle",
-    "drain_events",
-    # http (escape hatch — no browser)
+    # http (escape hatch — no browser; does not overlap Playwright)
     "http_get",
     # memory + site
     "bootstrap_site", "remember", "remember_global", "remember_preference",
     "memory_read",
-    # task / fan-out
+    # task / fan-out (site-skills run on the Playwright surface — see
+    # task_runner.run_task, which injects page/context into the task module)
     "list_site_skills", "load_site_skill", "run_task",
     "run_tasks_concurrent",
     # errors

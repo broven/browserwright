@@ -162,7 +162,13 @@ import threading
 import traceback
 from urllib.parse import quote
 
-from browserwright import close_tab, js, open, wait_for_load
+# Phase C PR3 removed the page/tab driving primitives from the agent EXPORTS
+# surface (it's Playwright `page`/`context` now). This test exercises the
+# DAEMON's concurrent multi-session bookkeeping across several in-process
+# Session objects/threads — not the single-process injected `page` — so it
+# drives the daemon directly via the still-present internal primitive functions.
+from browserwright.primitives.interact import js
+from browserwright.primitives.page import close_tab, open, wait_for_load
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
 
@@ -306,7 +312,15 @@ import threading
 import traceback
 from urllib.parse import quote
 
-from browserwright import close_tab, js, list_tabs, open, wait_for_load
+# Phase C PR3: daemon multi-session coverage via the internal primitives (the
+# agent surface is Playwright now — see the note in the two-session test).
+from browserwright.primitives.interact import js
+from browserwright.primitives.page import (
+    close_tab,
+    list_tabs,
+    open,
+    wait_for_load,
+)
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
 

@@ -7,14 +7,16 @@ from pathlib import Path
 from .helpers import run_skill
 
 
-def test_open_background_and_query_dom(ext_ready, e2e_daemon):
+def test_open_and_query_dom(ext_ready, e2e_daemon):
+    """Drive the injected Playwright `page` over the extension backend: set
+    inline content (the extension aborts `data:` navigations over
+    chrome.debugger — facade spec — so use set_content), then read the DOM."""
     script = (
         "import json\n"
-        "h = open('data:text/html,<h1>e2e</h1>')\n"
-        "wait_for_load()\n"
-        "txt = js(\"document.querySelector('h1').textContent\")\n"
-        "info = page_info()\n"
-        "print(json.dumps({'text': txt, 'title': info.get('title'), 'url': info.get('url')}))\n"
+        "page.set_content('<h1>e2e</h1>', wait_until='load')\n"
+        "txt = page.locator('h1').text_content()\n"
+        "info = {'title': page.title(), 'url': page.url}\n"
+        "print(json.dumps({'text': txt, 'title': info['title'], 'url': info['url']}))\n"
     )
     result = run_skill(script=script, backend="extension",
                        runtime_dir=e2e_daemon.runtime_dir)
@@ -27,16 +29,17 @@ def test_open_background_and_query_dom(ext_ready, e2e_daemon):
     )
     payload = json.loads(line)
     assert payload["text"] == "e2e"
-    assert payload["url"].startswith("data:text/html")
 
 
 def test_screenshot_is_non_trivial(ext_ready, e2e_daemon, tmp_path):
+    """Screenshots are now taken via the Playwright `page` (the agent
+    capture_screenshot primitive was removed in Phase C PR3)."""
     out_png = tmp_path / "shot.png"
     script = (
-        f"open('data:text/html,<h1 style=\"font-size:120px\">SHOT</h1>')\n"
-        "wait_for_load()\n"
-        f"path = capture_screenshot({str(out_png)!r})\n"
-        f"print(path)\n"
+        "page.set_content('<h1 style=\"font-size:120px\">SHOT</h1>', "
+        "wait_until='load')\n"
+        f"page.screenshot(path={str(out_png)!r})\n"
+        f"print({str(out_png)!r})\n"
     )
     result = run_skill(script=script, backend="extension", timeout=60,
                        runtime_dir=e2e_daemon.runtime_dir)

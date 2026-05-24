@@ -1,5 +1,8 @@
-"""Search Google for `query` and return the top N organic results."""
-from browserwright import *  # noqa: F401, F403
+"""Search Google for `query` and return the top N organic results.
+
+Phase C surface: drives the injected Playwright ``page`` (reused, navigated in
+place) and reads results via ``page.evaluate``.
+"""
 
 ARGS = {
     "query": {"type": "str", "required": True, "desc": "search query"},
@@ -11,29 +14,27 @@ OUTPUT = "list[{title: str, url: str, snippet: str}]"
 TAGS = ["search", "general"]
 REQUIRES_LOGIN = False
 ESTIMATED_DURATION_SEC = 8
-LAST_VERIFIED = "2026-05-18"
+LAST_VERIFIED = "2026-05-25"
 
 
 def selftest():
-    new_tab("https://www.google.com/?hl=en")
-    if not wait_for_load(timeout=10):
-        return False
-    info = page_info()
-    assert "google.com" in info["url"], f"unexpected url after navigate: {info['url']}"
-    return True
+    page.goto("https://www.google.com/?hl=en", wait_until="load")
+    return "google.com" in page.url
 
 
 def run(args, ctx=None):
     from urllib.parse import quote_plus
 
+    pg = ctx.page if ctx is not None and getattr(ctx, "page", None) else page
+
     q = args["query"]
     limit = int(args.get("limit", 10))
     hl = args.get("hl", "en")
-    new_tab(f"https://www.google.com/search?q={quote_plus(q)}&hl={hl}")
-    wait_for_load(timeout=15)
-    results = js(
+    pg.goto(f"https://www.google.com/search?q={quote_plus(q)}&hl={hl}",
+            wait_until="load")
+    results = pg.evaluate(
         """
-        return Array.from(document.querySelectorAll('div.g, div[data-hveid]'))
+        (limit) => Array.from(document.querySelectorAll('div.g, div[data-hveid]'))
           .map(div => {
             const a = div.querySelector('a[href^="http"]');
             const h = div.querySelector('h3');
@@ -46,8 +47,8 @@ def run(args, ctx=None):
             };
           })
           .filter(Boolean)
-          .slice(0, %d);
-        """
-        % limit
+          .slice(0, limit)
+        """,
+        limit,
     )
     return results or []

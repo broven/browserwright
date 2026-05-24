@@ -236,18 +236,27 @@ def test_memory_only_heredoc_does_not_connect_rdp(rdp_autofacade_daemon):
     page bind, and (belt + suspenders) that no extra tab was created."""
     runtime_dir, _facade_ws = rdp_autofacade_daemon
     sid = _seed_session(runtime_dir, "rdp")
+    # Count tabs WITHOUT binding a `page`. The agent `list_tabs` primitive was
+    # removed from the EXPORTS surface in Phase C PR3, but it survives as an
+    # internal function — and unlike touching `context`/`page` (which connects
+    # the facade and auto-binds/opens the session's tab via current_page), the
+    # internal `list_tabs` is a pure read that does NOT open a tab. That is what
+    # makes it a valid bracket for the lazy memory-only heredoc.
+    count_probe = (
+        "from browserwright.primitives.page import list_tabs\n"
+        "print('NTABS=' + str(len(list_tabs())))"
+    )
     try:
-        # Count rdp tabs before.
-        before = run_skill("print('NTABS=' + str(len(list_tabs())))",
+        before = run_skill(count_probe,
                            backend="rdp", runtime_dir=runtime_dir,
                            extra_env={"BD_SESSION": sid})
-        # A pure-Python heredoc: no page/context access at all.
+        # A pure-Python heredoc: no page/context/snapshot access at all.
         r = run_skill("print('answer=' + str(6 * 7))",
                       backend="rdp", runtime_dir=runtime_dir,
                       extra_env={"BD_SESSION": sid})
         assert r.returncode == 0, f"memory heredoc failed: {r.stderr}"
         assert "answer=42" in r.stdout
-        after = run_skill("print('NTABS=' + str(len(list_tabs())))",
+        after = run_skill(count_probe,
                           backend="rdp", runtime_dir=runtime_dir,
                           extra_env={"BD_SESSION": sid})
         assert _grep(before.stdout, "NTABS") == _grep(after.stdout, "NTABS"), (

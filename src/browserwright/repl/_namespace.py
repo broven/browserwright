@@ -1,9 +1,10 @@
 """Assemble the exec globals shared by inline / repl-server / task entry points.
 
 Every entry point hot-imports ``browserwright`` so the agent always sees the
-same names (``goto_url``, ``remember``, etc.). We also pull ``json``, ``re``,
-``time``, and a handful of builtins that agents reach for constantly — saves
-a ``import`` line per heredoc.
+same names (``http_get``, ``remember``, etc.). It also injects the per-heredoc
+Playwright surface (``page`` / ``context`` / ``snapshot``). We also pull
+``json``, ``re``, ``time``, and a handful of builtins that agents reach for
+constantly — saves a ``import`` line per heredoc.
 
 Finally we hot-load ``$BS_HOME/agent_helpers.py`` — the agent-editable
 primitive layer (see SKILL.md "Extending the primitive surface"). It loads
@@ -45,9 +46,10 @@ def _load_agent_helpers(g: dict[str, Any]) -> None:
             return
         module = importlib.util.module_from_spec(spec)
         # Pre-seed the helper module's globals with the core surface so a
-        # helper can call ``goto_url`` / ``js`` / ``upload_file`` etc. with no
-        # import — a function resolves free names against its own module dict,
-        # which is this one. (browser-harness requires explicit imports here.)
+        # helper can call ``http_get`` / ``remember`` / ``run_task`` etc. with
+        # no import — a function resolves free names against its own module
+        # dict, which is this one. (browser-harness requires explicit imports
+        # here.)
         module.__dict__.update(
             {k: v for k, v in g.items() if not k.startswith("__")})
         spec.loader.exec_module(module)
@@ -92,12 +94,11 @@ def build_globals() -> dict[str, Any]:
     g["page"] = _LazyHandleProxy(handle, "page")
     g["context"] = _LazyHandleProxy(handle, "context")
     g["__bw_playwright_handle__"] = handle
-    # Phase C PR2: `snapshot()` becomes the Playwright first-party AI aria
-    # snapshot bound to THIS heredoc's `page` (refs → `page.locator("aria-ref=
-    # eN")`). It deliberately OVERRIDES the legacy coordinate `snapshot` placed
-    # by EXPORTS above — the old coordinate-snapshot is part of the legacy CDP
-    # primitive surface being removed in PR3; replacing its behaviour now keeps
-    # the agent on one (ref-based) observation verb.
+    # Phase C: `snapshot()` is the Playwright first-party AI aria snapshot
+    # bound to THIS heredoc's `page` (refs → `page.locator("aria-ref=eN")`).
+    # The legacy coordinate `snapshot` was removed from EXPORTS in PR3, so this
+    # is now the sole observation verb the agent gets — there is nothing left
+    # to override.
     from .snapshot import make_snapshot
     g["snapshot"] = make_snapshot(handle)
     # Agent-editable layer last, so helpers can call core primitives.

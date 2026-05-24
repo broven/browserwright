@@ -119,9 +119,9 @@ def _filter_interactive(snap: str) -> str:
       - the structural ancestor lines needed to keep indentation readable
         (a kept line's parents).
 
-    A line with neither a ref nor a name (pure ``- generic`` wrappers, ``- text``
-    leaves) is dropped UNLESS it is an ancestor of a kept line. This keeps the
-    output interaction-oriented and token-frugal without breaking the tree.
+    A line without a ref (pure ``- generic`` wrappers, ``- text`` leaves) is
+    dropped UNLESS it is an ancestor of a kept (ref-carrying) line. This keeps
+    the output interaction-oriented and token-frugal without breaking the tree.
     """
     lines = snap.splitlines()
     if not lines:

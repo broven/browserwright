@@ -21,7 +21,6 @@ Three roots are searched in order: `./site-skills/` (CWD, git-trackable), then `
 
 ```python
 """One-line description of what this task does."""
-from browserwright import *
 
 ARGS = {
     "query": {"type": "str", "required": True, "desc": "Search term"},
@@ -31,15 +30,16 @@ OUTPUT = "{title: str, url: str}"
 TAGS = ["search", "example"]
 REQUIRES_LOGIN = False
 ESTIMATED_DURATION_SEC = 5
-LAST_VERIFIED = "2026-05-19"
+LAST_VERIFIED = "2026-05-25"
 
 def run(args, ctx=None):
-    open(f"https://example.com/search?q={args['query']}")
-    wait_for_load()
-    return {"title": page_info()["title"], "url": current_tab()}
+    # `page` / `context` / `snapshot` are injected by the runtime — the same
+    # Playwright surface a heredoc gets (also on ctx: ctx.page / ctx.context).
+    page.goto(f"https://example.com/search?q={args['query']}", wait_until="load")
+    return {"title": page.title(), "url": page.url}
 ```
 
-Module-level constants are all optional except `ARGS` and `run`. The runtime imports the file with `importlib`, validates args against `ARGS`, then calls `run(args, ctx)`. If you define `OUTPUT_SCHEMA`, the runtime validates `run()`'s return shape against it. `ctx.memory` is the parsed frontmatter of the site's `memory.md`.
+Module-level constants are all optional except `ARGS` and `run`. The runtime imports the file with `importlib`, injects the Playwright `page` / `context` / `snapshot` (lazily — a task that never touches them opens no browser), validates args against `ARGS`, then calls `run(args, ctx)`. If you define `OUTPUT_SCHEMA`, the runtime validates `run()`'s return shape against it. `ctx.memory` is the parsed frontmatter of the site's `memory.md`; `ctx.page` / `ctx.context` / `ctx.snapshot` mirror the injected globals.
 
 ## Site memory.md template
 

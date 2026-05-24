@@ -27,7 +27,9 @@ HELP = """browserwright — Layer 2 of the browser stack.
 
 Usage:
   browserwright <<'PY'
-  print(page_info())
+  page.goto("https://example.com")
+  print(page.title())
+  print(snapshot())
   PY
 
   browserwright session new --backend=<extension|rdp> --name=NAME [--create | --attach=PORT]
@@ -423,7 +425,11 @@ def _cmd_userscript(args: list[str]) -> int:
         # session), report that the push still SUCCEEDED rather than letting an
         # opaque reload error look like a push failure.
         try:
-            from .api import capture_screenshot, reload
+            # These are internal driving helpers (no longer on the agent
+            # EXPORTS surface — Phase C PR3); the userscript --verify
+            # convenience still uses them directly from the primitive modules.
+            from .primitives.inspect import capture_screenshot
+            from .primitives.page import reload
 
             reload()
             print(capture_screenshot())

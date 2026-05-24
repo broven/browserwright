@@ -6,7 +6,12 @@ For programmatic use inside REPL/task scripts, import names from the top-level
 ``browserwright`` namespace (everything from ``browserwright.api`` is re-exported
 here)::
 
-    from browserwright import goto_url, capture_screenshot, remember
+    from browserwright import http_get, remember, run_task
+
+Browser driving itself is done with real Playwright in heredocs via the
+injected ``page`` / ``context`` (and ``snapshot()``) — see
+``repl/_namespace.build_globals``. Those are NOT importable from this module;
+they are bound per-heredoc to the session's current tab.
 """
 from .version import __version__  # noqa: F401
 

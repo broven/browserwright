@@ -119,11 +119,9 @@ browserwright-daemon launch-chrome --port 9333 --profile bs-smoke --persistent -
 
 # Drive it
 BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
-open("https://example.com")
-wait_for_load()
-info = page_info()
-print(f"URL:   {info.get('url')}")
-print(f"Title: {info.get('title')}")
+page.goto("https://example.com", wait_until="load")
+print(f"URL:   {page.url}")
+print(f"Title: {page.title()}")
 PY
 # expected:
 #   URL:   https://example.com/
@@ -141,8 +139,8 @@ A **session** is the isolation key that lets multiple agents drive browsers with
 ```bash
 sid=$(browserwright session new --backend=extension)
 BD_SESSION=$sid browserwright <<'PY'
-open("https://news.ycombinator.com")
-print(page_info())
+page.goto("https://news.ycombinator.com", wait_until="load")
+print(page.title())
 PY
 browserwright whoami --session=$sid
 browserwright session end --session=$sid
@@ -155,11 +153,11 @@ One global daemon serves every session (fixed socket `browserwright-daemon.sock`
 ### Two invocation forms
 
 ```bash
-# (a) Inline heredoc — one-off scripts, all primitives pre-imported
+# (a) Inline heredoc — one-off scripts; drive the injected Playwright `page`
 BD_SESSION=$sid browserwright <<'PY'
-goto_url("https://news.ycombinator.com")
-wait_for_load()
-print(page_info())
+page.goto("https://news.ycombinator.com", wait_until="load")
+print(page.title())
+print(snapshot())          # [ref=eN] aria tree → page.locator("aria-ref=eN")
 PY
 
 # (b) Solidified task — reusable, pre-saved flow under ~/.browserwright/site-skills/<host>/tasks/
@@ -191,14 +189,29 @@ browserwright userscript logs <id>
 browserwright userscript remove <id>
 ```
 
-### Primitives (pre-imported in every heredoc)
+### The heredoc surface
 
-- **Navigation:** `goto_url`, `open` (unified tab-opener; `new_tab`/`open_background` remain as deprecated aliases), `current_page`, `attach_active`, `switch_tab`, `list_tabs`, `current_tab`, `ensure_real_tab`
-- **Interaction:** `click_at_xy(x, y)`, `type_text`, `press_key`, `fill_input`, `scroll`, `upload_file`
-- **Inspection:** `js(code)`, `cdp(method, params)`, `page_info()`, `capture_screenshot()`, `snapshot()`, `describe_page()`, `diff_snapshot(before)`
-- **Waiting:** `wait`, `wait_for_load`, `wait_for_element`, `wait_for_network_idle`
+Browser driving is **real synchronous Playwright**. Every heredoc gets three
+names injected, already connected through the daemon's Playwright CDP facade:
+
+- **`page`** — a Playwright `Page` bound to the session's current tab, **reused
+  across heredocs**. Navigate it in place (`page.goto`, `page.locator`,
+  `page.fill`, `page.click`, …); never `page.close()`.
+- **`context`** — the Playwright `BrowserContext`. `context.new_page()` only when
+  you genuinely need a second tab.
+- **`snapshot()`** — a first-party AI aria snapshot; each node carries a
+  `[ref=eN]` you act on via `page.locator("aria-ref=eN")`. Prefer this over
+  screenshots; re-`snapshot()` after each action (observe → act → observe).
+
+The connection is lazy — a heredoc that only uses the helpers below opens no
+browser. **Tab discipline:** reuse the bound tab, navigate in place, never
+close the browser/context (those are the user's real tabs).
+
+Non-browser helpers (also pre-imported):
+
 - **HTTP (no browser, for static pages):** `http_get(url)`
 - **Memory:** `remember`, `remember_global`, `remember_preference`, `memory_read`
+- **Site-skills / tasks:** `list_site_skills`, `load_site_skill`, `run_task`, `run_tasks_concurrent`, `bootstrap_site`
 
 Full catalogue and guidance in `skill/SKILL.md`.
 
