@@ -122,6 +122,7 @@ class DaemonHandle:
 
 def _port_free(port: int) -> bool:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", port))
             return True
@@ -159,6 +160,9 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     # the old BD_NAME-suffixed socket.)
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
+    # Keep the daemon's session ledger aligned with helpers.run_skill(), which
+    # seeds extension sessions under this isolated test home.
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "extension")
     # Relay-port override (the harness already pins 29989) keeps the test relay
     # off the production 19989.
     env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
@@ -497,6 +501,9 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
     env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+    # Keep daemon-side session routing aligned with helpers.run_skill() for
+    # RDP attach/create parity tests.
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "rdp")
     # Don't inherit the user's toml (relay_url / ports / default_backend).
     env["BD_CONFIG"] = ""
 

@@ -6,7 +6,12 @@ objects open and operate on separate background tabs at the same time.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import time
+from pathlib import Path
+
+from browserwright.cdp import CDPSession
 
 from .helpers import SkillResult, run_skill
 
@@ -21,6 +26,127 @@ def _extract_payload(result: SkillResult) -> dict:
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     return json.loads(line)
+
+
+def _extension_id_from_path(ext_dir: Path) -> str:
+    digest = hashlib.sha256(str(ext_dir.resolve()).encode("utf-8")).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(ch, 16)) for ch in digest)
+
+
+def _extension_worker_target_id(cdp: CDPSession, extension_id: str) -> str:
+    targets = cdp.send("Target.getTargets")
+    prefix = f"chrome-extension://{extension_id}/"
+    for info in targets.get("targetInfos", []):
+        if (info.get("type") == "service_worker"
+                and info.get("url", "").startswith(prefix)):
+            return info["targetId"]
+    raise AssertionError(f"extension service worker not found: {targets!r}")
+
+
+def _chrome_tab_group_titles(
+    chrome,
+    extension_id: str,
+    group_ids: list[int],
+) -> dict[int, str]:
+    cdp = CDPSession(chrome.ws_url)
+    try:
+        worker = _extension_worker_target_id(cdp, extension_id)
+        session_id = cdp.attach(worker)
+        expression = (
+            "(async () => {"
+            f"const ids = {json.dumps(group_ids)};"
+            "const entries = await Promise.all(ids.map(async (id) => {"
+            "  const group = await chrome.tabGroups.get(id);"
+            "  return [String(id), group.title || ''];"
+            "}));"
+            "return Object.fromEntries(entries);"
+            "})()"
+        )
+        result = cdp.send(
+            "Runtime.evaluate",
+            session=session_id,
+            expression=expression,
+            returnByValue=True,
+            awaitPromise=True,
+        )
+    finally:
+        cdp.close()
+    if "exceptionDetails" in result:
+        raise AssertionError(f"tab group title query failed: {result!r}")
+    values = result.get("result", {}).get("value", {})
+    return {int(group_id): title for group_id, title in values.items()}
+
+
+def _chrome_close_tabs(chrome, extension_id: str, tab_ids: list[int]) -> None:
+    if not tab_ids:
+        return
+    cdp = CDPSession(chrome.ws_url)
+    try:
+        worker = _extension_worker_target_id(cdp, extension_id)
+        session_id = cdp.attach(worker)
+        expression = (
+            "(async () => {"
+            f"const ids = {json.dumps(tab_ids)};"
+            "await Promise.all(ids.map(async (id) => {"
+            "  try { await chrome.tabs.remove(id); } catch (_e) {}"
+            "}));"
+            "return true;"
+            "})()"
+        )
+        cdp.send(
+            "Runtime.evaluate",
+            session=session_id,
+            expression=expression,
+            returnByValue=True,
+            awaitPromise=True,
+        )
+    finally:
+        cdp.close()
+
+
+def _bs_home() -> Path:
+    return Path(__file__).resolve().parent / "_bs_home" / "extension"
+
+
+def _seed_sessions(records: dict[str, str]) -> list[tuple[Path, bool]]:
+    seeded = []
+    now = time.time()
+    ledger = _bs_home() / "sessions" / "ledger.json"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    existed = ledger.exists()
+    data = json.loads(ledger.read_text()) if existed else {
+        "next_id": 1,
+        "sessions": {},
+    }
+    for sid, name in records.items():
+        data["sessions"][sid] = {
+            "id": sid,
+            "backend": "extension",
+            "workspace": None,
+            "owner": "attach",
+            "name": name,
+            "created_at": now,
+            "last_seen": now,
+        }
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+    seeded.append((ledger, existed))
+    return seeded
+
+
+def _cleanup_seeded_sessions(
+    seeded: list[tuple[Path, bool]],
+    session_ids: set[str],
+) -> None:
+    for ledger, existed in seeded:
+        if not ledger.exists():
+            continue
+        data = json.loads(ledger.read_text())
+        for sid in session_ids:
+            data.get("sessions", {}).pop(sid, None)
+        if not existed and not data.get("sessions"):
+            ledger.unlink(missing_ok=True)
+        else:
+            ledger.write_text(json.dumps(data), encoding="utf-8")
 
 
 def test_extension_backend_multiple_sessions_operate_concurrently(ext_ready, e2e_daemon):
@@ -159,3 +285,176 @@ if errors:
     assert b["marker"] == "session-b"
     assert "session-a" in a["title"]
     assert "session-b" in b["title"]
+
+
+def test_extension_backend_three_sessions_get_named_groups_and_scoped_tabs(
+    ext_ready,
+    e2e_daemon,
+    e2e_chrome,
+    patched_ext_dir,
+):
+    """Three named sessions share one extension Chrome but see only their tabs."""
+    sessions = {
+        "e2e-three-a": "e2e-alpha-group",
+        "e2e-three-b": "e2e-bravo-group",
+        "e2e-three-c": "e2e-charlie-group",
+    }
+    seeded = _seed_sessions(sessions)
+    script = r'''
+import json
+import threading
+import traceback
+from urllib.parse import quote
+
+from browserwright import close_tab, js, list_tabs, open, wait_for_load
+from browserwright.session import Session, with_session
+from browserwright.session_ctx import resolve_session
+
+SESSION_IDS = [
+    "e2e-three-a",
+    "e2e-three-b",
+    "e2e-three-c",
+]
+RECORDS = {
+    session_id: resolve_session(session_id)
+    for session_id in SESSION_IDS
+}
+
+start = threading.Barrier(4)
+all_open = threading.Barrier(3)
+lock = threading.Lock()
+results = {}
+errors = {}
+
+def worker(session_id):
+    record = RECORDS[session_id]
+    sess = Session(record=record)
+    target_id = None
+    failed = False
+    try:
+        with with_session(sess):
+            start.wait(timeout=15)
+            name = record["name"]
+            html = (
+                "<!doctype html>"
+                f"<title>{name}</title>"
+                f"<main id='value'>{session_id}</main>"
+                "<script>window.e2eReady = true</script>"
+            )
+            tab = open("data:text/html;charset=utf-8," + quote(html))
+            target_id = tab["targetId"]
+            wait_for_load()
+            before = js("document.getElementById('value').textContent")
+            visible_before = list_tabs(include_chrome=False)
+
+            all_open.wait(timeout=30)
+
+            js(
+                "document.body.dataset.session = " + json.dumps(session_id) + ";"
+                "document.getElementById('value').textContent = "
+                "document.getElementById('value').textContent + ' / operated';"
+            )
+            after = js("document.getElementById('value').textContent")
+            marker = js("document.body.dataset.session")
+            visible_after = list_tabs(include_chrome=False)
+
+            with lock:
+                results[session_id] = {
+                    "name": name,
+                    "targetId": target_id,
+                    "tabId": tab["tabId"],
+                    "groupId": tab["groupId"],
+                    "title": js("document.title"),
+                    "before": before,
+                    "after": after,
+                    "marker": marker,
+                    "visibleBefore": visible_before,
+                    "visibleAfter": visible_after,
+                }
+    except BaseException:
+        failed = True
+        try:
+            all_open.abort()
+        except BaseException:
+            pass
+        with lock:
+            errors[session_id] = traceback.format_exc()
+    finally:
+        if failed and target_id:
+            try:
+                with with_session(sess):
+                    close_tab(target_id=target_id)
+            except BaseException:
+                pass
+        sess.close()
+
+threads = [
+    threading.Thread(target=worker, args=(session_id,), daemon=True)
+    for session_id in SESSION_IDS
+]
+for thread in threads:
+    thread.start()
+try:
+    start.wait(timeout=15)
+except BaseException:
+    start.abort()
+    all_open.abort()
+    raise
+for thread in threads:
+    thread.join(timeout=90)
+
+for thread in threads:
+    if thread.is_alive():
+        all_open.abort()
+        errors[thread.name] = "thread did not finish within 90s"
+
+print(json.dumps({"results": results, "errors": errors}, sort_keys=True))
+if errors:
+    raise SystemExit(1)
+'''
+    extension_id = _extension_id_from_path(patched_ext_dir)
+    tab_ids: list[int] = []
+    try:
+        result = run_skill(
+            script=script,
+            backend="extension",
+            timeout=150,
+            runtime_dir=e2e_daemon.runtime_dir,
+            extra_env={"BD_SESSION": next(iter(sessions))},
+        )
+        assert result.returncode == 0, (
+            f"skill exited {result.returncode};\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+
+        payload = _extract_payload(result)
+        assert payload["errors"] == {}
+        results = payload["results"]
+        assert set(results) == set(sessions)
+
+        group_ids = [entry["groupId"] for entry in results.values()]
+        assert len(set(group_ids)) == 3
+        assert all(group_id >= 0 for group_id in group_ids)
+
+        tab_ids = [entry["tabId"] for entry in results.values()]
+
+        titles = _chrome_tab_group_titles(e2e_chrome, extension_id, group_ids)
+        assert titles == {
+            entry["groupId"]: sessions[session_id]
+            for session_id, entry in results.items()
+        }
+
+        for session_id, entry in results.items():
+            assert entry["name"] == sessions[session_id]
+            assert entry["before"] == session_id
+            assert entry["after"] == f"{session_id} / operated"
+            assert entry["marker"] == session_id
+            assert sessions[session_id] in entry["title"]
+
+            before_targets = {tab["targetId"] for tab in entry["visibleBefore"]}
+            after_targets = {tab["targetId"] for tab in entry["visibleAfter"]}
+            assert before_targets == {entry["targetId"]}
+            assert after_targets == {entry["targetId"]}
+    finally:
+        _chrome_close_tabs(e2e_chrome, extension_id, tab_ids)
+        _cleanup_seeded_sessions(seeded, set(sessions))
