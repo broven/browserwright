@@ -46,6 +46,7 @@
 //   straight to the ws. The daemon's relay then routes them per-session.
 
 const RELAY_URL = "ws://127.0.0.1:19989/";
+const BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION = "1";
 const PROTOCOL_VERSION = "1.3";  // chrome.debugger.attach signature
 const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000, 10000];
 
@@ -97,6 +98,8 @@ function connect() {
         installId: id,
         browser: "chrome",
         version: manifest.version,
+        browserwrightVersion: manifest.version,
+        extensionProtocolVersion: BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION,
       });
       // Re-announce currently-attached tabs so the daemon's ghost table
       // recovers after a reconnect.

@@ -60,6 +60,8 @@ from typing import Any, Awaitable, Callable
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
+from browserwright.version import EXTENSION_PROTOCOL_VERSION
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +105,8 @@ class _ExtensionConn:
     install_id: str = ""
     browser: str = ""
     version: str = ""
+    browserwright_version: str = ""
+    extension_protocol_version: str = ""
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     pending: dict[int, asyncio.Future] = field(default_factory=dict)
     tabs: dict[int, GhostTarget] = field(default_factory=dict)
@@ -513,11 +517,29 @@ class RelayServer:
         """
         path = request.path or "/"
         if path.startswith("/__status__"):
+            extensions = [
+                {
+                    "install_id": getattr(e, "install_id", ""),
+                    "browser": getattr(e, "browser", ""),
+                    "version": getattr(e, "version", ""),
+                    "browserwright_version": getattr(e, "browserwright_version", ""),
+                    "extension_protocol_version": getattr(
+                        e, "extension_protocol_version", ""
+                    ),
+                    "compatible": (
+                        getattr(e, "extension_protocol_version", "")
+                        in ("", EXTENSION_PROTOCOL_VERSION)
+                    ),
+                }
+                for e in self._extensions.values()
+                if e.hello_received.is_set()
+            ]
             body = json.dumps({
                 "running": True,
                 "extensions": len(self._extensions),
-                "install_ids": [e.install_id for e in self._extensions.values()
-                                if e.hello_received.is_set()],
+                "install_ids": [e["install_id"] for e in extensions],
+                "extension_protocol_version": EXTENSION_PROTOCOL_VERSION,
+                "extension_details": extensions,
                 "tab_count": sum(len(e.tabs) for e in self._extensions.values()),
             })
             resp = conn.respond(http.HTTPStatus.OK, body)
@@ -580,14 +602,33 @@ class RelayServer:
             ext.install_id = str(msg.get("installId") or "")
             ext.browser = str(msg.get("browser") or "")
             ext.version = str(msg.get("version") or "")
+            ext.browserwright_version = str(msg.get("browserwrightVersion") or ext.version)
+            ext.extension_protocol_version = str(
+                msg.get("extensionProtocolVersion") or ""
+            )
             # Re-key the extension by install_id (so multiple extensions don't
             # collide on temp_key collisions).
             self._extensions.pop(temp_key, None)
             self._extensions[ext.install_id or temp_key] = ext
             ext.hello_received.set()
             self._first_ready.set()
-            logger.info("extension hello: install_id=%s browser=%s version=%s",
-                        ext.install_id, ext.browser, ext.version)
+            if (
+                ext.extension_protocol_version
+                and ext.extension_protocol_version != EXTENSION_PROTOCOL_VERSION
+            ):
+                logger.warning(
+                    "extension protocol mismatch: install_id=%s extension=%s daemon=%s",
+                    ext.install_id,
+                    ext.extension_protocol_version,
+                    EXTENSION_PROTOCOL_VERSION,
+                )
+            logger.info(
+                "extension hello: install_id=%s browser=%s version=%s protocol=%s",
+                ext.install_id,
+                ext.browser,
+                ext.version,
+                ext.extension_protocol_version or "legacy",
+            )
             return
 
         if kind == "ping":

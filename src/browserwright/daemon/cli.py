@@ -112,6 +112,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stop.add_argument("--timeout", type=float, default=5.0,
                         help="seconds to wait for graceful shutdown before SIGKILL")
 
+    p_restart = sub.add_parser(
+        "restart",
+        help="restart the installed LaunchAgent daemon after an upgrade")
+    _add_name(p_restart)
+    p_restart.add_argument("--timeout", type=float, default=5.0,
+                           help="seconds to wait for graceful unload/load")
+
     # status (v0.2)
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
     _add_name(p_status)
@@ -201,7 +208,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE=1."))
 
     # version
-    sub.add_parser("version", help="print the installed version and exit")
+    p_ver = sub.add_parser("version", help="print the installed version and exit")
+    p_ver.add_argument("--json", action="store_true")
+    p_ver.add_argument("action", nargs="?", choices=["check"])
 
     # stats (v0.5 observability)
     p_stats = sub.add_parser("stats", help="dump in-process metrics counters")
@@ -827,6 +836,21 @@ def _cmd_launch_chrome(args, cfg: Config) -> int:
 
 
 def _cmd_version(args, cfg: Config) -> int:
+    from browserwright.version import version_info
+
+    info = version_info()
+    if getattr(args, "action", None) == "check":
+        if args.json:
+            print(json.dumps(info, sort_keys=True))
+        elif info["ok"]:
+            print(f"browserwright-daemon {__version__} (versions ok)")
+        else:
+            for issue in info["issues"]:
+                print(f"{issue['code']}: {issue['message']}", file=sys.stderr)
+        return 0 if info["ok"] else 1
+    if getattr(args, "json", False):
+        print(json.dumps(info, sort_keys=True))
+        return 0
     print(f"browserwright-daemon {__version__}")
     return 0
 
@@ -1239,6 +1263,27 @@ def _cmd_uninstall(args, cfg: Config) -> int:
     return 0
 
 
+def _cmd_restart(args, cfg: Config) -> int:
+    if sys.platform != "darwin":
+        print("error: `restart` is macOS-only (LaunchAgent)", file=sys.stderr)
+        return 1
+    plist_path = _launchagent_plist_path()
+    if not plist_path.exists():
+        print(
+            "error: no LaunchAgent installed; run `browserwright-daemon install` "
+            "or restart your foreground `serve` process manually",
+            file=sys.stderr,
+        )
+        return 2
+    _launchctl("unload", str(plist_path))
+    rc, _, err = _launchctl("load", "-w", str(plist_path))
+    if rc != 0:
+        print(f"error: launchctl load failed: {err.strip()}", file=sys.stderr)
+        return 3
+    print(json.dumps({"ok": True, "restarted": str(plist_path)}, sort_keys=True))
+    return 0
+
+
 def _cmd_list(args, cfg: Config) -> int:
     """Report the single global daemon: whether it's installed as a
     LaunchAgent and whether it's running on the socket."""
@@ -1284,6 +1329,7 @@ _DISPATCH = {
     # v0.2
     "serve": _cmd_serve,
     "stop": _cmd_stop,
+    "restart": _cmd_restart,
     "status": _cmd_status,
     "disconnect": _cmd_disconnect,
     "logs": _cmd_logs,

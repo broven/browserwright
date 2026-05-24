@@ -5,4 +5,4 @@ The package surface is the `browserwright-daemon` console script; importing this
 directly is not part of the public contract (Skill talks via subprocess only).
 """
 
-__version__ = "0.5.3"
+from browserwright.version import __version__  # noqa: F401

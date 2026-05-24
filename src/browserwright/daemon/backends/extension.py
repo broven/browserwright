@@ -29,6 +29,7 @@ from ..config import Config
 from ..errors import Unavailable
 from .base import Backend, DoctorResult, ResolveResult
 from ..server.relay import DEFAULT_RELAY_PORT
+from browserwright.version import EXTENSION_PROTOCOL_VERSION, package_version
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,40 @@ class ExtensionBackend(Backend):
             )
 
         install_ids = status.get("install_ids") or []
+        details = status.get("extension_details") or []
+        incompatible = [
+            item for item in details
+            if item.get("compatible") is False
+        ]
+        version_mismatch = [
+            item for item in details
+            if item.get("browserwright_version")
+            and item.get("browserwright_version") != package_version()
+        ]
+        if incompatible:
+            return DoctorResult(
+                name=self.name,
+                available=False,
+                ws_url=None,
+                detail=(
+                    "extension relay connected, but protocol is incompatible "
+                    f"(daemon expects {EXTENSION_PROTOCOL_VERSION})"
+                ),
+                ux_warning="reload the unpacked extension from the matching release",
+                needs_user_action="reload `chrome-extension/` in Chrome",
+                ux_cost=self.ux_cost,
+            )
+        warning = None
+        if version_mismatch:
+            seen = sorted({
+                str(item.get("browserwright_version"))
+                for item in version_mismatch
+                if item.get("browserwright_version")
+            })
+            warning = (
+                f"extension version(s) {seen} do not match package "
+                f"{package_version()}; reload the unpacked extension"
+            )
         tabs = int(status.get("tab_count", 0))
         return DoctorResult(
             name=self.name,
@@ -132,7 +167,7 @@ class ExtensionBackend(Backend):
             ws_url=None,
             detail=(f"{ext_count} extension(s) connected "
                     f"(install_ids={install_ids}, attached tabs={tabs})"),
-            ux_warning=None,
+            ux_warning=warning,
             needs_user_action=None,
             ux_cost=self.ux_cost,
         )

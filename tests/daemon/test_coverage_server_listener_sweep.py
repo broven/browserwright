@@ -83,7 +83,7 @@ def test_process_request_ping_windows_token_and_origin(monkeypatch):
     ping = process_request(conn, SimpleNamespace(path="/__ping__?x=1", headers={}))
     assert ping.status.value == 200
     assert ping.headers["Content-Type"] == "application/json"
-    assert _ipc.parse_pong(ping.body.encode()) == (2468, "0.5.3")
+    assert _ipc.parse_pong(ping.body.encode()) == (2468, listener_mod.__version__)
 
     monkeypatch.setattr(listener_mod._ipc, "IS_WINDOWS", True)
     allowed = process_request(
@@ -145,7 +145,11 @@ async def test_open_server_windows_and_unix_bind_branches(monkeypatch, tmp_path)
 @pytest.mark.asyncio
 async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypatch, capsys):
     cleanup_calls: list[str] = []
-    monkeypatch.setattr(listener_mod._ipc, "ping_async", lambda timeout: asyncio.sleep(0, result=999))
+    monkeypatch.setattr(
+        listener_mod._ipc,
+        "ping_status_async",
+        lambda timeout: asyncio.sleep(0, result=(999, listener_mod.__version__)),
+    )
     assert await listener_mod.run_serve(Config(backend="env")) == 1
     assert "already running (pid 999)" in capsys.readouterr().err
 
@@ -168,7 +172,11 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
             raise OSError("busy")
 
     server = FakeServer()
-    monkeypatch.setattr(listener_mod._ipc, "ping_async", lambda timeout: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(
+        listener_mod._ipc,
+        "ping_status_async",
+        lambda timeout: asyncio.sleep(0, result=(None, None)),
+    )
     monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: cleanup_calls.append("cleanup"))
     monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: cleanup_calls.append(f"pid:{pid}"))
     monkeypatch.setattr(listener_mod, "_cleanup_orphan_rdp_chrome", lambda: cleanup_calls.append("orphans"))

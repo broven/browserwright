@@ -36,7 +36,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-browserwright = ["site_skills_starter/**/*"]
+browserwright = ["site_skills_starter/**/*", "skill_runtime.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

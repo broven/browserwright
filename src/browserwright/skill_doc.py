@@ -54,11 +54,11 @@ def _curated_header() -> str:
     """Return curated guidance prose, read at runtime — never frozen here.
 
     Preference order:
-      1. A real ``SKILL.md`` shipped alongside the package (if one ever lands).
+      1. ``skill_runtime.md`` shipped inside the package.
       2. The CLI ``HELP`` banner, which is itself the curated quick-start.
     """
     pkg_dir = Path(__file__).resolve().parent
-    for candidate in (pkg_dir / "SKILL.md", pkg_dir.parent / "SKILL.md"):
+    for candidate in (pkg_dir / "skill_runtime.md",):
         try:
             if candidate.is_file():
                 return candidate.read_text(encoding="utf-8").rstrip()

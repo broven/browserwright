@@ -28,6 +28,36 @@ def test_parse_kv_args_coerces_json_space_values_and_flags():
     }
 
 
+def test_cmd_version_check_json_reports_consistent_versions(capsys):
+    from browserwright import cli
+
+    assert cli._cmd_version(["check", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["version"] == payload["extension_version"]
+    assert payload["extension_protocol_version"] == "1"
+
+
+def test_cmd_release_status_json(monkeypatch, capsys):
+    from browserwright import cli, release_install
+
+    monkeypatch.setattr(
+        release_install,
+        "status",
+        lambda: {
+            "schema_version": 1,
+            "installed_version": "0.6.0",
+            "daemon": {"alive": True, "version": "0.5.9", "restart_required": True},
+            "skill": [],
+            "releases": [],
+        },
+    )
+
+    assert cli._cmd_release(["status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["daemon"]["restart_required"] is True
+
+
 @pytest.mark.parametrize(
     "args, err",
     [

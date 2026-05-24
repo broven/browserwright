@@ -66,9 +66,13 @@ def _ensure_daemon_running() -> None:
     we ping first to avoid the churn.
     """
     from .daemon import _ipc
+    from .version import package_version
     try:
-        if _ipc.ping_sync(timeout=1.0) is not None:
-            return  # already running
+        pid, running_version = _ipc.ping_status_sync(timeout=1.0)
+        if pid is not None and running_version == package_version():
+            return  # already running the installed version
+        if pid is not None:
+            _run(["browserwright-daemon", "stop"])
     except Exception:
         pass
     _spawn_detached(["browserwright-daemon", "serve"])

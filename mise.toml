@@ -1,5 +1,5 @@
-[tasks.reinstall]
-description = "Sync deps and entry points for the browserwright package (single venv, two console scripts)"
+[tasks.dev-link]
+description = "Development only: link this checkout into global PATH/skill dirs; a broken checkout can break global agents"
 dir = "{{config_root}}"
 run = """
 #!/usr/bin/env bash
@@ -38,3 +38,32 @@ done
 
 echo "Done. Installed: browserwright (+ browserwright-daemon), Claude skill"
 """
+
+[tasks.reinstall]
+description = "Alias for dev-link; development only and not release-isolated"
+depends = ["dev-link"]
+
+[tasks.install-release]
+description = "Build an immutable local release and activate global browserwright symlinks"
+dir = "{{config_root}}"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+uv run browserwright release install-local --force
+"""
+
+[tasks.version-check]
+description = "Verify package, generated skill, daemon, and extension versions agree"
+dir = "{{config_root}}"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+uv run browserwright version check
+uv run browserwright-daemon version check
+uv run browserwright --print-skill >/dev/null
+"""
+
+[tasks.restart-daemon]
+description = "Restart the installed browserwright LaunchAgent daemon after a local release"
+dir = "{{config_root}}"
+run = "browserwright-daemon restart"

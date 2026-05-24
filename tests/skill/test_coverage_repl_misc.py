@@ -106,6 +106,12 @@ def test_skill_doc_falls_back_when_cli_help_import_fails(monkeypatch):
     assert skill_doc._curated_header() == "browserwright — Layer 2 of the browser stack."
 
 
+def test_skill_doc_uses_packaged_runtime_guide():
+    from browserwright import skill_doc
+
+    assert "Version Discipline" in skill_doc._curated_header()
+
+
 def test_skill_doc_signature_uses_ellipsis_for_uninspectable_callable(monkeypatch):
     from browserwright import skill_doc
 

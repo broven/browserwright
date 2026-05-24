@@ -81,11 +81,17 @@ async def run_serve(cfg: Config) -> int:
     # answers, refuse to start a second copy of ourselves (enforces the
     # "at most one global daemon" invariant) — but if the ping comes back
     # negative, we cleanup the dead socket file and proceed.
-    existing_pid = await _ipc.ping_async(timeout=1.0)
+    existing_pid, existing_version = await _ipc.ping_status_async(timeout=1.0)
     if existing_pid is not None:
+        version_hint = ""
+        if existing_version and existing_version != __version__:
+            version_hint = (
+                f" (running {existing_version}, installed {__version__}; "
+                "use `browserwright-daemon stop` or `browserwright-daemon restart`)"
+            )
         print(
             f"browserwright-daemon already running (pid {existing_pid}); "
-            f"use `browserwright-daemon stop` to shut it down",
+            f"use `browserwright-daemon stop` to shut it down{version_hint}",
             file=sys.stderr,
         )
         return 1

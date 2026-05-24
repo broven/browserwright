@@ -8,7 +8,7 @@ here)::
 
     from browserwright import goto_url, capture_screenshot, remember
 """
-__version__ = "0.5.1"
+from .version import __version__  # noqa: F401
 
 # Re-export the primitive namespace assembled in api.py so user scripts can
 # `from browserwright import *`. The REPL/inline/task entry points use the same

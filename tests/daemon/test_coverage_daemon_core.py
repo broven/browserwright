@@ -103,6 +103,13 @@ def test_cmd_status_json_includes_dead_endpoint(monkeypatch, capsys):
     assert payload["endpoint"]["path"] == "/tmp/missing.sock"
 
 
+def test_cmd_daemon_version_check_json_reports_consistent_versions(capsys):
+    assert cli_mod.main(["version", "check", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["version"] == payload["extension_version"]
+
+
 @pytest.mark.parametrize("json_mode", [False, True])
 def test_cmd_active_tab_none_outputs_mode_specific_shape(monkeypatch, capsys, json_mode):
     async def fake_rpc(cfg, method, params, *, client_label, timeout, browser_session=None):
