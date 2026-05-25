@@ -53,6 +53,19 @@ set -euo pipefail
 uv run browserwright release install-local --force
 """
 
+[tasks.update-local-global-install]
+description = "Update the local global browserwright install from this checkout, verify it, and restart the daemon when needed"
+dir = "{{config_root}}"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+uv run browserwright release install-local --force --restart-daemon
+browserwright release status
+browserwright version check
+browserwright-daemon version check
+browserwright --print-skill >/dev/null
+"""
+
 [tasks.version-check]
 description = "Verify package, generated skill, daemon, and extension versions agree"
 dir = "{{config_root}}"
