@@ -12,13 +12,13 @@
 # rather than resolving deps on-demand. Single package now (the agent-facing
 # layer + the bundled daemon under browserwright.daemon).
 [post-create]
-sync = "uv sync --extra test"
+sync = "uv sync --group dev"
 
 # Unit tests. agent-e2e is excluded: it requires the claude_agent_sdk (not in
 # the default venv) and a live Chrome extension. real_chrome e2e is opt-in and
 # can be run separately via: tests/daemon/e2e/run.sh
 [pre-merge]
-test = "uv run --extra test python -m pytest -q -m 'not real_chrome' --ignore=tests/skill/agent-e2e"
+test = "uv run --group dev python -m pytest -q -m 'not real_chrome' --ignore=tests/skill/agent-e2e"
 
 # Kill any stale test daemon on port 29989 left by an interrupted e2e run.
 [pre-remove]
