@@ -57,6 +57,9 @@ def skill_targets() -> list[Path]:
         return [Path(p).expanduser() for p in override.split(os.pathsep) if p]
     return [
         Path.home() / ".claude" / "skills" / "browserwright",
+        Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+        / "skills"
+        / "browserwright",
         Path.home() / ".pi" / "agent" / "skills" / "browserwright",
     ]
 

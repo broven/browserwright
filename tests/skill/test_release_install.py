@@ -29,23 +29,40 @@ def _isolate_release_env(monkeypatch, tmp_path):
     release_root = tmp_path / "global" / "share" / "browserwright"
     local_bin = tmp_path / "global" / "bin"
     skill_a = tmp_path / "claude" / "skills" / "browserwright"
-    skill_b = tmp_path / "pi" / "skills" / "browserwright"
+    skill_b = tmp_path / "codex" / "skills" / "browserwright"
+    skill_c = tmp_path / "pi" / "skills" / "browserwright"
     chrome_target = tmp_path / "icloud" / "chrome-extension" / "browserwright"
     monkeypatch.setenv(release_install.ROOT_ENV, str(release_root))
     monkeypatch.setenv(release_install.LOCAL_BIN_ENV, str(local_bin))
     monkeypatch.setenv(release_install.CHROME_EXTENSION_TARGET_ENV, str(chrome_target))
     monkeypatch.setenv(
         release_install.SKILL_TARGETS_ENV,
-        os.pathsep.join([str(skill_a), str(skill_b)]),
+        os.pathsep.join([str(skill_a), str(skill_b), str(skill_c)]),
     )
-    return release_root, local_bin, skill_a, skill_b
+    return release_root, local_bin, skill_a, skill_b, skill_c
+
+
+def test_default_skill_targets_include_claude_codex_and_pi(monkeypatch, tmp_path):
+    from browserwright import release_install
+
+    home = tmp_path / "home"
+    codex_home = tmp_path / "custom-codex"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv(release_install.SKILL_TARGETS_ENV, raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert release_install.skill_targets() == [
+        home / ".claude" / "skills" / "browserwright",
+        codex_home / "skills" / "browserwright",
+        home / ".pi" / "agent" / "skills" / "browserwright",
+    ]
 
 
 def test_release_install_local_copies_artifacts_and_activates(monkeypatch, tmp_path):
     from browserwright import release_install
 
     repo = _fake_repo(tmp_path / "repo")
-    release_root, local_bin, skill_a, skill_b = _isolate_release_env(monkeypatch, tmp_path)
+    release_root, local_bin, skill_a, skill_b, skill_c = _isolate_release_env(monkeypatch, tmp_path)
     monkeypatch.setattr(release_install, "repo_root", lambda: repo)
     monkeypatch.setattr(release_install, "package_version", lambda: "0.6.0")
     monkeypatch.setattr(
@@ -79,6 +96,7 @@ def test_release_install_local_copies_artifacts_and_activates(monkeypatch, tmp_p
     assert local_bin.joinpath("browserwright").resolve() == installed / ".venv" / "bin" / "browserwright"
     assert skill_a.resolve() == installed / "skill"
     assert skill_b.resolve() == installed / "skill"
+    assert skill_c.resolve() == installed / "skill"
     assert skill_a.resolve() != repo / "skill"
     assert result["chrome_extension_sync"]["path"].endswith("chrome-extension/browserwright")
     assert (tmp_path / "icloud" / "chrome-extension" / "browserwright" / "manifest.json").is_file()
@@ -87,7 +105,7 @@ def test_release_install_local_copies_artifacts_and_activates(monkeypatch, tmp_p
 def test_release_status_reports_daemon_restart_and_skill_link(monkeypatch, tmp_path):
     from browserwright import release_install
 
-    _release_root, local_bin, skill_a, _skill_b = _isolate_release_env(monkeypatch, tmp_path)
+    _release_root, local_bin, skill_a, _skill_b, _skill_c = _isolate_release_env(monkeypatch, tmp_path)
     installed = release_install.release_dir("0.6.0")
     (installed / ".venv" / "bin").mkdir(parents=True)
     (installed / ".venv" / "bin" / "browserwright").write_text("# cli")

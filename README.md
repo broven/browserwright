@@ -13,7 +13,7 @@ One installable package, two CLIs that work together:
 │   ├── …                     Layer 2 — sessions / primitives / site skills / memory / userscripts
 │   └── daemon/               Layer 1 — CDP URL resolver + proxy (env/rdp/extension/cloud backends)
 ├── chrome-extension/         unpacked relay extension for the `extension` backend
-├── skill/                    Claude Code skill bundle (symlink to ~/.claude/skills/browserwright)
+├── skill/                    Agent skill bundle (symlinked into Claude Code, Codex, and Pi)
 ├── tests/{skill,daemon}/     test suites
 ├── docs/                     deeper docs (skill.md, daemon.md, session-model.md, …)
 └── browser-connection.md     why this stack exists (CDP discovery, Chrome 144+ popups)
@@ -47,6 +47,7 @@ and points global entry points at that release copy:
 ~/.local/bin/browserwright        -> releases/<version>/.venv/bin/browserwright
 ~/.local/bin/browserwright-daemon -> releases/<version>/.venv/bin/browserwright-daemon
 ~/.claude/skills/browserwright    -> releases/<version>/skill
+~/.codex/skills/browserwright     -> releases/<version>/skill
 ~/.pi/agent/skills/browserwright  -> releases/<version>/skill
 ```
 
@@ -224,15 +225,17 @@ browserwright doctor                         # skill-side health
 browserwright-daemon stats                   # observability counters when `serve` is running
 ```
 
-## Claude Code integration
+## Agent integrations
 
-The `skill/` directory is a Claude Code skill bundle. Symlink it to `~/.claude/skills/browserwright` (step 3 of install) and Claude Code discovers it. The bundle is a stable shell; it tells the agent to run `browserwright --print-skill` for the version-locked runtime guide. Prompts like *"open example.com and screenshot it"*, *"scrape the HN front page"*, or *"write me a userscript that …"* trigger it automatically.
+The `skill/` directory is an agent skill bundle. Release install symlinks it into Claude Code, Codex, and Pi skill directories, and each symlink points at the active immutable release copy. The bundle is a stable shell; it tells the agent to run `browserwright --print-skill` for the version-locked runtime guide. Prompts like *"open example.com and screenshot it"*, *"scrape the HN front page"*, or *"write me a userscript that …"* trigger it automatically.
 
 ## Uninstall
 
 ```bash
 rm ~/.local/bin/browserwright ~/.local/bin/browserwright-daemon
 rm ~/.claude/skills/browserwright
+rm ~/.codex/skills/browserwright
+rm ~/.pi/agent/skills/browserwright
 rm -rf .venv
 rm -rf ~/.cache/browserwright-daemon ~/.browserwright
 ```

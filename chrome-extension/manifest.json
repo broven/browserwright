@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "browserwright-daemon relay",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Local CDP relay for browserwright-daemon (Mode B, --backend extension). Connects to ws://127.0.0.1:19989 and proxies chrome.debugger commands.",
   "permissions": [
     "debugger",
