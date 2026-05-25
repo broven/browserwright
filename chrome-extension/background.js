@@ -801,12 +801,109 @@ const TITLE_PREFIX = "\u{1F440} ";  // 👀 + space
 
 const MARKER_INSTALL_SCRIPT = `
 (function() {
-  if (window.__bdTitleMarker) return;
   const PREFIX = '\u{1F440} ';
-  function ensurePrefix() {
-    const t = document.title || '';
-    if (!t.startsWith(PREFIX)) document.title = PREFIX + t;
+
+  function stripPrefix(value) {
+    let title = typeof value === 'string' ? value : '';
+    while (title.startsWith(PREFIX)) {
+      title = title.slice(PREFIX.length);
+    }
+    return title;
   }
+
+  const previousMarker = window.__bdTitleMarker || null;
+  try {
+    previousMarker && previousMarker.obs && previousMarker.obs.disconnect();
+  } catch (e) {}
+  try {
+    previousMarker && previousMarker.restoreTitleAccessor &&
+      previousMarker.restoreTitleAccessor();
+  } catch (e) {}
+
+  function findTitleOwner() {
+    if (typeof Document !== 'undefined' &&
+        Object.getOwnPropertyDescriptor(Document.prototype, 'title')) {
+      return Document.prototype;
+    }
+    if (typeof HTMLDocument !== 'undefined' &&
+        Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title')) {
+      return HTMLDocument.prototype;
+    }
+    return typeof Document !== 'undefined' ? Document.prototype : null;
+  }
+
+  const titleOwner = findTitleOwner();
+  const titleDescriptor = titleOwner
+    ? Object.getOwnPropertyDescriptor(titleOwner, 'title')
+    : null;
+
+  function rawTitle(doc) {
+    doc = doc || document;
+    if (titleDescriptor && titleDescriptor.get) {
+      return titleDescriptor.get.call(doc) || '';
+    }
+    const el = doc.querySelector && doc.querySelector('title');
+    return el ? (el.textContent || '') : '';
+  }
+
+  function writeRawTitle(doc, title) {
+    doc = doc || document;
+    if (titleDescriptor && titleDescriptor.set) {
+      titleDescriptor.set.call(doc, title);
+      return;
+    }
+    let el = doc.querySelector && doc.querySelector('title');
+    if (!el && doc.head && doc.createElement) {
+      el = doc.createElement('title');
+      doc.head.appendChild(el);
+    }
+    if (el) el.textContent = title;
+  }
+
+  let normalizing = false;
+  function ensurePrefix() {
+    if (normalizing) return;
+    normalizing = true;
+    try {
+      const clean = stripPrefix(rawTitle());
+      const marked = PREFIX + clean;
+      if (rawTitle() !== marked) writeRawTitle(document, marked);
+    } finally {
+      normalizing = false;
+    }
+  }
+
+  function installTitleAccessor(target) {
+    if (!target) return;
+    Object.defineProperty(target, 'title', {
+      configurable: true,
+      enumerable: true,
+      get: function() {
+        return stripPrefix(rawTitle(this));
+      },
+      set: function(value) {
+        writeRawTitle(this, PREFIX + stripPrefix(String(value)));
+      },
+    });
+  }
+
+  function restoreTitleAccessor() {
+    try { delete document.title; } catch (e) {}
+    if (!titleOwner) return;
+    try {
+      if (titleDescriptor) {
+        Object.defineProperty(titleOwner, 'title', titleDescriptor);
+      } else {
+        delete titleOwner.title;
+      }
+    } catch (e) {}
+  }
+
+  try {
+    installTitleAccessor(titleOwner);
+    installTitleAccessor(document);
+  } catch (e) {}
+
   const obs = new MutationObserver(ensurePrefix);
   function attachObs() {
     if (!document.head) return;
@@ -818,18 +915,70 @@ const MARKER_INSTALL_SCRIPT = `
   } else {
     document.addEventListener('DOMContentLoaded', attachObs, { once: true });
   }
-  window.__bdTitleMarker = { obs };
+  window.__bdTitleMarker = {
+    obs,
+    ensurePrefix,
+    restoreTitleAccessor,
+    nativeTitleDescriptor: titleDescriptor,
+    nativeTitleOwner: titleOwner,
+  };
 })();
 `;
 
 const MARKER_REMOVE_SCRIPT = `
 (function() {
   const PREFIX = '\u{1F440} ';
-  try { window.__bdTitleMarker && window.__bdTitleMarker.obs.disconnect(); } catch (e) {}
-  delete window.__bdTitleMarker;
-  if (document.title && document.title.startsWith(PREFIX)) {
-    document.title = document.title.slice(PREFIX.length);
+  function stripPrefix(value) {
+    let title = typeof value === 'string' ? value : '';
+    while (title.startsWith(PREFIX)) {
+      title = title.slice(PREFIX.length);
+    }
+    return title;
   }
+  const marker = window.__bdTitleMarker || null;
+  const nativeTitleDescriptor =
+    marker && marker.nativeTitleDescriptor;
+  const titleDescriptor =
+    nativeTitleDescriptor ||
+    Object.getOwnPropertyDescriptor(Document.prototype, 'title') ||
+    (typeof HTMLDocument !== 'undefined'
+      ? Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title')
+      : null);
+  function rawTitle(doc) {
+    doc = doc || document;
+    if (titleDescriptor && titleDescriptor.get) {
+      return titleDescriptor.get.call(doc) || '';
+    }
+    const el = doc.querySelector && doc.querySelector('title');
+    return el ? (el.textContent || '') : '';
+  }
+  function writeRawTitle(doc, title) {
+    doc = doc || document;
+    if (nativeTitleDescriptor && nativeTitleDescriptor.set) {
+      nativeTitleDescriptor.set.call(doc, title);
+      return;
+    }
+    if (titleDescriptor && titleDescriptor.set &&
+        !(marker && marker.restoreTitleAccessor)) {
+      titleDescriptor.set.call(doc, title);
+      return;
+    }
+    let el = doc.querySelector && doc.querySelector('title');
+    if (!el && doc.head && doc.createElement) {
+      el = doc.createElement('title');
+      doc.head.appendChild(el);
+    }
+    if (el) el.textContent = title;
+  }
+  try { window.__bdTitleMarker && window.__bdTitleMarker.obs.disconnect(); } catch (e) {}
+  const clean = stripPrefix(rawTitle());
+  try {
+    marker && marker.restoreTitleAccessor && marker.restoreTitleAccessor();
+  } catch (e) {
+    try { delete document.title; } catch (_e) {}
+  }
+  delete window.__bdTitleMarker;
+  writeRawTitle(document, clean);
 })();
 `;
 
@@ -838,10 +987,14 @@ const MARKER_REMOVE_SCRIPT = `
 const markedTabs = new Map();
 
 function stripMarker(title) {
-  if (typeof title === "string" && title.startsWith(TITLE_PREFIX)) {
-    return title.slice(TITLE_PREFIX.length);
+  if (typeof title !== "string") {
+    return title || "";
   }
-  return title || "";
+  let clean = title;
+  while (clean.startsWith(TITLE_PREFIX)) {
+    clean = clean.slice(TITLE_PREFIX.length);
+  }
+  return clean;
 }
 
 async function keepTabRendered(tabId) {
