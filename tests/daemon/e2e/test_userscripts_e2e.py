@@ -7,10 +7,47 @@ import socketserver
 import subprocess
 import threading
 import time
+import uuid
 from contextlib import contextmanager
+from pathlib import Path
 
 from .conftest import TEST_EXT_PORT, scrubbed_env
 from .helpers import run_skill
+
+_BS_HOME_EXT = Path(__file__).resolve().parent / "_bs_home" / "extension"
+
+
+def _seed_ext_session() -> str:
+    """Seed a persistent extension session in the daemon's BS_HOME ledger and
+    return its id. The userscript CLI requires a session (`--session`/
+    `BD_SESSION`) — every `BrowserwrightDaemon.userscript.*` verb is
+    session-scoped at the daemon boundary (`_require_browser_session`)."""
+    sessions_dir = _BS_HOME_EXT / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = sessions_dir / "ledger.json"
+    sid = f"e2e-us-{uuid.uuid4().hex}"
+    now = time.time()
+    record = {
+        "id": sid, "backend": "extension", "workspace": None, "owner": "attach",
+        "name": "e2e-us", "created_at": now, "last_seen": now,
+    }
+    try:
+        existing = json.loads(ledger_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing = {"next_id": 1, "sessions": {}}
+    existing.setdefault("sessions", {})[sid] = record
+    ledger_path.write_text(json.dumps(existing), encoding="utf-8")
+    return sid
+
+
+def _cleanup_ext_session(sid: str) -> None:
+    ledger_path = _BS_HOME_EXT / "sessions" / "ledger.json"
+    try:
+        data = json.loads(ledger_path.read_text())
+        data.get("sessions", {}).pop(sid, None)
+        ledger_path.write_text(json.dumps(data), encoding="utf-8")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
 
 
 def _enable_user_scripts_toggle(e2e_chrome) -> None:
@@ -127,6 +164,7 @@ def _last_json(stdout: str) -> dict:
 
 
 def _daemon_userscript(args: list[str], *, runtime_dir: str,
+                       session: str | None = None,
                        timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
     daemon_bin = shutil.which("browserwright-daemon") or "browserwright-daemon"
     env = scrubbed_env()
@@ -137,6 +175,10 @@ def _daemon_userscript(args: list[str], *, runtime_dir: str,
     env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
+    # Every `userscript` verb is session-scoped at the daemon boundary; the
+    # `--session` arg defaults to BD_SESSION.
+    if session is not None:
+        env["BD_SESSION"] = session
     return subprocess.run(
         [daemon_bin, "userscript", *args],
         text=True,
@@ -149,6 +191,7 @@ def _daemon_userscript(args: list[str], *, runtime_dir: str,
 def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e_chrome, tmp_path):
     _enable_user_scripts_toggle(e2e_chrome)
     rd = e2e_daemon.runtime_dir  # the test daemon's XDG_RUNTIME_DIR (fixed socket)
+    us_sid = _seed_ext_session()  # userscript verbs are session-scoped
 
     userjs = tmp_path / "e2e.user.js"
     userjs.write_text(
@@ -164,7 +207,7 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
         encoding="utf-8",
     )
 
-    pushed = _daemon_userscript(["push", str(userjs)], runtime_dir=rd)
+    pushed = _daemon_userscript(["push", str(userjs)], runtime_dir=rd, session=us_sid)
     assert pushed.returncode == 0, pushed.stderr
     pushed_payload = json.loads(pushed.stdout)
     assert pushed_payload.get("sync", {}).get("ok") is True, pushed_payload
@@ -196,16 +239,16 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
         # Injection on the matching page must have appended an audit-log entry.
         deadline = time.monotonic() + 5.0
         while True:
-            logs = _daemon_userscript(["logs", "--id", script_id, "--limit=20"], runtime_dir=rd)
+            logs = _daemon_userscript(["logs", "--id", script_id, "--limit=20"], runtime_dir=rd, session=us_sid)
             assert logs.returncode == 0, logs.stderr
             if any(entry.get("id") == script_id for entry in json.loads(logs.stdout)["logs"]):
                 break
             if time.monotonic() > deadline:
-                all_logs = _daemon_userscript(["logs", "--limit=50"], runtime_dir=rd)
+                all_logs = _daemon_userscript(["logs", "--limit=50"], runtime_dir=rd, session=us_sid)
                 raise AssertionError(f"missing audit log for {script_id}: filtered={logs.stdout} all={all_logs.stdout}")
             time.sleep(0.2)
 
-        toggled = _daemon_userscript(["toggle", identity, "--enabled=false"], runtime_dir=rd)
+        toggled = _daemon_userscript(["toggle", identity, "--enabled=false"], runtime_dir=rd, session=us_sid)
         assert toggled.returncode == 0, toggled.stderr
         disabled_probe = run_skill(
             script=(
@@ -223,8 +266,10 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
         assert disabled_probe.returncode == 0, disabled_probe.stderr
         assert _last_json(disabled_probe.stdout)["sentinel"] is None
 
-    removed = _daemon_userscript(["remove", identity], runtime_dir=rd)
+    removed = _daemon_userscript(["remove", identity], runtime_dir=rd, session=us_sid)
     assert removed.returncode == 0, removed.stderr
-    listed = _daemon_userscript(["list", "--site=http://127.0.0.1/e2e"], runtime_dir=rd)
+    listed = _daemon_userscript(["list", "--site=http://127.0.0.1/e2e"], runtime_dir=rd, session=us_sid)
     assert listed.returncode == 0, listed.stderr
     assert json.loads(listed.stdout)["scripts"] == []
+
+    _cleanup_ext_session(us_sid)

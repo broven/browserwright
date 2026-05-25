@@ -46,7 +46,11 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import TEST_EXT_PORT, _isolated_runtime_dir  # noqa: F401
+from .conftest import (  # noqa: F401
+    TEST_EXT_FACADE_PORT as _CONFTEST_FACADE_PORT,
+    TEST_EXT_PORT,
+    _isolated_runtime_dir,
+)
 
 # A test facade port distinct from production (19990), the rdp-facade test
 # (29991), and the relay (29989).
@@ -54,73 +58,18 @@ TEST_EXT_FACADE_PORT = 29992
 
 
 @pytest.fixture
-def e2e_ext_facade_daemon(e2e_artifacts_dir):
-    """Spawn `browserwright-daemon serve --backend extension --extension-port N
-    --facade-port M`, isolated via a throwaway XDG_RUNTIME_DIR. Yields
-    (ext_port, facade_port, runtime_dir) once the facade /json/version answers.
+def e2e_ext_facade_daemon(e2e_daemon, ext_ready):
+    """Reuse the session-scoped extension daemon.
+
+    The CfT extension is patched to dial ONE fixed relay port (TEST_EXT_PORT =
+    29989), so only one extension daemon can own it per pytest session — a
+    second daemon on 29989 would collide (this fixture used to spawn one and
+    failed `_port_free` whenever `e2e_daemon` was alive in a full-suite run).
+    `e2e_daemon` already serves 29989 WITH a facade on
+    `conftest.TEST_EXT_FACADE_PORT`, and `ext_ready` blocks until the extension
+    SW has connected. Yields (ext_port, facade_port, runtime_dir).
     """
-    import shutil
-
-    if not _port_free(TEST_EXT_PORT):
-        pytest.fail(f"port {TEST_EXT_PORT} already in use; another test daemon?")
-
-    log_path = e2e_artifacts_dir / "daemon-ext-facade.log"
-    log_fh = open(log_path, "wb")  # noqa: SIM115 — closed in teardown
-
-    runtime_dir = _isolated_runtime_dir()
-    env = os.environ.copy()
-    env["XDG_RUNTIME_DIR"] = runtime_dir
-    env["TMPDIR"] = runtime_dir
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "extension")
-    env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
-    env["BD_CONFIG"] = ""
-
-    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
-
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "browserwright.daemon.cli", "serve",
-            "--backend", "extension",
-            "--extension-port", str(TEST_EXT_PORT),
-            "--facade-port", str(TEST_EXT_FACADE_PORT),
-            "-v",
-        ],
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        env=env,
-    )
-
-    version_url = f"http://127.0.0.1:{TEST_EXT_FACADE_PORT}/json/version"
-    deadline = time.monotonic() + 10.0
-    last_err = None
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            log_fh.flush()
-            pytest.fail(f"ext facade daemon exited early ({proc.returncode}); "
-                        f"see {log_path}")
-        try:
-            with urllib.request.urlopen(version_url, timeout=0.5) as resp:
-                if resp.status == 200:
-                    break
-        except (urllib.error.URLError, OSError) as e:
-            last_err = e
-            time.sleep(0.2)
-    else:
-        log_fh.flush()
-        pytest.fail(f"ext facade /json/version never came up; last={last_err}; "
-                    f"see {log_path}")
-
-    yield (TEST_EXT_PORT, TEST_EXT_FACADE_PORT, runtime_dir)
-
-    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=2)
-    log_fh.close()
-    shutil.rmtree(runtime_dir, ignore_errors=True)
+    yield (TEST_EXT_PORT, _CONFTEST_FACADE_PORT, e2e_daemon.runtime_dir)
 
 
 @pytest.fixture

@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from .conftest import (
+    TEST_EXT_FACADE_PORT,
     TEST_EXT_PORT,
     TEST_RDP_PORT,
     _isolated_runtime_dir,
@@ -335,73 +336,19 @@ def test_snapshot_ref_roundtrip_rdp(rdp_autofacade_daemon):
 
 
 @pytest.fixture
-def ext_autofacade_ready(e2e_artifacts_dir, e2e_chrome):
-    """Spawn the extension daemon WITHOUT --facade-port, wait for the CfT
-    extension SW to connect, and prove the facade auto-enabled. Yields
-    (runtime_dir, facade_ws)."""
-    import shutil
+def ext_autofacade_ready(e2e_daemon, ext_ready):
+    """Reuse the session-scoped extension daemon. Yields (runtime_dir, facade_ws).
 
-    if not _port_free(TEST_EXT_PORT):
-        pytest.fail(f"port {TEST_EXT_PORT} already in use; another test daemon?")
-
-    log_path = e2e_artifacts_dir / "daemon-ext-autofacade.log"
-    log_fh = open(log_path, "wb")  # noqa: SIM115
-
-    runtime_dir = _isolated_runtime_dir()
-    env = os.environ.copy()
-    env["XDG_RUNTIME_DIR"] = runtime_dir
-    env["TMPDIR"] = runtime_dir
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "extension")
-    env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
-    env["BD_CONFIG"] = ""
-
-    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
-
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "browserwright.daemon.cli", "serve",
-         "--backend", "extension", "--extension-port", str(TEST_EXT_PORT), "-v"],
-        stdout=log_fh, stderr=subprocess.STDOUT, env=env,
-    )
-
-    facade_ws = _status_facade_ws(env)
-    if facade_ws is None:
-        log_fh.flush()
-        proc.terminate()
-        pytest.fail(f"ext daemon never advertised a facade ws; see {log_path}")
-
-    # Wait for the CfT extension SW to connect to the relay.
-    deadline = time.monotonic() + 15.0
-    last = None
-    connected = False
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{TEST_EXT_PORT}/__status__", timeout=0.5
-            ) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            last = body
-            if int(body.get("extensions", 0)) >= 1:
-                connected = True
-                break
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
-            pass
-        time.sleep(0.2)
-    if not connected:
-        log_fh.flush()
-        proc.terminate()
-        pytest.fail(f"extension never connected within 15s; last status={last}")
-
-    yield runtime_dir, facade_ws
-
-    subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=2)
-    log_fh.close()
-    shutil.rmtree(runtime_dir, ignore_errors=True)
+    The CfT extension is patched to dial ONE fixed relay port (TEST_EXT_PORT =
+    29989), so only one extension daemon can own it per pytest session — a
+    second daemon on 29989 would collide (this fixture used to spawn one and
+    failed `_port_free` whenever the session-scoped `e2e_daemon` was alive in a
+    full-suite run). `e2e_daemon` already serves 29989 WITH a facade on
+    `conftest.TEST_EXT_FACADE_PORT`, and `ext_ready` blocks until the extension
+    SW has connected — exactly what these consumers need (a usable facade ws).
+    """
+    yield (e2e_daemon.runtime_dir,
+           f"ws://127.0.0.1:{TEST_EXT_FACADE_PORT}/cdp")
 
 
 # Extension backend `page.goto("data:...")` is aborted by Chrome over
