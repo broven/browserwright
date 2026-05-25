@@ -43,6 +43,8 @@ Module-level constants are all optional except `ARGS` and `run`. The runtime imp
 
 ## Site memory.md template
 
+Site memory is not only for saved tasks. During ordinary browsing, if you learn stable reusable facts about a host, call `remember(host_or_url, text, section=...)`; it creates this file lazily. Keep notes short and sanitized.
+
 `~/.browserwright/site-skills/<site>/memory.md`:
 
 ```markdown

@@ -28,7 +28,7 @@ HELP = """browserwright — Layer 2 of the browser stack.
 Usage:
   browserwright -s <session-id> -e 'page.goto("https://example.com"); print(page.title())'
 
-  browserwright session new --backend=<extension|rdp> --name=NAME [--create | --attach=PORT]
+  browserwright session new --backend=<extension|rdp> --name=TAB_GROUP_TITLE [--create | --attach=PORT]
   browserwright session reset <id>
   browserwright session end --session=ID
   browserwright session list [--json]
@@ -405,7 +405,9 @@ def _cmd_session(args: list[str]) -> int:
         backend = kw.get("backend")
         if backend not in ("extension", "rdp"):
             print("usage: browserwright session new --backend=<extension|rdp> "
-                  "--name=NAME [--create | --attach=PORT]", file=sys.stderr)
+                  "--name=TAB_GROUP_TITLE [--create | --attach=PORT]", file=sys.stderr)
+            print("--name is the Chrome tab group title; choose a short task-specific label.",
+                  file=sys.stderr)
             return 1
         try:
             sid = session_create.new(

@@ -19,3 +19,5 @@ browserwright --print-skill
 Follow the generated `browserwright --print-skill` output for command forms, session rules, primitives, userscripts, trust boundaries, and recovery behavior.
 
 Also read `memory.md` in this skill directory before choosing a backend. It records the user's backend preferences and scenario decisions.
+
+When you discover stable, reusable behavior for a specific site, record a short sanitized note with `remember(host_or_url, text, section=...)`. This creates or updates that site's `site-skills/<site>/memory.md`; do not wait until you are writing a reusable task. Never store secrets, tokens, passwords, or private page content.

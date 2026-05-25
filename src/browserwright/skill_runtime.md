@@ -21,10 +21,10 @@ If `version check` reports an extension mismatch, reload the unpacked `chrome-ex
 
 ## Start With A Session
 
-A session is the isolation key. Create one session, then pass it to every later browser-driving call with `-s`.
+A session is the isolation key. Create one session, then pass it to every later browser-driving call with `-s`. The `--name` value is the Chrome tab group title the user may see, so choose a short task-specific label instead of a generic name like `personal`.
 
 ```bash
-sid=$(browserwright session new --backend=extension --name=personal)
+sid=$(browserwright session new --backend=extension --name=hn-research)
 browserwright -s "$sid" -e $'
 page.goto("https://example.com")
 print(page.title())
@@ -148,6 +148,23 @@ These run without driving the browser:
 - `http_get(url, ...)` — fetch a URL directly (escape hatch, no tab).
 - `remember(...)`, `remember_global(...)`, `remember_preference(...)`, `memory_read(...)` — site / global memory.
 - `list_site_skills(...)`, `load_site_skill(...)`, `run_task(...)`, `run_tasks_concurrent(...)`, `bootstrap_site(...)` — the task / site-skill layer.
+
+## Site Memory
+
+Use site memory proactively. When you learn stable, reusable facts about a website, write them with `remember(host_or_url, text, section=...)` before ending the task. This lazy-creates `~/.browserwright/site-skills/<site>/memory.md`; do not wait until you are also creating a reusable task.
+
+Good site-memory candidates:
+
+- Stable selectors, aria-ref patterns, URL templates, pagination/search flows, export/download paths.
+- Login/account quirks, paywall/captcha/rate-limit notes, layout differences between logged-in and anonymous views.
+- User-approved workflow preferences for that site, such as "always use the table view" or "open reports in a new tab".
+
+Do not store secrets, tokens, passwords, private page content, or one-off transient results. If a note may be useful across future visits to the same host, store a short sanitized line:
+
+```python
+remember("https://example.com", "Search results use /search?q=... and the Export button appears after filters load.", section="Notes")
+print(memory_read("example.com"))
+```
 
 ## Userscripts
 

@@ -9,7 +9,7 @@ The agent reads this file on every browserwright invocation. It carries two thin
 
 | Backend | Connects to | How to use |
 |---|---|---|
-| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=rdp --create --name=bs-dev)` then run `browserwright -s "$sid" -e '...'` |
+| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=rdp --create --name=task-label)` then run `browserwright -s "$sid" -e '...'` |
 | `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve` (one global daemon) then load the bundled `chrome-extension/` directory |
 | `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --provider <name>` + provider auth env vars |
 | `env` | An externally-supplied CDP URL | Set `BROWSER_DAEMON_CDP_URL=ws://...` before calling |
@@ -20,6 +20,9 @@ The user runs different kinds of work in different browsers. Match the task to a
 
 ```yaml
 default_backend: extension
+
+# `session new --name` is the Chrome tab group title the user may see.
+# Prefer short task-specific labels over generic names like "personal".
 
 scenarios:
   - name: personal
@@ -37,7 +40,7 @@ scenarios:
   - name: public
     when: 公共页面、无需 cookie 的一次性抓取、UI 测试、文档/示例站、批量 http_get
     backend: rdp
-    launch_command: browserwright session new --backend=rdp --create --name=bs-dev
+    launch_command: browserwright session new --backend=rdp --create --name=<task-label>
     env: {}
     notes: |
       Zero popups, safe for iterative inline `-s/-e` calls.

@@ -575,10 +575,12 @@ def run() -> int:
     print("Next steps:")
     if choice == "1":
         print("  - Run `browserwright-daemon launch-chrome` to start the isolated profile.")
-        print("  - Then create a session: `browserwright session new --backend=rdp --create`.")
+        print("  - Then create a session: `browserwright session new --backend=rdp --create --name=TASK`.")
+        print("    (`--name` is the Chrome tab group title; choose a short task label.)")
     elif choice == "2":
         print("  - Make sure your fingerprint browser is open on the chosen port.")
-        print("  - Then attach a session: `browserwright session new --backend=rdp --attach=PORT`.")
+        print("  - Then attach a session: `browserwright session new --backend=rdp --attach=PORT --name=TASK`.")
+        print("    (`--name` is the Chrome tab group title; choose a short task label.)")
     elif choice == "3":
         ext_dir = chrome_extension_path()
         print("  1. Install the unpacked Chrome extension:")
@@ -598,7 +600,8 @@ def run() -> int:
         print("  3. In Chrome, click the extension icon → 'Attach this tab'.")
         print("     Verify with: `browserwright-daemon doctor --json` →")
         print("     look for `extension` backend `available=true` + `ws_url` set.")
-        print("  4. Then create a session: `browserwright session new --backend=extension`.")
+        print("  4. Then create a session: `browserwright session new --backend=extension --name=TASK`.")
+        print("     (`--name` is the Chrome tab group title; choose a short task label.)")
     elif choice == "4":
         provider = cloud_fields["cloud_provider_hint"]
         auth_kind = cloud_fields["cloud_auth_kind"]
