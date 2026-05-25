@@ -438,6 +438,32 @@ def test_tab_rpc_handlers_cover_success_and_failures(monkeypatch, capsys):
     assert "error: end boom" in captured.err
 
 
+def test_end_and_kill_executor_pass_browser_session_for_ws_scoping(monkeypatch):
+    """Regression: `end-session` / `kill-executor` MUST put the session on the
+    transient ws (`browser_session=`), or the daemon's `_require_browser_session`
+    rejects the ws (no `?session=`) at the boundary before the executor reap
+    runs — the discovery file then survives `session end` (phase B e2e bug)."""
+    calls = []
+
+    def fake_rpc(cfg, method, params, **kwargs):
+        calls.append((method, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
+    monkeypatch.setattr(cli, "_run", lambda value: value)
+
+    assert cli._cmd_end_session(_ns(session="bw-s", group_id=None), Config()) == 0
+    assert cli._cmd_kill_executor(_ns(session="bw-s"), Config()) == 0
+
+    end_method, end_kwargs = calls[0]
+    assert end_method == "BrowserwrightDaemon.endSession"
+    assert end_kwargs["browser_session"] == "bw-s"
+
+    kill_method, kill_kwargs = calls[1]
+    assert kill_method == "BrowserwrightDaemon.killExecutor"
+    assert kill_kwargs["browser_session"] == "bw-s"
+
+
 def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, tmp_path):
     import subprocess
 

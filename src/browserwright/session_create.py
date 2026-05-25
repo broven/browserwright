@@ -91,6 +91,21 @@ def _close_browser(record: dict) -> None:
         _run(["browserwright-daemon", "end-session", "--session", str(sid)])
 
 
+def _reap_executor(record: dict) -> None:
+    """Best-effort: reap this session's resident Phase B executor (no browser
+    teardown). Called for EVERY owner on `end()` so an attach session's
+    long-lived executor subprocess doesn't leak — the full `endSession` path is
+    create-only and would also close the browser an attach session must keep.
+
+    Best-effort by contract: a dead daemon / no-executor / stale binary all
+    return non-zero from `_run`, which we ignore — `session end` must never fail
+    because the executor couldn't be reaped (the orphan-sweep on the next daemon
+    start is the backstop)."""
+    sid = record.get("id")
+    if sid:
+        _run(["browserwright-daemon", "kill-executor", "--session", str(sid)])
+
+
 def reap(*, idle_seconds: float) -> list[dict]:
     """Prune idle sessions; for create-owned ones, also tear down the browser
     the daemon launched. Returns the pruned records."""
@@ -206,9 +221,15 @@ def end(record: dict) -> str:
     if record.get("backend") == "extension":
         _end_extension_workspace(record)
     if record.get("owner") == "create":
+        # `_close_browser` → daemon `endSession`, which ALSO kills the executor
+        # (symmetric in `_handle_end_session`), so no separate reap needed here.
         _close_browser(record)
         msg = f"session {sid} ended; the browser it launched was closed."
     else:
+        # attach: leave the browser running (semantics unchanged) but still reap
+        # the session's resident executor so it doesn't leak — `endSession` is
+        # create-only and the attach path never otherwise contacts the daemon.
+        _reap_executor(record)
         msg = (f"session {sid} ended. The browser is still running — you "
                f"attached to it, so it was left untouched.")
     reg.remove(sid)

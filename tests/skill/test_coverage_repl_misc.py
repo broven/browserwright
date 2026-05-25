@@ -112,6 +112,21 @@ def test_skill_doc_uses_packaged_runtime_guide():
     assert "Version Discipline" in skill_doc._curated_header()
 
 
+def test_skill_doc_documents_state_and_reset_surface():
+    # PR3 DoD: --print-skill must teach the persistent `state` + `reset()`
+    # surface and the "same live objects across heredocs" mental model (flipping
+    # the phase C "every heredoc reconnects" narrative).
+    from browserwright import skill_doc
+
+    doc = skill_doc.render()
+    assert "state" in doc
+    assert "reset()" in doc
+    assert "persist" in doc.lower()
+    assert "same live object" in doc.lower()
+    # Both state-loss paths are documented so the agent isn't surprised.
+    assert "daemon restart" in doc.lower()
+
+
 def test_skill_doc_signature_uses_ellipsis_for_uninspectable_callable(monkeypatch):
     from browserwright import skill_doc
 

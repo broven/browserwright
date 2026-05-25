@@ -275,6 +275,17 @@ def _build_parser() -> argparse.ArgumentParser:
                            "is the key)")
     # Output is always JSON (single-line discipline); no --json flag.
 
+    # kill-executor (Phase B) — reap ONLY a session's resident executor, no
+    # browser teardown. Used by `session end` to avoid leaking an attach
+    # session's executor (the full end-session path is create-only).
+    p_ke = sub.add_parser(
+        "kill-executor",
+        help="reap a session's persistent executor subprocess (no browser teardown)",
+    )
+    _add_name(p_ke)
+    p_ke.add_argument("--session", required=True,
+                      help="the browserwright session id whose executor to reap")
+
     # userscript — resident extension userscripts
     p_us = sub.add_parser("userscript", help="manage resident extension userscripts")
     _add_name(p_us)
@@ -1112,6 +1123,32 @@ def _cmd_end_session(args, cfg: Config) -> int:
             es_params,
             client_label="cli-end-session",
             timeout=10.0,
+            browser_session=args.session,
+        ))
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _cmd_kill_executor(args, cfg: Config) -> int:
+    """Phase B: reap a session's resident executor (no browser teardown).
+
+    Best-effort by design — a dead daemon / missing executor must not fail
+    `session end`, so every failure mode maps to a clean exit code the caller
+    tolerates. Prints the `{ok, killed}` JSON result on success."""
+    try:
+        result = _run(_rpc_via_ws(
+            cfg,
+            "BrowserwrightDaemon.killExecutor",
+            {"session": args.session},
+            client_label="cli-kill-executor",
+            timeout=10.0,
+            browser_session=args.session,
         ))
     except Unavailable as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1363,6 +1400,7 @@ _DISPATCH = {
     "open-background": _cmd_open_background,
     "close-tab": _cmd_close_tab,
     "end-session": _cmd_end_session,
+    "kill-executor": _cmd_kill_executor,
     "userscript": _cmd_userscript,
     # v0.5.5 — LaunchAgent service (macOS) so the daemon is long-running.
     "install": _cmd_install,

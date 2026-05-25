@@ -1050,6 +1050,12 @@ class Router:
         if method == "BrowserwrightDaemon.endSession":
             await self._handle_end_session(client, msg, req_id)
             return
+        if method == "BrowserwrightDaemon.ensureExecutor":
+            await self._handle_ensure_executor(client, msg, req_id)
+            return
+        if method == "BrowserwrightDaemon.killExecutor":
+            await self._handle_kill_executor(client, msg, req_id)
+            return
         if method == "BrowserwrightDaemon.recoverSession":
             await self._handle_recover_session(client, msg, req_id)
             return
@@ -1338,10 +1344,22 @@ class Router:
         ) is None:
             return
 
+        # Phase B (PR2): kill this session's persistent executor FIRST, symmetric
+        # for rdp + extension (each session has its own executor keyed on the
+        # daemon registry, even though extension sessions share one
+        # UpstreamContext). Idempotent — a no-op when no executor was spawned.
+        daemon = self.daemon
+        registry = getattr(daemon, "executors", None) if daemon is not None else None
+        if registry is not None:
+            try:
+                registry.kill(session)
+            except Exception as e:  # noqa: BLE001 - executor kill is best-effort
+                logger.warning("endSession: executor kill for %s failed: %r",
+                               session, e)
+
         # rdp branch: if this session has a live per-session context, tear it
         # down — close the upstream + SIGTERM the daemon-owned Chrome + drop the
         # context. A later ensureSession recreates a fresh context + relaunches.
-        daemon = self.daemon
         if daemon is not None and getattr(daemon, "contexts", None) is not None:
             if session in daemon.contexts:  # type: ignore[attr-defined]
                 try:
@@ -1386,6 +1404,86 @@ class Router:
                 req_id, -32603, f"endSession failed: {e!r}"))
             return
         await self._send_to_client(client.client_id, _result_response(req_id, result))
+
+    async def _handle_ensure_executor(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """Phase B (Fork 2 control plane): lazily spawn the session's persistent
+        executor and return its data-plane socket path.
+
+        The daemon OWNS the executor lifecycle (Fork 1a): it spawns the
+        subprocess if absent (single-flight per session — no double-spawn),
+        waits for it to bind + write its `_ipc` discovery file, and returns
+        ``{exec_sock}``. The thin heredoc client then connects DIRECTLY to that
+        socket to ship code (bulk data never touches this event loop)."""
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        session = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.ensureExecutor", params)
+        if session is None:
+            return
+        daemon = self.daemon
+        registry = getattr(daemon, "executors", None) if daemon is not None else None
+        if registry is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                "ensureExecutor unavailable: daemon has no executor registry"))
+            return
+        # Failure #4 fix: ensure the session's UPSTREAM (rdp Chrome) is launched
+        # + ready BEFORE we spawn the executor. The executor's cold-start
+        # `connect_over_cdp(facade)` resolves the rdp Chrome's DYNAMIC port,
+        # which is only pinned once `_ensure_upstream` (→ `_launch_rdp_chrome`)
+        # has run. Pre-restart, ordinary client frames launched Chrome before
+        # the executor connected; post-restart the executor path is hit FIRST,
+        # so without this the facade probes the stale default port (9222), 404s,
+        # and the executor exits during cold-start. Mirror the other verbs'
+        # lazy-open (openBackgroundTab / closeTab). Best-effort + bounded: a
+        # launch failure surfaces as a proper error envelope, never a crash.
+        if (self._ensure_upstream is not None
+                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+            try:
+                await self._ensure_upstream()
+            except Exception as e:  # noqa: BLE001
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"ensureExecutor failed (upstream open): {e!r}"))
+                return
+        try:
+            sock_path = await registry.ensure(session)
+        except Exception as e:  # noqa: BLE001
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"ensureExecutor failed: {e!r}"))
+            return
+        await self._send_to_client(client.client_id, _result_response(
+            req_id, {"exec_sock": sock_path}))
+
+    async def _handle_kill_executor(
+        self, client: ClientState, msg: dict, req_id: int | None,
+    ) -> None:
+        """Reap ONLY this session's persistent executor — no browser teardown.
+
+        Used by `session_create.end()` to reap an attach-owned session's
+        resident executor (the full `endSession` path is create-only and would
+        also tear down the browser, which an attach session must leave running).
+        Idempotent: a no-op `{ok: True, killed: False}` when no executor exists.
+        Best-effort — a missing registry still answers a clean (non-`-32601`)
+        result so a stale-daemon caller never errors on `session end`."""
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        session = params.get("session")
+        if not isinstance(session, str) or not session:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "BrowserwrightDaemon.killExecutor requires params.session"))
+            return
+        daemon = self.daemon
+        registry = getattr(daemon, "executors", None) if daemon is not None else None
+        killed = False
+        if registry is not None:
+            try:
+                killed = bool(registry.kill(session))
+            except Exception as e:  # noqa: BLE001 - executor kill is best-effort
+                logger.warning("killExecutor: kill for %s failed: %r", session, e)
+        await self._send_to_client(client.client_id, _result_response(
+            req_id, {"ok": True, "killed": killed}))
 
     async def _handle_close_tab(
         self, client: ClientState, msg: dict, req_id: int | None,

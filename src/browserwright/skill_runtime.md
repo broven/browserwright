@@ -36,10 +36,11 @@ Use `--backend=extension` for the user's daily Chrome. Use `--backend=rdp --crea
 
 ## Driving The Browser: real Playwright
 
-Inside a `browserwright <<'PY' … PY` heredoc you write **synchronous Playwright**. Three names are injected for you, already connected to the session through the daemon facade:
+Inside a `browserwright <<'PY' … PY` heredoc you write **synchronous Playwright**. Four names are injected for you, served by a **resident per-session executor** the daemon spawns on first browser use:
 
-- `page` — a Playwright `Page` **bound to the session's current tab**. The binding is persisted across heredocs, so the SAME tab is reused every invocation. This is the whole point: navigate it in place, never re-open.
+- `page` — a Playwright `Page` **bound to the session's current tab**.
 - `context` — the Playwright `BrowserContext`. Use `context.new_page()` only when you genuinely need a second tab.
+- `state` — a plain `dict` that **persists across heredoc calls** (see below).
 - `snapshot()` — observe the page (see below).
 
 ```bash
@@ -50,7 +51,53 @@ print(snapshot())
 PY
 ```
 
-The connection is **lazy**: a heredoc that never touches `page` / `context` / `snapshot` (e.g. one that only calls `remember()` or `run_task()`) opens no browser connection at all.
+The connection is **lazy**: a heredoc that never touches `page` / `context` / `snapshot` / `state` / `reset` (e.g. one that only calls `remember()` or `run_task()`) opens no browser connection and spawns no executor — it stays lightweight.
+
+### Same live objects across heredocs (mental model)
+
+These are NOT re-created per heredoc. A long-lived per-session **executor** holds the live `page` / `context` / `browser` and your `state` for the whole session, and each heredoc that touches the browser surface ships its body to that executor. So:
+
+- `page` and `context` are the **same live objects** across separate heredoc calls — they do not reconnect or re-bind each time. Navigate `page` in place; the NEXT heredoc sees the same tab on the same URL, with no re-navigation.
+- The first browser heredoc cold-starts the executor (connect + bind the session's current tab). After that, only a `reset()`, a daemon restart, or an executor crash rebinds — steady state is "same objects."
+
+This is the whole point: you are continuing one live session, not starting over each invocation.
+
+### `state` — persistent scratchpad across calls
+
+`state` is a `dict` injected **by reference** every call, so anything you stash survives to the next heredoc:
+
+```bash
+BD_SESSION=$sid browserwright <<'PY'
+page.goto("https://example.com", wait_until="load")
+state["seen_title"] = page.title()           # remember it
+PY
+
+BD_SESSION=$sid browserwright <<'PY'
+print("last title was:", state.get("seen_title"))   # still there
+PY
+```
+
+Use `state` for cross-call working memory (a collected list, a cursor, a flag). It is **per session** and never leaks to another session.
+
+> **Two ways `state` is intentionally cleared** (so you are not surprised):
+> 1. You call `reset()` (below) — it clears `state` on purpose.
+> 2. The daemon restarts (or the executor crashes): the executor self-exits and the next heredoc cold-starts a fresh one that re-binds the session's current tab via the ledger, but `state` starts empty. Persist anything you must keep across a restart with `remember(...)`, not `state`.
+
+### `reset()` — rebuild a broken connection / clean slate
+
+`reset()` tears down and rebuilds the Playwright connection, re-binds the session's current tab, and **clears `state`**. Use it when:
+
+- the connection broke or the page closed (you see connection / "Frame detached" / facade errors), or
+- you want a deliberate clean slate (drop `state`, re-bind a fresh `page`).
+
+```bash
+BD_SESSION=$sid browserwright <<'PY'
+reset()                       # rebuild + clear state
+page.goto("https://example.com", wait_until="load")
+PY
+```
+
+`reset()` does **not** kill the executor or close the user's tabs — it just rebuilds the live objects.
 
 ### Tab discipline (read this)
 

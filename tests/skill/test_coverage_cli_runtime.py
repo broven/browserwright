@@ -374,14 +374,84 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
 
     message = session_create.end(reg.get(sid))
 
-    assert calls == [[
-        "browserwright-daemon",
-        "end-session",
-        "--session",
-        sid,
-        "--group-id",
-        "12",
-    ]]
+    # Extension is attach-owned: end() closes the session's owned tabs
+    # (end-session, threading the durable group-id) AND best-effort reaps the
+    # session's resident Phase B executor (kill-executor) so it doesn't leak —
+    # the browser itself stays running.
+    assert calls == [
+        [
+            "browserwright-daemon",
+            "end-session",
+            "--session",
+            sid,
+            "--group-id",
+            "12",
+        ],
+        [
+            "browserwright-daemon",
+            "kill-executor",
+            "--session",
+            sid,
+        ],
+    ]
+    assert "still running" in message
+    assert reg.get(sid) is None
+
+
+def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):
+    """Failure #3 hardening: an attach-owned rdp session's `end()` leaves the
+    browser running (semantics unchanged) but still best-effort reaps the
+    session's resident executor (`kill-executor`) so it doesn't leak — the full
+    `endSession` path is create-only and never otherwise contacts the daemon."""
+    from browserwright import session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    calls = []
+    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    # The browser must NOT be closed for an attach session.
+    monkeypatch.setattr(session_create, "_close_browser",
+                        lambda rec: calls.append(["CLOSE_BROWSER", rec["id"]]))
+
+    message = session_create.end(reg.get(sid))
+
+    assert calls == [["browserwright-daemon", "kill-executor", "--session", sid]]
+    assert "still running" in message  # browser untouched (semantics preserved)
+    assert reg.get(sid) is None
+
+
+def test_session_create_end_create_rdp_does_not_double_reap(tmp_bs_home, monkeypatch):
+    """A create-owned session's `end()` drives `_close_browser` (→ daemon
+    `endSession`, which ALSO kills the executor), so it must NOT additionally
+    call `kill-executor` (no redundant reap)."""
+    from browserwright import session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="create", name="owned",
+                       workspace={"port": 12345})
+    calls = []
+    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+
+    message = session_create.end(reg.get(sid))
+
+    # Only the create-owned browser teardown (end-session); no kill-executor.
+    assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
+    assert "was closed" in message
+    assert reg.get(sid) is None
+
+
+def test_session_create_end_reap_tolerates_dead_daemon(tmp_bs_home, monkeypatch):
+    """The executor reap is best-effort: a dead daemon (subprocess error) must
+    NOT fail `session end` — `_reap_executor` swallows it via `_run`."""
+    from browserwright import session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+
+    def boom(*_a, **_k):
+        raise subprocess.TimeoutExpired("browserwright-daemon", timeout=10)
+
+    monkeypatch.setattr(session_create.subprocess, "run", boom)
+
+    # Must not raise even though the daemon is unreachable.
+    message = session_create.end(reg.get(sid))
     assert "still running" in message
     assert reg.get(sid) is None
 

@@ -112,6 +112,93 @@ def read_facade_file() -> tuple[str | None, int | None]:
         return None, None
 
 
+# ---- Phase B: per-session executor discovery -------------------------------
+#
+# The persistent per-session executor (`browserwright._executor`) binds its OWN
+# unix socket (the data plane — Fork 2) and writes a discovery file the thin
+# heredoc client reads after the daemon `ensureExecutor` verb spawns it. The
+# socket NAME must be short: AF_UNIX `sun_path` has a hard 104-byte budget on
+# macOS (see `_runtime_dir`), and `_runtime_dir()` is already `/tmp` for that
+# reason — so we key the per-session socket on a SHORT id digest, not the raw
+# session id (which can be long, e.g. `e2e-phasec-<uuid4hex>`).
+#
+# TODO(Windows): there is no AF_UNIX on Windows; the executor socket will need
+# the same TCP+token fallback the mode_b path uses (`make_tcp_socket` +
+# port-file). Not built here — POSIX unix-socket happy path only for PR1.
+
+
+def _exec_shortid(session_id: str) -> str:
+    """A short, filesystem-safe digest of a session id for the socket name.
+
+    Keeps the AF_UNIX path within the 104-byte budget regardless of how long
+    the raw session id is. 12 hex chars of SHA-256 is collision-safe enough for
+    a per-machine, per-user runtime dir."""
+    import hashlib
+
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+
+
+def executor_sock_path(session_id: str) -> Path:
+    """Unix socket the per-session executor binds (`bw-exec-<shortid>.sock`)."""
+    return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.sock"
+
+
+def executor_file_path(session_id: str) -> Path:
+    """Discovery file the executor writes when its socket is bound + ready.
+
+    Holds JSON ``{"sock": "<path>", "pid": N, "session": "<id>"}``."""
+    return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.json"
+
+
+def write_executor_file(session_id: str, sock: str, pid: int) -> None:
+    """Atomic write of the executor discovery file (mirrors write_facade_file).
+
+    Written by the executor once its socket is bound and the worker is ready,
+    so a reader that sees the file can immediately connect."""
+    fp = executor_file_path(session_id)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fp.with_name(fp.name + ".tmp")
+    tmp.write_text(json.dumps({"sock": sock, "pid": pid, "session": session_id}))
+    os.replace(tmp, fp)
+
+
+def read_executor_file(session_id: str) -> tuple[str | None, int | None]:
+    """Return ``(sock_path, pid)`` of the session's executor, or
+    ``(None, None)`` when the discovery file is absent/unreadable."""
+    try:
+        d = json.loads(executor_file_path(session_id).read_text())
+        return str(d["sock"]), int(d["pid"])
+    except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
+        return None, None
+
+
+def cleanup_executor(session_id: str) -> None:
+    """Best-effort: nuke a session's executor socket + discovery file. Called by
+    the executor on exit and by the daemon when it reaps/kills the executor."""
+    for p in (executor_sock_path(session_id), executor_file_path(session_id)):
+        try:
+            p.unlink()
+        except (FileNotFoundError, IsADirectoryError, OSError):
+            pass
+
+
+def make_executor_socket(session_id: str) -> socket.socket:
+    """Create + bind the executor's AF_UNIX socket with 0600 perms (mirrors
+    `make_unix_socket`, but on the per-session executor path)."""
+    path = executor_sock_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o077)
+    try:
+        s.bind(str(path))
+    finally:
+        os.umask(old_umask)
+    s.listen(8)
+    return s
+
+
 def endpoint_describe() -> dict:
     """Public-facing description of the IPC endpoint for `status` / `url --mode-b-proxy`.
     Spec §6.1 --json shape."""

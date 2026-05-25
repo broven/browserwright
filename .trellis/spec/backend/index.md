@@ -21,6 +21,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Logging Guidelines](./logging-guidelines.md) | stdlib logging, BD_LOG_JSON, metrics counters | ✅ Filled |
 | [Playwright CDP Facade](./playwright-cdp-facade.md) | connect_over_cdp facade: additive transport, fan-out await-ordering, extension CRPage init fidelity | ✅ Filled |
 | [Agent Surface: Playwright](./agent-playwright-surface.md) | heredoc Playwright page/context + aria-ref snapshot; auto-bind to current tab; lazy connect, never close real tabs | ✅ Filled |
+| [Persistent Executor](./agent-executor-model.md) | phase B resident per-session executor: live page/context/state across heredocs, control/data plane split, decoupled readiness, rdp-Chrome-style lifecycle | ✅ Filled |
 
 ---
 

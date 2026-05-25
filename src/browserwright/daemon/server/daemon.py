@@ -85,6 +85,13 @@ class Daemon:
         self.cfg = cfg
         self.shared_context = shared_context
         self.contexts: dict[str, UpstreamContext] = {}
+        # Phase B: per-session persistent executor subprocesses, keyed by
+        # session id (mirrors `contexts`). Lazily spawned by the
+        # `ensureExecutor` verb (PR1). Supervised by the daemon (PR2): idle/crash
+        # reap via the idle-watchdog, endSession kill in the endSession handler,
+        # kill-all on graceful shutdown, orphan-sweep on startup.
+        from .executor_registry import ExecutorRegistry
+        self.executors = ExecutorRegistry()
         # Injected factory `(backend, cfg, session_id) -> UpstreamContext`.
         # Lives in listener.py (it builds the _UpstreamHolder); injected to
         # avoid an import cycle.

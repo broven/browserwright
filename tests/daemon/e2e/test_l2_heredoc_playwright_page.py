@@ -120,11 +120,18 @@ def rdp_autofacade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
-def _seed_session(runtime_dir: str, backend: str) -> str:
+def _seed_session(runtime_dir: str, backend: str,
+                  owner: str = "attach") -> str:
     """Create a persistent ledger session under the backend's BS_HOME and
     return its id. Unlike helpers.run_skill's transient record, this one
     survives across heredoc invocations so the SECOND heredoc resolves the same
-    bound tab from the ledger."""
+    bound tab from the ledger.
+
+    ``owner`` defaults to ``"attach"`` (the common case: the test attaches to a
+    daemon-launched Chrome). Pass ``owner="create"`` when the test needs
+    ``session end`` to actually drive the daemon's endSession verb — only a
+    create-owned session contacts the daemon on teardown (an attach session
+    deliberately leaves the browser untouched, ``session_create.end``)."""
     bs_home = Path(__file__).resolve().parent / "_bs_home" / backend
     sessions_dir = bs_home / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -132,7 +139,7 @@ def _seed_session(runtime_dir: str, backend: str) -> str:
     sid = f"e2e-phasec-{uuid.uuid4().hex}"
     now = time.time()
     record = {
-        "id": sid, "backend": backend, "workspace": None, "owner": "attach",
+        "id": sid, "backend": backend, "workspace": None, "owner": owner,
         "name": "e2e-phasec", "created_at": now, "last_seen": now,
     }
     # Merge into any existing ledger so we don't clobber other sessions.

@@ -104,6 +104,11 @@ async def run_serve(cfg: Config) -> int:
     # ephemeral rdp sessions start clean (and so a relaunch on the same profile
     # isn't blocked by a stale SingletonLock).
     _cleanup_orphan_rdp_chrome()
+    # Phase B (PR2): the executor is "rdp Chrome v2" — sweep orphan executor
+    # subprocesses + their stale `bw-exec-*` sockets/discovery files left by a
+    # prior daemon SIGKILL, same rationale as the rdp sweep above.
+    from .executor_registry import cleanup_orphan_executors
+    cleanup_orphan_executors()
 
     # Log file is best-effort — we route Python logging to it but never crash
     # the daemon over a write failure.
@@ -212,9 +217,13 @@ async def run_serve(cfg: Config) -> int:
                            "continuing without it", facade_port, e)
             facade = None
 
-    idle_task: asyncio.Task | None = None
-    if cfg.idle_close_after is not None and cfg.idle_close_after > 0:
-        idle_task = asyncio.create_task(_idle_watchdog(daemon, cfg.idle_close_after))
+    # The watchdog runs unconditionally: even when upstream idle-close is off
+    # (cfg.idle_close_after None), it must still crash-reap dead executors
+    # (Fork 4 self-exit / segfault) so the registry never accumulates corpses.
+    # Upstream idle-close + executor idle-reap are gated on cfg.idle_close_after
+    # inside the loop.
+    idle_task: asyncio.Task | None = asyncio.create_task(
+        _idle_watchdog(daemon, cfg.idle_close_after))
     try:
         await stop.wait()
         logger.info("browserwright-daemon shutdown requested")
@@ -956,21 +965,39 @@ class _UpstreamHolder:
 # ---- graceful shutdown -----------------------------------------------------
 
 
-async def _idle_watchdog(daemon: "Daemon", idle_after: float) -> None:
+async def _idle_watchdog(daemon: "Daemon", idle_after: float | None) -> None:
     """Spec §6.5/§6.6: when configured, close each upstream after `idle_after`
     seconds with no activity. The next client command lazy-opens it again.
 
     Phase 2: iterate every context (shared + rdp) so per-upstream idle is
     enforced independently — one busy upstream doesn't keep an idle one warm.
 
-    Default is None (never) — the listener only schedules this task when
-    `idle_close_after` is set. We poll at half the threshold so the wakeup
-    granularity matches the policy.
+    Phase B (PR2): the same loop supervises the per-session executors —
+      - crash-reap (ALWAYS, even when idle-close is off): drop executors whose
+        child has exited on its own (Fork 4 facade-death self-exit / segfault)
+        so the registry never holds corpses + the next ensure cold-starts fresh;
+      - idle-reap (gated on idle_after, like upstream idle-close): SIGTERM
+        executors idle past the threshold so a long-abandoned session doesn't
+        leak a subprocess.
+
+    Runs unconditionally; idle-close + idle-reap are no-ops when `idle_after`
+    is None. We poll at half the idle threshold (or every 5s when idle is off,
+    just for crash-reap granularity).
     """
-    poll = max(1.0, idle_after / 2.0)
+    poll = 5.0 if not idle_after else max(1.0, idle_after / 2.0)
     try:
         while True:
             await asyncio.sleep(poll)
+            # --- executor supervision (Phase B PR2) ---
+            try:
+                daemon.executors.reap_dead()
+                if idle_after:
+                    daemon.executors.reap_idle(idle_after)
+            except Exception as e:  # noqa: BLE001 - never let reap break the loop
+                logger.warning("executor reap failed: %r", e)
+            # --- upstream idle-close (gated) ---
+            if not idle_after:
+                continue
             for ctx in daemon.all_contexts():
                 if ctx.state.upstream_phase != UpstreamPhase.CONNECTED:
                     continue
@@ -1002,6 +1029,12 @@ async def _graceful_shutdown(daemon: "Daemon") -> None:
             await ctx.holder.trigger_close("daemon_shutdown")
         except Exception as e:
             logger.warning("shutdown close failed for %s: %r", ctx.backend, e)
+    # Phase B (PR2): SIGTERM every registered executor — they are daemon
+    # children and must die with us (mirrors the per-context close above).
+    try:
+        daemon.executors.kill_all()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("executor shutdown kill failed: %r", e)
 
 
 # ---- helper for the cli serve dispatcher ----------------------------------

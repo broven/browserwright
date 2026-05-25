@@ -97,6 +97,141 @@ def _agent_page_targets(sess: Any) -> list[dict]:
     return out
 
 
+# ---- reusable connect + bind (shared by PlaywrightHandle and the executor) --
+#
+# Phase B: the persistent per-session executor (``browserwright._executor``)
+# runs the SAME connect+bind dance, just ONCE at cold-start instead of per
+# heredoc. These free functions are the single source of truth so the executor
+# never re-implements (and never drifts from) the FATAL "no Playwright CDP
+# session over the extension facade" constraint. ``PlaywrightHandle`` below is
+# the per-heredoc Phase C consumer; the executor is the Phase B consumer.
+
+
+def connect_over_cdp(pw: Any, *, attempts: int = 1,
+                     backoff_s: float = 0.5) -> Any:
+    """``chromium.connect_over_cdp`` to the daemon facade. Returns the Browser.
+
+    Raises :class:`FacadeUnavailable` when the facade ws can't be discovered or
+    the connect fails — the actionable error the agent should see.
+
+    ``attempts`` / ``backoff_s`` (defense-in-depth for the Phase B executor
+    cold-start, Failure #4): a freshly-restarted daemon launches the rdp Chrome
+    lazily, so the executor can race a Chrome that is still binding its CDP port
+    — the facade then 404s/403s for a brief window. Retrying the connect a few
+    times over a few seconds absorbs that startup race. The per-heredoc Phase C
+    consumer keeps ``attempts=1`` (the daemon is already warm there); only the
+    executor cold-start passes a higher count. Discovery (`_facade_ws_url`) is
+    re-read each attempt so a freshly-(re)written facade file is picked up."""
+    attempts = max(1, attempts)
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            ws_url = _facade_ws_url()
+        except FacadeUnavailable as e:
+            last_exc = e
+            ws_url = None
+        if ws_url is not None:
+            try:
+                return pw.chromium.connect_over_cdp(ws_url, timeout=20000)
+            except Exception as e:  # noqa: BLE001
+                last_exc = FacadeUnavailable(
+                    f"connect_over_cdp({ws_url!r}) failed: {e}")
+        if i < attempts - 1:
+            import time as _time
+            _time.sleep(backoff_s)
+    if isinstance(last_exc, FacadeUnavailable):
+        raise last_exc
+    raise FacadeUnavailable(
+        "connect_over_cdp failed: facade unavailable after "
+        f"{attempts} attempt(s)")
+
+
+def context_for_browser(browser: Any) -> Any:
+    """The first existing BrowserContext, or a fresh one."""
+    return browser.contexts[0] if browser.contexts else browser.new_context()
+
+
+def bind_current_page(context: Any, sess: Any) -> Any:
+    """Bind the Playwright ``Page`` to the session's current tab.
+
+    The tab itself is resolved/created via the AGENT primitive
+    ``current_page()`` — NOT ``context.new_page()``. This is deliberate:
+
+      - ``current_page()`` owns the reuse/recovery/auto-open discipline
+        (reuse the ledger target, recover via the tab group, else open a
+        fresh tab in THIS session's group, NOT adopt) and PERSISTS the
+        chosen target to the ledger, so the next cold-start resolves the same
+        tab — the cross-call reuse acceptance.
+      - It also creates the tab inside the session's tab group (extension
+        backend), keeping the agent ledger and the Playwright view on ONE
+        tab. ``context.new_page()`` over the facade would open an un-grouped
+        tab the agent path can't track → ledger drift → tab explosion.
+
+    We then attach Playwright to that exact tab by matching the agent's
+    targetId against ``context.pages`` (the facade replays ``attached`` events
+    for every open tab, so a session-group tab IS enumerable). Mapping is done
+    WITHOUT any Playwright CDP session — a per-page (``context.new_cdp_session``)
+    or even a second browser-level (``new_browser_cdp_session``) session is
+    FATAL over the extension facade (the facade reuses one synthetic sessionId
+    → a Playwright-driver assert kills the connection). We correlate by URL via
+    the AGENT path instead.
+    """
+    from ..primitives.page import current_page
+
+    # Resolve/create + persist the session's current tab via the agent path.
+    info = current_page()
+    target_id = info.get("targetId") if isinstance(info, dict) else None
+
+    if target_id:
+        page = page_for_target(context, sess, target_id, info.get("url"))
+        if page is not None:
+            return page
+
+    # Could not correlate a Playwright Page to the agent tab (e.g. the facade
+    # hasn't replayed it yet). Fall back to a Playwright-created page so the
+    # agent still gets a usable handle; the agent ledger already points at the
+    # current tab for the next cold-start.
+    if context.pages:
+        return context.pages[0]
+    return context.new_page()
+
+
+def page_for_target(context: Any, sess: Any, target_id: str,
+                     hint_url: str | None = None) -> Any | None:
+    """Find the live Playwright Page for the session's ``target_id``.
+
+    Mapping uses NO Playwright CDP session (fatal over the extension facade —
+    see ``_agent_page_targets``). Steady state — the session owns exactly one
+    tab — binds that page directly (one tab per session is the whole point of
+    the reuse discipline, and also resolves the ``about:blank`` ambiguity URLs
+    can't). Otherwise correlate the target's URL (agent-path
+    ``Target.getTargets``, or the caller's hint) to the matching page."""
+    pages = list(context.pages)
+    if not pages:
+        return None
+    if len(pages) == 1:
+        return pages[0]
+    url = hint_url
+    if url is None:
+        targets = _agent_page_targets(sess)
+        url = next((t["url"] for t in targets
+                    if t["targetId"] == target_id), None)
+    if not url:
+        return None
+    matches = [p for p in pages if p.url == url]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    # Ambiguous (e.g. several `about:blank` tabs incl. a non-session one):
+    # prefer the MOST-RECENTLY-announced match. The facade replays targets in
+    # creation order, so the session's just-opened tab is announced last —
+    # `context.pages` preserves that order. This disambiguates the fresh-blank
+    # first bind; once the agent tab carries real content its url is unique and
+    # the tie never arises.
+    return matches[-1]
+
+
 class PlaywrightHandle:
     """Owns the lazy Playwright connection + the bound ``page`` / ``context``.
 
@@ -124,107 +259,27 @@ class PlaywrightHandle:
                 "playwright is not importable; it is a runtime dependency of "
                 "the skill heredoc `page`/`context` surface") from e
 
-        ws_url = _facade_ws_url()
         # Enter sync_playwright() and connect_over_cdp. Keep the context manager
-        # so close() can __exit__ it (stops the bundled driver process).
+        # so close() can __exit__ it (stops the bundled driver process). The
+        # connect + bind logic is the shared free functions (also used by the
+        # Phase B executor), so the FATAL "no Playwright CDP session over the
+        # extension facade" constraint lives in exactly one place.
+        from ..session import current_session
+
         self._pw_cm = sync_playwright()
         self._pw = self._pw_cm.__enter__()
         try:
-            self._browser = self._pw.chromium.connect_over_cdp(ws_url, timeout=20000)
+            self._browser = connect_over_cdp(self._pw)
         except Exception as e:
             # Tear the driver back down so a failed connect doesn't leak it.
             with _suppress():
                 self._pw_cm.__exit__(type(e), e, e.__traceback__)
             self._pw_cm = None
             self._pw = None
-            raise FacadeUnavailable(
-                f"connect_over_cdp({ws_url!r}) failed: {e}") from e
-        self._context = (self._browser.contexts[0] if self._browser.contexts
-                         else self._browser.new_context())
-        self._page = self._bind_current_page()
+            raise
+        self._context = context_for_browser(self._browser)
+        self._page = bind_current_page(self._context, current_session())
         self._connected = True
-
-    def _bind_current_page(self) -> Any:
-        """Bind the Playwright ``Page`` to the session's current tab.
-
-        The tab itself is resolved/created via the AGENT primitive
-        ``current_page()`` — NOT ``context.new_page()``. This is deliberate:
-
-          - ``current_page()`` owns the reuse/recovery/auto-open discipline
-            (reuse the ledger target, recover via the tab group, else open a
-            fresh tab in THIS session's group, NOT adopt) and PERSISTS the
-            chosen target to the ledger, so the next heredoc resolves the same
-            tab — the cross-heredoc reuse acceptance.
-          - It also creates the tab inside the session's tab group (extension
-            backend), keeping the agent ledger and the Playwright view on ONE
-            tab. ``context.new_page()`` over the facade would open an
-            un-grouped tab the agent path can't track → ledger drift → tab
-            explosion on the next heredoc.
-
-        We then attach Playwright to that exact tab by matching the agent's
-        targetId against ``context.pages`` (the facade replays ``attached``
-        events for every open tab, so a session-group tab IS enumerable).
-        Mapping is done WITHOUT any Playwright CDP session — a per-page
-        (``context.new_cdp_session``) or even a second browser-level
-        (``new_browser_cdp_session``) session is FATAL over the extension facade
-        (the facade reuses one synthetic sessionId → a Playwright-driver assert
-        kills the connection). We correlate by URL via the AGENT path instead.
-        """
-        from ..primitives.page import current_page
-        from ..session import current_session
-
-        sess = current_session()
-        # Resolve/create + persist the session's current tab via the agent path.
-        info = current_page()
-        target_id = info.get("targetId") if isinstance(info, dict) else None
-
-        if target_id:
-            page = self._page_for_target(sess, target_id, info.get("url"))
-            if page is not None:
-                return page
-
-        # Could not correlate a Playwright Page to the agent tab (e.g. the
-        # facade hasn't replayed it yet). Fall back to a Playwright-created page
-        # so the agent still gets a usable handle this heredoc; the agent ledger
-        # already points at the current tab for the next one.
-        if self._context.pages:
-            return self._context.pages[0]
-        return self._context.new_page()
-
-    def _page_for_target(self, sess: Any, target_id: str,
-                         hint_url: str | None = None) -> Any | None:
-        """Find the live Playwright Page for the session's ``target_id``.
-
-        Mapping uses NO Playwright CDP session (fatal over the extension facade
-        — see ``_agent_page_targets``). Steady state — the session owns exactly
-        one tab — binds that page directly (one tab per session is the whole
-        point of the reuse discipline, and also resolves the ``about:blank``
-        ambiguity URLs can't). Otherwise correlate the target's URL (agent-path
-        ``Target.getTargets``, or the caller's hint) to the matching page."""
-        pages = list(self._context.pages)
-        if not pages:
-            return None
-        if len(pages) == 1:
-            return pages[0]
-        url = hint_url
-        if url is None:
-            targets = _agent_page_targets(sess)
-            url = next((t["url"] for t in targets
-                        if t["targetId"] == target_id), None)
-        if not url:
-            return None
-        matches = [p for p in pages if p.url == url]
-        if not matches:
-            return None
-        if len(matches) == 1:
-            return matches[0]
-        # Ambiguous (e.g. several `about:blank` tabs incl. a non-session one):
-        # prefer the MOST-RECENTLY-announced match. The facade replays targets
-        # in creation order, so the session's just-opened tab is announced last
-        # — `context.pages` preserves that order. This disambiguates the
-        # fresh-blank first bind; once the agent tab carries real content its
-        # url is unique and the tie never arises.
-        return matches[-1]
 
     # ---- accessors (trigger the lazy connect) ---------------------------
 
