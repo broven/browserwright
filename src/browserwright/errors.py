@@ -90,20 +90,20 @@ class DaemonUnavailable(BrowserwrightError):
 
 
 class NoSession(BrowserwrightError):
-    """No BD_SESSION provided. Refuse rather than silently sharing a browser (P1)."""
+    """No explicit session provided. Refuse rather than silently sharing a browser."""
 
     exit_code = 2
     default_fix = (
         "run `browserwright session new --backend=<extension|rdp> --name=NAME` "
-        "then pass --session=<id> (or set BD_SESSION=<id>)"
+        "then run `browserwright -s <id> -e 'print(snapshot())'`"
     )
 
     def __init__(self, detail: str = "", fix: str = ""):
         self.detail = detail
         super().__init__(
             "no session: run `browserwright session new --backend=<extension|rdp> "
-            "--name=NAME` first (use the `=` form), then pass --session=<id> "
-            "(or BD_SESSION=<id>) on every call. " + detail,
+            "--name=NAME` first (use the `=` form), then pass -s <id> on "
+            "every execute call. " + detail,
             fix=fix,
         )
 

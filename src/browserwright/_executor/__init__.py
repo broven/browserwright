@@ -3,8 +3,8 @@
 A resident, per-session **sync** subprocess (``python -m browserwright._executor
 --session <id>``) that holds live Playwright ``page`` / ``context`` / ``browser``
 + a persistent ``state`` dict + one long-lived facade ``connect_over_cdp``
-connection for its whole lifetime. The ``browserwright <<'PY' … PY`` heredoc CLI
-degrades to a **thin client**: it ships the code body to the session's executor,
+connection for its whole lifetime. The ``browserwright -s <id> -e <code>`` CLI
+is a **thin client**: it ships the code body to the session's executor,
 which runs it in a namespace where ``page`` / ``context`` / ``state`` are the
 LIVE persistent objects, and returns the result.
 

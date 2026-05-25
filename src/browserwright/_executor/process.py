@@ -153,12 +153,10 @@ class _Worker:
                     "msg": (f"executor call exceeded {req.timeout_ms}ms; the "
                             "worker is still finishing it — later calls queue "
                             "behind it"),
-                    "fix": ("the call is slow or wedged; a later call (incl. "
-                            "`reset()`) QUEUES behind the still-running one, so "
-                            "if it never returns, end the session "
-                            "(`browserwright session end`) to recycle the "
-                            "executor out-of-band — that is the only hard-wedge "
-                            "escape (sync Playwright can't be force-killed)"),
+                    "fix": ("the call is slow or wedged; run "
+                            f"`browserwright session reset {self._session_id}` "
+                            "to recycle the executor without closing browser "
+                            "tabs, then retry the call"),
                 },
                 exit_code=3)
 
@@ -201,7 +199,7 @@ class _Worker:
         from ..session_ctx import resolve_session
 
         # Bind the session from the ledger (same as inline.py's entrypoint).
-        rec = resolve_session()
+        rec = resolve_session(self._session_id)
         set_session(Session(record=rec))
         # Enter the sync_playwright() driver ONCE — on the FIRST cold-start only.
         # On a retry after a failed connect we REUSE the live driver (just re-run
@@ -586,9 +584,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="the session id this executor serves")
     args = parser.parse_args(argv)
     session_id = args.session
-    # The client passes the session via env so resolve_session() binds it; mirror
-    # that so a daemon-spawned executor (which sets BD_SESSION on spawn) resolves
-    # the same ledger record. The --session flag is authoritative.
+    # Keep the env marker for helper code that still reads it; the --session
+    # flag is authoritative for binding.
     os.environ["BD_SESSION"] = session_id
 
     worker = _Worker(session_id)

@@ -8,10 +8,10 @@ here)::
 
     from browserwright import http_get, remember, run_task
 
-Browser driving itself is done with real Playwright in heredocs via the
-injected ``page`` / ``context`` (and ``snapshot()``) — see
+Browser driving itself is done with real Playwright in inline ``-s/-e`` calls
+via the injected ``page`` / ``context`` (and ``snapshot()``) — see
 ``repl/_namespace.build_globals``. Those are NOT importable from this module;
-they are bound per-heredoc to the session's current tab.
+they are bound per call to the session's current tab.
 """
 from .version import __version__  # noqa: F401
 

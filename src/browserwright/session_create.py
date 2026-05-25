@@ -106,6 +106,22 @@ def _reap_executor(record: dict) -> None:
         _run(["browserwright-daemon", "kill-executor", "--session", str(sid)])
 
 
+def reset_executor(record: dict) -> str:
+    """Recycle only this session's resident executor.
+
+    The session ledger entry, browser, context, tabs, and ownership semantics
+    are intentionally left intact. The next ``browserwright -s <id> -e ...``
+    call cold-starts a fresh executor against the same session.
+    """
+    _ensure_daemon_running()
+    _reap_executor(record)
+    sid = record["id"]
+    return (
+        f"session {sid} reset; executor was recycled. "
+        "The browser and tabs were left untouched."
+    )
+
+
 def reap(*, idle_seconds: float) -> list[dict]:
     """Prune idle sessions; for create-owned ones, also tear down the browser
     the daemon launched. Returns the pruned records."""

@@ -55,7 +55,7 @@ def allocate(*, backend: str, owner: str,
                         f"session name {name!r} is already taken by session "
                         f"{conflict!r}. Names must be globally unique. Either "
                         f"pick a different --name, reuse the existing session "
-                        f"via BD_SESSION={conflict} (no new session needed), or "
+                        f"with `browserwright -s {conflict} -e ...`, or "
                         f"end it first: browserwright session end "
                         f"--session={conflict}"
                     )

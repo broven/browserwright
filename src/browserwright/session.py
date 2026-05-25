@@ -57,7 +57,7 @@ class Session:
                 raise NoSession(
                     "no session bound: a Session needs an explicit ledger "
                     "record (its backend/daemon comes from `session new`). "
-                    "Set BD_SESSION, or pass record=/daemon= explicitly."
+                    "Pass record=/daemon= explicitly."
                 )
             from .mode_b_client import client_for_session
             daemon = client_for_session(record)
@@ -163,7 +163,7 @@ def current_session() -> Session:
       2. The process-wide default singleton, bound by ``set_session()``.
 
     There is no env-guessed default: a Session's backend/daemon comes from an
-    explicit ledger record. Entry points (the heredoc runner) bind one via
+    explicit ledger record. Entry points bind one via
     ``set_session(Session(record=...))`` before primitives run. Calling this
     with nothing bound raises ``NoSession`` from ``Session.__init__``.
     """
@@ -179,7 +179,7 @@ def current_session() -> Session:
 
 
 def set_session(sess: Optional[Session]) -> None:
-    """Bind the process-wide default Session. The heredoc entry point calls
+    """Bind the process-wide default Session. The CLI entry point calls
     this with a record-bound Session; tests use it to install a mock. Pushing
     via ``with_session()`` is preferred when the override should be scoped."""
     global _singleton

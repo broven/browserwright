@@ -9,7 +9,7 @@ The agent reads this file on every browserwright invocation. It carries two thin
 
 | Backend | Connects to | How to use |
 |---|---|---|
-| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent` then prefix the call: `BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY' ... PY` |
+| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=rdp --create --name=bs-dev)` then run `browserwright -s "$sid" -e '...'` |
 | `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve` (one global daemon) then load the bundled `chrome-extension/` directory |
 | `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --provider <name>` + provider auth env vars |
 | `env` | An externally-supplied CDP URL | Set `BROWSER_DAEMON_CDP_URL=ws://...` before calling |
@@ -30,27 +30,24 @@ scenarios:
     notes: |
       User has the unpacked extension loaded into their daily Chrome
       (chrome-extension/, v0.4+). The daemon relays CDP through the extension —
-      no popups, no banner. Inline heredocs against extension are safe (no
-      popup-accumulation hazard).
-      已于 2026-05-19 在 doctor 里确认 extension ✓，直接 inline heredoc 即可。
+      no popups, no banner. Inline `browserwright -s <id> -e ...` calls against
+      extension are safe (no popup-accumulation hazard).
+      已于 2026-05-19 在 doctor 里确认 extension ✓，直接用 `-s/-e` 调用即可。
 
   - name: public
     when: 公共页面、无需 cookie 的一次性抓取、UI 测试、文档/示例站、批量 http_get
     backend: rdp
-    launch_command: browserwright-daemon launch-chrome --port 9333 --profile bs-dev --persistent
-    env:
-      BD_PORT: 9333
-      BD_BACKEND: rdp
+    launch_command: browserwright session new --backend=rdp --create --name=bs-dev
+    env: {}
     notes: |
-      Zero popups, safe for iterative inline heredocs.
+      Zero popups, safe for iterative inline `-s/-e` calls.
 
   - name: fingerprint
     when: 批量注册、反爬严重的站点、指纹浏览器场景 (AdsPower / MultiLogin / GoLogin / 比特浏览器)、需要独立账号身份的工作
     backend: rdp
     launch_command: 用户在指纹浏览器内启动目标账号并暴露 CDP 端口
     env:
-      BD_PORT: <ask user — varies by fingerprint tool / profile>
-      BD_BACKEND: rdp
+      session: browserwright session new --backend=rdp --attach=<port> --name=<profile>
     notes: |
       Ask the user which fingerprint browser + which port at the start of each session;
       never assume a default port. One isolated Chrome per account profile.
@@ -60,8 +57,8 @@ scenarios:
 Each browserwright invocation:
   1. Read the task description the user just gave.
   2. Match it to a `when:` field above (top-down, first match wins).
-  3. Use that scenario's `backend`, `launch_command`, and `env`. Prepend the env vars
-     to the `browserwright` call. If the scenario needs user-specific values (e.g., a
+  3. Use that scenario's `backend` and `launch_command`, keep the returned session id,
+     and pass it with `browserwright -s <id> -e ...`. If the scenario needs user-specific values (e.g., a
      fingerprint browser port), ask the user before proceeding.
   4. If no scenario matches, use `default_backend` and consider asking the user
      whether this new type of work deserves its own scenario entry here.

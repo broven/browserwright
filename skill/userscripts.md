@@ -44,7 +44,7 @@ Supported v1 metadata directives:
 
 1. Write or edit `something.user.js`.
 2. Push it: `browserwright userscript push something.user.js`.
-3. Open the target site through a browserwright CDP heredoc.
+3. Open the target site with `browserwright -s <id> -e ...`.
 4. Verify the intended effect.
 5. If red, edit the file, push again, reload or reopen the target page, and re-verify.
 

@@ -685,7 +685,7 @@ def test_ensure_cold_started_enters_driver_once_and_reuses_on_retry(monkeypatch)
 
     monkeypatch.setattr(_Worker, "_start_driver", fake_start_driver)
     monkeypatch.setattr("browserwright.session_ctx.resolve_session",
-                        lambda: {"id": "sess-driveronce"})
+                        lambda explicit=None: {"id": "sess-driveronce"})
     monkeypatch.setattr("browserwright.session.set_session", lambda s: None)
 
     connect = {"n": 0}

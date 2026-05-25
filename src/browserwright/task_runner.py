@@ -1,11 +1,11 @@
 """Loader + runner for ``site-skills/<site>/tasks/<name>.py`` modules.
 
-Phase C PR3: a site-skill task drives the browser with the SAME surface a
-heredoc gets — real Playwright ``page`` / ``context`` bound to the session's
+Phase C PR3: a site-skill task drives the browser with the SAME surface inline
+execution gets — real Playwright ``page`` / ``context`` bound to the session's
 current tab, plus ``snapshot()``. ``run()`` reads those as free globals
 (``page.goto(...)``), so the runner injects them into the loaded module's
 namespace before calling ``run`` and tears the lazy connection down after.
-Like the heredoc, the connection is LAZY: a task that never touches the
+Like inline execution, the connection is LAZY: a task that never touches the
 browser opens no connection.
 """
 from __future__ import annotations

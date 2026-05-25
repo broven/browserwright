@@ -1,7 +1,7 @@
 """Top-level ``browserwright`` CLI dispatch.
 
 Subcommands:
-  session new | end | list | prune        (P2: explicit session creation)
+  session new | reset | end | list | prune        (P2: explicit session creation)
   whoami --session=ID
   task <site>/<name> [--arg=val ...]    NOT IN v0.1 ENTRY: minimal stub
   install
@@ -26,13 +26,10 @@ from . import __version__
 HELP = """browserwright — Layer 2 of the browser stack.
 
 Usage:
-  browserwright <<'PY'
-  page.goto("https://example.com")
-  print(page.title())
-  print(snapshot())
-  PY
+  browserwright -s <session-id> -e 'page.goto("https://example.com"); print(page.title())'
 
   browserwright session new --backend=<extension|rdp> --name=NAME [--create | --attach=PORT]
+  browserwright session reset <id>
   browserwright session end --session=ID
   browserwright session list [--json]
   browserwright session prune [--idle=SECONDS]
@@ -88,6 +85,57 @@ def _parse_kv_args(args: list[str]) -> dict:
             out[key] = True
         i += 1
     return out
+
+
+def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse playwriter-style execution flags.
+
+    Supports both short and long forms:
+      browserwright -s 1 -e 'print(snapshot())'
+      browserwright --session=1 --execute='print(snapshot())'
+    """
+    session_id: Optional[str] = None
+    code: Optional[str] = None
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a in {"-s", "--session"}:
+            if i + 1 >= n:
+                return None, None, f"{a} requires a value"
+            session_id = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--session="):
+            session_id = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in {"-e", "--execute"}:
+            if i + 1 >= n:
+                return None, None, f"{a} requires a value"
+            code = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--execute="):
+            code = a.split("=", 1)[1]
+            i += 1
+            continue
+        return None, None, f"unknown execute argument: {a!r}"
+    if not session_id:
+        return None, None, "missing session id: pass -s <id>"
+    if code is None:
+        return None, None, "missing code: pass -e '<python>'"
+    return session_id, code, None
+
+
+def _cmd_execute(args: list[str]) -> int:
+    session_id, code, err = _parse_execute_args(args)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
+              file=sys.stderr)
+        return 1
+    from .repl import inline
+    return inline.run_code(code or "", session_id=session_id or "")
 
 
 def _cmd_task(args: list[str]) -> int:
@@ -343,12 +391,12 @@ def _cmd_memory(args: list[str]) -> int:
 
 
 def _cmd_session(args: list[str]) -> int:
-    """``browserwright session {new|end|list|prune} ...`` (P2)."""
+    """``browserwright session {new|reset|end|list|prune} ...`` (P2)."""
     from . import session_create
     from . import session_registry as reg
 
     if not args:
-        print("usage: browserwright session {new|end|list|prune} ...", file=sys.stderr)
+        print("usage: browserwright session {new|reset|end|list|prune} ...", file=sys.stderr)
         return 1
     sub = args[0]
     kw = _parse_kv_args(args[1:])
@@ -379,6 +427,18 @@ def _cmd_session(args: list[str]) -> int:
             print(str(e), file=sys.stderr)
             return e.exit_code
         print(session_create.end(rec))
+        return 0
+
+    if sub == "reset":
+        from .errors import NoSession
+        from .session_ctx import resolve_session
+        raw_sid = args[1] if len(args) > 1 and not args[1].startswith("--") else kw.get("session")
+        try:
+            rec = resolve_session(raw_sid)
+        except NoSession as e:
+            print(str(e), file=sys.stderr)
+            return e.exit_code
+        print(session_create.reset_executor(rec))
         return 0
 
     if sub == "list":
@@ -579,19 +639,26 @@ def _cmd_release(args: list[str]) -> int:
 def main(argv: Optional[list[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # `browserwright` with stdin (heredoc) → inline.
-    if not argv and not sys.stdin.isatty():
-        from .repl import inline
-        sys.exit(inline.run(sys.stdin))
-
     # `--print-skill` is a flag (leading dash) but is a real command, not help;
     # intercept it before the help check below.
     if argv and argv[0] in {"--print-skill", "print-skill"}:
         sys.exit(_cmd_print_skill(argv[1:]))
 
+    if not argv and not sys.stdin.isatty():
+        print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
+              file=sys.stderr)
+        sys.exit(1)
+
     if not argv or argv[0] in {"-h", "--help"}:
         sys.stdout.write(HELP)
         sys.exit(0 if argv else 1)
+
+    if argv and (
+        argv[0] in {"-s", "--session", "-e", "--execute"}
+        or argv[0].startswith("--session=")
+        or argv[0].startswith("--execute=")
+    ):
+        sys.exit(_cmd_execute(argv))
 
     cmd = argv[0]
     rest = argv[1:]
@@ -621,7 +688,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     if cmd == "userscript":
         sys.exit(_cmd_userscript(rest))
 
-    # Catch heredoc usage: `cat foo.py | browserwright`.
     print(f"unknown command: {cmd!r}", file=sys.stderr)
     print(HELP, file=sys.stderr)
     sys.exit(1)

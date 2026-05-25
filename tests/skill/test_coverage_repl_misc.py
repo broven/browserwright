@@ -16,7 +16,7 @@ import pytest
 
 
 def _stub_inline_session(monkeypatch):
-    """Bind inline.run to a fake resolved session without opening a daemon."""
+    """Bind inline.run_code to a fake resolved session without opening a daemon."""
     from browserwright import session, session_ctx
 
     record = {"id": "s-test", "backend": "extension", "owner": "attach"}
@@ -32,13 +32,22 @@ def _stub_inline_session(monkeypatch):
     return captured
 
 
-def test_inline_run_empty_input_prints_usage(capsys):
+def test_inline_run_rejects_stdin_heredoc(capsys):
     from browserwright.repl import inline
 
-    rc = inline.run(io.StringIO(" \n\t\n"))
+    rc = inline.run(io.StringIO("print('old')\n"))
 
     assert rc == 1
-    assert "browserwright <<'PY'" in capsys.readouterr().err
+    assert "browserwright -s <session-id> -e" in capsys.readouterr().err
+
+
+def test_inline_run_code_empty_input_prints_usage(capsys):
+    from browserwright.repl import inline
+
+    rc = inline.run_code(" \n\t\n", session_id="s-test")
+
+    assert rc == 1
+    assert "browserwright -s <session-id> -e" in capsys.readouterr().err
 
 
 def test_inline_run_replays_stdout_before_browserwright_error(monkeypatch, capsys):
@@ -46,7 +55,10 @@ def test_inline_run_replays_stdout_before_browserwright_error(monkeypatch, capsy
     from browserwright.repl import inline
 
     captured = _stub_inline_session(monkeypatch)
-    rc = inline.run(io.StringIO("print('before')\nraise BrowserwrightError('boom', fix='retry')\n"))
+    rc = inline.run_code(
+        "print('before')\nraise BrowserwrightError('boom', fix='retry')\n",
+        session_id="s-test",
+    )
     streams = capsys.readouterr()
 
     assert rc == 3
@@ -61,7 +73,7 @@ def test_inline_run_system_exit_non_integer_is_success(monkeypatch, capsys):
     from browserwright.repl import inline
 
     _stub_inline_session(monkeypatch)
-    rc = inline.run(io.StringIO("print('leaving')\nraise SystemExit('done')\n"))
+    rc = inline.run_code("print('leaving')\nraise SystemExit('done')\n", session_id="s-test")
 
     assert rc == 0
     assert capsys.readouterr().out == "leaving\n"
@@ -71,7 +83,7 @@ def test_inline_run_unexpected_exception_returns_traceback(monkeypatch, capsys):
     from browserwright.repl import inline
 
     _stub_inline_session(monkeypatch)
-    rc = inline.run(io.StringIO("print('pre')\n1 / 0\n"))
+    rc = inline.run_code("print('pre')\n1 / 0\n", session_id="s-test")
     streams = capsys.readouterr()
 
     assert rc == 3
@@ -114,8 +126,7 @@ def test_skill_doc_uses_packaged_runtime_guide():
 
 def test_skill_doc_documents_state_and_reset_surface():
     # PR3 DoD: --print-skill must teach the persistent `state` + `reset()`
-    # surface and the "same live objects across heredocs" mental model (flipping
-    # the phase C "every heredoc reconnects" narrative).
+    # surface and the "same live objects across calls" mental model.
     from browserwright import skill_doc
 
     doc = skill_doc.render()

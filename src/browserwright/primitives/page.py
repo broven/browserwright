@@ -446,15 +446,11 @@ def ensure_real_tab() -> dict | None:
 
 
 def _session_name_and_id(sess) -> tuple[Any, Any]:
-    """Resolve the current session's (name, id) from the bound record or
-    BD_SESSION→ledger. Either may be None when no session is in scope."""
+    """Resolve the current session's (name, id) from the bound record.
+
+    Either may be None when no session is in scope.
+    """
     rec = getattr(sess, "session_record", None)
-    if not isinstance(rec, dict):
-        try:
-            from ..session_ctx import resolve_session
-            rec = resolve_session()
-        except Exception:
-            rec = None
     if isinstance(rec, dict):
         return rec.get("name"), rec.get("id")
     return None, None

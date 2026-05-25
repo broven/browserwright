@@ -1,6 +1,6 @@
 """Thin-client side of the executor data plane.
 
-Used by ``repl/inline.py`` when a heredoc touches ``page`` / ``context`` /
+Used by ``repl/inline.py`` when inline code touches ``page`` / ``context`` /
 ``snapshot`` / ``state`` / ``reset``: the whole code body is shipped to the
 session's resident executor and the response is replayed locally.
 

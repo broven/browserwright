@@ -3,7 +3,7 @@
 These are thin re-exports + tiny convenience wrappers around
 ``browserwright.discovery`` and ``browserwright.task_runner`` so an agent
 typing ``list_site_skills()`` / ``run_task("github.com/list_issues")`` /
-``load_site_skill("github.com")`` from the REPL or an inline heredoc
+``load_site_skill("github.com")`` from the REPL or inline execution
 doesn't get a NameError. Spec §A.2 v0.5.1 (F-4 catch-up).
 """
 from __future__ import annotations

@@ -1,20 +1,20 @@
-"""``browserwright <<'PY' ... PY`` — single-shot heredoc execution.
+"""``browserwright -s <id> -e <code>`` — single-shot code execution.
 
 Two paths, chosen by a cheap static pre-check on the code (Phase B, Fork 7):
 
-  - **In-process** (Phase C path, unchanged): a heredoc that touches NONE of
+  - **In-process** (Phase C path, unchanged): code that touches NONE of
     ``{page, context, snapshot, state, reset}`` — pure ``memory()`` /
     site-skill / ``http_get`` — is exec'd here, in this short-lived process. It
     never spawns or contacts an executor (stays lightweight).
-  - **Shipped to the executor** (Phase B path): a heredoc that references any of
+  - **Shipped to the executor** (Phase B path): code that references any of
     those names is shipped WHOLE to the session's resident, per-session executor
     subprocess, where ``page`` / ``context`` are LIVE objects that survive
-    across heredoc calls and ``state`` is a persistent dict. You cannot return a
+    across calls and ``state`` is a persistent dict. You cannot return a
     live cross-process ``Page`` into a local ``exec``, so the entire body runs
     there.
 
 The old cross-process Skill REPL daemon was removed (P3): it froze
-``BD_NAME``/backend into a shared SINGLETON and forwarded heredocs without their
+``BD_NAME``/backend into a shared SINGLETON and forwarded calls without their
 env — the documented cross-talk accident. Phase B's executor avoids that by
 keying strictly on ``session_id`` (playwriter's ``Map<sessionId, executor>``),
 never a shared singleton.
@@ -60,10 +60,18 @@ def _touches_executor_surface(code_obj) -> bool:
 
 
 def run(stdin: IO[str]) -> int:
-    """Execute heredoc input. Returns the desired exit code."""
+    """Deprecated stdin entrypoint kept only to reject old heredoc usage."""
     code = stdin.read()
+    del code
+    print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
+          file=sys.stderr)
+    return 1
+
+
+def run_code(code: str, *, session_id: str) -> int:
+    """Execute inline code for an explicit session id."""
     if not code.strip():
-        print("usage: browserwright <<'PY'\\n  print(snapshot())\\nPY",
+        print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
               file=sys.stderr)
         return 1
 
@@ -74,7 +82,7 @@ def run(stdin: IO[str]) -> int:
     from ..session import Session, set_session
     from ..session_ctx import resolve_session
     try:
-        rec = resolve_session()
+        rec = resolve_session(session_id)
     except NoSession as e:
         print(str(e), file=sys.stderr)
         return e.exit_code

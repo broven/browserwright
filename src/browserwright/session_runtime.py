@@ -22,16 +22,11 @@ from .errors import CDPError
 
 
 def _resolve_sid(sess) -> Optional[str]:
-    """Best-effort current session id: from the bound record, else BD_SESSION."""
+    """Best-effort current session id from the bound record."""
     rec = getattr(sess, "session_record", None)
     if isinstance(rec, dict) and rec.get("id"):
         return rec["id"]
-    try:
-        from .session_ctx import resolve_session
-        rec = resolve_session()
-    except Exception:
-        return None
-    return rec.get("id") if isinstance(rec, dict) else None
+    return None
 
 
 def _resolve_record(sess) -> Optional[dict]:

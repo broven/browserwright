@@ -34,7 +34,7 @@ LAST_VERIFIED = "2026-05-25"
 
 def run(args, ctx=None):
     # `page` / `context` / `snapshot` are injected by the runtime — the same
-    # Playwright surface a heredoc gets (also on ctx: ctx.page / ctx.context).
+    # Playwright surface inline execution gets (also on ctx: ctx.page / ctx.context).
     page.goto(f"https://example.com/search?q={args['query']}", wait_until="load")
     return {"title": page.title(), "url": page.url}
 ```

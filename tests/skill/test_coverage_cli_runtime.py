@@ -28,6 +28,37 @@ def test_parse_kv_args_coerces_json_space_values_and_flags():
     }
 
 
+def test_parse_execute_args_supports_short_and_long_forms():
+    from browserwright import cli
+
+    assert cli._parse_execute_args(["-s", "1", "-e", "print(1)"]) == (
+        "1",
+        "print(1)",
+        None,
+    )
+    assert cli._parse_execute_args(["--session=2", "--execute=print(2)"]) == (
+        "2",
+        "print(2)",
+        None,
+    )
+    assert cli._parse_execute_args(["-s", "1"])[2] == "missing code: pass -e '<python>'"
+
+
+def test_cmd_execute_dispatches_to_inline_run_code(monkeypatch):
+    from browserwright import cli
+    from browserwright.repl import inline
+
+    calls = []
+    monkeypatch.setattr(
+        inline,
+        "run_code",
+        lambda code, *, session_id: calls.append((session_id, code)) or 0,
+    )
+
+    assert cli._cmd_execute(["-s", "abc", "-e", "print('ok')"]) == 0
+    assert calls == [("abc", "print('ok')")]
+
+
 def test_cmd_version_check_json_reports_consistent_versions(capsys):
     from browserwright import cli
 
@@ -239,6 +270,22 @@ def test_cmd_session_usage_errors(capsys, tmp_bs_home):
     assert "unknown session subcommand" in capsys.readouterr().err
 
 
+def test_cmd_session_reset_recycles_executor(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "reset_executor",
+        lambda rec: calls.append(rec["id"]) or f"reset {rec['id']}",
+    )
+
+    assert cli._cmd_session(["reset", sid]) == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"reset {sid}\n"
+
+
 def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, capsys):
     from browserwright import cli
 
@@ -362,6 +409,21 @@ def test_session_create_reap_closes_only_create_owned_sessions(tmp_bs_home, monk
 
     assert {rec["id"] for rec in pruned} == {create_sid, attach_sid}
     assert closed == [create_sid]
+
+
+def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
+    from browserwright import session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    calls = []
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: calls.append(["ensure"]))
+    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+
+    message = session_create.reset_executor(reg.get(sid))
+
+    assert calls == [["ensure"], ["browserwright-daemon", "kill-executor", "--session", sid]]
+    assert "left untouched" in message
+    assert reg.get(sid) is not None
 
 
 def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch):

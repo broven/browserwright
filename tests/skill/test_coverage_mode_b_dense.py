@@ -424,6 +424,18 @@ def test_resolve_session_empty_explicit_arg_refuses_even_with_env(tmp_bs_home, m
         session_ctx.resolve_session("")
 
 
+def test_resolve_session_requires_explicit_arg_even_with_env(tmp_bs_home, monkeypatch):
+    from browserwright import session_ctx
+    from browserwright import session_registry as reg
+    from browserwright.errors import NoSession
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    monkeypatch.setenv("BD_SESSION", sid)
+
+    with pytest.raises(NoSession):
+        session_ctx.resolve_session()
+
+
 def test_open_unix_websocket_uses_synthetic_http_upgrade(monkeypatch):
     import importlib
 

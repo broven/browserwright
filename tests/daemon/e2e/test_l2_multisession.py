@@ -158,6 +158,7 @@ def test_extension_backend_multiple_sessions_operate_concurrently(ext_ready, e2e
     """
     script = r'''
 import json
+import os
 import threading
 import traceback
 from urllib.parse import quote
@@ -172,11 +173,11 @@ from browserwright.primitives.page import close_tab, open, wait_for_load
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
 
-# browserwright inline requires an explicit ledger session. run_skill() injects
+# browserwright inline requires an explicit ledger session. The harness injects
 # BD_SESSION and the two Session objects below intentionally share that
 # extension-daemon endpoint while keeping their CDP connections/current_target_id
 # state independent.
-root_record = resolve_session()
+root_record = resolve_session(os.environ.get("BD_SESSION"))
 
 start = threading.Barrier(3)
 both_open = threading.Barrier(2)

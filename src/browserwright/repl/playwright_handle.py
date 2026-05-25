@@ -1,10 +1,10 @@
-"""Lazy Playwright ``page`` / ``context`` for the heredoc namespace (Phase C).
+"""Lazy Playwright ``page`` / ``context`` for the inline execution namespace.
 
-The agent writes real Playwright Python in ``browserwright <<'PY' … PY``
-heredocs against an injected ``page`` (and ``context``). The handle:
+The agent writes real Playwright Python in ``browserwright -s <id> -e <code>``
+against an injected ``page`` (and ``context``). The handle:
 
   - **connects lazily**: nothing happens until the first attribute access on
-    ``page`` / ``context``. A pure ``memory()`` / site-skill heredoc never opens
+    ``page`` / ``context``. A pure ``memory()`` / site-skill call never opens
     a browser connection (see :class:`_LazyHandle`).
   - **connects through the daemon facade**: it reads the facade ws URL the
     daemon advertised (``browserwright-daemon status``'s ``facade.ws`` →
@@ -16,17 +16,17 @@ heredocs against an injected ``page`` (and ``context``). The handle:
     selects the Playwright ``Page`` whose CDP ``targetId`` matches it. If the
     session has no current tab it opens one (``about:blank``) and binds it —
     mirroring ``primitives/page.py:current_page()``'s "auto-open, NOT adopt"
-    rule. The bound target is persisted back to the ledger so the NEXT heredoc
-    resolves the SAME tab (cross-heredoc tab reuse — the whole point of Phase
+    rule. The bound target is persisted back to the ledger so the NEXT call
+    resolves the SAME tab (cross-call tab reuse — the whole point of Phase
     C). ``context.new_page()`` is the explicit "new tab" escape hatch.
 
-Lifecycle: the heredoc runner calls :meth:`PlaywrightHandle.close` in a
-``finally`` so the Playwright connection is torn down cleanly at heredoc end.
+Lifecycle: the inline runner calls :meth:`PlaywrightHandle.close` in a
+``finally`` so the Playwright connection is torn down cleanly at call end.
 ``connect_over_cdp``'s ``browser.close()`` only DISCONNECTS the CDP transport —
 it does NOT close the user's real tabs/browser — so closing is safe. We never
 call ``page.close()`` / ``context.close()``.
 
-Sync API only: the heredoc is a standalone process with no running asyncio
+Sync API only: inline execution is a standalone process with no running asyncio
 loop, so we use ``playwright.sync_api``. The session's daemon client
 (``mode_b_client`` over a unix socket) is plain sockets, not asyncio — so there
 is no loop conflict with Playwright's sync driver.
