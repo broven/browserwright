@@ -67,7 +67,7 @@ async function refresh() {
   primary.textContent = connected ? "Connected to daemon" : "Disconnected";
   secondary.textContent = connected
     ? `install ${(status.installId || "").slice(0, 12)}…`
-    : "Run `browserwright-daemon serve --backend extension` and reopen this popup";
+    : "Run `browserwright-daemon serve` and reopen this popup";
   attachBtn.disabled = !connected;
   detachBtn.disabled = !connected || (status.attachedTabs || []).length === 0;
 

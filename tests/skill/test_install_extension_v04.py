@@ -160,9 +160,10 @@ def test_wizard_choice_4_available_writes_preference(monkeypatch, tmp_bs_home,
     assert "wrote daemon.preferred_backend = 'extension'" in out
     # Wizard surfaced the absolute extension path.
     assert "/opt/browserwright-daemon/chrome-extension" in out
-    # And mentioned the Mode B requirement.
-    assert "serve --backend extension" in out
-    assert "Mode A" in out  # the cautionary aside about Mode A unavailability
+    # And mentioned the single global daemon requirement.
+    assert "browserwright-daemon serve" in out
+    assert "browserwright-daemon install" in out
+    assert "routes session" in out
 
     from browserwright.memory.global_mem import global_memory
     blob = global_memory().read()

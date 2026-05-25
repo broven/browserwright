@@ -97,8 +97,8 @@ ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 |---|---|---|
 | `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析） | 1（最高） |
 | `rdp` | 假设 Chrome 启动时带了 `--remote-debugging-port=9222`，HTTP 探测 `/json/version` | 2 |
-| `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**驱动用户日常 Chrome 的唯一路径**。 | 默认不在链中，需 `--backend extension` 显式选 |
-| `cloud` | 远程托管浏览器（Browser Use / Browserless / Hyperbrowser），daemon Mode B 自连 upstream ws 时按 AuthProvider 注入 `Authorization: Bearer ...` / mTLS client cert（v0.1 `env` backend 只能 URL-embedded token，所以专门拆这条）。**v0.5 起真实装**。 | 默认不在链中，需 `--backend cloud` 显式选 |
+| `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**驱动用户日常 Chrome 的唯一路径**。 | `browserwright-daemon serve` 默认启动这个 shared relay；具体 session 仍用 `browserwright session new --backend=extension` 选择 |
+| `cloud` | 远程托管浏览器（Browser Use / Browserless / Hyperbrowser），daemon Mode B 自连 upstream ws 时按 AuthProvider 注入 `Authorization: Bearer ...` / mTLS client cert（v0.1 `env` backend 只能 URL-embedded token，所以专门拆这条）。**v0.5 起真实装**。 | shared upstream 可通过 `--backend cloud` / `BD_BACKEND` / `default_backend` 选择；rdp session 仍按 session ledger 分流 |
 
 ## v0.4 extension backend
 
@@ -110,7 +110,7 @@ ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 
 1. **注册 daemon 为 LaunchAgent**：`browserwright-daemon install`
 
-   写入 `~/Library/LaunchAgents/com.browserwright-daemon.default.plist` 并 `launchctl load`。daemon 会：
+   写入 `~/Library/LaunchAgents/com.browserwright-daemon.plist` 并 `launchctl load`。daemon 会：
    - 每次登录自动启动（`RunAtLoad`）
    - 崩了 launchd 自动重启（`KeepAlive`，`Crashed=true`）
    - 本地 unix socket 永远在 `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`（全局唯一、无 name 后缀；第二个 daemon 起不来——stale-detect 拒绝）
@@ -244,15 +244,15 @@ $ browserwright-daemon stats --json | jq '.proxy_pre_open_overflow_total'
 
 字段：`ts`（ISO-8601 UTC）、`level`、`logger`、`msg`，可选 `extra`（来自 `logger.info(..., extra={...})`）、可选 `exc_info`。
 
-无 `--backend` 时按 `env → rdp` 顺序尝试，第一个返回 URL 就用它（`extension` 和 `cloud` 需要显式 `--backend` 选）。
+`browserwright-daemon serve` 是单全局 daemon：无 `--backend` 时启动默认 shared `extension` relay，rdp sessions 根据 session ledger 懒创建自己的 upstream context。`--backend` 只用于覆盖 shared upstream（例如 cloud/env 调试），不是安装或启动一个“只服务某 backend”的 daemon。
 
 ## 配置（可选）
 
 `~/.config/browserwright-daemon/config.toml`：
 
 ```toml
-# 覆盖默认 fallback chain 的首选 backend（与 `BD_BACKEND` 等价；
-# CLI `--backend` 仍最高优先级）
+# 覆盖 daemon shared upstream（与 `BD_BACKEND` 等价；
+# CLI `--backend` 仍最高优先级）。不影响 rdp session 按 ledger 分流。
 default_backend = "extension"
 
 [backends.rdp]
@@ -268,10 +268,9 @@ relay_url = "ws://127.0.0.1:19989"
 ```
 
 > **fallback_chain 已撤掉**：v0.1 README 曾文档化 `fallback_chain = [...]`
-> 但 parser 从来没读这个 key（REVIEW.md F-5 / Task #15）。v0.5+ 推荐用
-> `_CHAIN_OPT_OUT` 机制：`extension` 和 `cloud` 默认不在 auto chain，
-> 必须 `--backend` / `BD_BACKEND` / `default_backend` 显式选。已覆盖 ~80%
-> 自定义顺序需求。
+> 但 parser 从来没读这个 key（REVIEW.md F-5 / Task #15）。当前 daemon
+> 不再靠 fallback chain 表达日常使用路径；session backend 写在 session
+> ledger，shared upstream 才读取 `--backend` / `BD_BACKEND` / `default_backend`。
 
 MVP 阶段 config 文件不是必须的——所有项都有合理默认值，env var 可以覆盖。
 

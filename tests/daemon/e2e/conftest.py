@@ -149,7 +149,7 @@ def e2e_artifacts_dir() -> Path:
 
 @pytest.fixture(scope="session")
 def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
-    """Spawn `browserwright-daemon serve --backend extension --extension-port N`
+    """Spawn `browserwright-daemon serve --extension-port N`
     for the duration of the session, isolated from the developer's real daemon
     via a throwaway XDG_RUNTIME_DIR (distinct fixed socket) + the test relay
     port. No `--name` (single global daemon). Yields a DaemonHandle.
@@ -494,8 +494,7 @@ def e2e_chrome_rdp(tmp_path_factory):
 
 @pytest.fixture
 def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
-    """Spawn `browserwright-daemon serve --backend rdp` against the rdp Chrome,
-    for the rdp scenario.
+    """Spawn the single daemon with a test RDP port for the rdp scenario.
 
     Single-global-daemon: no `--name`. Isolated from the developer's daemon (and
     from the extension `e2e_daemon`) via its own throwaway XDG_RUNTIME_DIR →

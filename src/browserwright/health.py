@@ -81,7 +81,7 @@ def doctor_checks() -> dict:
             "fail",
             info.get("error") or "browserwright-daemon did not respond",
             "install/start the daemon: ensure `browserwright-daemon` is on PATH "
-            "then `browserwright-daemon serve --backend <extension|rdp>`",
+            "then `browserwright-daemon serve`",
         )
     else:
         add("daemon", "pass", "browserwright-daemon responded to doctor", "")
@@ -125,7 +125,7 @@ def doctor_checks() -> dict:
                 "fail",
                 "daemon reported no backends",
                 "start a backend: load the extension or "
-                "`browserwright-daemon serve --backend rdp`",
+                "create an rdp session after `browserwright-daemon serve`",
             )
 
     # 4. extension/relay specific: if an extension backend exists but is

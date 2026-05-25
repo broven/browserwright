@@ -480,13 +480,20 @@ def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, 
     monkeypatch.setattr(cli.os.path, "expanduser", lambda p: str(tmp_path / "home" / p.removeprefix("~/")))
     monkeypatch.setattr(cli, "_launchctl", lambda *args: launchctl_calls.append(args) or (0, "", ""))
 
-    assert cli._cmd_install(_ns(backend="extension", extension_port=29999, force=False), Config()) == 0
+    assert cli._cmd_install(_ns(backend=None, extension_port=29999, force=False), Config()) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["extension_port"] == 29999
     assert launchctl_calls == [("load", "-w", str(plist))]
+    assert "--backend" not in plist.read_text()
+    assert "<string>serve</string>" in plist.read_text()
 
-    assert cli._cmd_install(_ns(backend="extension", extension_port=None, force=False), Config()) == 1
+    plist.unlink()
+    assert cli._cmd_install(_ns(backend="rdp", extension_port=None, force=False), Config()) == 0
+    assert "--backend" not in plist.read_text()
+    assert "install --backend` is ignored" in capsys.readouterr().err
+
+    assert cli._cmd_install(_ns(backend=None, extension_port=None, force=False), Config()) == 1
     assert "already exists" in capsys.readouterr().err
 
     assert cli._cmd_uninstall(_ns(), Config()) == 0
@@ -496,6 +503,6 @@ def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, 
     assert json.loads(capsys.readouterr().out)["reason"] == "no LaunchAgent installed"
 
     monkeypatch.setattr(cli, "_launchctl", lambda *args: (9, "", "load failed"))
-    assert cli._cmd_install(_ns(backend="extension", extension_port=None, force=True), Config()) == 3
+    assert cli._cmd_install(_ns(backend=None, extension_port=None, force=True), Config()) == 3
     assert not plist.exists()
     assert "launchctl load failed: load failed" in capsys.readouterr().err

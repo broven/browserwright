@@ -102,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--extension-port", type=int, default=None, metavar="N",
         help=("Bind the extension relay ws server on this port instead of "
-              "the default 19989. Only relevant when --backend extension. "
+              "the default 19989. Only relevant to the shared extension relay. "
               "Equivalent to BD_EXTENSION_PORT env or "
               "[backends.extension].port in config.toml."))
     # Playwright facade (Phase C: auto-enabled). Expose a Playwright-facing
@@ -314,11 +314,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # and is reachable on the same socket across reboots.
     p_inst = sub.add_parser(
         "install",
-        help="register the daemon as a macOS LaunchAgent (auto-start + KeepAlive)")
+        help=("register the single global daemon as a macOS LaunchAgent "
+              "(auto-start + KeepAlive)"))
     _add_name(p_inst)
-    p_inst.add_argument("--backend", default="extension",
-                        choices=names(),
-                        help="backend the LaunchAgent will serve (default: extension)")
+    p_inst.add_argument("--backend", choices=names(), default=None,
+                        help=argparse.SUPPRESS)
     p_inst.add_argument("--extension-port", type=int, default=None, metavar="N",
                         help="override the relay ws port (default 19989)")
     p_inst.add_argument("--force", action="store_true",
@@ -340,8 +340,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_common(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--backend", choices=names(),
-                    help="pin to one backend; otherwise the chain runs env -> rdp "
-                         "(extension and cloud require explicit --backend)")
+                    help=("pin backend for this command; for `serve`, this only "
+                          "chooses the shared upstream while session backends "
+                          "still route per session"))
     sp.add_argument("--timeout", type=float, default=None,
                     help="per-backend timeout in seconds (default 5)")
     sp.add_argument("--config", help="optional toml config path; otherwise reads BD_CONFIG")
@@ -1199,14 +1200,14 @@ def _resolve_browserwright_daemon_bin() -> str:
     )
 
 
-def _build_plist(*, backend: str, extension_port: int | None) -> str:
+def _build_plist(*, extension_port: int | None) -> str:
     """Emit the plist content. Kept inline (no XML lib) — the schema is
     fixed + tiny, and we avoid a dependency. Every interpolated value passes
     through ``xml.sax.saxutils.escape``. Pure: no side effects — the caller is
     responsible for creating the log dir.
     """
     bin_path = _resolve_browserwright_daemon_bin()
-    args = [bin_path, "serve", "--backend", backend]
+    args = [bin_path, "serve"]
     if extension_port is not None:
         args += ["--extension-port", str(extension_port)]
     log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
@@ -1265,6 +1266,10 @@ def _cmd_install(args, cfg: Config) -> int:
               "for Linux run `browserwright-daemon serve` from a systemd-user "
               "unit yourself for now", file=sys.stderr)
         return 1
+    if getattr(args, "backend", None):
+        print("warning: `browserwright-daemon install --backend` is ignored; "
+              "the LaunchAgent runs the single global daemon and session "
+              "backends route per session", file=sys.stderr)
     label = _LAUNCHAGENT_LABEL
     plist_path = _launchagent_plist_path()
     if plist_path.exists() and not args.force:
@@ -1276,9 +1281,7 @@ def _cmd_install(args, cfg: Config) -> int:
     # `_build_plist` so the generator stays pure / unit-testable (N-1).
     log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
     os.makedirs(log_dir, exist_ok=True)
-    content = _build_plist(
-        backend=args.backend, extension_port=args.extension_port,
-    )
+    content = _build_plist(extension_port=args.extension_port)
     # If --force and the plist exists, unload the old one first so launchctl
     # picks up the new ProgramArguments cleanly.
     if plist_path.exists():
@@ -1296,7 +1299,6 @@ def _cmd_install(args, cfg: Config) -> int:
         "ok": True,
         "label": label,
         "plist": str(plist_path),
-        "backend": args.backend,
         "extension_port": args.extension_port,
     }, sort_keys=True))
     return 0

@@ -80,7 +80,7 @@ class NetworkError(BrowserwrightError):
 class DaemonUnavailable(BrowserwrightError):
     exit_code = 2
     default_fix = (
-        "start the daemon: `browserwright-daemon serve --backend <extension|rdp>` "
+        "start the single global daemon: `browserwright-daemon serve` "
         "(or run `browserwright doctor` to see what is missing)"
     )
 

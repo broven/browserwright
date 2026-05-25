@@ -78,10 +78,10 @@ class ExtensionBackend(Backend):
                 available=False,
                 ws_url=None,
                 detail=(f"no extension relay listening on 127.0.0.1:{self._port} "
-                        f"— start `browserwright-daemon serve --backend extension`"),
+                        f"— start `browserwright-daemon serve`"),
                 ux_warning=None,
                 needs_user_action=(
-                    "start daemon in Mode B with extension backend, "
+                    "start the single global daemon, "
                     "then load the Chrome extension from `chrome-extension/`"),
                 ux_cost=self.ux_cost,
             )
@@ -179,7 +179,7 @@ class ExtensionBackend(Backend):
         """
         raise Unavailable(
             "extension backend is a LOCAL_RELAY — it cannot be used via "
-            "`browserwright-daemon url`. Run `browserwright-daemon serve --backend "
-            "extension` instead and connect via the daemon's unix socket.",
+            "`browserwright-daemon url`. Run `browserwright-daemon serve` "
+            "instead and connect via the daemon's unix socket.",
             attempts={self.name: "LOCAL_RELAY backend requires Mode B serve"},
         )

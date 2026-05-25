@@ -31,8 +31,8 @@ TEST_FACADE_PORT = 29991
 
 @pytest.fixture
 def e2e_rdp_facade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
-    """Spawn `browserwright-daemon serve --backend rdp --facade-port N` against
-    the rdp Chrome, isolated via a throwaway XDG_RUNTIME_DIR. Yields the facade
+    """Spawn the single daemon with `--facade-port N` against the rdp Chrome,
+    isolated via a throwaway XDG_RUNTIME_DIR. Yields the facade
     port once the facade's `/json/version` answers."""
     import shutil
 

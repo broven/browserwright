@@ -554,7 +554,7 @@ def run() -> int:
     print(f"wrote daemon.preferred_backend = {backend!r} to {mem.path}")
     if cloud_fields:
         # Daemon reads ``~/.config/browserwright-daemon/config.toml`` at
-        # ``serve --backend cloud`` startup. The wizard is the canonical
+            # daemon startup. The wizard is the canonical
         # writer of the ``[backends.cloud]`` section.
         try:
             cfg_path = _write_daemon_cloud_config(
@@ -593,10 +593,11 @@ def run() -> int:
             print("       - click 'Load unpacked' → pick the daemon's")
             print("         `chrome-extension/` directory.")
             print("         (Hint: `browserwright-daemon extension-path --json` prints it.)")
-        print("  2. Start the daemon in extension-relay mode:")
-        print("       browserwright-daemon serve --backend extension")
-        print("       (Mode B socket only — Mode A subprocess cannot host the")
-        print("        relay; the daemon will raise DaemonUnavailable on Mode A.)")
+        print("  2. Start the single global daemon:")
+        print("       browserwright-daemon serve")
+        print("       (or install it once as a LaunchAgent: `browserwright-daemon install`.)")
+        print("       The daemon hosts the extension relay and still routes session")
+        print("       backends per session.")
         print("  3. In Chrome, click the extension icon → 'Attach this tab'.")
         print("     Verify with: `browserwright-daemon doctor --json` →")
         print("     look for `extension` backend `available=true` + `ws_url` set.")
@@ -618,10 +619,10 @@ def run() -> int:
             print(f"     Cert / key paths (daemon reads these at serve startup):")
             print(f"       cert: {cloud_fields['cloud_cert_file']}")
             print(f"       key:  {cloud_fields['cloud_key_file']}")
-        print("  3. Start the daemon in cloud-relay mode:")
-        print(f"       browserwright-daemon serve --backend cloud --provider {provider}")
-        print("       (daemon-impl-2 may also expose `browserwright-daemon set-credentials`")
-        print("        — check `browserwright-daemon --help` once v0.5 is installed.)")
+        print("  3. Start the single global daemon:")
+        print("       browserwright-daemon serve")
+        print("       The daemon reads the cloud provider/auth config written above")
+        print("       when cloud is selected as the shared upstream.")
         print("  4. Verify: `browserwright-daemon doctor --json` →")
         print("     look for `cloud` backend `available=true` + `ws_url` set.")
     return 0
