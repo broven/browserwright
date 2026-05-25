@@ -76,3 +76,37 @@ Phase C of the playwriter-model adoption: replaced the agent surface with real s
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Phase B: persistent per-session executor
+
+**Date**: 2026-05-25
+**Task**: Phase B: persistent per-session executor
+**Branch**: `feat/phase-b-persistent-executor`
+
+### Summary
+
+Implemented phase B (PR1 executor process skeleton + data plane, PR2 lifecycle supervision, PR3 reset()+output protocol+docs): a resident per-session executor subprocess holding live Playwright page/context + persistent state across heredoc calls. Control plane = ensureExecutor verb (lazy single-flight spawn, rdp upstream pre-launch); data plane = executor's own unix socket (length-framed JSON). Executor readiness decoupled from the control-plane RPC (publish socket on bind, defer cold-start to first execute) to avoid ws-keepalive timeouts. Daemon supervises like rdp-Chrome (idle/endSession/crash/shutdown/orphan-sweep); reset() + facade-death self-exit are the two state-loss paths. inline.py routes only page/context/state/snapshot/reset-touching heredocs to the executor via a co_names pre-check; pure-memory stays in-process. Captured contracts in .trellis/spec/backend/agent-executor-model.md. Verified: unit 424 full / 375 fast green; full e2e suite 36/36 green (rdp + extension, CfT harness) after 4 e2e fix rounds (reset driver-reuse, endSession browser_session, ensureExecutor upstream pre-launch + BD_RDP_PORT, decoupled readiness) plus fixing 2 pre-existing phase-C extension-harness gaps surfaced by the full run (userscript session seeding; autofacade extension fixtures reusing the session daemon instead of colliding on the fixed relay port 29989).
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8b59d81` | (see git log) |
+| `b21b906` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
