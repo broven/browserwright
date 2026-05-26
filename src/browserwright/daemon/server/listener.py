@@ -38,7 +38,7 @@ from ..resolver import resolve
 from ..observability import metrics, install_json_logging_if_requested
 from .state import CloseReason, DaemonState, UpstreamPhase
 from .proxy import Router
-from .daemon import Daemon, UpstreamContext
+from .daemon import Daemon, UnknownSessionError, UpstreamContext
 from .upstream import UpstreamConnection
 from .relay import RelayServer
 from .extension_upstream import ExtensionUpstream
@@ -443,7 +443,15 @@ class _ClientHandler:
         label = query.get("client", "anonymous")
         session_id = query.get("session") or None
 
-        ctx = self.daemon.context_for(session_id)
+        try:
+            ctx = (self.daemon.context_for_required(session_id)
+                   if session_id else self.daemon.context_for(None))
+        except UnknownSessionError:
+            logger.warning("refusing client %s: unknown session %s",
+                           label, session_id)
+            with contextlib.suppress(Exception):
+                await conn.close(code=1008, reason="unknown browserwright session")
+            return
         state = ctx.state
         router = ctx.router
         holder = ctx.holder
@@ -538,6 +546,7 @@ class _UpstreamHolder:
         self.rdp_pid: int | None = None
         self.rdp_profile_dir: str | None = None
         self.rdp_port: int | None = None
+        self.rdp_owns_browser: bool = False
 
     @property
     def is_open(self) -> bool:
@@ -611,7 +620,8 @@ class _UpstreamHolder:
                     # → resolve() probes it. Other rdp callers (env/cloud share
                     # `_open_chrome_upstream` too) skip this — only a holder with
                     # a session_id + rdp backend owns a Chrome.
-                    if cfg.backend == "rdp" and self.session_id is not None:
+                    if (cfg.backend == "rdp" and self.session_id is not None
+                            and self.rdp_owns_browser):
                         await self._launch_rdp_chrome(cfg)
                     await self._open_chrome_upstream(cfg)
             except Exception:

@@ -219,8 +219,16 @@ def test_backend_info_stats_attach_and_rpc_success_paths(monkeypatch, capsys, tm
             "schema_version": 7,
         }
 
-    monkeypatch.setattr(cli, "_rpc_via_ws", fake_backend_rpc)
-    assert cli._cmd_backend_info(_ns(json=False), Config()) == 0
+    backend_calls = []
+
+    async def fake_backend_rpc_capture(*args, **kwargs):
+        backend_calls.append((args, kwargs))
+        return await fake_backend_rpc(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_backend_rpc_capture)
+    assert cli._cmd_backend_info(_ns(json=False, session="bw-s"), Config()) == 0
+    assert backend_calls[-1][0][2] == {"bsSession": "bw-s"}
+    assert backend_calls[-1][1]["browser_session"] == "bw-s"
     monkeypatch.setattr(cli, "_rpc_via_ws", real_rpc_via_ws)
 
     stats_ws = _AsyncWs([

@@ -172,6 +172,9 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     assert client.disconnect_upstream("done") is True
     assert client.running_daemon_version() == "1.2.3"
     assert client.installed_daemon_version() == "9.8.7"
+    assert commands[0][0] == [
+        "browserwright-daemon", "backend-info", "--json", "--session", "s-1",
+    ]
     assert commands[3][0] == [
         "browserwright-daemon", "disconnect", "--reason", "done",
         "--session", "s-1",
@@ -229,6 +232,7 @@ def test_open_background_and_close_tab_success_and_error_details(monkeypatch):
 
     monkeypatch.setattr(mb.subprocess, "run", fake_run)
     client = ModeBClient()
+    client._session_id = "s-1"
 
     assert client.open_background("https://e.test", group="Research") == {
         "targetId": "t-bg",
@@ -241,6 +245,8 @@ def test_open_background_and_close_tab_success_and_error_details(monkeypatch):
         "https://e.test",
         "--group",
         "Research",
+        "--session",
+        "s-1",
     ]
 
     assert client.close_tab() is None
@@ -251,6 +257,8 @@ def test_open_background_and_close_tab_success_and_error_details(monkeypatch):
     assert commands[-1] == [
         "browserwright-daemon",
         "close-tab",
+        "--session",
+        "s-1",
         "--target-id",
         "t-bg",
         "--session-id",

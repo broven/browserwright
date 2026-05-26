@@ -230,7 +230,7 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
 
     holder = Holder()
     ctx = SimpleNamespace(state=state, router=router, holder=holder, backend="env")
-    daemon = SimpleNamespace(context_for=lambda session_id: ctx, _next_client_id=iter([77]))
+    daemon = SimpleNamespace(context_for_required=lambda session_id: ctx, _next_client_id=iter([77]))
     monkeypatch.setattr("browserwright.session_registry.get", lambda sid: {"name": "Session One"})
 
     await listener_mod._ClientHandler(daemon, Config(backend="env")).serve_one(Conn())
@@ -335,6 +335,46 @@ async def test_rdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
     assert dropped == ["abc"]
     assert state.upstream_phase == UpstreamPhase.DISCONNECTED
     assert router.upstream_senders[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_rdp_attach_session_ensure_open_does_not_launch(monkeypatch):
+    cfg = Config(backend="rdp")
+    cfg.backends.rdp.port = 9444
+    state = DaemonState("rdp")
+    router = _Router()
+    holder = listener_mod._UpstreamHolder(state, router, cfg, session_id="attach")
+    holder.rdp_owns_browser = False
+    launched: list[str] = []
+
+    async def fake_launch(_cfg):
+        launched.append("launch")
+
+    async def fake_resolve(_cfg):
+        assert _cfg.backends.rdp.port == 9444
+        return SimpleNamespace(ws_url="ws://127.0.0.1:9444/devtools/browser/x")
+
+    class FakeConn:
+        is_open = True
+
+        def __init__(self, *, on_frame, on_close):
+            self.send_text = object()
+            self.send_command = self._send_command
+
+        async def open(self, ws_url, **kwargs):
+            assert ws_url == "ws://127.0.0.1:9444/devtools/browser/x"
+
+        async def _send_command(self, method, params):
+            return {}
+
+    monkeypatch.setattr(holder, "_launch_rdp_chrome", fake_launch)
+    monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
+    monkeypatch.setattr(listener_mod, "UpstreamConnection", FakeConn)
+
+    await holder.ensure_open()
+
+    assert launched == []
+    assert state.upstream_phase == UpstreamPhase.CONNECTED
 
 
 @pytest.mark.asyncio

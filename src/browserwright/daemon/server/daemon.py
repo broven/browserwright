@@ -38,6 +38,10 @@ from .proxy import Router
 logger = logging.getLogger(__name__)
 
 
+class UnknownSessionError(KeyError):
+    """Raised when an explicit session-bound client names no ledger session."""
+
+
 # ---- per-upstream context --------------------------------------------------
 
 
@@ -109,30 +113,35 @@ class Daemon:
         idle / signal paths that must iterate every live upstream."""
         return [self.shared_context, *self.contexts.values()]
 
-    def context_for(self, session_id: str | None) -> UpstreamContext:
+    def context_for(self, session_id: str | None, *, require_known: bool = False) -> UpstreamContext:
         """Resolve the `UpstreamContext` that should serve `session_id`.
 
         - None / empty session       → the shared (real-browser) context.
         - ledger backend == "rdp"     → a per-session context (created lazily).
-        - any other / unknown backend → the shared context (extension/env/cloud
-          all multiplex onto the one shared upstream).
+        - extension/env/cloud         → the shared context.
+        - unknown explicit session    → raises when `require_known=True`.
 
         The backend is the ledger's immutable `backend` field — never a client
-        param (docs §RPCs). An unknown session id (not in the ledger) falls
-        back to the shared context: the client may simply not have created a
-        ledger entry, and refusing here would be a regression vs the old
-        single-daemon model where any client just got the one upstream.
+        param (docs §RPCs). Sessionless clients keep the historical shared
+        context; explicit session-bound clients can require the ledger record so
+        a typo or stale id never silently falls into the extension backend.
         """
         if not session_id:
             return self.shared_context
         record = session_registry.get(session_id)
         if record is None:
+            if require_known:
+                raise UnknownSessionError(session_id)
             return self.shared_context
         backend = record.get("backend")
         if backend == "rdp":
             return self._ensure_rdp_context(session_id, record)
         # extension / env / cloud → shared upstream.
         return self.shared_context
+
+    def context_for_required(self, session_id: str) -> UpstreamContext:
+        """Resolve an explicitly session-bound context, failing closed."""
+        return self.context_for(session_id, require_known=True)
 
     def _ensure_rdp_context(self, session_id: str, record: dict) -> UpstreamContext:
         """Get or create the per-session rdp context.

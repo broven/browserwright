@@ -117,6 +117,11 @@ class Session:
         cached = getattr(self, "_backend_name_cache", None)
         if cached is not None:
             return cached
+        if isinstance(self.session_record, dict):
+            name = self.session_record.get("backend") or ""
+            if name:
+                self._backend_name_cache = name  # type: ignore[attr-defined]
+                return name
         info = None
         getter = getattr(self.daemon, "get_backend_info", None)
         if callable(getter):

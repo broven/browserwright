@@ -519,6 +519,7 @@ async def test_kill_executor_verb_idempotent_without_registry():
 @pytest.mark.asyncio
 async def test_kill_executor_verb_requires_session():
     router, client, captured = _router_with_client()
+    client.session_id = None
     router.daemon = object()
     await router.route_from_client(client, json.dumps({
         "id": 1,
@@ -526,3 +527,28 @@ async def test_kill_executor_verb_requires_session():
         "params": {},
     }))
     assert captured[client.client_id][-1]["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_kill_executor_rejects_mismatched_browserwright_session_param():
+    router, client, captured = _router_with_client()
+    killed: list[str] = []
+
+    class _Daemon:
+        class _Reg:
+            def kill(self, session_id):
+                killed.append(session_id)
+                return True
+
+        executors = _Reg()
+
+    router.daemon = _Daemon()
+    await router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "BrowserwrightDaemon.killExecutor",
+        "params": {"session": "other"},
+    }))
+    assert killed == []
+    err = captured[client.client_id][-1]["error"]
+    assert err["code"] == -32602
+    assert "session mismatch" in err["message"]

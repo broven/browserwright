@@ -39,6 +39,14 @@ async def test_json_version_payload(facade):
     assert body["webSocketDebuggerUrl"] == f"ws://127.0.0.1:{port}{FACADE_WS_PATH}"
 
 
+async def test_json_version_payload_preserves_session_query(facade):
+    port = facade.port
+    body = await _get_json(f"http://127.0.0.1:{port}/json/version?session=rdp%207")
+    assert body["webSocketDebuggerUrl"] == (
+        f"ws://127.0.0.1:{port}{FACADE_WS_PATH}?session=rdp%207"
+    )
+
+
 async def test_json_list_payload(facade):
     port = facade.port
     for path in ("/json", "/json/list"):
@@ -95,7 +103,7 @@ async def test_session_query_routes_facade_to_session_context(monkeypatch):
     calls = []
 
     class _Daemon:
-        def context_for(self, session_id):
+        def context_for_required(self, session_id):
             calls.append(session_id)
             return ctx
 
@@ -124,6 +132,27 @@ async def test_facade_without_session_keeps_shared_backend():
         request = SimpleNamespace(path="/cdp")
 
     assert f._context_for_connection(_Conn()) is None
+
+
+async def test_facade_unknown_session_fails_closed():
+    from browserwright.daemon.server.daemon import UnknownSessionError
+
+    class _Daemon:
+        def context_for_required(self, session_id):
+            raise UnknownSessionError(session_id)
+
+    f = PlaywrightFacade(cfg=Config(backend="extension"), port=0, daemon=_Daemon())
+
+    class _Conn:
+        request = SimpleNamespace(path="/cdp?session=missing")
+        closed = []
+
+        async def close(self, *, code=1000, reason=""):
+            self.closed.append((code, reason))
+
+    conn = _Conn()
+    await f._handle_client(conn)
+    assert conn.closed == [(1008, "unknown browserwright session")]
 
 
 async def _get_json(url: str):

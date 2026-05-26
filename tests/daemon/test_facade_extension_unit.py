@@ -23,6 +23,7 @@ from typing import AsyncIterator
 
 import websockets
 
+from browserwright import session_registry as reg
 from browserwright.daemon.server.facade_extension import ExtensionFacadeBridge
 from browserwright.daemon.server.relay import RelayServer
 
@@ -79,7 +80,11 @@ class _MockExtension:
             tab = self._next_created_tab
             self._next_created_tab += 1
             url = msg.get("url", "about:blank")
-            self.tabs_meta[tab] = {"url": url, "title": "new"}
+            group_id = msg.get("groupId")
+            if not isinstance(group_id, int) or group_id < 0:
+                group_id = 700 + tab
+            self.tabs_meta[tab] = {
+                "url": url, "title": "new", "groupId": group_id}
             # The extension announces the attach (the relay turns it into a
             # ghost + fan-out) just like the real one.
             await self.ws.send(json.dumps({
@@ -87,7 +92,25 @@ class _MockExtension:
                 "targetInfo": {"url": url, "title": "new"},
             }))
             await self._respond(cmd_id, {"tabId": tab, "url": url,
-                                         "title": "new", "groupId": -1})
+                                         "title": "new", "groupId": group_id})
+            return
+        if kind == "queryGroup":
+            gid = msg.get("groupId")
+            tabs = []
+            if isinstance(gid, int) and gid >= 0:
+                tabs = [
+                    {
+                        "tabId": tab,
+                        "url": meta.get("url", ""),
+                        "title": meta.get("title", ""),
+                    }
+                    for tab, meta in sorted(self.tabs_meta.items())
+                    if meta.get("groupId") == gid
+                ]
+            await self._respond(cmd_id, {
+                "groupId": gid if isinstance(gid, int) else -1,
+                "tabs": tabs,
+            })
             return
         if kind == "command":
             method = msg.get("method")
@@ -120,9 +143,11 @@ class _MockExtension:
         }))
 
     async def announce_attached(self, *, tab_id: int, url: str = "https://t/",
-                                title: str = "t") -> None:
+                                title: str = "t", group_id: int | None = None) -> None:
         assert self.ws is not None
         self.tabs_meta[tab_id] = {"url": url, "title": title}
+        if group_id is not None:
+            self.tabs_meta[tab_id]["groupId"] = group_id
         await self.ws.send(json.dumps({
             "type": "attached", "tabId": tab_id,
             "targetInfo": {"url": url, "title": title},
@@ -274,6 +299,43 @@ async def test_set_discover_targets_acks_and_replays():
             and f["params"]["targetInfo"]["targetId"] == "ext-tab-5")
 
 
+async def test_session_bound_replay_only_announces_session_group(tmp_home):
+    sid = reg.allocate(backend="extension", owner="create", name="Research")
+    reg.update(sid, runtime={"group_id": 44})
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    await ext.announce_attached(tab_id=10, url="https://mine/", group_id=44)
+    await ext.announce_attached(tab_id=11, url="https://other/", group_id=55)
+    await asyncio.sleep(0.05)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        client.feed({"id": 1, "method": "Target.setAutoAttach",
+                     "params": {"autoAttach": True}})
+
+        assert await client.wait_for(lambda f: f.get("id") == 1
+                                     and "result" in f)
+        assert await client.wait_for(
+            lambda f: f.get("method") == "Target.attachedToTarget"
+            and f["params"]["targetInfo"]["targetId"] == "ext-tab-10")
+        await asyncio.sleep(0.1)
+        assert not any(
+            f.get("method") == "Target.attachedToTarget"
+            and f["params"]["targetInfo"]["targetId"] == "ext-tab-11"
+            for f in client.sent
+        )
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
+
+
 # ---- A3: createTarget maps to a background tab -----------------------------
 
 
@@ -289,6 +351,33 @@ async def test_create_target_opens_background_tab():
         await client.wait_for(
             lambda f: f.get("method") == "Target.attachedToTarget"
             and f["params"]["targetInfo"]["targetId"] == tid)
+
+
+async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
+    sid = reg.allocate(backend="extension", owner="create", name="Research")
+    reg.update(sid, runtime={"group_id": 44})
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        client.feed({"id": 3, "method": "Target.createTarget",
+                     "params": {"url": "https://new/"}})
+        res = await client.wait_for(lambda f: f.get("id") == 3 and "result" in f)
+        tid = res["result"]["targetId"]
+        tab_id = int(tid.rsplit("-", 1)[1])
+        assert ext.tabs_meta[tab_id]["groupId"] == 44
+        assert (reg.get(sid).get("runtime") or {})["group_id"] == 44
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
 
 
 # ---- A4: Runtime.enable barrier --------------------------------------------

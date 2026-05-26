@@ -54,7 +54,7 @@ from .. import __version__
 from ..config import DEFAULT_FACADE_PORT, Config
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
-from .daemon import Daemon, UpstreamContext
+from .daemon import Daemon, UnknownSessionError, UpstreamContext
 from .facade_extension import ExtensionFacadeBridge
 from .relay import RelayServer
 from .upstream import _localhost_bypass_proxy
@@ -160,10 +160,11 @@ class PlaywrightFacade:
         `/json/version`, `/json`, and `/json/list` (the latter two are cheap
         and some CDP clients probe them)."""
         path = (request.path or "/").split("?", 1)[0]
+        session_id = self._session_for_request(request)
         if path == "/json/version":
-            return self._http_json(conn, self._version_payload())
+            return self._http_json(conn, self._version_payload(session_id))
         if path in ("/json", "/json/list"):
-            return self._http_json(conn, self._list_payload())
+            return self._http_json(conn, self._list_payload(session_id))
         # Anything else (e.g. the /cdp ws upgrade) falls through to the ws
         # handler. Return None to allow the upgrade.
         return None
@@ -175,18 +176,26 @@ class PlaywrightFacade:
         resp.headers["Content-Type"] = "application/json"
         return resp
 
-    def _ws_url(self) -> str:
-        return f"ws://{self._host}:{self._port}{FACADE_WS_PATH}"
+    def _session_for_request(self, request) -> str | None:
+        qs = parse_qs(urlparse(request.path or "/").query)
+        return (qs.get("session") or [None])[0]
 
-    def _version_payload(self) -> dict:
+    def _ws_url(self, session_id: str | None = None) -> str:
+        suffix = ""
+        if session_id:
+            from urllib.parse import quote
+            suffix = f"?session={quote(session_id, safe='')}"
+        return f"ws://{self._host}:{self._port}{FACADE_WS_PATH}{suffix}"
+
+    def _version_payload(self, session_id: str | None = None) -> dict:
         return {
             "Browser": f"Browserwright/{__version__}",
             "Protocol-Version": "1.3",
             "User-Agent": f"Browserwright facade {__version__}",
-            "webSocketDebuggerUrl": self._ws_url(),
+            "webSocketDebuggerUrl": self._ws_url(session_id),
         }
 
-    def _list_payload(self) -> list:
+    def _list_payload(self, session_id: str | None = None) -> list:
         # The browser-level endpoint is what Playwright wants; per-page targets
         # are discovered via Target.* over the ws once connected. We advertise a
         # single synthetic "browser" entry pointing at our ws.
@@ -194,10 +203,15 @@ class PlaywrightFacade:
             "type": "browser",
             "title": "Browserwright",
             "url": "",
-            "webSocketDebuggerUrl": self._ws_url(),
+            "webSocketDebuggerUrl": self._ws_url(session_id),
         }]
 
     # ---- ws passthrough --------------------------------------------------
+
+    def _session_for_connection(self, conn: ServerConnection) -> str | None:
+        parsed = urlparse(conn.request.path or "/")
+        qs = parse_qs(parsed.query)
+        return (qs.get("session") or [None])[0]
 
     def _context_for_connection(self, conn: ServerConnection) -> UpstreamContext | None:
         """Resolve the session-bound upstream context for this facade client.
@@ -209,12 +223,10 @@ class PlaywrightFacade:
         """
         if self._daemon is None:
             return None
-        parsed = urlparse(conn.request.path or "/")
-        qs = parse_qs(parsed.query)
-        session_id = (qs.get("session") or [None])[0]
+        session_id = self._session_for_connection(conn)
         if not session_id:
             return None
-        return self._daemon.context_for(session_id)
+        return self._daemon.context_for_required(session_id)
 
     async def _handle_client(self, conn: ServerConnection) -> None:
         """One Playwright client connected. For the extension backend, bridge
@@ -224,7 +236,12 @@ class PlaywrightFacade:
         if task is not None:
             self._sessions.add(task)
         try:
-            ctx = self._context_for_connection(conn)
+            try:
+                ctx = self._context_for_connection(conn)
+            except UnknownSessionError:
+                with contextlib.suppress(Exception):
+                    await conn.close(code=1008, reason="unknown browserwright session")
+                return
             backend = ctx.backend if ctx is not None else (self._cfg.backend or "extension")
             if backend == "extension":
                 await self._handle_extension_client(conn, ctx)
@@ -250,7 +267,11 @@ class PlaywrightFacade:
             with contextlib.suppress(Exception):
                 await conn.close(code=1011, reason="extension relay unavailable")
             return
-        bridge = ExtensionFacadeBridge(client=conn, relay=relay)
+        bridge = ExtensionFacadeBridge(
+            client=conn,
+            relay=relay,
+            session_id=self._session_for_connection(conn),
+        )
         try:
             await bridge.run()
         except websockets.exceptions.ConnectionClosed:

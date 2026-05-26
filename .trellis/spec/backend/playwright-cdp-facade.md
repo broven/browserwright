@@ -25,10 +25,15 @@ are mandatory.
   browser-level CDP from the relay's tab state; forwards page-domain frames to
   `chrome.debugger` via the extension.
 - Session-bound facade clients append `?session=<browserwright-session-id>` to the
-  `/cdp` websocket URL. The facade must route that client through
-  `Daemon.context_for(session_id)`, exactly like the agent websocket path, so a
-  single global daemon can serve extension, rdp-create, and rdp-attach sessions
-  without treating backend as a daemon-global choice.
+  `/cdp` websocket URL. HTTP discovery (`/json/version?session=<id>`) must
+  preserve that query in `webSocketDebuggerUrl`. The facade must route that
+  client through `Daemon.context_for_required(session_id)`, exactly like the
+  agent websocket path, so an unknown explicit session fails closed instead of
+  silently falling into the shared extension backend.
+- Extension facade sessions scope discovery and `Target.createTarget` to the
+  session's durable tab group (`ledger.runtime.group_id`, creating/persisting a
+  group id when the first page is opened). Only truly sessionless raw facade
+  clients keep the legacy unscoped "all attached tabs" view.
 
 ## 3. Contracts
 

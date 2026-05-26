@@ -178,6 +178,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "backend-info",
         help="report the running daemon's backend identity (Mode B identity probe)")
     _add_name(p_bi)
+    p_bi.add_argument("--session", default=os.environ.get("BD_SESSION"),
+                      help="browserwright session id (defaults to BD_SESSION)")
     p_bi.add_argument("--json", action="store_true")
 
     # attach-active (v0.5.4 — extension backend only)
@@ -520,9 +522,11 @@ async def _run_backend_info(args, cfg: Config) -> int:
             print("daemon not running", file=sys.stderr)
         return 2
     try:
+        params = {"bsSession": args.session} if args.session else {}
         info = await _rpc_via_ws(
-            cfg, "BrowserwrightDaemon.getBackendInfo", {},
+            cfg, "BrowserwrightDaemon.getBackendInfo", params,
             client_label="cli-backend-info", timeout=5.0,
+            browser_session=args.session,
         )
     except (Unavailable, DaemonError) as e:
         print(f"error: {e}", file=sys.stderr)

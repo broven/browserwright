@@ -38,11 +38,9 @@ lives HERE, not inside `extension_upstream.py`):
         (bounded) for `Runtime.executionContextCreated` so Playwright doesn't
         race ahead of the main-frame default context.
 
-`getTargets` scope policy: the agent path scopes `Target.getTargets` to a
-session's tab group (so two sessions sharing one Chrome are mutually invisible).
-The Playwright facade connection is session-LESS (a raw CDP client), so we use
-the UNSCOPED `ExtensionUpstream.send_text` enumeration — Playwright should see
-every attached tab, which is exactly what makes `context.pages()` enumerate.
+`getTargets` scope policy: session-bound facade connections scope discovery to
+that session's tab group, while genuinely sessionless raw CDP clients keep the
+historical unscoped enumeration.
 """
 from __future__ import annotations
 
@@ -54,6 +52,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection
 
+from ... import session_registry
 from .extension_upstream import (
     ExtensionUpstream,
     _new_upstream_session_id,
@@ -116,9 +115,12 @@ class ExtensionFacadeBridge:
     detaches the relay listener and tears down state.
     """
 
-    def __init__(self, *, client: ServerConnection, relay: RelayServer):
+    def __init__(self, *, client: ServerConnection, relay: RelayServer,
+                 session_id: str | None = None):
         self._client = client
         self._relay = relay
+        self._session_id = session_id
+        self._session_name, self._group_id = self._load_session_scope(session_id)
         # A dedicated ExtensionUpstream over the SAME relay. on_frame routes
         # synthesized/forwarded frames back to THIS Playwright client. on_close
         # is a no-op — the facade owns connection teardown, not the upstream.
@@ -173,6 +175,35 @@ class ExtensionFacadeBridge:
         # so `_handle_runtime_enable` can gate its response on the real event
         # rather than a blind sleep.
         self._ctx_waiters: dict[int, list[asyncio.Future]] = {}
+        if self._session_id is not None and self._group_id is not None:
+            self._ext._bind_group(self._session_id, self._group_id)  # noqa: SLF001
+
+    @staticmethod
+    def _load_session_scope(session_id: str | None) -> tuple[str | None, int | None]:
+        if not session_id:
+            return None, None
+        rec = session_registry.get(session_id)
+        if not isinstance(rec, dict):
+            return None, None
+        name = rec.get("name")
+        name = name if isinstance(name, str) and name else None
+        runtime = rec.get("runtime") or {}
+        gid = runtime.get("group_id") if isinstance(runtime, dict) else None
+        gid = gid if isinstance(gid, int) and gid >= 0 else None
+        return name, gid
+
+    def _persist_group_id(self, group_id: int) -> None:
+        if not self._session_id or group_id < 0:
+            return
+        self._group_id = group_id
+        self._ext._bind_group(self._session_id, group_id)  # noqa: SLF001
+        try:
+            rec = session_registry.get(self._session_id) or {}
+            runtime = dict(rec.get("runtime") or {})
+            runtime["group_id"] = group_id
+            session_registry.update(self._session_id, runtime=runtime)
+        except Exception:
+            pass
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -442,9 +473,18 @@ class ExtensionFacadeBridge:
         # announce attachedToTarget OURSELVES first, THEN send the response.
         self._creating += 1
         try:
-            # Same primitive shape the agent `open_background` verb uses.
+            group_name = self._session_name or "Agent"
+            group_id = self._group_id
             gt = await self._relay.create_background_tab(
-                url, group_name="Agent", group_id=None, background=True)
+                url, group_name=group_name, group_id=group_id, background=True)
+            created_group = getattr(gt, "group_id", -1)
+            created_group = int(created_group) if isinstance(created_group, int) else -1
+            if self._session_id is not None:
+                if created_group < 0:
+                    raise RuntimeError(
+                        "createTarget did not return a tab group id for the "
+                        "session-bound extension facade")
+                self._persist_group_id(created_group)
             # PR3 (research delta #2): a brand-new, not-yet-navigated tab must be
             # reported to Playwright with the initial-empty-document url ":" (NOT
             # "about:blank"), so CRPage's `isInitialEmptyPage = mainFrame().url()
@@ -599,10 +639,24 @@ class ExtensionFacadeBridge:
     # ---- target event synthesis (A2) ------------------------------------
 
     async def _replay_all_targets(self) -> None:
-        """Replay targetCreated + attachedToTarget for EVERY currently-known
-        tab — the playwriter relay behavior that makes context.pages()
-        enumerate. Unscoped on purpose (the facade connection is session-less;
-        Playwright should see all attached tabs)."""
+        """Replay targetCreated + attachedToTarget for visible tabs.
+
+        Session-bound facade connections see only the tab group recorded for
+        that Browserwright session. Sessionless raw CDP clients keep the legacy
+        unscoped view across all attached tabs.
+        """
+        if self._session_id is not None:
+            try:
+                infos = await self._ext.scoped_target_infos(self._session_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("facade(ext) scoped replay failed: %r", e)
+                infos = []
+            for info in infos:
+                target_id = info.get("targetId") if isinstance(info, dict) else None
+                tab_id = _tab_id_from_target_id(target_id) if isinstance(target_id, str) else None
+                if tab_id is not None:
+                    await self._announce_target(tab_id, send_created=True)
+            return
         for g in self._relay.list_ghost_targets():
             tab_id = _tab_id_from_target_id(g.target_id)
             if tab_id is None:
@@ -643,6 +697,20 @@ class ExtensionFacadeBridge:
                     "waitingForDebugger": False,
                 },
             }))
+
+    async def _tab_visible_to_session(self, tab_id: int) -> bool:
+        if self._session_id is None:
+            return True
+        try:
+            infos = await self._ext.scoped_target_infos(self._session_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("facade(ext) scoped visibility check failed: %r", e)
+            return False
+        target_id = f"ext-tab-{tab_id}"
+        return any(
+            isinstance(info, dict) and info.get("targetId") == target_id
+            for info in infos
+        )
 
     def _browser_target_info(self) -> dict:
         """Synthetic targetInfo for the browser itself (type=browser). Some
@@ -711,11 +779,15 @@ class ExtensionFacadeBridge:
             # avoids emitting attachedToTarget before the response.
             if self._creating > 0:
                 return
+            if not await self._tab_visible_to_session(tab_id):
+                return
             await self._announce_target(tab_id, send_created=True)
             return
 
         if kind == "detached":
             sid = self._tab_sessions.get(tab_id)
+            if self._session_id is not None and sid is None:
+                return
             self._evict_tab(tab_id)
             await self._send_to_client(json.dumps({
                 "method": "Target.detachedFromTarget",
@@ -758,6 +830,8 @@ class ExtensionFacadeBridge:
             # consistent and never throws "Frame has been detached").
             self._rewrite_event_frame_id(tab_id, method, params)
             sid = self._tab_sessions.get(tab_id)
+            if self._session_id is not None and sid is None:
+                return
             out: dict[str, Any] = {"method": method, "params": params}
             if sid is not None:
                 out["sessionId"] = sid

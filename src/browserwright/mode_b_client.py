@@ -222,8 +222,11 @@ class ModeBClient:
         the easiest path that doesn't require us to open a ws first.
         """
         try:
+            cmd = ["browserwright-daemon", "backend-info", "--json"]
+            if self._session_id:
+                cmd += ["--session", self._session_id]
             proc = subprocess.run(
-                ["browserwright-daemon", "backend-info", "--json"],
+                cmd,
                 capture_output=True, text=True, timeout=5,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -328,6 +331,8 @@ class ModeBClient:
         cmd = ["browserwright-daemon", "open-background",
                "--url", url,
                "--group", group]
+        if self._session_id:
+            cmd += ["--session", self._session_id]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=15,
@@ -368,6 +373,8 @@ class ModeBClient:
             return None
         self.last_cli_error = None
         cmd = ["browserwright-daemon", "close-tab"]
+        if self._session_id:
+            cmd += ["--session", self._session_id]
         if target_id:
             cmd += ["--target-id", target_id]
         if session_id:

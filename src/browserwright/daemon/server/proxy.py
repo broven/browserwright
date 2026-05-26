@@ -1468,11 +1468,9 @@ class Router:
         Best-effort — a missing registry still answers a clean (non-`-32601`)
         result so a stale-daemon caller never errors on `session end`."""
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        session = params.get("session")
-        if not isinstance(session, str) or not session:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32602,
-                "BrowserwrightDaemon.killExecutor requires params.session"))
+        session = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.killExecutor", params)
+        if session is None:
             return
         daemon = self.daemon
         registry = getattr(daemon, "executors", None) if daemon is not None else None

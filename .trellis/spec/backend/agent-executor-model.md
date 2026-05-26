@@ -31,7 +31,9 @@ model, keyed per session to avoid the deleted global-REPL cross-talk).
   (per-session `asyncio.Lock` single-flight; for rdp it `_ensure_upstream()`s
   the Chrome FIRST so the deferred cold-start can connect).
 - Control plane: `BrowserwrightDaemon.killExecutor {session}` — reap without
-  browser teardown (used by `session_create.end()` for attach sessions).
+  browser teardown (used by `session_create.end()` for attach sessions). The
+  websocket must be bound with the same `?session=<id>`; sessionless or
+  mismatched requests fail at the daemon boundary.
 - Control-plane callers must keep Browserwright's durable session id separate
   from CDP's top-level `sessionId`. The websocket is already bound with
   `?session=<id>`; optional request validation repeats it as `params.bsSession`

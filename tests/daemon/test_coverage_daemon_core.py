@@ -758,7 +758,11 @@ def test_daemon_context_for_rdp_lazily_creates_isolated_config(monkeypatch):
 
 
 def test_daemon_context_for_unknown_or_non_rdp_uses_shared(monkeypatch):
-    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.daemon import (
+        Daemon,
+        UnknownSessionError,
+        UpstreamContext,
+    )
     from browserwright.daemon.server.state import DaemonState
 
     class Router:
@@ -769,8 +773,11 @@ def test_daemon_context_for_unknown_or_non_rdp_uses_shared(monkeypatch):
     monkeypatch.setattr("browserwright.daemon.server.daemon.session_registry.get", lambda sid: None)
     assert daemon.context_for(None) is shared
     assert daemon.context_for("missing") is shared
+    with pytest.raises(UnknownSessionError):
+        daemon.context_for_required("missing")
     monkeypatch.setattr("browserwright.daemon.server.daemon.session_registry.get", lambda sid: {"backend": "extension"})
     assert daemon.context_for("extension-session") is shared
+    assert daemon.context_for_required("extension-session") is shared
 
 
 @pytest.mark.asyncio
