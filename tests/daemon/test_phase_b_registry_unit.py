@@ -276,6 +276,28 @@ async def test_ensure_executor_verb_returns_socket():
 
 
 @pytest.mark.asyncio
+async def test_ensure_executor_rejects_mismatched_browserwright_session_param():
+    router, client, captured = _router_with_client()
+
+    class _Daemon:
+        class _Reg:
+            async def ensure(self, session_id):
+                raise AssertionError("registry must not be reached")
+
+        executors = _Reg()
+
+    router.daemon = _Daemon()
+    await router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "BrowserwrightDaemon.ensureExecutor",
+        "params": {"bsSession": "other"},
+    }))
+    err = captured[client.client_id][-1]["error"]
+    assert err["code"] == -32602
+    assert "session mismatch" in err["message"]
+
+
+@pytest.mark.asyncio
 async def test_ensure_executor_verb_requires_ws_session():
     router, client, captured = _router_with_client()
     client.session_id = None  # no ws ?session=

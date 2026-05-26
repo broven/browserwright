@@ -138,6 +138,28 @@ def test_skill_doc_documents_state_and_reset_surface():
     assert "daemon restart" in doc.lower()
 
 
+def test_executor_control_plane_uses_browserwright_session_param():
+    from browserwright._executor import client as exec_client
+
+    calls = []
+
+    class _CDP:
+        def send(self, method, **kwargs):
+            calls.append((method, kwargs))
+            return {"exec_sock": "/tmp/bw-exec.sock"}
+
+    sess = type("Sess", (), {
+        "session_record": {"id": "rdp-7", "backend": "rdp"},
+        "cdp": _CDP(),
+    })()
+
+    assert exec_client.ensure_executor(sess) == "/tmp/bw-exec.sock"
+    assert calls == [(
+        "BrowserwrightDaemon.ensureExecutor",
+        {"bsSession": "rdp-7"},
+    )]
+
+
 def test_skill_doc_signature_uses_ellipsis_for_uninspectable_callable(monkeypatch):
     from browserwright import skill_doc
 

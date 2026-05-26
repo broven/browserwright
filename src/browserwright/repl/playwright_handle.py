@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from ..errors import BrowserwrightError
 
@@ -52,22 +53,47 @@ class FacadeUnavailable(BrowserwrightError):
                    "pass `--facade-port 0`.")
 
 
-def _facade_ws_url() -> str:
+def _current_browserwright_session_id() -> str | None:
+    """Best-effort Browserwright session id bound to the current process."""
+    try:
+        from ..session import current_session
+        rec = getattr(current_session(), "session_record", None)
+    except Exception:
+        return None
+    if isinstance(rec, dict) and rec.get("id"):
+        return str(rec["id"])
+    return None
+
+
+def _with_session_query(ws_url: str, session_id: str | None) -> str:
+    """Append the Browserwright session id to the facade URL query."""
+    if not session_id:
+        return ws_url
+    parts = urlsplit(ws_url)
+    query = parts.query
+    sep = "&" if query else ""
+    query = f"{query}{sep}session={quote(session_id, safe='')}"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+def _facade_ws_url(*, session_id: str | None = None) -> str:
     """Discover the running daemon's facade ws URL.
 
     Prefers an explicit ``BD_FACADE_WS`` override (tests / advanced setups),
     else reads the daemon's ``_ipc`` facade discovery file. Raises
     :class:`FacadeUnavailable` when nothing is found."""
     override = os.environ.get("BD_FACADE_WS")
+    if session_id is None:
+        session_id = _current_browserwright_session_id()
     if override:
-        return override
+        return _with_session_query(override, session_id)
     from ..daemon import _ipc
     ws, _port = _ipc.read_facade_file()
     if not ws:
         raise FacadeUnavailable(
             "no Playwright facade advertised by the daemon "
             "(facade discovery file absent)")
-    return ws
+    return _with_session_query(ws, session_id)
 
 
 def _agent_page_targets(sess: Any) -> list[dict]:

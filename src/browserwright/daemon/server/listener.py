@@ -203,7 +203,8 @@ async def run_serve(cfg: Config) -> int:
                 return shared_context.holder.relay
 
             facade = PlaywrightFacade(cfg=cfg, port=facade_port,
-                                      relay_getter=_shared_relay)
+                                      relay_getter=_shared_relay,
+                                      daemon=daemon)
             bound = await facade.start()
             facade_ws = f"ws://127.0.0.1:{bound}/cdp"
             # Advertise the bound ws so the skill layer can discover it (Phase C

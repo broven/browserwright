@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,6 +84,46 @@ async def test_stop_cleans_up_inflight_session(facade):
     again = PlaywrightFacade(cfg=Config(backend="rdp"), port=0)
     assert await again.start() > 0
     await again.stop()
+
+
+async def test_session_query_routes_facade_to_session_context(monkeypatch):
+    shared_cfg = Config(backend="extension")
+    session_cfg = Config(backend="rdp")
+    session_cfg.backends.rdp.port = 9444
+    holder = SimpleNamespace(_cfg=session_cfg, relay=None)
+    ctx = SimpleNamespace(backend="rdp", holder=holder)
+    calls = []
+
+    class _Daemon:
+        def context_for(self, session_id):
+            calls.append(session_id)
+            return ctx
+
+    f = PlaywrightFacade(cfg=shared_cfg, port=0, daemon=_Daemon())
+
+    async def fake_resolve(cfg):
+        assert cfg.backends.rdp.port == 9444
+        return SimpleNamespace(ws_url="ws://127.0.0.1:9444/devtools/browser/session")
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.facade.resolve_upstream", fake_resolve)
+
+    class _Conn:
+        request = SimpleNamespace(path="/cdp?session=rdp-session")
+
+    assert await f._resolve_rdp_ws(f._context_for_connection(_Conn())) == (
+        "ws://127.0.0.1:9444/devtools/browser/session"
+    )
+    assert calls == ["rdp-session"]
+
+
+async def test_facade_without_session_keeps_shared_backend():
+    f = PlaywrightFacade(cfg=Config(backend="extension"), port=0)
+
+    class _Conn:
+        request = SimpleNamespace(path="/cdp")
+
+    assert f._context_for_connection(_Conn()) is None
 
 
 async def _get_json(url: str):

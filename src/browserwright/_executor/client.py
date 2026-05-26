@@ -53,7 +53,11 @@ def ensure_executor(sess) -> str:
     control-plane verb."""
     sid = _session_id(sess)
     try:
-        res = sess.cdp.send("BrowserwrightDaemon.ensureExecutor", session=sid)
+        # The browserwright session is already bound on the websocket query
+        # (`?session=<id>`). Do not pass it as CDP's top-level `sessionId`;
+        # that field means "attached target session" inside the proxy mux.
+        res = sess.cdp.send(
+            "BrowserwrightDaemon.ensureExecutor", bsSession=sid)
     except Exception as e:  # noqa: BLE001
         raise ExecutorUnavailable(
             f"ensureExecutor failed for session {sid!r}: {e}") from e

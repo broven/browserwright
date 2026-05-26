@@ -45,6 +45,7 @@ import http
 import json
 import logging
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
@@ -53,6 +54,7 @@ from .. import __version__
 from ..config import DEFAULT_FACADE_PORT, Config
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
+from .daemon import Daemon, UpstreamContext
 from .facade_extension import ExtensionFacadeBridge
 from .relay import RelayServer
 from .upstream import _localhost_bypass_proxy
@@ -81,7 +83,8 @@ class PlaywrightFacade:
 
     def __init__(self, *, cfg: Config, port: int = DEFAULT_FACADE_PORT,
                  host: str = "127.0.0.1",
-                 relay_getter: Callable[[], RelayServer | None] | None = None):
+                 relay_getter: Callable[[], RelayServer | None] | None = None,
+                 daemon: Daemon | None = None):
         self._cfg = cfg
         self._port = port
         self._host = host
@@ -92,6 +95,10 @@ class PlaywrightFacade:
         # may be (re)bound across reconnects, so we resolve it lazily per
         # client connection rather than capturing the instance now).
         self._relay_getter = relay_getter
+        # Single-daemon model: raw Playwright facade clients may carry
+        # `?session=<id>`. When present, route them to that session's
+        # UpstreamContext instead of the shared daemon backend.
+        self._daemon = daemon
         # Track live passthrough/bridge tasks so stop() can cancel them.
         self._sessions: set[asyncio.Task] = set()
 
@@ -192,10 +199,22 @@ class PlaywrightFacade:
 
     # ---- ws passthrough --------------------------------------------------
 
-    def _backend_name(self) -> str:
-        """The effective shared backend. `run_serve` defaults a missing backend
-        to extension, so mirror that here."""
-        return self._cfg.backend or "extension"
+    def _context_for_connection(self, conn: ServerConnection) -> UpstreamContext | None:
+        """Resolve the session-bound upstream context for this facade client.
+
+        A missing session keeps the historical shared-backend facade behavior
+        used by generic `connect_over_cdp` callers. A present session id must
+        use the same ledger-backed `Daemon.context_for()` routing as the agent
+        websocket path.
+        """
+        if self._daemon is None:
+            return None
+        parsed = urlparse(conn.request.path or "/")
+        qs = parse_qs(parsed.query)
+        session_id = (qs.get("session") or [None])[0]
+        if not session_id:
+            return None
+        return self._daemon.context_for(session_id)
 
     async def _handle_client(self, conn: ServerConnection) -> None:
         """One Playwright client connected. For the extension backend, bridge
@@ -205,19 +224,27 @@ class PlaywrightFacade:
         if task is not None:
             self._sessions.add(task)
         try:
-            if self._backend_name() == "extension":
-                await self._handle_extension_client(conn)
+            ctx = self._context_for_connection(conn)
+            backend = ctx.backend if ctx is not None else (self._cfg.backend or "extension")
+            if backend == "extension":
+                await self._handle_extension_client(conn, ctx)
                 return
-            await self._handle_rdp_client(conn)
+            await self._handle_rdp_client(conn, ctx)
         finally:
             if task is not None:
                 self._sessions.discard(task)
 
-    async def _handle_extension_client(self, conn: ServerConnection) -> None:
+    async def _handle_extension_client(
+        self, conn: ServerConnection, ctx: UpstreamContext | None = None,
+    ) -> None:
         """Bridge a Playwright client to the extension backend via the shared
         relay. Requires the relay to be up (it is started eagerly in run_serve
         for the extension backend)."""
-        relay = self._relay_getter() if self._relay_getter is not None else None
+        relay = None
+        if ctx is not None:
+            relay = getattr(ctx.holder, "relay", None)
+        if relay is None and self._relay_getter is not None:
+            relay = self._relay_getter()
         if relay is None:
             logger.warning("facade(ext): no relay available; refusing client")
             with contextlib.suppress(Exception):
@@ -233,10 +260,12 @@ class PlaywrightFacade:
             with contextlib.suppress(Exception):
                 await bridge.aclose()
 
-    async def _handle_rdp_client(self, conn: ServerConnection) -> None:
+    async def _handle_rdp_client(
+        self, conn: ServerConnection, ctx: UpstreamContext | None = None,
+    ) -> None:
         """rdp backend (PR1): transparent byte-for-byte passthrough."""
         try:
-            ws_url = await self._resolve_rdp_ws()
+            ws_url = await self._resolve_rdp_ws(ctx)
         except Unavailable as e:
             logger.warning("facade: cannot resolve upstream Chrome: %s", e)
             with contextlib.suppress(Exception):
@@ -255,13 +284,14 @@ class PlaywrightFacade:
         except Exception as e:  # noqa: BLE001
             logger.warning("facade: bridge crashed: %r", e)
 
-    async def _resolve_rdp_ws(self) -> str:
+    async def _resolve_rdp_ws(self, ctx: UpstreamContext | None = None) -> str:
         """Resolve the upstream Chrome CDP ws URL via the daemon resolver.
 
         Phase A1 is rdp-only; the resolver's rdp backend reads
         `/json/version` (or the DevToolsActivePort fallback) and returns the
         browser-level ws the daemon-owned Chrome is listening on."""
-        rr = await resolve_upstream(self._cfg)
+        cfg = getattr(ctx.holder, "_cfg", self._cfg) if ctx is not None else self._cfg
+        rr = await resolve_upstream(cfg)
         return rr.ws_url
 
     async def _bridge(self, client: ServerConnection, upstream_url: str) -> None:

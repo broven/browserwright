@@ -24,6 +24,11 @@ are mandatory.
 - extension backend → `ExtensionFacadeBridge` (`_handle_extension_client`): synthesizes
   browser-level CDP from the relay's tab state; forwards page-domain frames to
   `chrome.debugger` via the extension.
+- Session-bound facade clients append `?session=<browserwright-session-id>` to the
+  `/cdp` websocket URL. The facade must route that client through
+  `Daemon.context_for(session_id)`, exactly like the agent websocket path, so a
+  single global daemon can serve extension, rdp-create, and rdp-attach sessions
+  without treating backend as a daemon-global choice.
 
 ## 3. Contracts
 
@@ -37,6 +42,18 @@ bridge.
 **Why**: The agent path depends on `Target.setAutoAttach` being a silent ack and on
 sessionId being stripped (the Router re-adds it). Emitting synthetic target events or
 echoing sessionId into that path is a regression.
+
+### Convention: backend choice is session-scoped, not facade-global
+
+The daemon is single and global. The session ledger's immutable `backend` field
+is the routing source of truth. The skill/executor Playwright handle appends the
+bound Browserwright session id to the facade websocket URL; the facade then asks
+`Daemon.context_for(session_id)` for the correct `UpstreamContext`.
+
+Without this, a default shared daemon (`extension`) plus an rdp session can
+start the rdp upstream correctly through `ensureExecutor`, then have the
+executor's later `connect_over_cdp` enter the extension facade because the raw
+facade connection was sessionless. That is cross-backend leakage.
 
 ### Gotcha: relay fan-out is safe ONLY by await-ordering
 
@@ -105,6 +122,11 @@ Playwright's `CRPage.FrameSession._initialize()` rejects → `Target.closeTarget
     ordering, per-tab state eviction.
   - `Runtime.enable` disable→enable + context-event gate; page-session `setAutoAttach`
     forwarded; `browserContextId` present.
+- `tests/daemon/test_facade_unit.py`: session query routing picks the session's
+  `UpstreamContext` and uses its rdp config even when the shared daemon backend is
+  extension; a missing session preserves shared-backend behavior.
+- `tests/daemon/test_phase_c_foundation_unit.py`: the skill Playwright facade URL
+  includes the bound Browserwright session id and preserves existing query params.
 - `tests/daemon/e2e/test_l1_playwright_facade_extension.py`: high-level `new_page()` +
   navigation over the extension harness (CDP-level + high-level cases).
 - `tests/daemon/e2e/test_l1_playwright_facade.py`: rdp passthrough non-regression.

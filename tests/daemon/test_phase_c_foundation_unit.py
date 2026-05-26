@@ -71,6 +71,25 @@ def test_facade_file_bad_json(tmp_path, monkeypatch):
     assert _ipc.read_facade_file() == (None, None)
 
 
+def test_facade_ws_url_carries_bound_browserwright_session(tmp_path, monkeypatch):
+    import browserwright.repl.playwright_handle as ph
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+    monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "rdp 7")
+
+    assert ph._facade_ws_url() == "ws://127.0.0.1:19990/cdp?session=rdp%207"
+
+
+def test_facade_ws_url_preserves_existing_query(tmp_path, monkeypatch):
+    import browserwright.repl.playwright_handle as ph
+
+    monkeypatch.setenv("BD_FACADE_WS", "ws://127.0.0.1:19990/cdp?debug=1")
+    monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "s-1")
+
+    assert ph._facade_ws_url() == "ws://127.0.0.1:19990/cdp?debug=1&session=s-1"
+
+
 # ---- status --json surfaces facade -----------------------------------------
 
 

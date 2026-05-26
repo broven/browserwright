@@ -32,6 +32,12 @@ model, keyed per session to avoid the deleted global-REPL cross-talk).
   the Chrome FIRST so the deferred cold-start can connect).
 - Control plane: `BrowserwrightDaemon.killExecutor {session}` — reap without
   browser teardown (used by `session_create.end()` for attach sessions).
+- Control-plane callers must keep Browserwright's durable session id separate
+  from CDP's top-level `sessionId`. The websocket is already bound with
+  `?session=<id>`; optional request validation repeats it as `params.bsSession`
+  or `params.session`. Do **not** pass the Browserwright session id through the
+  CDP client's `session=` argument, because that serializes as top-level
+  `sessionId` and means "attached target session" in the proxy mux.
 - Data plane (executor's own unix socket): length-framed JSON
   `ExecuteRequest{code, timeout_ms}` → `ExecuteResponse{console, return_value,
   warnings, screenshots, truncated, error, exit_code}`. Bulk code/output NEVER
@@ -119,7 +125,9 @@ a local `exec`).
   unlink; lazy cold-start on first execute + reuse; cold-start failure →
   actionable error with retry; driver entered once (no re-enter on retry/reset);
   `reset()` disarm-old/re-arm-new WITHOUT `os._exit`; `endSession`/`killExecutor`
-  pass `browser_session` to `_rpc_via_ws`.
+  pass `browser_session` to `_rpc_via_ws`; `ensureExecutor` uses
+  `params.bsSession` (not top-level CDP `sessionId`) and rejects mismatches
+  against the websocket-bound Browserwright session.
 - E2E (`tests/daemon/e2e/test_l2_phase_b_executor.py`, rdp + extension, CfT
   harness): cross-heredoc state/page persist; single-executor/single-tab;
   `reset()` clears state + page still works (process survives); `endSession`
