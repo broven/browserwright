@@ -581,7 +581,7 @@ def _cmd_release(args: list[str]) -> int:
             else:
                 print(f"installed browserwright {info['version']} -> {info['path']}")
                 if info.get("activated"):
-                    print("activated release symlinks")
+                    print("activated global entry points")
                 if info["actions"].get("restart_daemon"):
                     print("next: restart daemon (`browserwright-daemon restart`)")
                 if info["actions"].get("reload_chrome_extension"):
@@ -603,7 +603,7 @@ def _cmd_release(args: list[str]) -> int:
             suffix = "  restart required" if daemon.get("restart_required") else ""
             print(f"running daemon:    {daemon_version}{suffix}")
             ok = all(row.get("ok") for row in info.get("skill", []))
-            print(f"skill install:     {'release-linked ok' if ok else 'needs relink'}")
+            print(f"skill install:     {'copied ok' if ok else 'needs reinstall'}")
             return 0
 
         if sub == "list":

@@ -28,8 +28,7 @@ done
 
 # Ensure skill dir symlinks.
 skill_src="$REPO/skill"
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-for skill_dst in "$HOME/.claude/skills/browserwright" "$codex_home/skills/browserwright" "$HOME/.pi/agent/skills/browserwright"; do
+for skill_dst in "$HOME/.agents/skills/browserwright"; do
   if [[ ! -L "$skill_dst" || "$(readlink "$skill_dst")" != "$skill_src" ]]; then
     echo "linking $skill_dst -> $skill_src"
     mkdir -p "$(dirname "$skill_dst")"

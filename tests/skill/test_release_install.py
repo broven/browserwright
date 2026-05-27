@@ -46,14 +46,12 @@ def test_default_skill_targets_include_claude_codex_and_pi(monkeypatch, tmp_path
     from browserwright import release_install
 
     home = tmp_path / "home"
-    codex_home = tmp_path / "custom-codex"
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.delenv(release_install.SKILL_TARGETS_ENV, raising=False)
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
     assert release_install.skill_targets() == [
         home / ".claude" / "skills" / "browserwright",
-        codex_home / "skills" / "browserwright",
+        home / ".agents" / "skills" / "browserwright",
         home / ".pi" / "agent" / "skills" / "browserwright",
     ]
 
@@ -94,15 +92,17 @@ def test_release_install_local_copies_artifacts_and_activates(monkeypatch, tmp_p
     assert (installed / "chrome-extension" / "manifest.json").is_file()
     assert json.loads((installed / "release.json").read_text(encoding="utf-8"))["version"] == "0.6.0"
     assert local_bin.joinpath("browserwright").resolve() == installed / ".venv" / "bin" / "browserwright"
-    assert skill_a.resolve() == installed / "skill"
-    assert skill_b.resolve() == installed / "skill"
-    assert skill_c.resolve() == installed / "skill"
-    assert skill_a.resolve() != repo / "skill"
+    assert not skill_a.is_symlink()
+    assert not skill_b.is_symlink()
+    assert not skill_c.is_symlink()
+    assert (skill_a / "SKILL.md").read_text(encoding="utf-8") == "# shell\n"
+    assert (skill_b / "SKILL.md").read_text(encoding="utf-8") == "# shell\n"
+    assert (skill_c / "SKILL.md").read_text(encoding="utf-8") == "# shell\n"
     assert result["chrome_extension_sync"]["path"].endswith("chrome-extension/browserwright")
     assert (tmp_path / "icloud" / "chrome-extension" / "browserwright" / "manifest.json").is_file()
 
 
-def test_release_status_reports_daemon_restart_and_skill_link(monkeypatch, tmp_path):
+def test_release_status_reports_daemon_restart_and_copied_skill(monkeypatch, tmp_path):
     from browserwright import release_install
 
     _release_root, local_bin, skill_a, _skill_b, _skill_c = _isolate_release_env(monkeypatch, tmp_path)
@@ -110,9 +110,10 @@ def test_release_status_reports_daemon_restart_and_skill_link(monkeypatch, tmp_p
     (installed / ".venv" / "bin").mkdir(parents=True)
     (installed / ".venv" / "bin" / "browserwright").write_text("# cli")
     (installed / "skill").mkdir()
+    (installed / "skill" / "SKILL.md").write_text("# shell\n", encoding="utf-8")
     (installed / "release.json").write_text('{"version":"0.6.0"}\n', encoding="utf-8")
     release_install._atomic_symlink(installed / ".venv" / "bin" / "browserwright", local_bin / "browserwright")
-    release_install._atomic_symlink(installed / "skill", skill_a)
+    release_install._copytree_replace(installed / "skill", skill_a)
     monkeypatch.setattr(release_install, "_daemon_status", lambda: {"alive": True, "version": "0.5.9"})
 
     status = release_install.status()
@@ -120,6 +121,7 @@ def test_release_status_reports_daemon_restart_and_skill_link(monkeypatch, tmp_p
     assert status["installed_version"] == "0.6.0"
     assert status["daemon"]["restart_required"] is True
     assert status["skill"][0]["ok"] is True
+    assert status["skill"][0]["target"] is None
 
 
 def test_release_activate_rejects_missing_version(monkeypatch, tmp_path):

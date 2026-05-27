@@ -57,9 +57,7 @@ def skill_targets() -> list[Path]:
         return [Path(p).expanduser() for p in override.split(os.pathsep) if p]
     return [
         Path.home() / ".claude" / "skills" / "browserwright",
-        Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-        / "skills"
-        / "browserwright",
+        Path.home() / ".agents" / "skills" / "browserwright",
         Path.home() / ".pi" / "agent" / "skills" / "browserwright",
     ]
 
@@ -116,6 +114,20 @@ def hash_paths(paths: list[Path]) -> str:
             h.update(rel.encode("utf-8"))
             h.update(b"\0")
             h.update(_file_hash(path))
+    return h.hexdigest()
+
+
+def hash_directory_contents(root: Path) -> str:
+    h = hashlib.sha256()
+    if not root.exists():
+        return h.hexdigest()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if "__pycache__" in path.parts or path.name.endswith((".pyc", ".pyo")):
+            continue
+        rel = path.relative_to(root).as_posix()
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(_file_hash(path))
     return h.hexdigest()
 
 
@@ -199,6 +211,22 @@ def _copytree(src: Path, dst: Path) -> None:
         dst,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
     )
+
+
+def _copytree_replace(src: Path, dst: Path) -> None:
+    if not src.is_dir():
+        raise ReleaseError(f"required directory missing: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    _copytree(src, tmp)
+    if dst.exists() and not dst.is_symlink():
+        shutil.rmtree(dst)
+    elif dst.exists() or dst.is_symlink():
+        dst.unlink()
+    os.replace(tmp, dst)
 
 
 def sync_chrome_extension(version: str) -> dict[str, Any] | None:
@@ -294,7 +322,7 @@ def activate(version: str) -> dict[str, Any]:
         bin_dir / "browserwright-daemon",
     )
     for skill in skill_targets():
-        _atomic_symlink(target / "skill", skill)
+        _copytree_replace(target / "skill", skill)
     return {"version": version, "path": str(target)}
 
 
@@ -402,11 +430,20 @@ def status() -> dict[str, Any]:
     active = active_release_dir()
     version = active.name if active else None
     daemon = _daemon_status()
+    active_skill = active / "skill" if active else None
+    expected_skill_hash = (
+        hash_directory_contents(active_skill) if active_skill is not None else None
+    )
     skill = [
         {
             "path": str(path),
             "target": str(path.resolve()) if path.is_symlink() else None,
-            "ok": path.is_symlink() and active is not None and path.resolve() == active / "skill",
+            "ok": (
+                path.is_dir()
+                and not path.is_symlink()
+                and expected_skill_hash is not None
+                and hash_directory_contents(path) == expected_skill_hash
+            ),
         }
         for path in skill_targets()
     ]
