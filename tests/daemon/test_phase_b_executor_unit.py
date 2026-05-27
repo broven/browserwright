@@ -797,6 +797,17 @@ def test_connect_over_cdp_retries_then_succeeds(monkeypatch):
     assert slept == [0.1, 0.1]  # backed off between the 3 attempts
 
 
+def test_connect_over_cdp_adds_session_query(monkeypatch):
+    """Session-scoped facade connections let extension context.new_page() tabs
+    join the browserwright session group and close on session end."""
+    from browserwright.repl import playwright_handle as ph
+
+    monkeypatch.setattr(ph, "_facade_ws_url", lambda: "ws://x/cdp?existing=1")
+    pw = _FakePw(fail_times=0)
+    browser = ph.connect_over_cdp(pw, session_id="bw-s")
+    assert browser == "browser@ws://x/cdp?existing=1&session=bw-s"
+
+
 def test_connect_over_cdp_exhausts_attempts_raises(monkeypatch):
     """All attempts fail → FacadeUnavailable with the last failure context."""
     from browserwright.repl import playwright_handle as ph

@@ -45,6 +45,7 @@ import http
 import json
 import logging
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
@@ -223,7 +224,23 @@ class PlaywrightFacade:
             with contextlib.suppress(Exception):
                 await conn.close(code=1011, reason="extension relay unavailable")
             return
-        bridge = ExtensionFacadeBridge(client=conn, relay=relay)
+        query = parse_qs(urlparse(conn.request.path or "/").query)
+        session_id = (query.get("session") or [None])[0]
+        session_name = None
+        session_group_id = None
+        if session_id:
+            from ... import session_registry
+            rec = session_registry.get(session_id)
+            if isinstance(rec, dict):
+                session_name = rec.get("name")
+                runtime = rec.get("runtime") or {}
+                gid = runtime.get("group_id") if isinstance(runtime, dict) else None
+                if isinstance(gid, int) and gid >= 0:
+                    session_group_id = gid
+        bridge = ExtensionFacadeBridge(
+            client=conn, relay=relay,
+            session_id=session_id, session_name=session_name,
+            session_group_id=session_group_id)
         try:
             await bridge.run()
         except websockets.exceptions.ConnectionClosed:

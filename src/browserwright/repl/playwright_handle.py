@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..errors import BrowserwrightError
 
@@ -68,6 +69,25 @@ def _facade_ws_url() -> str:
             "no Playwright facade advertised by the daemon "
             "(facade discovery file absent)")
     return ws
+
+
+def _session_scoped_ws_url(ws_url: str, session_id: str | None) -> str:
+    """Attach the browserwright session id to a facade ws URL."""
+    if not session_id:
+        return ws_url
+    parts = urlsplit(ws_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["session"] = session_id
+    return urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urlencode(query), parts.fragment,
+    ))
+
+
+def _session_id_from(sess: Any) -> str | None:
+    rec = getattr(sess, "session_record", None)
+    sid = rec.get("id") if isinstance(rec, dict) else None
+    return sid if isinstance(sid, str) and sid else None
 
 
 def _agent_page_targets(sess: Any) -> list[dict]:
@@ -107,7 +127,8 @@ def _agent_page_targets(sess: Any) -> list[dict]:
 # the per-heredoc Phase C consumer; the executor is the Phase B consumer.
 
 
-def connect_over_cdp(pw: Any, *, attempts: int = 1,
+def connect_over_cdp(pw: Any, *, session_id: str | None = None,
+                     attempts: int = 1,
                      backoff_s: float = 0.5) -> Any:
     """``chromium.connect_over_cdp`` to the daemon facade. Returns the Browser.
 
@@ -132,6 +153,7 @@ def connect_over_cdp(pw: Any, *, attempts: int = 1,
             ws_url = None
         if ws_url is not None:
             try:
+                ws_url = _session_scoped_ws_url(ws_url, session_id)
                 return pw.chromium.connect_over_cdp(ws_url, timeout=20000)
             except Exception as e:  # noqa: BLE001
                 last_exc = FacadeUnavailable(
@@ -268,8 +290,10 @@ class PlaywrightHandle:
 
         self._pw_cm = sync_playwright()
         self._pw = self._pw_cm.__enter__()
+        sess = current_session()
         try:
-            self._browser = connect_over_cdp(self._pw)
+            self._browser = connect_over_cdp(
+                self._pw, session_id=_session_id_from(sess))
         except Exception as e:
             # Tear the driver back down so a failed connect doesn't leak it.
             with _suppress():
@@ -278,7 +302,7 @@ class PlaywrightHandle:
             self._pw = None
             raise
         self._context = context_for_browser(self._browser)
-        self._page = bind_current_page(self._context, current_session())
+        self._page = bind_current_page(self._context, sess)
         self._connected = True
 
     # ---- accessors (trigger the lazy connect) ---------------------------
