@@ -252,11 +252,13 @@ class _Worker:
         # times over ~10s so the startup race doesn't hard-fail the executor.
         # `ensureExecutor` now also pre-launches Chrome before returning the exec
         # socket, so this is belt-and-suspenders, not the primary fix.
+        sess = current_session()
         self._browser = ph.connect_over_cdp(
-            self._pw, attempts=_COLD_START_CONNECT_ATTEMPTS,
+            self._pw, session_id=ph._session_id_from(sess),
+            attempts=_COLD_START_CONNECT_ATTEMPTS,
             backoff_s=_COLD_START_CONNECT_BACKOFF_S)
         self._context = ph.context_for_browser(self._browser)
-        self._page = ph.bind_current_page(self._context, current_session())
+        self._page = ph.bind_current_page(self._context, sess)
         self._snapshot_holder.page = self._page
         self._snapshot = make_snapshot(self._snapshot_holder)
         self._arm_facade_death()

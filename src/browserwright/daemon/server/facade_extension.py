@@ -50,6 +50,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection
@@ -116,9 +117,15 @@ class ExtensionFacadeBridge:
     detaches the relay listener and tears down state.
     """
 
-    def __init__(self, *, client: ServerConnection, relay: RelayServer):
+    def __init__(
+        self, *, client: ServerConnection, relay: RelayServer,
+        session_id: str | None = None, session_name: str | None = None,
+        session_group_id: int | None = None,
+    ):
         self._client = client
         self._relay = relay
+        self._session_id = session_id
+        self._session_name = session_name or session_id
         # A dedicated ExtensionUpstream over the SAME relay. on_frame routes
         # synthesized/forwarded frames back to THIS Playwright client. on_close
         # is a no-op — the facade owns connection teardown, not the upstream.
@@ -127,6 +134,10 @@ class ExtensionFacadeBridge:
             on_frame=self._send_to_client,
             on_close=self._noop_close,
         )
+        if (self._session_id is not None
+                and isinstance(session_group_id, int)
+                and session_group_id >= 0):
+            self._ext._bind_group(self._session_id, session_group_id)  # noqa: SLF001
         # tab_id → synthetic flat sessionId we've handed Playwright for it. One
         # entry per tab we've announced via attachedToTarget, so a later
         # `targetDestroyed`/`detachedFromTarget` references the same session and
@@ -442,9 +453,16 @@ class ExtensionFacadeBridge:
         # announce attachedToTarget OURSELVES first, THEN send the response.
         self._creating += 1
         try:
-            # Same primitive shape the agent `open_background` verb uses.
-            gt = await self._relay.create_background_tab(
-                url, group_name="Agent", group_id=None, background=True)
+            # Same session-group discipline as the agent `open_background`
+            # verb: when the Playwright facade is session-scoped, tabs created
+            # by context.new_page() must belong to that session so session end
+            # can close them.
+            gt = await self._ext.open_background_tab(
+                url, group_name=self._session_name,
+                session_id=self._session_id,
+                background=True)
+            tab_id = int(gt["tabId"])
+            self._persist_session_group(gt.get("groupId"))
             # PR3 (research delta #2): a brand-new, not-yet-navigated tab must be
             # reported to Playwright with the initial-empty-document url ":" (NOT
             # "about:blank"), so CRPage's `isInitialEmptyPage = mainFrame().url()
@@ -454,18 +472,34 @@ class ExtensionFacadeBridge:
             # the extension's tab has already committed about:blank by attach
             # time, so we normalize it here until the first real frameNavigated.
             if url in ("", "about:blank"):
-                self._fresh_blank_tabs.add(gt.tab_id)
+                self._fresh_blank_tabs.add(tab_id)
             else:
-                self._tab_url[gt.tab_id] = url
+                self._tab_url[tab_id] = url
             # Announce BEFORE the response (Chrome ordering Playwright relies on).
-            await self._announce_target(gt.tab_id, send_created=True)
+            await self._announce_target(
+                tab_id, sid=gt.get("sessionId"), send_created=True)
         except Exception as e:  # noqa: BLE001
             await self._error(req_id, -32603,
                               f"createTarget→createTab failed: {e!r}")
             return
         finally:
             self._creating -= 1
-        await self._respond(req_id, {"targetId": gt.target_id})
+        await self._respond(req_id, {"targetId": gt["targetId"]})
+
+    def _persist_session_group(self, group_id: Any) -> None:
+        """Best-effort: make facade-created tabs durable for session end."""
+        if self._session_id is None or not isinstance(group_id, int) or group_id < 0:
+            return
+        try:
+            from ... import session_registry
+            rec = session_registry.get(self._session_id)
+            runtime = (rec.get("runtime") or {}) if isinstance(rec, dict) else {}
+            runtime = dict(runtime) if isinstance(runtime, dict) else {}
+            runtime["group_id"] = group_id
+            runtime["updated_at"] = time.time()
+            session_registry.update(self._session_id, runtime=runtime)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _handle_close_target(self, req_id: int | None,
                                    params: dict) -> None:
