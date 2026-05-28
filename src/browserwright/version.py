@@ -16,10 +16,29 @@ _SEMVER_RE = re.compile(
 )
 
 
+def _is_browserwright_pyproject(path: Path) -> bool:
+    """Return True when `path` is a pyproject.toml owned by the browserwright project.
+
+    Walking up from `__file__` toward a `pyproject.toml` is ambiguous: a user
+    who runs `pip install browserwright` inside another project's virtualenv
+    would otherwise resolve that unrelated project's root as our "repo root"
+    and start hunting for `chrome-extension/manifest.json` there. Anchoring on
+    `project.name == "browserwright"` keeps `_repo_root()` honest.
+    """
+    try:
+        import tomllib
+
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        return data.get("project", {}).get("name") == PACKAGE_NAME
+    except Exception:
+        return False
+
+
 def _repo_root() -> Path | None:
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "pyproject.toml").is_file():
+        candidate = parent / "pyproject.toml"
+        if candidate.is_file() and _is_browserwright_pyproject(candidate):
             return parent
     return None
 
@@ -84,14 +103,26 @@ class VersionIssue:
 
 
 def check_versions() -> list[VersionIssue]:
-    """Return version consistency issues across the repo-distributed pieces."""
+    """Return version consistency issues across the repo-distributed pieces.
+
+    `chrome-extension/` is intentionally NOT part of the PyPI packaging
+    contract — the extension ships separately via the Chrome Web Store. So a
+    missing manifest is only a problem when we are running from a browserwright
+    repo checkout (or a legacy local release that copied the extension beside
+    the venv). For a PyPI/`uv tool` install, the absence of the manifest is
+    expected; only the version-mismatch case still applies.
+    """
     issues: list[VersionIssue] = []
     pkg = package_version()
     ext = extension_version()
     if not is_semver(pkg):
         issues.append(VersionIssue("package-not-semver", f"package version is not semver: {pkg}"))
     if ext is None:
-        issues.append(VersionIssue("extension-missing", "chrome-extension/manifest.json was not found"))
+        # Only flag a missing manifest when we can identify a browserwright
+        # repo checkout — that's the only context where the extension is
+        # expected to live next to the package.
+        if _repo_root() is not None:
+            issues.append(VersionIssue("extension-missing", "chrome-extension/manifest.json was not found"))
     elif not is_semver(ext):
         issues.append(VersionIssue("extension-not-semver", f"extension version is not semver: {ext}"))
     elif ext != pkg:
