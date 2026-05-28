@@ -195,10 +195,12 @@ def isolated_session() -> Session:
     """A fresh Session for fan-out / isolated task runs.
 
     Inherits the current session's daemon binding (so it drives the *same*
-    browser) but isolates target tracking (its own ``current_target_id``), so
-    concurrent tasks don't yank each other's attached tab. Prefers the ledger
-    record (own client connection) and falls back to sharing the parent's
-    daemon when the parent was constructed without a record (tests)."""
+    browser) but isolates target tracking (its own ``current_target_id``).
+    Task runners must bind the returned session to a fresh target before using
+    browser primitives; otherwise reconnect recovery may still see the parent
+    ledger target. Prefers the ledger record (own client connection) and falls
+    back to sharing the parent's daemon when the parent was constructed without
+    a record (tests)."""
     parent = current_session()
     if parent.session_record is not None:
         return Session(record=parent.session_record)

@@ -106,7 +106,7 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
 
     try:
         proc = subprocess.run(
-            [skill_bin],
+            [skill_bin, "-s", env["BD_SESSION"], "--code-stdin"],
             input=script,
             text=True,
             capture_output=True,

@@ -1,11 +1,11 @@
 """Multi-task fan-out (v0.3).
 
-Runs N tasks concurrently. Each one gets its own ``Session`` (and therefore
-its own ws to the daemon, its own sessionId namespace, its own
-``current_target_id``). The daemon v0.3 multi-client mux serialises traffic
-into the single upstream Chrome ws; from Skill's point of view the tasks
-are truly independent — `new_tab()` in task A doesn't yank the tab task B
-is operating on.
+Runs N tasks concurrently. Each one goes through ``run_task(...,
+isolated=True)``, which gives it a fresh ``Session`` and pre-binds that session
+to a freshly opened tab before task code sees the browser. The daemon v0.3
+multi-client mux serialises traffic into the single upstream Chrome ws; from
+Skill's point of view the tasks are truly independent — one task's navigation
+doesn't yank the tab another task is operating on.
 
 This module is intentionally small. The hard work was done in #55 (the
 ``ContextVar``-backed ``with_session`` machinery). Here we just iterate.

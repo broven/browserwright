@@ -534,11 +534,20 @@ def _cmd_memory(args: list[str]) -> int:
     return 1
 
 
-def _cmd_session(args: list[str]) -> int:
+def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     """``browserwright session {new|reset|end|list|prune} ...`` (P2)."""
     from . import session_create
     from . import session_registry as reg
 
+    if not args:
+        print("usage: browserwright session {new|reset|end|list|prune} ...", file=sys.stderr)
+        return 1
+    inner_session, args, err = _extract_session_arg(args)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
+    if inner_session:
+        session_id = inner_session
     if not args:
         print("usage: browserwright session {new|reset|end|list|prune} ...", file=sys.stderr)
         return 1
@@ -569,9 +578,9 @@ def _cmd_session(args: list[str]) -> int:
 
     if sub == "end":
         from .errors import NoSession
-        from .session_ctx import resolve_session
+        from .session_ctx import resolve_session_or_env
         try:
-            rec = resolve_session(kw.get("session"))
+            rec = resolve_session_or_env(session_id)
         except NoSession as e:
             print(str(e), file=sys.stderr)
             return e.exit_code
@@ -580,10 +589,10 @@ def _cmd_session(args: list[str]) -> int:
 
     if sub == "reset":
         from .errors import NoSession
-        from .session_ctx import resolve_session
-        raw_sid = args[1] if len(args) > 1 and not args[1].startswith("--") else kw.get("session")
+        from .session_ctx import resolve_session_or_env
+        raw_sid = args[1] if len(args) > 1 and not args[1].startswith("--") else session_id
         try:
-            rec = resolve_session(raw_sid)
+            rec = resolve_session_or_env(raw_sid)
         except NoSession as e:
             print(str(e), file=sys.stderr)
             return e.exit_code
@@ -666,18 +675,24 @@ def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int
     return result.returncode
 
 
-def _cmd_whoami(args: list[str]) -> int:
+def _cmd_whoami(args: list[str], *, session_id: Optional[str] = None) -> int:
     """``browserwright whoami --session=ID`` — the ledger view of a session.
 
     Live-browser fields (group/tab count/sample URL) are filled by a daemon
     round-trip in Phase 5/6; for now we print only ledger-known fields.
     """
     from .errors import NoSession
-    from .session_ctx import resolve_session
+    from .session_ctx import resolve_session_or_env
 
+    inner_session, args, err = _extract_session_arg(args)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
+    if inner_session:
+        session_id = inner_session
     kw = _parse_kv_args(args)
     try:
-        rec = resolve_session(kw.get("session"))
+        rec = resolve_session_or_env(session_id or kw.get("session"))
     except NoSession as e:
         print(str(e), file=sys.stderr)
         return e.exit_code
@@ -857,9 +872,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     if cmd == "release":
         sys.exit(_cmd_release(rest))
     if cmd == "session":
-        sys.exit(_cmd_session(rest))
+        sys.exit(_cmd_session(rest, session_id=global_session))
     if cmd == "whoami":
-        sys.exit(_cmd_whoami(rest))
+        sys.exit(_cmd_whoami(rest, session_id=global_session))
     if cmd == "userscript":
         sys.exit(_cmd_userscript(rest, session_id=global_session))
 

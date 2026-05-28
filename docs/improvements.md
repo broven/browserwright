@@ -74,11 +74,11 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 
 | | 条目 | 层 | 状态 | 备注 / 证据 |
 |---|---|---|---|---|
-| F1 | `remember_preference` 写 frontmatter 时保留 `global.md` body | L1 | ✅ | `GlobalMemory.set_preference()` 已保留 body,新增回归覆盖 body 不变 |
+| F1 | `remember_preference` 写 frontmatter 时保留 `global.md` body | L1 | ✅ | `GlobalMemory.set_preference()` 父分支已保留 body;本 PR 新增回归 guard 覆盖 body 不变 |
 | F2 | `NeedsUserConfirm.fix` 不再误导 `confirm=True`;偏好写支持 `commit=True` | L1 | ✅ | `errors.py` 默认 fix 改为 `confirm=False`;`remember_preference(..., commit=True)` 作为清晰别名 |
 | F3 | `userscript push --verify` 绑定 `-s/--session/BD_SESSION` 后再 reload/screenshot | L2 | ✅ | `_cmd_userscript()` 转发 session 到 daemon,verify 段调用共享 session binder |
 | F4 | `browserwright task <site>/<name>` 支持 session binding | L2 | ✅ | 支持 `browserwright -s <id> task ...`、task 内 `--session`、`BD_SESSION`;`--output json` alias |
-| F5 | `run_tasks_concurrent` 走 task_runner isolated session | L2 | ✅ | `_run_one()` 调 `run_task(..., isolated=True)`,保持顺序与错误聚合 envelope |
+| F5 | `run_tasks_concurrent` 的 isolated task 预绑定 fresh target | L2 | ✅ | `run_task(..., isolated=True)` 在 worker session 内先 `open()` 唯一 data URL,避免共享 parent ledger target 的 RDP attach owner race 与多 blank tab 绑定歧义 |
 | F6 | 文档同步原语名与 Playwright 主路径 | L1/L3 | ✅ | runtime guide / skill shell 改为 `page.goto`、Playwright locator、显式 import internal primitives |
 | F7 | `--print-skill` 区分 inline 默认 namespace 与可 import internal primitives | L1 | ✅ | `skill_doc.render()` 增加 `browserwright.primitives` 列表与导入说明 |
 | F8 | `page.goto()` 后 target 同步 | L1 | ⏸ | 当前 Phase C steady-state 由 resident executor 持有 live `page`;legacy inspect 原语仍基于 `current_target_id`,需 facade target 映射设计后补 |

@@ -368,6 +368,71 @@ def test_cmd_session_reset_recycles_executor(tmp_bs_home, monkeypatch, capsys):
     assert capsys.readouterr().out == f"reset {sid}\n"
 
 
+def test_global_session_prefix_dispatches_whoami(tmp_bs_home, capsys):
+    from browserwright import cli, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", sid, "whoami"])
+    assert exc.value.code == 0
+    assert json.loads(capsys.readouterr().out)["id"] == sid
+
+
+def test_global_session_prefix_dispatches_session_end(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "end",
+        lambda rec: calls.append(rec["id"]) or f"ended {rec['id']}",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", sid, "session", "end"])
+    assert exc.value.code == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"ended {sid}\n"
+
+
+def test_session_inner_session_overrides_global_prefix(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    outer = reg.allocate(backend="rdp", owner="attach", name="outer")
+    inner = reg.allocate(backend="rdp", owner="attach", name="inner")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "end",
+        lambda rec: calls.append(rec["id"]) or f"ended {rec['id']}",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", outer, "session", "--session", inner, "end"])
+    assert exc.value.code == 0
+    assert calls == [inner]
+    assert capsys.readouterr().out == f"ended {inner}\n"
+
+
+def test_session_reset_uses_bd_session_fallback(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    monkeypatch.setenv("BD_SESSION", sid)
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "reset_executor",
+        lambda rec: calls.append(rec["id"]) or f"reset {rec['id']}",
+    )
+
+    assert cli._cmd_session(["reset"]) == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"reset {sid}\n"
+
+
 def test_cmd_session_new_stderr_keeps_stdout_bare(monkeypatch, tmp_bs_home, capsys):
     from browserwright import cli, session_create
 
@@ -797,9 +862,13 @@ def test_task_runner_isolated_session_closes_after_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "isolated_session", lambda: fake_session)
     monkeypatch.setattr(session_mod, "with_session", lambda sess: FakeContext())
+    monkeypatch.setattr("browserwright.primitives.page.open", lambda url: events.append(("open", url)))
 
     assert task_runner.run_task("site", "ok", isolated=True) == "ok"
-    assert events == ["enter", "exit", "close"]
+    assert events[0] == "enter"
+    assert events[1][0] == "open"
+    assert events[1][1].startswith("data:text/html;charset=utf-8,<title>browserwright-isolated-")
+    assert events[2:] == ["exit", "close"]
 
 
 def test_run_tasks_concurrent_uses_isolated_task_runner(monkeypatch):

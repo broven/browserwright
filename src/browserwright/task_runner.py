@@ -61,9 +61,11 @@ def run_task(site: str, name: str, *, isolated: bool = False, **kwargs) -> Any:
       - ``OUTPUT_SCHEMA`` (if defined on the module) validates ``run()``
         return shape; mismatch raises ``BrowserwrightError`` with details.
       - ``isolated=True`` runs the task in its own ``Session`` pushed onto the
-        ``ContextVar`` for the duration of ``run()``. Other concurrently-
-        executing tasks see *their* sessions via ``current_session()``, so
-        ``new_tab`` / ``current_target_id`` don't collide.
+        ``ContextVar`` for the duration of ``run()``. The isolated session is
+        first bound to a freshly opened, uniquely identifiable tab so
+        concurrent workers do not all recover and attach the parent session's
+        persisted ledger target or confuse several blank tabs during
+        Playwright binding.
         Default ``False`` keeps the single-task / REPL behavior — same Session
         is reused, same target tracking, no extra ws roundtrips.
     """
@@ -117,6 +119,13 @@ def run_task(site: str, name: str, *, isolated: bool = False, **kwargs) -> Any:
     sess = isolated_session()
     try:
         with with_session(sess):
+            import uuid
+            from .primitives.page import open as _open_tab
+            prebind_url = (
+                "data:text/html;charset=utf-8,"
+                f"<title>browserwright-isolated-{uuid.uuid4().hex}</title>"
+            )
+            _open_tab(prebind_url)
             return _run_inner()
     finally:
         # The isolated Session owns the CDP it lazily opened during this run;
