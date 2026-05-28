@@ -98,6 +98,9 @@ def capture_screenshot(path: Optional[str] = None, *, full: bool = False,
     abs_path = str(Path(path).resolve())
     if annotate:
         out: dict = {"path": abs_path, "legend": legend or []}
+        if isinstance(legend, list) and len(legend) >= 120:
+            out["truncated"] = True
+            out["total_count"] = len(legend)
         if mark_error:
             # The overlay failed to paint; the legend coords are still valid but
             # the agent must NOT assume numbered marks are visible on the image.
@@ -163,6 +166,14 @@ def _draw_set_of_mark() -> tuple:
             "name": n.get("name"),
             "x": n.get("x"),
             "y": n.get("y"),
+        })
+    if isinstance(snap, dict) and snap.get("truncated"):
+        legend.append({
+            "n": len(legend),
+            "role": "status",
+            "name": f"truncated after {len(nodes)} nodes",
+            "x": None,
+            "y": None,
         })
     code = _DRAW_MARK_JS.replace("__NODES__", json.dumps(legend))
     err: Optional[str] = None

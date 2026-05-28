@@ -38,7 +38,7 @@ Usage:
   browserwright whoami --session=ID
   browserwright userscript {push|list|remove|toggle|logs} ...
 
-  browserwright task <site>/<name> [--key=value ...] [--isolated]
+  browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
 
   browserwright sub add <git-url> [--name NAME]
@@ -56,6 +56,29 @@ Usage:
 
   browserwright version [--json | check]
   browserwright --print-skill            (alias: print-skill)
+"""
+
+TASK_HELP = """Usage:
+  browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
+
+Runs a site-skill task in the bound Browserwright session. Session may also be
+provided as --session=<id> after `task`, or via BD_SESSION.
+
+Flags:
+  --json-args JSON       merge a JSON object into task args
+  --json-output          print task result as JSON
+  --output json          alias for --json-output
+"""
+
+USERSCRIPT_HELP = """Usage:
+  browserwright [-s <session-id>] userscript {push|install|list|remove|toggle|logs} ...
+
+For push/install:
+  browserwright -s <session-id> userscript push ./script.user.js [--verify]
+
+`--verify` is handled by browserwright: after a successful daemon push it
+reloads the bound tab and prints a screenshot path. Session may also come from
+--session=<id> after `userscript`, or BD_SESSION.
 """
 
 
@@ -87,6 +110,64 @@ def _parse_kv_args(args: list[str]) -> dict:
             out[key] = True
         i += 1
     return out
+
+
+def _split_global_session(args: list[str]) -> tuple[Optional[str], list[str], Optional[str]]:
+    """Extract a leading global ``-s/--session`` without changing command args."""
+    session_id: Optional[str] = None
+    rest: list[str] = []
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a in {"-s", "--session"}:
+            if i + 1 >= n:
+                return None, [], f"{a} requires a value"
+            session_id = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--session="):
+            session_id = a.split("=", 1)[1]
+            i += 1
+            continue
+        rest.extend(args[i:])
+        break
+    return session_id, rest, None
+
+
+def _extract_session_arg(args: list[str]) -> tuple[Optional[str], list[str], Optional[str]]:
+    """Remove ``-s/--session`` from a subcommand arg list."""
+    session_id: Optional[str] = None
+    out: list[str] = []
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a in {"-s", "--session"}:
+            if i + 1 >= n:
+                return None, [], f"{a} requires a value"
+            session_id = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--session="):
+            session_id = a.split("=", 1)[1]
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return session_id, out, None
+
+
+def _bind_cli_session(session_id: Optional[str]):
+    from .errors import NoSession
+    from .session import Session, set_session
+    from .session_ctx import resolve_session_or_env
+
+    try:
+        rec = resolve_session_or_env(session_id)
+    except NoSession as e:
+        print(str(e), file=sys.stderr)
+        return e.exit_code
+    set_session(Session(record=rec))
+    return 0
 
 
 def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -182,16 +263,35 @@ def _cmd_execute(args: list[str]) -> int:
     return inline.run_code(code or "", session_id=session_id or "")
 
 
-def _cmd_task(args: list[str]) -> int:
+def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
+    if args and args[0] in {"-h", "--help"}:
+        sys.stdout.write(TASK_HELP)
+        return 0
     if not args:
-        print("usage: browserwright task <site>/<name> [--key=val ...]", file=sys.stderr)
+        print("usage: browserwright -s <session-id> task <site>/<name> [--key=val ...]", file=sys.stderr)
+        return 1
+    inner_session, args, err = _extract_session_arg(args)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
+    if inner_session:
+        session_id = inner_session
+    if not args:
+        print("usage: browserwright -s <session-id> task <site>/<name> [--key=val ...]", file=sys.stderr)
         return 1
     spec = args[0]
     if "/" not in spec:
         print("task spec must be <site>/<name>", file=sys.stderr)
         return 1
+    bound = _bind_cli_session(session_id)
+    if bound:
+        return bound
     site, name = spec.split("/", 1)
     kwargs = _parse_kv_args(args[1:])
+    if kwargs.get("output") == "json":
+        kwargs["json_output"] = True
+    json_output = bool(kwargs.pop("json_output", False) or kwargs.pop("json-output", False))
+    kwargs.pop("output", None)
     # JSON-args envelope for Layer 3 callers.
     js = kwargs.pop("json-args", None)
     if js is not None:
@@ -208,7 +308,7 @@ def _cmd_task(args: list[str]) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"task crashed: {e!r}", file=sys.stderr)
         return 3
-    if "--json-output" in args or kwargs.get("json_output"):
+    if json_output:
         sys.stdout.write(json.dumps(result, default=str))
     else:
         sys.stdout.write(repr(result))
@@ -230,7 +330,7 @@ def _cmd_doctor(args: list[str]) -> int:
     checks = info.get("checks", [])
     any_fail = any(c.get("status") == "fail" for c in checks)
 
-    if "--json" in args:
+    if "--json" in args or "--output=json" in args or args[-2:] == ["--output", "json"]:
         sys.stdout.write(json.dumps(info, indent=2, default=str) + "\n")
         return 1 if any_fail else 0
 
@@ -263,7 +363,7 @@ def _cmd_list_tasks(args: list[str]) -> int:
     kwargs = _parse_kv_args(args)
     from .discovery import list_tasks
     tasks = list_tasks(site=kwargs.get("site"), query=kwargs.get("query"))
-    if kwargs.get("json"):
+    if kwargs.get("json") or kwargs.get("output") == "json":
         sys.stdout.write(json.dumps(tasks, default=str) + "\n")
         return 0
     if not tasks:
@@ -463,6 +563,7 @@ def _cmd_session(args: list[str]) -> int:
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return 1
+        print(f"OK: session {sid} created", file=sys.stderr)
         print(sid)  # token-frugal: bare id
         return 0
 
@@ -491,7 +592,7 @@ def _cmd_session(args: list[str]) -> int:
 
     if sub == "list":
         rows = reg.list_all()
-        if kw.get("json"):
+        if kw.get("json") or kw.get("output") == "json":
             sys.stdout.write(json.dumps(rows, indent=2, default=str) + "\n")
             return 0
         if not rows:
@@ -503,7 +604,7 @@ def _cmd_session(args: list[str]) -> int:
         return 0
 
     if sub == "prune":
-        idle = kw.get("idle", 3600)
+        idle = kw.get("idle", 24 * 3600)
         pruned = session_create.reap(idle_seconds=float(idle))
         print(f"pruned {len(pruned)} idle session(s).")
         return 0
@@ -512,7 +613,16 @@ def _cmd_session(args: list[str]) -> int:
     return 1
 
 
-def _cmd_userscript(args: list[str]) -> int:
+def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int:
+    if not args or args[0] in {"-h", "--help"}:
+        sys.stdout.write(USERSCRIPT_HELP)
+        return 0 if args else 1
+    inner_session, args, err = _extract_session_arg(args)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
+    if inner_session:
+        session_id = inner_session
     # ``--verify`` is a browserwright-level convenience on ``push``: after a
     # successful push, reload the live tab and screenshot it so the agent sees
     # the effect in one step instead of the manual push→reload→screenshot
@@ -520,7 +630,10 @@ def _cmd_userscript(args: list[str]) -> int:
     verify = "--verify" in args
     fwd = [a for a in args if a != "--verify"]
 
-    result = subprocess.run(["browserwright-daemon", "userscript", *fwd])
+    daemon_cmd = ["browserwright-daemon", "userscript"]
+    if session_id:
+        daemon_cmd += ["--session", session_id]
+    result = subprocess.run([*daemon_cmd, *fwd])
     if result.returncode != 0:
         # Push failed — don't reload/screenshot a stale state. Surface the
         # push failure so the agent fixes the script first.
@@ -533,6 +646,11 @@ def _cmd_userscript(args: list[str]) -> int:
         # session), report that the push still SUCCEEDED rather than letting an
         # opaque reload error look like a push failure.
         try:
+            bound = _bind_cli_session(session_id)
+            if bound:
+                raise RuntimeError(
+                    "no drivable session bound; pass -s <id> or set BD_SESSION"
+                )
             # These are internal driving helpers (no longer on the agent
             # EXPORTS surface — Phase C PR3); the userscript --verify
             # convenience still uses them directly from the primitive modules.
@@ -701,12 +819,21 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.stdout.write(HELP)
         sys.exit(0 if argv else 1)
 
-    if argv and (
-        argv[0] in {"-s", "--session", "-e", "--execute"}
-        or argv[0].startswith("--session=")
-        or argv[0].startswith("--execute=")
-    ):
-        sys.exit(_cmd_execute(argv))
+    global_session, command_argv, session_err = _split_global_session(argv)
+    if session_err:
+        print(f"usage error: {session_err}", file=sys.stderr)
+        sys.exit(1)
+    if global_session is not None:
+        if command_argv and (
+            command_argv[0] in {"-e", "--execute", "-f", "--code-file", "--code-stdin"}
+            or command_argv[0].startswith("--execute=")
+            or command_argv[0].startswith("--code-file=")
+        ):
+            sys.exit(_cmd_execute(argv))
+        argv = command_argv
+        if not argv:
+            print("usage error: -s/--session requires a command or execute code", file=sys.stderr)
+            sys.exit(1)
 
     cmd = argv[0]
     rest = argv[1:]
@@ -714,7 +841,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if cmd in {"--version", "version"}:
         sys.exit(_cmd_version(rest))
     if cmd == "task":
-        sys.exit(_cmd_task(rest))
+        sys.exit(_cmd_task(rest, session_id=global_session))
     if cmd == "doctor":
         sys.exit(_cmd_doctor(rest))
     if cmd == "install":
@@ -734,7 +861,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if cmd == "whoami":
         sys.exit(_cmd_whoami(rest))
     if cmd == "userscript":
-        sys.exit(_cmd_userscript(rest))
+        sys.exit(_cmd_userscript(rest, session_id=global_session))
 
     print(f"unknown command: {cmd!r}", file=sys.stderr)
     print(HELP, file=sys.stderr)

@@ -144,6 +144,25 @@ def doctor_checks() -> dict:
                 or "open Chrome and load the unpacked extension, then re-run doctor",
             )
 
+    # Backend-specific warnings should not hide in raw output. Surface every
+    # warning as a top-level check so human output and JSON consumers both see
+    # version skew / schema mismatch / UX warnings even when a backend is
+    # otherwise available.
+    for b in backends:
+        warning = b.get("ux_warning")
+        if not warning:
+            continue
+        name = f"{b.get('name', 'backend')}_warning"
+        if any(c.get("name") == name and c.get("message") == warning for c in checks):
+            continue
+        add(
+            name,
+            "warn",
+            warning,
+            b.get("needs_user_action")
+            or "update browserwright-daemon, browserwright, and the Chrome extension to matching versions",
+        )
+
     # 5. helper surface parses (local, deterministic): can we import the
     #    primitive surface agents actually call? A broken install / syntax
     #    error here would otherwise only show up mid-task.

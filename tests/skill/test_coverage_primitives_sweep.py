@@ -396,11 +396,19 @@ def test_site_memory_host_resolution_confirm_and_reads(tmp_bs_home, fake_session
     with pytest.raises(NeedsUserConfirm) as exc:
         site.remember_preference("daemon.preferred_backend", "rdp")
     assert exc.value.proposal == {"key": "daemon.preferred_backend", "value": "rdp"}
+    assert "commit=True" in exc.value.fix
     assert site.remember_preference("daemon.preferred_backend", "rdp", confirm=False) == {
         "key": "daemon.preferred_backend",
         "value": "rdp",
         "previous": None,
     }
+    before_body = site.memory_read()["global"]["body"]
+    assert site.remember_preference("ui.theme", "dark", commit=True) == {
+        "key": "ui.theme",
+        "value": "dark",
+        "previous": None,
+    }
+    assert site.memory_read()["global"]["body"] == before_body
     assert site.memory_read()["global"]["frontmatter"]["daemon"]["preferred_backend"] == "rdp"
 
     site.remember("https://docs.example.test/path", "offline dense note")

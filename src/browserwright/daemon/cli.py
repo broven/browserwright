@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from xml.sax.saxutils import escape as _xml_escape
 from typing import NoReturn
 
@@ -606,11 +607,23 @@ def _cmd_status(args, cfg: Config) -> int:
     """Report endpoint + liveness. JSON shape used by Skill for status pings."""
     from . import _ipc
     pid, version = _ipc.ping_status_sync(timeout=1.0)
+    probe_state = "ok" if pid is not None else "not_running"
+    if pid is None and _ipc.sock_path().exists():
+        deadline = time.monotonic() + 0.6
+        while time.monotonic() < deadline:
+            time.sleep(0.15)
+            pid, version = _ipc.ping_status_sync(timeout=0.3)
+            if pid is not None:
+                probe_state = "ok_after_retry"
+                break
+        else:
+            probe_state = "transient_probe_failed"
     ep = _ipc.endpoint_describe()
     facade_ws, facade_port = _ipc.read_facade_file()
     status = {
         "schema_version": 1,
         "alive": pid is not None,
+        "probe_state": probe_state,
         "pid": pid,
         "version": version,
         "endpoint": ep,

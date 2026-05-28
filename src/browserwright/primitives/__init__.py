@@ -65,3 +65,19 @@ from .site import (  # noqa: F401
     remember_global,
     remember_preference,
 )
+
+__all__ = [
+    "list_site_skills", "load_site_skill", "run_task",
+    "http_get",
+    "capture_screenshot", "cdp", "describe_page", "diff_snapshot",
+    "page_info", "snapshot",
+    "click_at_xy", "dispatch_key", "drain_events", "fill_input", "js",
+    "press_key", "scroll", "type_text", "upload_file",
+    "wait_for_element", "wait_for_network_idle",
+    "attach_active", "attach_readonly", "close_tab", "current_page",
+    "current_tab", "ensure_real_tab", "goto_url", "iframe_target",
+    "list_tabs", "new_tab", "open", "open_background", "reload",
+    "switch_tab", "wait", "wait_for_load",
+    "bootstrap_site", "memory_read", "remember", "remember_global",
+    "remember_preference",
+]

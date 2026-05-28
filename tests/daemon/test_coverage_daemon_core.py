@@ -88,7 +88,7 @@ def test_cmd_url_mode_b_proxy_tcp_without_port_exits_unavailable(monkeypatch, ca
     assert "no daemon running" in captured.err
 
 
-def test_cmd_status_json_includes_dead_endpoint(monkeypatch, capsys):
+def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
     from browserwright.daemon import _ipc
 
     monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: (None, None))
@@ -97,10 +97,33 @@ def test_cmd_status_json_includes_dead_endpoint(monkeypatch, capsys):
         "endpoint_describe",
         lambda: {"transport": "unix", "path": "/tmp/missing.sock", "host": None, "port": None, "token": None},
     )
+    monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "missing.sock")
     assert cli_mod._cmd_status(SimpleNamespace(json=True), Config()) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["alive"] is False
     assert payload["endpoint"]["path"] == "/tmp/missing.sock"
+    assert payload["probe_state"] == "not_running"
+
+
+def test_cmd_status_json_marks_transient_probe_failure(monkeypatch, tmp_path, capsys):
+    from browserwright.daemon import _ipc
+
+    sock = tmp_path / "daemon.sock"
+    sock.write_text("", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: calls.append(timeout) or (None, None))
+    monkeypatch.setattr(_ipc, "sock_path", lambda: sock)
+    monkeypatch.setattr(
+        _ipc,
+        "endpoint_describe",
+        lambda: {"transport": "unix", "path": str(sock), "host": None, "port": None, "token": None},
+    )
+    monkeypatch.setattr(cli_mod.time, "sleep", lambda _seconds: None)
+
+    assert cli_mod._cmd_status(SimpleNamespace(json=True), Config()) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["probe_state"] == "transient_probe_failed"
+    assert len(calls) > 1
 
 
 def test_cmd_daemon_version_check_json_reports_consistent_versions(capsys):

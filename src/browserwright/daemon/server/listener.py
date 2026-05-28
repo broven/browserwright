@@ -92,7 +92,8 @@ async def run_serve(cfg: Config) -> int:
             )
         print(
             f"browserwright-daemon already running (pid {existing_pid}); "
-            f"use `browserwright-daemon stop` to shut it down{version_hint}",
+            f"try `browserwright-daemon status` or "
+            f"`browserwright-daemon restart`{version_hint}",
             file=sys.stderr,
         )
         return 1

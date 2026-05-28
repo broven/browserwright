@@ -16,6 +16,7 @@ import socket
 
 import pytest
 
+from browserwright._executor.client import ExecutorUnavailable
 from browserwright._executor import protocol
 from browserwright._executor.process import _LivePageHolder, _Worker
 from browserwright.repl import inline
@@ -61,6 +62,13 @@ def test_precheck_does_not_false_positive_on_attribute_names():
     # `page`) is acceptable to over-route — the fallback is always correct.
     # But a plain memory call referencing none of the names must stay in-process.
     assert _touches("d = {'k': 1}\nprint(d['k'])") is False
+
+
+def test_executor_unavailable_fix_mentions_reset():
+    err = ExecutorUnavailable("down")
+
+    assert "reset()" in err.fix
+    assert "session reset" in err.fix
 
 
 # ---- wire framing ----------------------------------------------------------

@@ -138,6 +138,30 @@ def test_skill_doc_documents_state_and_reset_surface():
     assert "daemon restart" in doc.lower()
 
 
+def test_skill_doc_lists_importable_internal_primitives():
+    from browserwright import skill_doc
+
+    doc = skill_doc.render()
+    assert "Importable internal primitives" in doc
+    assert "capture_screenshot" in doc
+    assert "diff_snapshot" in doc
+    assert "click_at_xy" in doc
+
+
+def test_snapshot_default_max_chars_is_less_aggressive():
+    from browserwright.repl import snapshot as snapshot_mod
+
+    class _Page:
+        def aria_snapshot(self, *, mode):
+            assert mode == "ai"
+            return "- root\n" + ("  - button \"Save\" [ref=e1]\n" * 700)
+
+    snap = snapshot_mod.make_snapshot(type("Handle", (), {"page": _Page()})())
+
+    assert len(snap()) > 6000
+    assert len(snap()) <= 20000 + len(snapshot_mod._TRUNC_MARKER) + 2
+
+
 def test_executor_control_plane_uses_browserwright_session_param():
     from browserwright._executor import client as exec_client
 

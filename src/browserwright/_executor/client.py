@@ -43,8 +43,9 @@ class ExecutorUnavailable(BrowserwrightError):
     executor)."""
 
     default_fix = ("ensure the daemon is running (`browserwright-daemon status "
-                   "--json` should show `alive`); it lazily spawns the "
-                   "per-session executor on first browser use.")
+                   "--json` should show `alive`); if the executor is stale, "
+                   "call `reset()` from inline code or run `browserwright "
+                   "session reset <id>` before retrying.")
 
 
 def ensure_executor(sess) -> str:

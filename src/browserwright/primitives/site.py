@@ -69,12 +69,14 @@ def remember_global(text: str, *, section: str = "Notes") -> str:
     return str(global_memory().path)
 
 
-def remember_preference(key: str, value: Any, *, confirm: bool = True) -> dict:
+def remember_preference(key: str, value: Any, *, confirm: bool = True,
+                        commit: Optional[bool] = None) -> dict:
     """Structured global preference write (spec §C.3 type D, US4).
 
     First call (``confirm=True``) raises ``NeedsUserConfirm``: the agent must
     surface a dialog to the user. After assent the agent re-calls with
-    ``confirm=False`` and the new value lands in ``global.md`` frontmatter.
+    ``confirm=False`` (or ``commit=True``) and the new value lands in
+    ``global.md`` frontmatter.
 
     **Dotted-key semantics** (v0.3.1 — Bug 4 from the AI E2E run):
     ``key`` is interpreted as a YAML frontmatter *path*, not a literal flat
@@ -110,15 +112,21 @@ def remember_preference(key: str, value: Any, *, confirm: bool = True) -> dict:
         # After the user agrees:
         remember_preference("daemon.preferred_backend", "extension",
                             confirm=False)
+        # equivalent:
+        remember_preference("daemon.preferred_backend", "extension",
+                            commit=True)
         # → global.md frontmatter gains:
         #     daemon:
         #       preferred_backend: extension
         #       set_by_user_at: <ts>
     """
+    if commit is not None:
+        confirm = not commit
     if confirm:
         raise NeedsUserConfirm(
             what=f"set {key} = {value!r}",
             proposal={"key": key, "value": value},
+            fix="surface the proposal to the user, then re-call with commit=True",
         )
     return global_memory().set_preference(key, value, confirm=False)
 

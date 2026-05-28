@@ -151,7 +151,9 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
         lambda timeout: asyncio.sleep(0, result=(999, listener_mod.__version__)),
     )
     assert await listener_mod.run_serve(Config(backend="env")) == 1
-    assert "already running (pid 999)" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "already running (pid 999)" in err
+    assert "browserwright-daemon status" in err
 
     class FakeServer:
         def __init__(self):

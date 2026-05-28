@@ -40,7 +40,7 @@ def make_snapshot(handle: PlaywrightHandle):
     facade on first use, exactly like ``page``/``context``)."""
 
     def snapshot(*, interactive_only: bool = True,
-                 max_chars: int | None = 6000) -> str:
+                 max_chars: int | None = 20000) -> str:
         """Observe the current ``page`` as a first-party Playwright AI aria
         snapshot. Returns a compact accessibility tree where each node carries
         a ``[ref=eN]`` ref.
