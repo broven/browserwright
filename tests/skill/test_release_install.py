@@ -154,3 +154,71 @@ def test_version_finds_extension_manifest_from_release_parent(monkeypatch, tmp_p
 
     assert version_mod.extension_manifest_path() == manifest
     assert version_mod.extension_version() == "0.6.0"
+
+
+def test_check_versions_skips_missing_extension_for_pypi_install(monkeypatch, tmp_path):
+    """A PyPI/`uv tool` install has no chrome-extension/ next to the package —
+    that is by design (extension ships via Chrome Web Store), so
+    `version check` must NOT flag `extension-missing` in that environment."""
+    from browserwright import version as version_mod
+
+    # Simulate a uv-tool install: package lives under site-packages with no
+    # browserwright pyproject.toml anywhere up the parent chain, and no
+    # chrome-extension/ sibling.
+    pkg_dir = tmp_path / "uv-tool" / "lib" / "python3.11" / "site-packages" / "browserwright"
+    pkg_dir.mkdir(parents=True)
+    fake_file = pkg_dir / "version.py"
+    fake_file.write_text("# fake\n", encoding="utf-8")
+
+    monkeypatch.setattr(version_mod, "__file__", str(fake_file))
+    # Pretend the installed package version equals what PyPI shipped.
+    monkeypatch.setattr(version_mod, "package_version", lambda: "0.6.2")
+
+    assert version_mod._repo_root() is None
+    assert version_mod.extension_manifest_path() is None
+    issues = version_mod.check_versions()
+    codes = [i.code for i in issues]
+    assert "extension-missing" not in codes
+    assert issues == []  # clean install: no issues at all
+
+
+def test_check_versions_still_flags_missing_extension_in_dev_checkout(monkeypatch, tmp_path):
+    """In a real browserwright repo checkout, a missing chrome-extension/ is
+    a genuine bug and must still surface."""
+    from browserwright import version as version_mod
+
+    repo = _fake_repo(tmp_path / "repo")
+    # Remove the manifest the fixture created so we hit the missing branch.
+    (repo / "chrome-extension" / "manifest.json").unlink()
+    pkg_dir = repo / "src" / "browserwright"
+    fake_file = pkg_dir / "version.py"
+    fake_file.write_text("# fake\n", encoding="utf-8")
+
+    monkeypatch.setattr(version_mod, "__file__", str(fake_file))
+    monkeypatch.setattr(version_mod, "package_version", lambda: "0.6.0")
+
+    assert version_mod._repo_root() == repo
+    codes = [i.code for i in version_mod.check_versions()]
+    assert "extension-missing" in codes
+
+
+def test_repo_root_ignores_unrelated_pyproject(monkeypatch, tmp_path):
+    """A pyproject.toml whose project name is not 'browserwright' must NOT be
+    treated as our repo root — otherwise installing browserwright into an
+    unrelated project's venv would resurrect the false `extension-missing`
+    failure."""
+    from browserwright import version as version_mod
+
+    foreign = tmp_path / "someproj"
+    venv_pkg = foreign / "venv" / "lib" / "python3.11" / "site-packages" / "browserwright"
+    venv_pkg.mkdir(parents=True)
+    (foreign / "pyproject.toml").write_text(
+        '[project]\nname="not-browserwright"\nversion="1.0.0"\n',
+        encoding="utf-8",
+    )
+    fake_file = venv_pkg / "version.py"
+    fake_file.write_text("# fake\n", encoding="utf-8")
+
+    monkeypatch.setattr(version_mod, "__file__", str(fake_file))
+
+    assert version_mod._repo_root() is None
