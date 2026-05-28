@@ -18,7 +18,7 @@ LAST_VERIFIED = "2026-05-25"
 
 
 def selftest():
-    page.goto("https://en.wikipedia.org/wiki/Wikipedia", wait_until="load")
+    page.goto("https://en.wikipedia.org/wiki/Wikipedia")
     return "Wikipedia" in page.title()
 
 
@@ -33,7 +33,7 @@ def run(args, ctx=None):
     lang = args.get("lang", "en")
     underscore_title = title.strip().replace(" ", "_")
     url = f"https://{lang}.wikipedia.org/wiki/{quote(underscore_title)}"
-    pg.goto(url, wait_until="load")
+    pg.goto(url)
     info = pg.evaluate(
         """
         () => {

@@ -24,7 +24,7 @@ _KINDS = {
 
 
 def selftest():
-    page.goto("https://news.ycombinator.com/", wait_until="load")
+    page.goto("https://news.ycombinator.com/")
     return "ycombinator.com" in page.url
 
 
@@ -34,7 +34,7 @@ def run(args, ctx=None):
     kind = args.get("kind", "top")
     limit = int(args.get("limit", 30))
     url = _KINDS.get(kind, _KINDS["top"])
-    pg.goto(url, wait_until="load")
+    pg.goto(url)
     rows = pg.evaluate(
         """
         () => {

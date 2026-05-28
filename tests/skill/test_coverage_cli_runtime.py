@@ -41,7 +41,43 @@ def test_parse_execute_args_supports_short_and_long_forms():
         "print(2)",
         None,
     )
-    assert cli._parse_execute_args(["-s", "1"])[2] == "missing code: pass -e '<python>'"
+    assert cli._parse_execute_args(["-s", "1"])[2] == (
+        "missing code: pass -e '<python>', -f <path>, or --code-stdin"
+    )
+
+
+def test_parse_execute_args_reads_code_file(tmp_path):
+    from browserwright import cli
+
+    script = tmp_path / "script.py"
+    script.write_text("print('from file')\n")
+
+    assert cli._parse_execute_args(["-s", "1", "-f", str(script)]) == (
+        "1",
+        "print('from file')\n",
+        None,
+    )
+
+
+def test_parse_execute_args_rejects_multiple_code_sources():
+    from browserwright import cli
+
+    assert cli._parse_execute_args(["-s", "1", "-e", "print(1)", "--code-stdin"])[2] == (
+        "pass only one of -e, -f, or --code-stdin"
+    )
+
+
+def test_parse_execute_args_reads_code_stdin(monkeypatch):
+    from io import StringIO
+    from browserwright import cli
+
+    monkeypatch.setattr(cli.sys, "stdin", StringIO("print('stdin')\n"))
+
+    assert cli._parse_execute_args(["--session=1", "--code-stdin"]) == (
+        "1",
+        "print('stdin')\n",
+        None,
+    )
 
 
 def test_cmd_execute_dispatches_to_inline_run_code(monkeypatch):

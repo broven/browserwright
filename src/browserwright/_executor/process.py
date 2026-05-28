@@ -399,13 +399,18 @@ class _Worker:
             # Restore traceback fidelity: the in-process path writes
             # `traceback.format_exc()` to stderr; a shipped heredoc must show
             # the SAME traceback. We carry it on the serialized error dict.
+            from ..errors import playwright_error_fix
+            error = {
+                "type": type(e).__name__,
+                "msg": str(e),
+                "traceback": traceback.format_exc(),
+            }
+            fix = playwright_error_fix(e)
+            if fix:
+                error["fix"] = fix
             return self._finish(
                 buf,
-                error={
-                    "type": type(e).__name__,
-                    "msg": str(e),
-                    "traceback": traceback.format_exc(),
-                },
+                error=error,
                 exit_code=3)
         return self._finish(buf, return_value=return_value, exit_code=0)
 

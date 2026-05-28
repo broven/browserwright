@@ -11,6 +11,7 @@ covered by `tests/daemon/e2e/test_l2_heredoc_playwright_page.py`.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 from browserwright.daemon import _ipc
 from browserwright.daemon.config import DEFAULT_FACADE_PORT, Config
@@ -165,6 +166,174 @@ def test_handle_close_is_noop_without_connect():
     # close() before any access is a clean no-op (idempotent).
     h.close()
     h.close()
+
+
+def test_smart_goto_ignores_explicit_wait_until_and_returns_response():
+    from browserwright.repl._smart_goto import patch_page_goto
+
+    class FakePage:
+        def __init__(self):
+            self.goto_calls = []
+            self.load_state_calls = []
+            self.evaluates = 0
+            self.listeners = {}
+
+        def goto(self, url, *, timeout=None, wait_until=None, referer=None):
+            self.goto_calls.append({
+                "url": url,
+                "timeout": timeout,
+                "wait_until": wait_until,
+                "referer": referer,
+            })
+            return {"url": url, "status": 200}
+
+        def wait_for_load_state(self, state, *, timeout=None):
+            self.load_state_calls.append((state, timeout))
+
+        def evaluate(self, *_args):
+            self.evaluates += 1
+            return True
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+        def on(self, event, handler):
+            self.listeners.setdefault(event, []).append(handler)
+
+        def off(self, event, handler):
+            self.listeners[event].remove(handler)
+
+    page = FakePage()
+    patch_page_goto(page)
+
+    response = page.goto("https://example.test/", timeout=1234,
+                         wait_until="load", referer="https://ref.test/")
+
+    assert response == {"url": "https://example.test/", "status": 200}
+    assert page.goto_calls == [{
+        "url": "https://example.test/",
+        "timeout": 1234,
+        "wait_until": "commit",
+        "referer": "https://ref.test/",
+    }]
+    assert page.load_state_calls[0][0] == "domcontentloaded"
+    assert 1 <= page.load_state_calls[0][1] <= 1234
+
+
+def test_smart_goto_accepts_timedelta_timeout():
+    from browserwright.repl._smart_goto import patch_page_goto
+
+    class FakePage:
+        def __init__(self):
+            self.goto_calls = []
+            self.load_state_calls = []
+
+        def goto(self, url, *, timeout=None, wait_until=None, referer=None):
+            self.goto_calls.append({
+                "url": url,
+                "timeout": timeout,
+                "wait_until": wait_until,
+                "referer": referer,
+            })
+            return {"url": url, "status": 200}
+
+        def wait_for_load_state(self, state, *, timeout=None):
+            self.load_state_calls.append((state, timeout))
+
+        def evaluate(self, *_args):
+            return True
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+        def on(self, *_args):
+            pass
+
+        def off(self, *_args):
+            pass
+
+    page = FakePage()
+    patch_page_goto(page)
+
+    page.goto("https://example.test/", timeout=timedelta(seconds=2))
+
+    assert page.goto_calls[0]["timeout"] == 2000
+    assert page.load_state_calls[0][0] == "domcontentloaded"
+    assert 1 <= page.load_state_calls[0][1] <= 2000
+
+
+def test_smart_goto_patches_context_new_page_results():
+    from browserwright.repl._smart_goto import patch_context_pages
+
+    class FakePage:
+        def __init__(self):
+            self.goto_calls = []
+
+        def goto(self, url, *, timeout=None, wait_until=None, referer=None):
+            self.goto_calls.append(wait_until)
+            return url
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            pass
+
+        def evaluate(self, *_args):
+            return True
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+        def on(self, *_args):
+            pass
+
+        def off(self, *_args):
+            pass
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = [FakePage()]
+
+        def new_page(self):
+            page = FakePage()
+            self.pages.append(page)
+            return page
+
+    context = FakeContext()
+    patch_context_pages(context)
+
+    existing = context.pages[0]
+    created = context.new_page()
+    existing.goto("https://old.test/", wait_until="networkidle")
+    created.goto("https://new.test/", wait_until="load")
+
+    assert existing.goto_calls == ["commit"]
+    assert created.goto_calls == ["commit"]
+
+
+def test_smart_goto_translates_commit_failure():
+    from browserwright.errors import PageLoadFailed
+    from browserwright.repl._smart_goto import patch_page_goto
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            raise TimeoutError("timed out")
+
+        def on(self, *_args):
+            pass
+
+        def off(self, *_args):
+            pass
+
+    page = FakePage()
+    patch_page_goto(page)
+
+    try:
+        page.goto("https://slow.test/")
+    except PageLoadFailed as exc:
+        assert exc.url == "https://slow.test/"
+        assert exc.reason == "commit"
+        assert "http_get" in exc.fix
+    else:
+        raise AssertionError("expected PageLoadFailed")
 
 
 # ---- PR2: snapshot() injection, filter, truncation ------------------------

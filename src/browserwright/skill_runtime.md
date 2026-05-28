@@ -45,13 +45,25 @@ Inside `browserwright -s <id> -e <code>` you write **synchronous Playwright**. F
 
 ```bash
 browserwright -s "$sid" -e $'
-page.goto("https://news.ycombinator.com", wait_until="load")
+page.goto("https://news.ycombinator.com")
 print(page.title())
 print(snapshot())
 '
 ```
 
 The connection is **lazy**: code that never touches `page` / `context` / `snapshot` / `state` / `reset` (e.g. one that only calls `remember()` or `run_task()`) opens no browser connection and spawns no executor — it stays lightweight.
+
+### Navigation: `page.goto()` has smart waiting
+
+Browserwright keeps the normal Playwright API, but transparently patches
+`page.goto(url, *, timeout=None, wait_until=None, referer=None)` on the injected
+`page` and on pages returned by `context.new_page()`. Any `wait_until` value you
+pass is accepted for compatibility and ignored: Browserwright always navigates
+to commit, waits briefly for DOMContentLoaded, then returns once rendering is
+stable or requests have been quiet. The default timeout is 60s, but normal
+pages return much earlier; if final stability is not reached, `goto` still
+returns the Playwright `Response | None` so you can inspect the page with
+`snapshot()`.
 
 ### Same live objects across calls (mental model)
 
@@ -68,7 +80,7 @@ This is the whole point: you are continuing one live session, not starting over 
 
 ```bash
 browserwright -s "$sid" -e $'
-page.goto("https://example.com", wait_until="load")
+page.goto("https://example.com")
 state["seen_title"] = page.title()           # remember it
 '
 
@@ -93,7 +105,7 @@ Use `state` for cross-call working memory (a collected list, a cursor, a flag). 
 ```bash
 browserwright -s "$sid" -e $'
 reset()                       # rebuild + clear state
-page.goto("https://example.com", wait_until="load")
+page.goto("https://example.com")
 '
 ```
 
@@ -114,7 +126,7 @@ The tab-explosion failure mode is opening a new tab for every step. Do not do th
 
 ```bash
 browserwright -s "$sid" -e $'
-page.goto("https://example.com/login", wait_until="load")
+page.goto("https://example.com/login")
 print(snapshot())                                  # find the refs
 page.locator("aria-ref=e5").fill("alice@example.com")
 page.locator("aria-ref=e6").fill("hunter2")

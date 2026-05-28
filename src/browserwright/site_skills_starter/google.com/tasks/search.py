@@ -18,7 +18,7 @@ LAST_VERIFIED = "2026-05-25"
 
 
 def selftest():
-    page.goto("https://www.google.com/?hl=en", wait_until="load")
+    page.goto("https://www.google.com/?hl=en")
     return "google.com" in page.url
 
 
@@ -30,8 +30,7 @@ def run(args, ctx=None):
     q = args["query"]
     limit = int(args.get("limit", 10))
     hl = args.get("hl", "en")
-    pg.goto(f"https://www.google.com/search?q={quote_plus(q)}&hl={hl}",
-            wait_until="load")
+    pg.goto(f"https://www.google.com/search?q={quote_plus(q)}&hl={hl}")
     results = pg.evaluate(
         """
         (limit) => Array.from(document.querySelectorAll('div.g, div[data-hveid]'))

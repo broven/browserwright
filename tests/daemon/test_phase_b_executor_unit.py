@@ -263,6 +263,17 @@ def test_generic_error_carries_traceback():
     assert "Traceback (most recent call last)" in r.error["traceback"]
 
 
+def test_playwright_like_timeout_error_carries_fix():
+    w, _page = _fake_worker_with_objects()
+    code = "raise TimeoutError('Locator.click: Timeout 30000ms exceeded')"
+
+    r = w._execute(protocol.ExecuteRequest(code, 1000))
+
+    assert r.error is not None
+    assert r.error["type"] == "TimeoutError"
+    assert "snapshot()" in r.error["fix"]
+
+
 def test_console_truncation():
     w, _page = _fake_worker_with_objects()
     # Print well over MAX_TEXT_CHARS.

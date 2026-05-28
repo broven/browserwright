@@ -16,7 +16,7 @@ LAST_VERIFIED = "2026-05-25"
 
 
 def selftest():
-    page.goto("https://www.producthunt.com/", wait_until="load")
+    page.goto("https://www.producthunt.com/")
     return "producthunt" in page.url
 
 
@@ -24,7 +24,7 @@ def run(args, ctx=None):
     pg = ctx.page if ctx is not None and getattr(ctx, "page", None) else page
 
     limit = int(args.get("limit", 20))
-    pg.goto("https://www.producthunt.com/", wait_until="load")
+    pg.goto("https://www.producthunt.com/")
     products = pg.evaluate(
         """
         () => {

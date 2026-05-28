@@ -153,3 +153,25 @@ def serialize(exc: BaseException) -> dict:
             except (TypeError, ValueError):
                 out[k] = repr(v)
     return out
+
+
+def playwright_error_fix(exc: BaseException) -> str:
+    """Best-effort recovery hint for raw Playwright exceptions.
+
+    This intentionally does not wrap or re-raise the original exception. It is
+    used at serialization boundaries so agent-authored ``try/except`` behavior
+    inside the executor stays native Playwright, while the surfaced error gains
+    a concrete next step.
+    """
+    msg = str(exc)
+    lower = msg.lower()
+    exc_type = type(exc).__name__
+    if "frame detached" in lower or "target closed" in lower or "page closed" in lower:
+        return "call reset() to rebuild the browser connection, then re-snapshot and retry"
+    if "timeout" not in lower and exc_type != "TimeoutError":
+        return ""
+    if "locator" in lower or "click" in lower or "fill" in lower:
+        return "call snapshot() to confirm the target still exists, then re-snapshot and retry with the current ref"
+    if "goto" in lower or "navigation" in lower:
+        return "retry page.goto(url); Browserwright will use smart waiting, or verify the site with http_get(url)"
+    return "call snapshot() to inspect the current page state, then retry the action with the current ref"

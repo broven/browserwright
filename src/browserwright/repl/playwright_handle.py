@@ -174,7 +174,10 @@ def connect_over_cdp(pw: Any, *, attempts: int = 1,
 
 def context_for_browser(browser: Any) -> Any:
     """The first existing BrowserContext, or a fresh one."""
-    return browser.contexts[0] if browser.contexts else browser.new_context()
+    context = browser.contexts[0] if browser.contexts else browser.new_context()
+    from ._smart_goto import patch_context_pages
+    patch_context_pages(context)
+    return context
 
 
 def bind_current_page(context: Any, sess: Any) -> Any:
@@ -203,6 +206,9 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     the AGENT path instead.
     """
     from ..primitives.page import current_page
+    from ._smart_goto import patch_context_pages, patch_page_goto
+
+    patch_context_pages(context)
 
     # Resolve/create + persist the session's current tab via the agent path.
     info = current_page()
@@ -211,19 +217,19 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     if target_id:
         page = page_for_target(context, sess, target_id, info.get("url"))
         if page is not None:
-            return page
+            return patch_page_goto(page)
         if _wait_for_session_announce(sess, timeout=2.0):
             page = page_for_target(context, sess, target_id, info.get("url"))
             if page is not None:
-                return page
+                return patch_page_goto(page)
 
     # Could not correlate a Playwright Page to the agent tab (e.g. the facade
     # hasn't replayed it yet). Fall back to a Playwright-created page so the
     # agent still gets a usable handle; the agent ledger already points at the
     # current tab for the next cold-start.
     if context.pages:
-        return context.pages[0]
-    return context.new_page()
+        return patch_page_goto(context.pages[0])
+    return patch_page_goto(context.new_page())
 
 
 def _wait_for_session_announce(sess: Any, *, timeout: float) -> bool:

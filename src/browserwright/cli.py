@@ -27,6 +27,8 @@ HELP = """browserwright — Layer 2 of the browser stack.
 
 Usage:
   browserwright -s <session-id> -e 'page.goto("https://example.com"); print(page.title())'
+  browserwright -s <session-id> -f script.py
+  browserwright -s <session-id> --code-stdin < script.py
 
   browserwright session new --backend=<extension|rdp> --name=SESSION_LABEL [--create | --attach=PORT]
   browserwright session reset <id>
@@ -96,6 +98,8 @@ def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], 
     """
     session_id: Optional[str] = None
     code: Optional[str] = None
+    code_file: Optional[str] = None
+    code_stdin = False
     i, n = 0, len(args)
     while i < n:
         a = args[i]
@@ -112,18 +116,57 @@ def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], 
         if a in {"-e", "--execute"}:
             if i + 1 >= n:
                 return None, None, f"{a} requires a value"
-            code = args[i + 1]
+            if code is not None or code_file is not None or code_stdin:
+                return None, None, "pass only one of -e, -f, or --code-stdin"
+            value = args[i + 1]
+            if value == "-":
+                code_stdin = True
+            else:
+                code = value
             i += 2
             continue
         if a.startswith("--execute="):
-            code = a.split("=", 1)[1]
+            if code is not None or code_file is not None or code_stdin:
+                return None, None, "pass only one of -e, -f, or --code-stdin"
+            value = a.split("=", 1)[1]
+            if value == "-":
+                code_stdin = True
+            else:
+                code = value
+            i += 1
+            continue
+        if a in {"-f", "--code-file"}:
+            if i + 1 >= n:
+                return None, None, f"{a} requires a value"
+            if code is not None or code_file is not None or code_stdin:
+                return None, None, "pass only one of -e, -f, or --code-stdin"
+            code_file = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--code-file="):
+            if code is not None or code_file is not None or code_stdin:
+                return None, None, "pass only one of -e, -f, or --code-stdin"
+            code_file = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--code-stdin":
+            if code is not None or code_file is not None or code_stdin:
+                return None, None, "pass only one of -e, -f, or --code-stdin"
+            code_stdin = True
             i += 1
             continue
         return None, None, f"unknown execute argument: {a!r}"
     if not session_id:
         return None, None, "missing session id: pass -s <id>"
+    if code_file is not None:
+        try:
+            code = Path(code_file).read_text()
+        except OSError as e:
+            return None, None, f"cannot read code file {code_file!r}: {e}"
+    elif code_stdin:
+        code = sys.stdin.read()
     if code is None:
-        return None, None, "missing code: pass -e '<python>'"
+        return None, None, "missing code: pass -e '<python>', -f <path>, or --code-stdin"
     return session_id, code, None
 
 
@@ -131,7 +174,8 @@ def _cmd_execute(args: list[str]) -> int:
     session_id, code, err = _parse_execute_args(args)
     if err:
         print(f"usage error: {err}", file=sys.stderr)
-        print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
+        print("usage: browserwright -s <session-id> "
+              "(-e 'print(snapshot())' | -f script.py | --code-stdin)",
               file=sys.stderr)
         return 1
     from .repl import inline

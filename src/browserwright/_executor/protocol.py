@@ -25,7 +25,7 @@ from typing import Any
 # pick a more generous default. It is deliberately bounded WELL UNDER any
 # realistic idle-reap threshold (`Config.idle_close_after`, default None = never)
 # so a slow-but-legitimate call never trips idle reclamation mid-flight.
-DEFAULT_TIMEOUT_MS = 30000
+DEFAULT_TIMEOUT_MS = 90000
 
 # Cap on the rendered text block (console + return value), mirroring
 # playwriter's ~10000-char truncation. Whole-line aware truncation lives in

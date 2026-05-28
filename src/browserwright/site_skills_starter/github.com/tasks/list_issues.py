@@ -20,7 +20,7 @@ LAST_VERIFIED = "2026-05-25"
 
 
 def selftest():
-    page.goto("https://github.com/", wait_until="load")
+    page.goto("https://github.com/")
     return page.url.startswith("https://github.com")
 
 
@@ -31,7 +31,7 @@ def run(args, ctx=None):
     state = args.get("state", "open")
     limit = int(args.get("limit", 20))
     url = f"https://github.com/{owner}/{repo}/issues?q=is%3Aissue+state%3A{state}"
-    pg.goto(url, wait_until="load")
+    pg.goto(url)
     results = pg.evaluate(
         """
         (limit) => {
