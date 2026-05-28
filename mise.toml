@@ -52,7 +52,14 @@ set -euo pipefail
 
 REPO="{{config_root}}"
 
-uv tool upgrade browserwright
+# `uv tool install --force` instead of `uv tool upgrade`: `upgrade` honors
+# whatever specifier landed in the receipt the last time the tool was
+# installed, so a one-time `uv tool install browserwright==X.Y.Z` pins the
+# receipt at `==X.Y.Z` and every subsequent upgrade is silently capped at
+# that version ("Nothing to upgrade"). `install --force` re-resolves against
+# PyPI latest each run with no specifier pin, costs ~500ms, and is idempotent,
+# which is what this task actually means ("always sync global to PyPI latest").
+uv tool install browserwright --force
 browserwright-daemon restart
 browserwright version check
 browserwright-daemon version check
