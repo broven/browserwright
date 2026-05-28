@@ -43,26 +43,108 @@ echo "Done. Installed: browserwright (+ browserwright-daemon), Claude/Codex/Pi s
 description = "Alias for dev-link; development only and not release-isolated"
 depends = ["dev-link"]
 
-[tasks.install-release]
-description = "Build an immutable local release and activate global browserwright symlinks"
+[tasks.upgrade-global]
+description = "Upgrade the globally installed browserwright (uv tool) to the latest PyPI version, restart the daemon, sync the Chrome extension to the global load path, and verify"
 dir = "{{config_root}}"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-uv run browserwright release install-local --force
-"""
 
-[tasks.update-local-global-install]
-description = "Update the local global browserwright install from this checkout, verify it, and restart the daemon when needed"
-dir = "{{config_root}}"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-uv run browserwright release install-local --force --restart-daemon
-browserwright release status
+REPO="{{config_root}}"
+
+uv tool upgrade browserwright
+browserwright-daemon restart
 browserwright version check
 browserwright-daemon version check
-browserwright --print-skill >/dev/null
+
+# --- Sync chrome-extension/ to the stable global load path. -----------------
+# Mirrors what `release_install.sync_chrome_extension` used to do for the
+# (now-retired) local release installer: copy the repo's chrome-extension/
+# into a fixed directory that Chrome can keep loaded as an unpacked extension
+# across browserwright upgrades. Override the target with
+# BROWSERWRIGHT_CHROME_EXTENSION_TARGET; default mirrors release_install.py.
+EXT_SRC="$REPO/chrome-extension"
+EXT_TARGET="${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/etc/chrome-extension/browserwright}"
+
+hash_ext_dir() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    echo ""
+    return
+  fi
+  ( cd "$dir" && find . -type f \\
+      ! -name ".DS_Store" \\
+      ! -name "*.pyc" \\
+      ! -path "*/__pycache__/*" \\
+      -print0 \\
+    | LC_ALL=C sort -z \\
+    | xargs -0 shasum -a 256 2>/dev/null \\
+  ) | shasum -a 256 | awk '{print $1}'
+}
+
+if [[ ! -d "$EXT_SRC" ]]; then
+  echo "Skipping chrome-extension sync: $EXT_SRC not found in repo checkout."
+elif [[ -z "${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-}" && "$(uname)" != "Darwin" ]]; then
+  echo "Skipping chrome-extension sync: set BROWSERWRIGHT_CHROME_EXTENSION_TARGET to enable on non-macOS."
+else
+  prev_hash="$(hash_ext_dir "$EXT_TARGET")"
+  mkdir -p "$(dirname "$EXT_TARGET")"
+  rsync -a --delete \\
+    --exclude '__pycache__' \\
+    --exclude '*.pyc' \\
+    --exclude '.DS_Store' \\
+    "$EXT_SRC/" "$EXT_TARGET/"
+
+  # Pin target manifest.json version to the installed CLI version. Today the
+  # PyPI release flow uses the git tag as the single source of truth for the
+  # package version, but it does NOT commit a matching bump back to
+  # chrome-extension/manifest.json in the repo. That means the source manifest
+  # we just rsync'd over can lag behind the published browserwright version
+  # (e.g., source says 0.6.2 while uv tool just upgraded to 0.6.4). Rewriting
+  # the version field here keeps the loaded extension's about-page version in
+  # lockstep with the daemon/CLI version users actually have on their machine.
+  cli_version="$(browserwright version)"
+  if [[ -f "$EXT_TARGET/manifest.json" && -n "$cli_version" ]]; then
+    python3 - "$EXT_TARGET/manifest.json" "$cli_version" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+version = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+updated, count = re.subn(
+    r'("version"\\s*:\\s*)"[^"]+"',
+    lambda m: f'{m.group(1)}"{version}"',
+    text,
+    count=1,
+)
+if count != 1:
+    sys.exit(f"could not rewrite version field in {path}")
+path.write_text(updated, encoding="utf-8")
+PY
+  fi
+
+  new_hash="$(hash_ext_dir "$EXT_TARGET")"
+  ext_version="$(python3 -c "import json,sys; print(json.load(open('$EXT_TARGET/manifest.json')).get('version',''))" 2>/dev/null || echo '?')"
+
+  echo ""
+  if [[ -z "$prev_hash" ]]; then
+    echo "✔ Installed chrome-extension at: $EXT_TARGET (version $ext_version)"
+    echo "  First time only: open chrome://extensions/, enable Developer mode,"
+    echo "  click 'Load unpacked', and select the path above."
+  elif [[ "$prev_hash" != "$new_hash" ]]; then
+    echo "🔁 chrome-extension changed (now $ext_version) — RELOAD REQUIRED"
+    echo "   1. Open chrome://extensions/"
+    echo "   2. Find 'browserwright-daemon relay' and click the reload (↻) icon"
+    echo "   Extension path: $EXT_TARGET"
+  else
+    echo "✔ chrome-extension up to date (version $ext_version, no reload needed)"
+  fi
+fi
+
+echo ""
+echo "Done. Global browserwright is on $(browserwright version) and the daemon is restarted."
 """
 
 [tasks.version-check]
