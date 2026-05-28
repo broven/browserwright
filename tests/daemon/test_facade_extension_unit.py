@@ -42,6 +42,7 @@ class _MockExtension:
         # 'createTab' / 'attach' / 'command' we provide sane defaults.
         self.tabs_meta: dict[int, dict] = {}
         self._next_created_tab = 100
+        self.create_tab_messages: list[dict] = []
         # Every chrome.debugger.sendCommand the relay forwarded, as
         # (tabId, method) tuples — lets tests assert what reached the extension.
         self.commands_seen: list[tuple] = []
@@ -77,12 +78,13 @@ class _MockExtension:
             await self._respond(cmd_id, {"targetInfo": meta})
             return
         if kind == "createTab":
+            self.create_tab_messages.append(msg)
             tab = self._next_created_tab
             self._next_created_tab += 1
             url = msg.get("url", "about:blank")
             group_id = msg.get("groupId")
             if not isinstance(group_id, int) or group_id < 0:
-                group_id = 700 + tab
+                group_id = 700 if msg.get("groupName") else -1
             self.tabs_meta[tab] = {
                 "url": url, "title": "new", "groupId": group_id}
             # The extension announces the attach (the relay turns it into a
@@ -380,6 +382,40 @@ async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
         await relay.stop()
 
 
+async def test_session_scoped_create_target_joins_session_group():
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay,
+        session_id="bw-s", session_name="Scoped Session")
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        client.feed({"id": 3, "method": "Target.createTarget",
+                     "params": {"url": "https://scoped/"}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 3 and "result" in f)
+        tid = res["result"]["targetId"]
+        await client.wait_for(
+            lambda f: f.get("method") == "Target.attachedToTarget"
+            and f["params"]["targetInfo"]["targetId"] == tid)
+
+        assert ext.create_tab_messages
+        created = ext.create_tab_messages[-1]
+        assert created["groupName"] == "Scoped Session"
+        assert "groupId" not in created
+        assert bridge._ext._groups["bw-s"] == 700  # noqa: SLF001
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
+
+
 async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
     relay = RelayServer(port=0)
@@ -411,6 +447,52 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
             await asyncio.wait_for(run_task, timeout=2.0)
         await ext.close()
         await relay.stop()
+
+
+async def test_session_scoped_create_target_persists_group_id(monkeypatch):
+    updates: list[tuple[str, dict]] = []
+
+    class _Registry:
+        @staticmethod
+        def get(_session_id):
+            return {"runtime": {"current_target_id": "ext-tab-old"}}
+
+        @staticmethod
+        def update(session_id, **fields):
+            updates.append((session_id, fields))
+
+    import browserwright.session_registry as session_registry
+
+    monkeypatch.setattr(session_registry, "get", _Registry.get)
+    monkeypatch.setattr(session_registry, "update", _Registry.update)
+
+    async with _wired() as (relay, ext, client, bridge):
+        bridge = ExtensionFacadeBridge(
+            client=client, relay=relay,
+            session_id="bw-s", session_name="Scoped Session")
+        await bridge._handle_create_target(3, {"url": "https://scoped/"})  # noqa: SLF001
+
+    assert updates
+    sid, fields = updates[-1]
+    assert sid == "bw-s"
+    assert fields["runtime"]["current_target_id"] == "ext-tab-old"
+    assert fields["runtime"]["group_id"] == 700
+    assert isinstance(fields["runtime"]["updated_at"], float)
+
+
+async def test_session_scoped_create_target_reuses_persisted_group_id():
+    async with _wired() as (relay, ext, client, bridge):
+        bridge = ExtensionFacadeBridge(
+            client=client, relay=relay,
+            session_id="bw-s", session_name="Scoped Session",
+            session_group_id=42)
+        await bridge._handle_create_target(3, {"url": "https://scoped/"})  # noqa: SLF001
+
+        assert ext.create_tab_messages
+        created = ext.create_tab_messages[-1]
+        assert created["groupName"] == "Scoped Session"
+        assert created["groupId"] == 42
+        assert bridge._ext._groups["bw-s"] == 42  # noqa: SLF001
 
 
 # ---- A4: Runtime.enable barrier --------------------------------------------

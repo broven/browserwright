@@ -267,11 +267,22 @@ class PlaywrightFacade:
             with contextlib.suppress(Exception):
                 await conn.close(code=1011, reason="extension relay unavailable")
             return
+        session_id = self._session_for_connection(conn)
+        session_name = None
+        session_group_id = None
+        if session_id:
+            from ... import session_registry
+            rec = session_registry.get(session_id)
+            if isinstance(rec, dict):
+                session_name = rec.get("name")
+                runtime = rec.get("runtime") or {}
+                gid = runtime.get("group_id") if isinstance(runtime, dict) else None
+                if isinstance(gid, int) and gid >= 0:
+                    session_group_id = gid
         bridge = ExtensionFacadeBridge(
-            client=conn,
-            relay=relay,
-            session_id=self._session_for_connection(conn),
-        )
+            client=conn, relay=relay,
+            session_id=session_id, session_name=session_name,
+            session_group_id=session_group_id)
         try:
             await bridge.run()
         except websockets.exceptions.ConnectionClosed:
