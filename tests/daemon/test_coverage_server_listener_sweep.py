@@ -268,6 +268,7 @@ async def test_extension_upstream_success_wires_callbacks_and_ready_events(monke
             self.send_text = self.attach_active_tab = self.open_background_tab = object()
             self.close_tab = self.close_tab_by_target_id = self.end_session = object()
             self.recover_session = self.userscript_request = object()
+            self.wait_session_announce = object()
             self.scoped_target_infos = object()
 
         async def open(self, *, timeout):
@@ -292,6 +293,7 @@ async def test_extension_upstream_success_wires_callbacks_and_ready_events(monke
     assert router.sent[1][1]["params"] == {"backend": "extension", "ws_url": "ext://ready"}
     assert router._attach_active_tab is holder.upstream.attach_active_tab
     assert router._open_background_tab is holder.upstream.open_background_tab
+    assert router._wait_session_announce is holder.upstream.wait_session_announce
     assert router._scoped_targets is holder.upstream.scoped_target_infos
     assert router.upstream_senders[-1] is holder.upstream.send_text
 

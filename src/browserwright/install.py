@@ -576,11 +576,11 @@ def run() -> int:
     if choice == "1":
         print("  - Run `browserwright-daemon launch-chrome` to start the isolated profile.")
         print("  - Then create a session: `browserwright session new --backend=rdp --create --name=TASK`.")
-        print("    (`--name` is the Chrome tab group title; choose a short task label.)")
+        print("    (`--name` labels the isolated browser session; choose a short task label.)")
     elif choice == "2":
         print("  - Make sure your fingerprint browser is open on the chosen port.")
         print("  - Then attach a session: `browserwright session new --backend=rdp --attach=PORT --name=TASK`.")
-        print("    (`--name` is the Chrome tab group title; choose a short task label.)")
+        print("    (`--name` labels the attached browser session; choose a short task label.)")
     elif choice == "3":
         ext_dir = chrome_extension_path()
         print("  1. Install the unpacked Chrome extension:")

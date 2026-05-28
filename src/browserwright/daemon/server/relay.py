@@ -138,6 +138,12 @@ class RelayServer:
         # the relay calls alongside `_on_event` — the facade registers/removes
         # itself here per connection without disturbing the agent handler.
         self._event_listeners: set[Callable[[dict], Awaitable[None]]] = set()
+        # Shared extension-session state. The daemon's primary
+        # ExtensionUpstream and every Playwright facade bridge are separate
+        # adapter instances over this one relay, so relay-scoped state is the
+        # in-process truth they can all see immediately.
+        self._session_groups: dict[str, int] = {}
+        self._session_announce_events: dict[str, asyncio.Event] = {}
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -220,6 +226,35 @@ class RelayServer:
     ) -> None:
         """Drop a fan-out observer (facade disconnect/stop). Idempotent."""
         self._event_listeners.discard(handler)
+
+    def bind_session_group(self, session_id: str, group_id: int) -> None:
+        if isinstance(group_id, int) and group_id >= 0:
+            self._session_groups[session_id] = group_id
+
+    def session_group(self, session_id: str | None) -> int | None:
+        if not session_id:
+            return None
+        return self._session_groups.get(session_id)
+
+    def reset_session_announce(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        self._session_announce_events.setdefault(session_id, asyncio.Event()).clear()
+
+    def set_session_announce(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        self._session_announce_events.setdefault(session_id, asyncio.Event()).set()
+
+    async def wait_session_announce(self, session_id: str,
+                                    timeout: float = 2.0) -> bool:
+        event = self._session_announce_events.setdefault(
+            session_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout))
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     # ---- public command API (used by extension upstream wrapper) ---------
 

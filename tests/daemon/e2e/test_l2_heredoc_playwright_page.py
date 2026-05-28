@@ -39,6 +39,11 @@ from .conftest import (
     _isolated_runtime_dir,
 )
 from .helpers import run_skill
+from .test_l2_multisession import (
+    _chrome_close_tabs,
+    _extension_id_from_path,
+    _extension_worker_target_id,
+)
 
 
 def _port_free(port: int) -> bool:
@@ -204,6 +209,236 @@ def _bound_target(backend: str, sid: str) -> str | None:
         return None
     rec = data.get("sessions", {}).get(sid, {})
     return (rec.get("runtime") or {}).get("current_target_id")
+
+
+def _session_group_id(sid: str) -> int | None:
+    ledger_path = (Path(__file__).resolve().parent / "_bs_home" / "extension"
+                   / "sessions" / "ledger.json")
+    try:
+        data = json.loads(ledger_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    gid = ((data.get("sessions", {}).get(sid, {}).get("runtime") or {})
+           .get("group_id"))
+    return gid if isinstance(gid, int) and gid >= 0 else None
+
+
+def _chrome_group_tab_ids(chrome, extension_id: str, group_id: int) -> list[int]:
+    from browserwright.cdp import CDPSession
+
+    cdp = CDPSession(chrome.ws_url)
+    try:
+        worker = _extension_worker_target_id(cdp, extension_id)
+        session_id = cdp.attach(worker)
+        expression = (
+            "(async () => {"
+            f"const gid = {int(group_id)};"
+            "const tabs = await chrome.tabs.query({groupId: gid});"
+            "return tabs.map(t => t.id);"
+            "})()"
+        )
+        result = cdp.send(
+            "Runtime.evaluate",
+            session=session_id,
+            expression=expression,
+            returnByValue=True,
+            awaitPromise=True,
+        )
+    finally:
+        cdp.close()
+    if "exceptionDetails" in result:
+        raise AssertionError(f"tab group query failed: {result!r}")
+    return list(result.get("result", {}).get("value", []))
+
+
+def _wait_extension_worker_connected(chrome, extension_id: str) -> None:
+    from browserwright.cdp import CDPSession
+
+    deadline = time.monotonic() + 10.0
+    last_result = None
+    while time.monotonic() < deadline:
+        cdp = CDPSession(chrome.ws_url)
+        try:
+            worker = _extension_worker_target_id(cdp, extension_id)
+            session_id = cdp.attach(worker)
+            result = cdp.send(
+                "Runtime.evaluate",
+                session=session_id,
+                expression="!!ws && ws.readyState === WebSocket.OPEN",
+                returnByValue=True,
+            )
+            last_result = result
+            value = result.get("result", {}).get("value")
+            if value is True:
+                return
+        except Exception as e:  # noqa: BLE001
+            last_result = repr(e)
+        finally:
+            cdp.close()
+        time.sleep(0.2)
+    raise AssertionError(
+        f"extension worker did not report relay connection; last={last_result!r}")
+
+
+def _assert_one_session_group(chrome, extension_id: str, sid: str) -> list[int]:
+    gid = _session_group_id(sid)
+    assert gid is not None, f"session {sid} did not persist runtime.group_id"
+    tab_ids = _chrome_group_tab_ids(chrome, extension_id, gid)
+    assert tab_ids, f"session group {gid} has no tabs"
+    return tab_ids
+
+
+def _run_execute(script: str, *, sid: str, runtime_dir: str,
+                 timeout: float = 60) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
+    env["BS_HOME"] = str(Path(__file__).resolve().parent
+                         / "_bs_home" / "extension")
+    env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
+    env["BD_CONFIG"] = ""
+    env["no_proxy"] = "127.0.0.1,localhost"
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    return subprocess.run(
+        ["browserwright", "-s", sid, "-e", script],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=timeout,
+    )
+
+
+def _one_group_case(
+    *,
+    sid: str,
+    script: str,
+    runtime_dir: str,
+    chrome,
+    extension_id: str,
+    timeout: float = 60,
+) -> None:
+    try:
+        _wait_extension_worker_connected(chrome, extension_id)
+        result = _run_execute(
+            script, sid=sid, runtime_dir=runtime_dir, timeout=timeout)
+        assert result.returncode == 0, (
+            f"heredoc failed; stdout={result.stdout!r} stderr={result.stderr!r}")
+        tab_ids = _assert_one_session_group(chrome, extension_id, sid)
+    finally:
+        gid = _session_group_id(sid)
+        tab_ids = (
+            _chrome_group_tab_ids(chrome, extension_id, gid)
+            if gid is not None else []
+        )
+        _chrome_close_tabs(chrome, extension_id, tab_ids)
+        _cleanup_session("extension", sid)
+
+
+def test_one_group_playwright_first_extension(ext_autofacade_ready, e2e_chrome,
+                                              patched_ext_dir):
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = ext_autofacade_ready
+    extension_id = _extension_id_from_path(patched_ext_dir)
+    sid = _seed_session(runtime_dir, "extension")
+    _one_group_case(
+        sid=sid,
+        runtime_dir=runtime_dir,
+        chrome=e2e_chrome,
+        extension_id=extension_id,
+        script=(
+            "page.goto('about:blank', wait_until='load')\n"
+            "print('ok')\n"
+        ),
+    )
+
+
+def test_one_group_agent_first_extension(ext_autofacade_ready, e2e_chrome,
+                                         patched_ext_dir):
+    runtime_dir, _facade_ws = ext_autofacade_ready
+    extension_id = _extension_id_from_path(patched_ext_dir)
+    sid = _seed_session(runtime_dir, "extension")
+    _one_group_case(
+        sid=sid,
+        runtime_dir=runtime_dir,
+        chrome=e2e_chrome,
+        extension_id=extension_id,
+        script=(
+            "from browserwright.primitives.page import open\n"
+            "tab = open('about:blank')\n"
+            "print(tab['targetId'])\n"
+        ),
+    )
+
+
+def test_one_group_mixed_extension(ext_autofacade_ready, e2e_chrome,
+                                   patched_ext_dir):
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = ext_autofacade_ready
+    extension_id = _extension_id_from_path(patched_ext_dir)
+    sid = _seed_session(runtime_dir, "extension")
+    _one_group_case(
+        sid=sid,
+        runtime_dir=runtime_dir,
+        chrome=e2e_chrome,
+        extension_id=extension_id,
+        script=(
+            "from browserwright.primitives.page import open\n"
+            "open('about:blank')\n"
+            "page.goto('about:blank', wait_until='load')\n"
+            "print('ok')\n"
+        ),
+    )
+
+
+def test_one_group_after_recover_extension(ext_autofacade_ready, e2e_chrome,
+                                           patched_ext_dir):
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = ext_autofacade_ready
+    extension_id = _extension_id_from_path(patched_ext_dir)
+    sid = _seed_session(runtime_dir, "extension")
+    try:
+        _wait_extension_worker_connected(e2e_chrome, extension_id)
+        first = _run_execute(
+            "page.goto('about:blank', wait_until='load')\nprint('first')\n",
+            sid=sid,
+            runtime_dir=runtime_dir,
+            timeout=60,
+        )
+        assert first.returncode == 0, (
+            f"initial heredoc failed; stdout={first.stdout!r} stderr={first.stderr!r}")
+
+        subprocess.run(
+            ["browserwright-daemon", "kill-executor", "--session", sid],
+            capture_output=True,
+            env={
+                **os.environ,
+                "XDG_RUNTIME_DIR": runtime_dir,
+                "TMPDIR": runtime_dir,
+                "BS_HOME": str(Path(__file__).resolve().parent
+                               / "_bs_home" / "extension"),
+                "BD_EXTENSION_PORT": str(TEST_EXT_PORT),
+                "BD_CONFIG": "",
+            },
+            timeout=10,
+        )
+
+        second = _run_execute(
+            "page.goto('about:blank', wait_until='load')\nprint('second')\n",
+            sid=sid,
+            runtime_dir=runtime_dir,
+            timeout=60,
+        )
+        assert second.returncode == 0, (
+            f"recovered heredoc failed; stdout={second.stdout!r} stderr={second.stderr!r}")
+        tab_ids = _assert_one_session_group(e2e_chrome, extension_id, sid)
+    finally:
+        gid = _session_group_id(sid)
+        tab_ids = (
+            _chrome_group_tab_ids(e2e_chrome, extension_id, gid)
+            if gid is not None else []
+        )
+        _chrome_close_tabs(e2e_chrome, extension_id, tab_ids)
+        _cleanup_session("extension", sid)
 
 
 def test_cross_heredoc_tab_reuse_rdp(rdp_autofacade_daemon):

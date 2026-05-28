@@ -380,6 +380,39 @@ async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
         await relay.stop()
 
 
+async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home):
+    sid = reg.allocate(backend="extension", owner="create", name="Research")
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        # Simulate the agent path winning the race after the facade bridge was
+        # constructed: the group id is now in the shared in-process truth, but
+        # not in bridge._group_id's constructor-time cache.
+        relay.bind_session_group(sid, 88)
+        assert bridge._group_id is None  # noqa: SLF001
+
+        client.feed({"id": 3, "method": "Target.createTarget",
+                     "params": {"url": "https://new/"}})
+        res = await client.wait_for(lambda f: f.get("id") == 3 and "result" in f)
+        tid = res["result"]["targetId"]
+        tab_id = int(tid.rsplit("-", 1)[1])
+        assert ext.tabs_meta[tab_id]["groupId"] == 88
+        assert bridge._group_id == 88  # noqa: SLF001
+        assert (reg.get(sid).get("runtime") or {})["group_id"] == 88
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
+
+
 # ---- A4: Runtime.enable barrier --------------------------------------------
 
 

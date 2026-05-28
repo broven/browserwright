@@ -205,6 +205,23 @@ class ExtensionFacadeBridge:
         except Exception:
             pass
 
+    def _refresh_session_group_id(self) -> int | None:
+        """Refresh the session group before creating a tab.
+
+        The daemon's agent path may have bound the group after this facade
+        bridge was constructed. The relay-scoped map is the same-process fast
+        path; the ledger is the restart/reconnect fallback.
+        """
+        if not self._session_id:
+            return self._group_id
+        gid = self._relay.session_group(self._session_id)
+        if gid is None:
+            _name, gid = self._load_session_scope(self._session_id)
+        if gid is not None:
+            self._group_id = gid
+            self._ext._bind_group(self._session_id, gid)  # noqa: SLF001
+        return self._group_id
+
     # ---- lifecycle -------------------------------------------------------
 
     async def run(self) -> None:
@@ -474,7 +491,8 @@ class ExtensionFacadeBridge:
         self._creating += 1
         try:
             group_name = self._session_name or "Agent"
-            group_id = self._group_id
+            group_id = self._refresh_session_group_id()
+            self._relay.reset_session_announce(self._session_id)
             gt = await self._relay.create_background_tab(
                 url, group_name=group_name, group_id=group_id, background=True)
             created_group = getattr(gt, "group_id", -1)
@@ -697,6 +715,7 @@ class ExtensionFacadeBridge:
                     "waitingForDebugger": False,
                 },
             }))
+            self._relay.set_session_announce(self._session_id)
 
     async def _tab_visible_to_session(self, tab_id: int) -> bool:
         if self._session_id is None:

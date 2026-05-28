@@ -1,3 +1,8 @@
+## Project Architecture Reference
+
+Before changing session routing, backend semantics, tab creation, Playwright
+facade behavior, or teardown semantics, read `docs/session-workspaces.md`.
+
 <!-- TRELLIS:START -->
 # Trellis Instructions
 

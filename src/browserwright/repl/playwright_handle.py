@@ -212,6 +212,10 @@ def bind_current_page(context: Any, sess: Any) -> Any:
         page = page_for_target(context, sess, target_id, info.get("url"))
         if page is not None:
             return page
+        if _wait_for_session_announce(sess, timeout=2.0):
+            page = page_for_target(context, sess, target_id, info.get("url"))
+            if page is not None:
+                return page
 
     # Could not correlate a Playwright Page to the agent tab (e.g. the facade
     # hasn't replayed it yet). Fall back to a Playwright-created page so the
@@ -220,6 +224,28 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     if context.pages:
         return context.pages[0]
     return context.new_page()
+
+
+def _wait_for_session_announce(sess: Any, *, timeout: float) -> bool:
+    """Wait for the daemon facade to announce the agent-created tab.
+
+    This is a daemon RPC because the Playwright binding code runs in the
+    skill/executor process, while the announce event is produced inside the
+    daemon's extension facade bridge.
+    """
+    try:
+        rec = getattr(sess, "session_record", None)
+        sid = rec.get("id") if isinstance(rec, dict) else None
+        if not sid:
+            return False
+        res = sess.cdp.send(
+            "BrowserwrightDaemon.waitForSessionAnnounce",
+            bsSession=sid,
+            timeout=timeout,
+        )
+        return bool(res.get("announced"))
+    except Exception:
+        return False
 
 
 def page_for_target(context: Any, sess: Any, target_id: str,

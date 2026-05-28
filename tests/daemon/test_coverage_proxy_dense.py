@@ -163,6 +163,27 @@ async def test_self_answer_focus_stats_version_and_backend_state():
 
 
 @pytest.mark.asyncio
+async def test_wait_session_announce_is_extension_only_noop_for_rdp():
+    state, router, cap, (client,) = setup_router("rdp-session", backend="rdp")
+    called = False
+
+    async def wait_session_announce(session_id: str, timeout: float) -> bool:
+        nonlocal called
+        called = True
+        return False
+
+    router._wait_session_announce = wait_session_announce
+    await router.route_from_client(client, json.dumps({
+        "id": 7,
+        "method": "BrowserwrightDaemon.waitForSessionAnnounce",
+        "params": {"timeout": 0.01},
+    }))
+
+    assert cap.per_client[client.client_id][-1]["result"] == {"announced": True}
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_extension_scoped_get_targets_success_error_and_fallback():
     state, router, cap, (scoped, sessionless) = setup_router(
         "scoped", "sessionless", backend="extension")

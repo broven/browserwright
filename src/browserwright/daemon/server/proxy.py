@@ -135,6 +135,8 @@ class Router:
         # (bs_session | None, *, group_id) -> dict.
         self._recover_session: (
             Callable[..., Awaitable[dict]] | None) = None
+        self._wait_session_announce: (
+            Callable[[str, float], Awaitable[bool]] | None) = None
         self._userscript_request: (
             Callable[[str, dict], Awaitable[dict | None]] | None) = None
         # Extension-backend-only: scope Target.getTargets to a session's tab
@@ -163,7 +165,7 @@ class Router:
         self, client: ClientState, session_id: str,
         explicit: str | None = None,
     ) -> str:
-        """Human-visible tab group title for a browserwright session."""
+        """Extension-only human-visible tab group title for a session."""
         if explicit:
             return explicit
         return client.session_name or session_id
@@ -903,6 +905,36 @@ class Router:
                 "client_count": len(self.state.clients),  # v0.3 addition
             }))
             return
+        if method == "BrowserwrightDaemon.waitForSessionAnnounce":
+            session_id = await self._require_browser_session(
+                client, req_id, method, params)
+            if session_id is None:
+                return
+            timeout = params.get("timeout")
+            timeout = float(timeout) if isinstance(timeout, (int, float)) else 2.0
+            if self.state.backend_name != "extension":
+                await self._send_to_client(client.client_id, _result_response(
+                    req_id, {"announced": True}))
+                return
+            if self._wait_session_announce is None:
+                if (self._ensure_upstream is not None
+                        and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                    try:
+                        await self._ensure_upstream()
+                    except Exception as e:
+                        await self._send_to_client(client.client_id, _error_response(
+                            req_id, -32603,
+                            f"waitForSessionAnnounce failed (upstream open): {e!r}"))
+                        return
+            if self._wait_session_announce is None:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32601,
+                    "BrowserwrightDaemon.waitForSessionAnnounce requires the extension backend"))
+                return
+            announced = await self._wait_session_announce(session_id, timeout)
+            await self._send_to_client(client.client_id, _result_response(
+                req_id, {"announced": bool(announced)}))
+            return
         if method == "BrowserwrightDaemon.subscribeFocus":
             if await self._require_browser_session(client, req_id, method, params) is None:
                 return
@@ -1069,11 +1101,12 @@ class Router:
     ) -> None:
         """Spec Phase B Feature 1.
 
-        Requires backend=extension (the only backend with the callback wired
-        in). Calls the upstream's open_background_tab, then registers the
-        returned (target_id, upstream_session_id) as a regular client-side
-        binding so subsequent CDP commands work through the same session-id
-        translation path as Target.attachToTarget.
+        Extension calls the extension upstream's open_background_tab inside the
+        session tab group. RDP handles the same public verb with raw CDP against
+        the session's isolated browser. Both paths register the returned
+        (target_id, upstream_session_id) as a regular client-side binding so
+        subsequent CDP commands work through the same session-id translation
+        path as Target.attachToTarget.
         """
         # Param validation runs FIRST: the schema-lock smoke test calls
         # every BrowserwrightDaemon.* method with no params and asserts the
@@ -1130,11 +1163,9 @@ class Router:
                 req_id, -32601,
                 "BrowserwrightDaemon.openBackgroundTab requires the extension backend"))
             return
-        # The group identity is the session's NAME, fixed (and required +
-        # unique) at `session new` and stored in the ledger — the daemon reads
-        # it off the connection (client.session_name) rather than the caller
-        # re-passing it on every open. This is an authoritative lookup, NOT a
-        # fallback: the session IS the tab group (decision 6).
+        # Extension-only: the tab-group title comes from the session label in
+        # the ledger unless explicitly overridden. The durable identity is the
+        # numeric groupId returned by the extension path, not this title.
         group_name = self._session_group_name(client, session, group_name)
         # `background` (default True) protects the user's focus on the
         # extension backend; background=False opens the tab in the foreground.

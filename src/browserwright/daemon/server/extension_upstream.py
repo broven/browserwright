@@ -139,6 +139,13 @@ class ExtensionUpstream:
         self._groups: dict[str, int] = {}        # bs session → tab-group id
         self._tab_url: dict[int, str] = {}        # tab_id → last-known url
 
+    def reset_session_announce(self, session_id: str | None) -> None:
+        self._relay.reset_session_announce(session_id)
+
+    async def wait_session_announce(self, session_id: str,
+                                    timeout: float = 2.0) -> bool:
+        return await self._relay.wait_session_announce(session_id, timeout)
+
     # ---- per-session group binding helpers -------------------------------
 
     def _bind_group(self, session_id: str, group_id: int) -> None:
@@ -147,6 +154,7 @@ class ExtensionUpstream:
         (empty) and will be recreated on the next open."""
         if isinstance(group_id, int) and group_id >= 0:
             self._groups[session_id] = group_id
+            self._relay.bind_session_group(session_id, group_id)
 
     @staticmethod
     def _group_required(*, group_name: str | None,
@@ -172,6 +180,8 @@ class ExtensionUpstream:
         decision 6). Empty list when the session has no live group (never opened
         a tab, or its last tab closed and Chrome auto-deleted the group)."""
         gid = self._groups.get(session_id) if session_id else None
+        if gid is None:
+            gid = self._relay.session_group(session_id)
         if gid is None:
             gid = group_id
         info = await self._relay.query_group_tabs(group_id=gid)
@@ -500,6 +510,9 @@ class ExtensionUpstream:
         created. The returned groupId is (re)bound to the session — that's the
         only per-session state we keep; membership comes from the live group."""
         gid = self._groups.get(session_id) if session_id else None
+        if gid is None:
+            gid = self._relay.session_group(session_id)
+        self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
             url, group_name=group_name, group_id=gid, background=background)
         group_id = getattr(gt, "group_id", -1)

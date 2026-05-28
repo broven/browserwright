@@ -862,6 +862,7 @@ class _UpstreamHolder:
         # Session-reconnect-recovery: rebuild a session's tab bindings from the
         # persisted numeric tab-group id.
         self.router._recover_session = ext.recover_session
+        self.router._wait_session_announce = ext.wait_session_announce
         self.router._userscript_request = ext.userscript_request
         # Scope Target.getTargets to the requesting session's tab group so
         # extension sessions sharing one Chrome are mutually invisible.
@@ -926,6 +927,7 @@ class _UpstreamHolder:
         self.router._close_tab_by_target_id = None
         self.router._end_session = None
         self.router._recover_session = None
+        self.router._wait_session_announce = None
         self.router._userscript_request = None
         # Phase 3: drop the rdp raw-CDP command channel (symmetric with the
         # extension callbacks above) so a post-close verb returns a clean error

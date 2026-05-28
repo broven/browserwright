@@ -94,7 +94,7 @@ class NoSession(BrowserwrightError):
 
     exit_code = 2
     default_fix = (
-        "run `browserwright session new --backend=<extension|rdp> --name=TAB_GROUP_TITLE` "
+        "run `browserwright session new --backend=<extension|rdp> --name=SESSION_LABEL` "
         "then run `browserwright -s <id> -e 'print(snapshot())'`"
     )
 
@@ -102,8 +102,8 @@ class NoSession(BrowserwrightError):
         self.detail = detail
         super().__init__(
             "no session: run `browserwright session new --backend=<extension|rdp> "
-            "--name=TAB_GROUP_TITLE` first (use the `=` form; --name is the "
-            "Chrome tab group title), then pass -s <id> on every execute call. "
+            "--name=SESSION_LABEL` first (use the `=` form; --name is a short "
+            "session label), then pass -s <id> on every execute call. "
             + detail,
             fix=fix,
         )

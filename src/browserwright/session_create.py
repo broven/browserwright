@@ -152,9 +152,9 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     if not name:
         raise ValueError(
             "session new requires --name=NAME — a short label (e.g. "
-            "--name=cf-bots) that becomes the Chrome tab group title. It need "
-            "not be unique; the session is bound internally by its numeric "
-            "tab-group id, not the name."
+            "--name=cf-bots). For extension sessions this becomes the Chrome "
+            "tab group title; for RDP sessions it labels the isolated browser "
+            "session. It need not be unique."
         )
     if backend == "extension":
         sid = reg.allocate(backend="extension",

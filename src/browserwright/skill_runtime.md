@@ -21,7 +21,7 @@ If `version check` reports an extension mismatch, reload the unpacked `chrome-ex
 
 ## Start With A Session
 
-A session is the isolation key. Create one session, then pass it to every later browser-driving call with `-s`. The `--name` value is the Chrome tab group title the user may see, so choose a short task-specific label instead of a generic name like `personal`.
+A session is the isolation key. Create one session, then pass it to every later browser-driving call with `-s`. The `--name` value is a short task-specific label instead of a generic name like `personal`: extension sessions show it as the Chrome tab group title, while RDP sessions use it to label the isolated browser session.
 
 ```bash
 sid=$(browserwright session new --backend=extension --name=hn-research)
