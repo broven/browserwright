@@ -185,6 +185,8 @@ The release installer also copies the unpacked Chrome extension into the stable 
 ```
 
 If `install-release` reports `reload_chrome_extension: true`, open `chrome://extensions/` and reload the `browserwright` unpacked extension from that stable path. The path does not change across releases; the installer overwrites its contents.
+Reload any existing tab that already shows a duplicated `👀` attach marker so
+the extension can normalize the title marker after the upgrade.
 
 ## Local release discipline
 
