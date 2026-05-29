@@ -1,11 +1,11 @@
 """Multi-task fan-out (v0.3).
 
-Runs N tasks concurrently. Each one gets its own ``Session`` (and therefore
-its own ws to the daemon, its own sessionId namespace, its own
-``current_target_id``). The daemon v0.3 multi-client mux serialises traffic
-into the single upstream Chrome ws; from Skill's point of view the tasks
-are truly independent — `new_tab()` in task A doesn't yank the tab task B
-is operating on.
+Runs N tasks concurrently. Each one goes through ``run_task(...,
+isolated=True)``, which gives it a fresh ``Session`` and pre-binds that session
+to a freshly opened tab before task code sees the browser. The daemon v0.3
+multi-client mux serialises traffic into the single upstream Chrome ws; from
+Skill's point of view the tasks are truly independent — one task's navigation
+doesn't yank the tab another task is operating on.
 
 This module is intentionally small. The hard work was done in #55 (the
 ``ContextVar``-backed ``with_session`` machinery). Here we just iterate.
@@ -35,7 +35,6 @@ import concurrent.futures
 from typing import Any, Callable, Iterable, Optional
 
 from .errors import BrowserwrightError
-from .session import isolated_session, with_session
 from .task_runner import run_task
 
 
@@ -54,20 +53,12 @@ class TaskResult(dict):
 
 
 def _run_one(spec: TaskSpec) -> TaskResult:
-    """Worker: build a fresh ``Session``, push it onto the ContextVar, run.
-
-    Each worker owns its CDP transport. We close it on exit so the daemon's
-    client slot is freed promptly. Daemon v0.3 doesn't enforce a single-client
-    cap, but releasing eagerly still helps the daemon's idle policy + uiState
-    accounting stay accurate.
-    """
+    """Worker: run one task through task_runner's isolated-session path."""
     import time
     site, name, kwargs = spec
     t0 = time.monotonic()
-    sess = isolated_session()
     try:
-        with with_session(sess):
-            value = run_task(site, name, **kwargs)
+        value = run_task(site, name, isolated=True, **kwargs)
     except BrowserwrightError as e:
         return TaskResult(
             site=site, name=name, ok=False,
@@ -80,8 +71,6 @@ def _run_one(spec: TaskSpec) -> TaskResult:
             error_type=type(e).__name__, error_msg=str(e),
             elapsed_sec=round(time.monotonic() - t0, 3),
         )
-    finally:
-        sess.close()
     return TaskResult(
         site=site, name=name, ok=True, value=value,
         elapsed_sec=round(time.monotonic() - t0, 3),

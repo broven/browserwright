@@ -103,7 +103,7 @@ def _primitive_surface() -> str:
         "",
         f"These {len(funcs)} callables are enumerated from "
         "`browserwright.EXPORTS` at runtime, so this list always matches the "
-        "installed binary.",
+        "inline default namespace of the installed binary.",
         "",
         *funcs,
     ]
@@ -114,7 +114,47 @@ def _primitive_surface() -> str:
             "",
             *errors,
         ]
+    parts += ["", _internal_primitive_surface()]
     return "\n".join(parts)
+
+
+def _internal_primitive_surface() -> str:
+    """Document helpers importable from ``browserwright.primitives``.
+
+    These are intentionally not injected into the inline namespace when they
+    overlap the Playwright page surface, but they remain available for advanced
+    scripts and for browserwright's own verify/recovery paths.
+    """
+    try:
+        from . import primitives
+    except Exception:  # noqa: BLE001
+        return "### Importable internal primitives\n\n(unavailable)"
+
+    default = set(getattr(browserwright, "EXPORTS", []) or [])
+    lines: list[str] = []
+    for name in sorted(getattr(primitives, "__all__", []) or dir(primitives)):
+        if name.startswith("_") or name in default:
+            continue
+        obj = getattr(primitives, name, None)
+        if obj is None or _is_exception(obj) or not callable(obj):
+            continue
+        sig = _signature(name, obj)
+        summary = _first_doc_line(obj)
+        line = f"- `{sig}`"
+        if summary:
+            line += f" — {summary}"
+        lines.append(line)
+    return "\n".join([
+        "### Importable internal primitives",
+        "",
+        "These helpers are **not** injected by default in inline code because "
+        "the primary browser surface is real Playwright (`page` / `context` / "
+        "`snapshot`). Import them explicitly when you need the older daemon "
+        "utility layer, for example `from browserwright.primitives import "
+        "capture_screenshot, diff_snapshot, click_at_xy`.",
+        "",
+        *lines,
+    ])
 
 
 def render() -> str:

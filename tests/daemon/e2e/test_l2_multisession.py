@@ -294,6 +294,67 @@ if errors:
     assert "session-b" in b["title"]
 
 
+def test_rdp_isolated_tasks_do_not_attach_parent_warm_target(e2e_rdp_daemon):
+    """Regression: isolated task sessions must not all fast-path attach the
+    parent ledger target. RDP proxy allows only one primary owner per target, so
+    this used to fail with -32602 when several workers bound the warm parent tab.
+    """
+    script = r'''
+import json
+import os
+import tempfile
+import textwrap
+import traceback
+from pathlib import Path
+
+from browserwright import task_runner
+from browserwright.multitask import run_tasks_concurrent
+from browserwright.primitives.page import open as open_tab
+
+root = Path(tempfile.mkdtemp(prefix="bd-task-e2e-"))
+task_dir = root / "site.test" / "tasks"
+task_dir.mkdir(parents=True)
+(task_dir / "worker.py").write_text(textwrap.dedent("""
+    ARGS = {}
+    def run(args, ctx=None):
+        page.goto(args["url"])
+        return {"title": page.title(), "url": page.url}
+"""), encoding="utf-8")
+
+task_runner.find_task_path = lambda site, name: task_dir / f"{name}.py"
+
+# Warm the parent session's ledger runtime with a real target before fan-out.
+# The bug path made every isolated worker recover and attach this same target.
+parent = open_tab("about:blank")
+
+try:
+    rows = run_tasks_concurrent([
+        ("site.test", "worker", {"url": "data:text/html,<title>one</title>"}),
+        ("site.test", "worker", {"url": "data:text/html,<title>two</title>"}),
+        ("site.test", "worker", {"url": "data:text/html,<title>three</title>"}),
+    ], max_workers=3)
+    print(json.dumps({"parent": parent["targetId"], "rows": rows}, sort_keys=True))
+except BaseException:
+    print(json.dumps({"error": traceback.format_exc()}))
+    raise
+'''
+    result = run_skill(
+        script=script,
+        backend="rdp",
+        runtime_dir=e2e_rdp_daemon,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"skill exited {result.returncode};\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+    payload = _extract_payload(result)
+    assert [row["ok"] for row in payload["rows"]] == [True, True, True], json.dumps(
+        payload, indent=2, sort_keys=True
+    )
+    titles = [row["value"]["title"] for row in payload["rows"]]
+    assert titles == ["one", "two", "three"]
+
+
 def test_extension_backend_three_sessions_get_named_groups_and_scoped_tabs(
     ext_ready,
     e2e_daemon,

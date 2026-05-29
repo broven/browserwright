@@ -103,3 +103,27 @@ def test_capture_screenshot_annotates_writes_and_always_clears(
         "Page.captureScreenshot",
         {"session": "sid-target-1", "format": "png", "captureBeyondViewport": True},
     )
+
+
+def test_capture_screenshot_annotate_reports_truncated_legend(
+    fake_session, monkeypatch, tmp_path
+):
+    from browserwright.primitives import inspect as inspect_mod
+
+    _, fake = fake_session
+    fake.responses["Page.captureScreenshot"] = {
+        "data": base64.b64encode(_ONE_BY_ONE_PNG).decode()
+    }
+    legend = [
+        {"n": i, "role": "button", "name": f"Button {i}", "x": i, "y": i}
+        for i in range(120)
+    ]
+    monkeypatch.setattr(inspect_mod, "_draw_set_of_mark", lambda: (legend, None))
+    monkeypatch.setattr(inspect_mod, "_clear_set_of_mark", lambda: None)
+
+    out = inspect_mod.capture_screenshot(
+        str(tmp_path / "shot.png"), annotate=True
+    )
+
+    assert out["truncated"] is True
+    assert out["total_count"] == 120

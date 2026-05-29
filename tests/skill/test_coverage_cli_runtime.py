@@ -95,6 +95,29 @@ def test_cmd_execute_dispatches_to_inline_run_code(monkeypatch):
     assert calls == [("abc", "print('ok')")]
 
 
+def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys):
+    from browserwright import cli
+    from browserwright import session_registry as reg
+    from browserwright import task_runner
+
+    sid = reg.allocate(backend="rdp", owner="create", name="job")
+    monkeypatch.setattr(task_runner, "run_task", lambda site, name, **kw: {
+        "site": site,
+        "name": name,
+        "kwargs": kw,
+    })
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", sid, "task", "example.com/check", "--count=2", "--output", "json"])
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "site": "example.com",
+        "name": "check",
+        "kwargs": {"count": 2},
+    }
+
+
 def test_cmd_version_check_json_reports_consistent_versions(capsys):
     from browserwright import cli
 
@@ -128,39 +151,62 @@ def test_cmd_release_status_json(monkeypatch, capsys):
 @pytest.mark.parametrize(
     "args, err",
     [
-        ([], "usage: browserwright task"),
+        ([], "usage: browserwright -s <session-id> task"),
         (["missing-slash"], "task spec must be"),
     ],
 )
-def test_cmd_task_rejects_bad_invocation(args, err, capsys):
+def test_cmd_task_rejects_bad_invocation(args, err, capsys, tmp_bs_home):
     from browserwright import cli
 
     assert cli._cmd_task(args) == 1
     assert err in capsys.readouterr().err
 
 
-def test_cmd_task_reports_missing_task(monkeypatch, capsys):
+def test_cmd_task_reports_missing_task(monkeypatch, capsys, tmp_bs_home):
     from browserwright import cli, task_runner
+    from browserwright import session_registry as reg
 
     def missing(site, name, **kwargs):
         raise FileNotFoundError(f"{site}/{name}")
 
     monkeypatch.setattr(task_runner, "run_task", missing)
+    sid = reg.allocate(backend="rdp", owner="create")
 
-    assert cli._cmd_task(["site/name"]) == 1
+    assert cli._cmd_task(["--session", sid, "site/name"]) == 1
     assert "task not found" in capsys.readouterr().err
 
 
-def test_cmd_task_reports_crash(monkeypatch, capsys):
+def test_cmd_task_reports_crash(monkeypatch, capsys, tmp_bs_home):
     from browserwright import cli, task_runner
+    from browserwright import session_registry as reg
 
     def crashed(site, name, **kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(task_runner, "run_task", crashed)
+    sid = reg.allocate(backend="rdp", owner="create")
 
-    assert cli._cmd_task(["site/name"]) == 3
+    assert cli._cmd_task(["--session", sid, "site/name"]) == 3
     assert "task crashed" in capsys.readouterr().err
+
+
+def test_cmd_task_binds_session_and_outputs_json(monkeypatch, tmp_bs_home, capsys):
+    from browserwright import cli, task_runner
+    from browserwright import session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    monkeypatch.setattr(task_runner, "run_task", lambda site, name, **kwargs: {
+        "site": site,
+        "name": name,
+        "limit": kwargs["limit"],
+    })
+
+    assert cli._cmd_task(["--session", sid, "site/name", "--limit=3", "--output", "json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "site": "site",
+        "name": "name",
+        "limit": 3,
+    }
 
 
 def test_cmd_doctor_human_failure_prints_fixes(monkeypatch, capsys):
@@ -322,6 +368,82 @@ def test_cmd_session_reset_recycles_executor(tmp_bs_home, monkeypatch, capsys):
     assert capsys.readouterr().out == f"reset {sid}\n"
 
 
+def test_global_session_prefix_dispatches_whoami(tmp_bs_home, capsys):
+    from browserwright import cli, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", sid, "whoami"])
+    assert exc.value.code == 0
+    assert json.loads(capsys.readouterr().out)["id"] == sid
+
+
+def test_global_session_prefix_dispatches_session_end(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "end",
+        lambda rec: calls.append(rec["id"]) or f"ended {rec['id']}",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", sid, "session", "end"])
+    assert exc.value.code == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"ended {sid}\n"
+
+
+def test_session_inner_session_overrides_global_prefix(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    outer = reg.allocate(backend="rdp", owner="attach", name="outer")
+    inner = reg.allocate(backend="rdp", owner="attach", name="inner")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "end",
+        lambda rec: calls.append(rec["id"]) or f"ended {rec['id']}",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-s", outer, "session", "--session", inner, "end"])
+    assert exc.value.code == 0
+    assert calls == [inner]
+    assert capsys.readouterr().out == f"ended {inner}\n"
+
+
+def test_session_reset_uses_bd_session_fallback(tmp_bs_home, monkeypatch, capsys):
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    monkeypatch.setenv("BD_SESSION", sid)
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "reset_executor",
+        lambda rec: calls.append(rec["id"]) or f"reset {rec['id']}",
+    )
+
+    assert cli._cmd_session(["reset"]) == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"reset {sid}\n"
+
+
+def test_cmd_session_new_stderr_keeps_stdout_bare(monkeypatch, tmp_bs_home, capsys):
+    from browserwright import cli, session_create
+
+    monkeypatch.setattr(session_create, "new", lambda **kwargs: "17")
+
+    assert cli._cmd_session(["new", "--backend=rdp", "--name=job"]) == 0
+    streams = capsys.readouterr()
+    assert streams.out == "17\n"
+    assert streams.err == "OK: session 17 created\n"
+
+
 def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, capsys):
     from browserwright import cli
 
@@ -336,6 +458,30 @@ def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, caps
     assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 7
     assert calls == [["browserwright-daemon", "userscript", "push", "script.js"]]
     assert capsys.readouterr().out == ""
+
+
+def test_cmd_userscript_verify_binds_bd_session(monkeypatch, tmp_bs_home, capsys):
+    from browserwright import cli
+    from browserwright import session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    monkeypatch.setenv("BD_SESSION", sid)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["browserwright-daemon", "status", "--json"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr("browserwright.mode_b_client.ModeBClient.is_alive", lambda self: False)
+    monkeypatch.setattr("browserwright.primitives.page.reload", lambda: {"ok": True})
+    monkeypatch.setattr("browserwright.primitives.inspect.capture_screenshot", lambda: "/tmp/shot.png")
+
+    assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 0
+    assert calls == [["browserwright-daemon", "userscript", "push", "script.js"]]
+    assert capsys.readouterr().out == "/tmp/shot.png\n"
 
 
 def test_daemon_doctor_synthetic_for_spawn_failure(monkeypatch):
@@ -418,6 +564,33 @@ def test_doctor_checks_extension_unavailable_is_actionable_warn(monkeypatch):
     assert extension["status"] == "warn"
     assert extension["message"] == "not connected"
     assert extension["fix"] == "load extension"
+
+
+def test_doctor_checks_surfaces_available_backend_ux_warning(monkeypatch):
+    from browserwright import health
+
+    monkeypatch.setattr(
+        health,
+        "daemon_doctor",
+        lambda: {
+            "schema_version": 2,
+            "backends": [
+                {
+                    "name": "extension",
+                    "available": True,
+                    "ux_warning": "extension version mismatch",
+                    "needs_user_action": "reload extension",
+                    "ws_url": "ws://relay",
+                }
+            ],
+        },
+    )
+
+    checks = health.doctor_checks()["checks"]
+    warning = next(c for c in checks if c["name"] == "extension_warning")
+    assert warning["status"] == "warn"
+    assert warning["message"] == "extension version mismatch"
+    assert warning["fix"] == "reload extension"
 
 
 def test_session_create_run_returns_one_for_spawn_errors(monkeypatch):
@@ -689,9 +862,37 @@ def test_task_runner_isolated_session_closes_after_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "isolated_session", lambda: fake_session)
     monkeypatch.setattr(session_mod, "with_session", lambda sess: FakeContext())
+    monkeypatch.setattr("browserwright.primitives.page.open", lambda url: events.append(("open", url)))
 
     assert task_runner.run_task("site", "ok", isolated=True) == "ok"
-    assert events == ["enter", "exit", "close"]
+    assert events[0] == "enter"
+    assert events[1][0] == "open"
+    assert events[1][1].startswith("data:text/html;charset=utf-8,<title>browserwright-isolated-")
+    assert events[2:] == ["exit", "close"]
+
+
+def test_run_tasks_concurrent_uses_isolated_task_runner(monkeypatch):
+    from browserwright import multitask
+
+    calls = []
+
+    def fake_run_task(site, name, **kwargs):
+        calls.append((site, name, kwargs))
+        return f"{site}/{name}"
+
+    monkeypatch.setattr(multitask, "run_task", fake_run_task)
+
+    rows = multitask.run_tasks_concurrent([
+        ("a.test", "one", {"x": 1}),
+        ("b.test", "two", {"y": 2}),
+    ], max_workers=2)
+
+    assert [row["ok"] for row in rows] == [True, True]
+    assert [row["value"] for row in rows] == ["a.test/one", "b.test/two"]
+    assert calls == [
+        ("a.test", "one", {"isolated": True, "x": 1}),
+        ("b.test", "two", {"isolated": True, "y": 2}),
+    ]
 
 
 class _RuntimeCDP:

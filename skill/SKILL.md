@@ -20,4 +20,8 @@ Follow the generated `browserwright --print-skill` output for command forms, ses
 
 Also read `memory.md` in this skill directory before choosing a backend. It records the user's backend preferences and scenario decisions.
 
+Use `page.evaluate(...)` or `page.locator(...).inner_text()` for bulk text extraction; `snapshot()` is for deciding and verifying actions. For multi-line code, heredocs, JSON literals, or complex quoting, use `browserwright -s "$sid" -f script.py` or `--code-stdin` rather than a dense `-e` one-liner.
+
 When you discover stable, reusable behavior for a specific site, record a short sanitized note with `remember(host_or_url, text, section=...)`. This creates or updates that site's `site-skills/<site>/memory.md`; do not wait until you are writing a reusable task. Never store secrets, tokens, passwords, or private page content.
+
+Memory choice: `remember(host, ...)` stores site notes, `remember_global(...)` stores cross-site notes in `~/.browserwright/global.md`, and `remember_preference(key, value)` is a two-step structured preference write: first call asks for confirmation, then call again with `commit=True` after the user agrees.

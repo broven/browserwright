@@ -70,6 +70,27 @@ skill **重「行动」、轻「感知与闭环」**:观察成本高且碎片化
 |---|---|---|---|---|
 | E1 | **skills-eval 框架**:把任务 prompt + skill 喂真实 agent CLI,双重打分 = pattern gate(`expectedPatterns` 必中 / `forbiddenPatterns` 必不中,多变体抗过拟合)+ 可选 LLM judge(rubric 1–5);分类 = 加载/选择/命令用法 | — | ✅ | 最小版已落 `evals/`(`run.py`/`cases.py`/`judge.py`/`mock_transcripts.py`):`--mock` 零成本双向验证(好 transcript 过、坏的红)、一次真实 `codex` 跑通、任一 case 失败 exit 1(本地跑)。**待扩**:更多 case。**最高杠杆**:有它后每个改动才有红绿可依(skill 跑红→改 skill 到绿、严禁过拟合,用多变体断言)。借鉴 `agent-browser/evals/` |
 
+## F. v0.6.4 eval batch — 2026-05-28 ZER-48 反馈
+
+| | 条目 | 层 | 状态 | 备注 / 证据 |
+|---|---|---|---|---|
+| F1 | `remember_preference` 写 frontmatter 时保留 `global.md` body | L1 | ✅ | `GlobalMemory.set_preference()` 父分支已保留 body;本 PR 新增回归 guard 覆盖 body 不变 |
+| F2 | `NeedsUserConfirm.fix` 不再误导 `confirm=True`;偏好写支持 `commit=True` | L1 | ✅ | `errors.py` 默认 fix 改为 `confirm=False`;`remember_preference(..., commit=True)` 作为清晰别名 |
+| F3 | `userscript push --verify` 绑定 `-s/--session/BD_SESSION` 后再 reload/screenshot | L2 | ✅ | `_cmd_userscript()` 转发 session 到 daemon,verify 段调用共享 session binder |
+| F4 | `browserwright task <site>/<name>` 支持 session binding | L2 | ✅ | 支持 `browserwright -s <id> task ...`、task 内 `--session`、`BD_SESSION`;`--output json` alias |
+| F5 | `run_tasks_concurrent` 的 isolated task 预绑定 fresh target | L2 | ✅ | `run_task(..., isolated=True)` 在 worker session 内先 `open()` 唯一 data URL,避免共享 parent ledger target 的 RDP attach owner race 与多 blank tab 绑定歧义 |
+| F6 | 文档同步原语名与 Playwright 主路径 | L1/L3 | ✅ | runtime guide / skill shell 改为 `page.goto`、Playwright locator、显式 import internal primitives |
+| F7 | `--print-skill` 区分 inline 默认 namespace 与可 import internal primitives | L1 | ✅ | `skill_doc.render()` 增加 `browserwright.primitives` 列表与导入说明 |
+| F8 | `page.goto()` 后 target 同步 | L1 | ⏸ | 当前 Phase C steady-state 由 resident executor 持有 live `page`;legacy inspect 原语仍基于 `current_target_id`,需 facade target 映射设计后补 |
+| F9 | 降低 snapshot 截断风险并显式回报 annotate 截断 | L1 | ✅ | REPL `snapshot(max_chars=20000)`;annotated screenshot 结果增加截断信号 |
+| F10 | `doctor` 上浮 backend `ux_warning` | L2 | ✅ | `doctor_checks()` 为 raw backend warning 生成顶层 warn check |
+| F11 | 子命令 help 覆盖 wrapper flags | L2 | ✅ | `browserwright task --help` / `browserwright userscript --help` 走本地 help |
+| F12 | SKILL/runtime 增加抽文本、复杂 quoting、memory 决策规则 | L1/L3 | ✅ | `skill_runtime.md` + `skill/SKILL.md` 更新 |
+| F13 | session UX:新建成功 stderr 提示、JSON alias、prune 默认 24h | L2 | ✅ | stdout 仍裸 sid;`session list --output json`;`session prune` 默认 24h |
+| F14 | daemon status socket 暂不可达时短重试并标记 transient | L2 | ✅ | `status --json` 增加 `probe_state` |
+| F15 | daemon serve 已有实例提示 status/restart | L2 | ✅ | 现有 single-daemon guard 保持 exit 1,提示改为 `status`/`restart` |
+| F16 | `--output json` alias | L2 | ✅ | task/list-tasks/session list/doctor 支持 alias;execute unknown args 已显式 usage error |
+
 ---
 
 ## 建议推进顺序

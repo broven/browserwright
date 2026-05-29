@@ -95,7 +95,9 @@ class NoSession(BrowserwrightError):
     exit_code = 2
     default_fix = (
         "run `browserwright session new --backend=<extension|rdp> --name=SESSION_LABEL` "
-        "then run `browserwright -s <id> -e 'print(snapshot())'`"
+        "then pass `-s <id>` to browserwright commands, for example "
+        "`browserwright -s <id> -e 'print(snapshot())'` or "
+        "`browserwright -s <id> task <site>/<name>`"
     )
 
     def __init__(self, detail: str = "", fix: str = ""):
@@ -134,7 +136,7 @@ class NeedsUserConfirm(BrowserwrightError):
             f"needs user confirm: {what}",
             # The proposal IS the next-action; mirror it into fix so the
             # generic envelope is uniform across every error type.
-            fix=fix or "surface the proposal to the user, then re-call with confirm=True",
+            fix=fix or "surface the proposal to the user, then re-call with confirm=False",
         )
 
 
