@@ -804,9 +804,15 @@ const MARKER_INSTALL_SCRIPT = `
   const PREFIX = '\u{1F440} ';
 
   function stripPrefix(value) {
-    let title = typeof value === 'string' ? value : '';
+    let title = String(value ?? '');
     while (title.startsWith(PREFIX)) {
       title = title.slice(PREFIX.length);
+    }
+    while (title.length > 0 && title.codePointAt(0) === 0x1F440) {
+      title = title.slice(2);
+      if (title.length > 0 && /\\s/.test(title[0])) {
+        title = title.slice(1);
+      }
     }
     return title;
   }
@@ -865,9 +871,12 @@ const MARKER_INSTALL_SCRIPT = `
     if (normalizing) return;
     normalizing = true;
     try {
-      const clean = stripPrefix(rawTitle());
+      const current = rawTitle();
+      const clean = stripPrefix(current);
       const marked = PREFIX + clean;
-      if (rawTitle() !== marked) writeRawTitle(document, marked);
+      if (stripPrefix(current) !== clean || current !== marked) {
+        writeRawTitle(document, marked);
+      }
     } finally {
       normalizing = false;
     }
@@ -882,7 +891,7 @@ const MARKER_INSTALL_SCRIPT = `
         return stripPrefix(rawTitle(this));
       },
       set: function(value) {
-        writeRawTitle(this, PREFIX + stripPrefix(String(value)));
+        writeRawTitle(this, PREFIX + stripPrefix(value));
       },
     });
   }
@@ -929,9 +938,15 @@ const MARKER_REMOVE_SCRIPT = `
 (function() {
   const PREFIX = '\u{1F440} ';
   function stripPrefix(value) {
-    let title = typeof value === 'string' ? value : '';
+    let title = String(value ?? '');
     while (title.startsWith(PREFIX)) {
       title = title.slice(PREFIX.length);
+    }
+    while (title.length > 0 && title.codePointAt(0) === 0x1F440) {
+      title = title.slice(2);
+      if (title.length > 0 && /\\s/.test(title[0])) {
+        title = title.slice(1);
+      }
     }
     return title;
   }
@@ -987,12 +1002,15 @@ const MARKER_REMOVE_SCRIPT = `
 const markedTabs = new Map();
 
 function stripMarker(title) {
-  if (typeof title !== "string") {
-    return title || "";
-  }
-  let clean = title;
+  let clean = String(title ?? "");
   while (clean.startsWith(TITLE_PREFIX)) {
     clean = clean.slice(TITLE_PREFIX.length);
+  }
+  while (clean.length > 0 && clean.codePointAt(0) === 0x1F440) {
+    clean = clean.slice(2);
+    if (clean.length > 0 && /\s/.test(clean[0])) {
+      clean = clean.slice(1);
+    }
   }
   return clean;
 }
