@@ -535,7 +535,8 @@ async function doAttachActive(id, groupId, groupName) {
     // Move the tab into our group (idempotent if already a member). When we
     // had no live group, chrome.tabs.group({tabIds}) creates one and we name
     // it with the session name for human-readable Chrome UI.
-    const finalGroupId = await _ensureTabInGroup(tab.id, groupName, ourGroupId);
+    const finalGroupId = await _ensureTabInGroup(
+      tab.id, groupName, ourGroupId, tab.windowId);
     if (!attachedTabs.has(tab.id)) {
       await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
       attachedTabs.add(tab.id);
@@ -595,7 +596,8 @@ async function doCreateTab(id, url, groupName, sessionGroupId, background) {
     if ((typeof sessionGroupId === "number" && sessionGroupId >= 0) ||
         (typeof groupName === "string" && groupName)) {
       const resolved = await _resolveSessionGroup(sessionGroupId, groupName);
-      groupId = await _ensureTabInGroup(tab.id, groupName, resolved);
+      groupId = await _ensureTabInGroup(
+        tab.id, groupName, resolved, tab.windowId);
     }
     await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
     attachedTabs.add(tab.id);
@@ -625,7 +627,7 @@ async function doCreateTab(id, url, groupName, sessionGroupId, background) {
   }
 }
 
-async function _ensureTabInGroup(tabId, groupName, resolvedGroupId) {
+async function _ensureTabInGroup(tabId, groupName, resolvedGroupId, windowId) {
   // Move `tabId` into the session's group and return the live groupId.
   //
   // groupId-first (the durable binding): if the caller already resolved a
@@ -636,7 +638,17 @@ async function _ensureTabInGroup(tabId, groupName, resolvedGroupId) {
     await chrome.tabs.group({ groupId: resolvedGroupId, tabIds: [tabId] });
     return resolvedGroupId;
   }
-  const newGroupId = await chrome.tabs.group({ tabIds: [tabId] });
+  // Pin the new group to the tab's OWN window. Without createProperties.windowId
+  // chrome.tabs.group() creates the group in the "current" window, which — when
+  // several browser windows are open — is often NOT the window the tab lives in.
+  // Chrome then tries to move the tab across windows and throws the misleading
+  // "Tabs can only be moved to and from normal windows." Binding the group to
+  // the tab's window keeps the operation in-window and avoids that failure.
+  const groupArgs = { tabIds: [tabId] };
+  if (typeof windowId === "number" && windowId >= 0) {
+    groupArgs.createProperties = { windowId };
+  }
+  const newGroupId = await chrome.tabs.group(groupArgs);
   if (typeof groupName === "string" && groupName) {
     try {
       await chrome.tabGroups.update(newGroupId, {
