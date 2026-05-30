@@ -314,8 +314,13 @@ def test_smart_goto_translates_commit_failure():
     from browserwright.repl._smart_goto import patch_page_goto
 
     class FakePage:
+        url = "about:blank"
+
         def goto(self, *_args, **_kwargs):
             raise TimeoutError("timed out")
+
+        def evaluate(self, *_args):
+            return "loading"
 
         def on(self, *_args):
             pass
@@ -334,6 +339,47 @@ def test_smart_goto_translates_commit_failure():
         assert "http_get" in exc.fix
     else:
         raise AssertionError("expected PageLoadFailed")
+
+
+def test_smart_goto_swallows_commit_error_when_page_actually_loaded():
+    from browserwright.repl._smart_goto import patch_page_goto
+
+    class FakePage:
+        url = "https://loaded.test/"
+
+        def __init__(self):
+            self.load_state_calls = []
+            self.evaluates = []
+            self.timeout_calls = []
+
+        def goto(self, *_args, **_kwargs):
+            raise TimeoutError("timed out")
+
+        def wait_for_load_state(self, state, *, timeout=None):
+            self.load_state_calls.append((state, timeout))
+
+        def evaluate(self, script, *_args):
+            self.evaluates.append(script)
+            if script == "() => document.readyState":
+                return "complete"
+            return True
+
+        def wait_for_timeout(self, ms):
+            self.timeout_calls.append(ms)
+
+        def on(self, *_args):
+            pass
+
+        def off(self, *_args):
+            pass
+
+    page = FakePage()
+    patch_page_goto(page)
+
+    assert page.goto("https://loaded.test/") is None
+    assert page.load_state_calls[0][0] == "domcontentloaded"
+    assert "() => document.readyState" in page.evaluates
+    assert any(script != "() => document.readyState" for script in page.evaluates)
 
 
 # ---- PR2: snapshot() injection, filter, truncation ------------------------
