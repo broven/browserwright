@@ -47,6 +47,25 @@ def test_facade_port_load_default_is_none(monkeypatch):
     assert cfg_ov.resolved_facade_port() == 29991
 
 
+def test_session_idle_prune_loads_from_toml_and_env(tmp_path):
+    from browserwright.daemon.config import load
+
+    cfg_path = tmp_path / "daemon.toml"
+    cfg_path.write_text("session_idle_prune = 12.5\n")
+
+    cfg = load(cli_config_path=str(cfg_path), env={})
+    assert cfg.session_idle_prune == 12.5
+
+    disabled = load(env={"BD_SESSION_IDLE_PRUNE": "0"})
+    assert disabled.session_idle_prune is None
+
+    overridden = load(
+        cli_config_path=str(cfg_path),
+        env={"BD_SESSION_IDLE_PRUNE": "33"},
+    )
+    assert overridden.session_idle_prune == 33.0
+
+
 # ---- _ipc facade discovery file --------------------------------------------
 
 

@@ -46,6 +46,8 @@ from .facade import PlaywrightFacade
 
 logger = logging.getLogger(__name__)
 
+_SESSION_PRUNE_INTERVAL_S = 3600.0
+
 
 # ---- per-upstream context factory ------------------------------------------
 
@@ -224,8 +226,10 @@ async def run_serve(cfg: Config) -> int:
     # (Fork 4 self-exit / segfault) so the registry never accumulates corpses.
     # Upstream idle-close + executor idle-reap are gated on cfg.idle_close_after
     # inside the loop.
+    await _auto_prune_sessions(daemon, reason="startup")
     idle_task: asyncio.Task | None = asyncio.create_task(
-        _idle_watchdog(daemon, cfg.idle_close_after))
+        _idle_watchdog(daemon, cfg.idle_close_after,
+                       session_idle_prune=cfg.session_idle_prune))
     try:
         await stop.wait()
         logger.info("browserwright-daemon shutdown requested")
@@ -979,7 +983,76 @@ class _UpstreamHolder:
 # ---- graceful shutdown -----------------------------------------------------
 
 
-async def _idle_watchdog(daemon: "Daemon", idle_after: float | None) -> None:
+async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
+    """Best-effort durable ledger prune.
+
+    The session idle clock is `ledger.last_seen`, updated when a new
+    user/agent instruction arrives. Executor liveness is deliberately ignored:
+    a stuck executor can stay alive forever and must not keep a session from
+    being cleaned after the instruction-idle threshold.
+    """
+    idle_seconds = daemon.cfg.session_idle_prune
+    if not idle_seconds:
+        return []
+    try:
+        from ... import session_registry
+        stale = session_registry.stale(idle_seconds=idle_seconds)
+    except Exception as e:  # noqa: BLE001 - cleanup must not kill the daemon
+        logger.warning("auto session-prune failed (%s): %r", reason, e)
+        return []
+    pruned: list[dict] = []
+    for rec in stale:
+        sid = str(rec.get("id") or "")
+        if not sid:
+            continue
+        try:
+            daemon.executors.kill(sid)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("auto session-prune executor kill failed "
+                           "(session=%s): %r", sid, e)
+        if rec.get("backend") == "rdp" and rec.get("owner") == "create":
+            try:
+                await daemon.teardown_rdp_context(sid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("auto session-prune rdp teardown failed "
+                               "(session=%s): %r", sid, e)
+        elif rec.get("backend") == "extension":
+            try:
+                runtime = rec.get("runtime") or {}
+                group_id = runtime.get("group_id")
+                group_id = (
+                    group_id
+                    if isinstance(group_id, int) and group_id >= 0
+                    else None
+                )
+                holder = daemon.shared_context.holder
+                upstream = holder.upstream
+                if hasattr(upstream, "end_session"):
+                    await upstream.end_session(sid, group_id)  # type: ignore[attr-defined]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("auto session-prune extension teardown failed "
+                               "(session=%s): %r", sid, e)
+        try:
+            removed = session_registry.remove(sid)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("auto session-prune ledger remove failed "
+                           "(session=%s): %r", sid, e)
+            removed = None
+        if removed is not None:
+            pruned.append(removed)
+    if pruned:
+        logger.info("auto-pruned %d idle session(s) on %s: %s",
+                    len(pruned), reason,
+                    [str(rec.get("id")) for rec in pruned])
+    return pruned
+
+
+async def _idle_watchdog(
+    daemon: "Daemon",
+    idle_after: float | None,
+    *,
+    session_idle_prune: float | None = None,
+) -> None:
     """Spec §6.5/§6.6: when configured, close each upstream after `idle_after`
     seconds with no activity. The next client command lazy-opens it again.
 
@@ -995,13 +1068,21 @@ async def _idle_watchdog(daemon: "Daemon", idle_after: float | None) -> None:
         leak a subprocess.
 
     Runs unconditionally; idle-close + idle-reap are no-ops when `idle_after`
-    is None. We poll at half the idle threshold (or every 5s when idle is off,
-    just for crash-reap granularity).
+    is None. Durable ledger prune is controlled independently by
+    `session_idle_prune`. We poll at the smallest active supervision cadence,
+    or every 5s when only crash-reap is active.
     """
-    poll = 5.0 if not idle_after else max(1.0, idle_after / 2.0)
+    cadences = [5.0]
+    if idle_after:
+        cadences.append(max(1.0, idle_after / 2.0))
+    if session_idle_prune:
+        cadences.append(_SESSION_PRUNE_INTERVAL_S)
+    poll = min(cadences)
+    last_session_prune_at = time.time()
     try:
         while True:
             await asyncio.sleep(poll)
+            now = time.time()
             # --- executor supervision (Phase B PR2) ---
             try:
                 daemon.executors.reap_dead()
@@ -1010,12 +1091,16 @@ async def _idle_watchdog(daemon: "Daemon", idle_after: float | None) -> None:
             except Exception as e:  # noqa: BLE001 - never let reap break the loop
                 logger.warning("executor reap failed: %r", e)
             # --- upstream idle-close (gated) ---
+            if session_idle_prune and (
+                    now - last_session_prune_at >= _SESSION_PRUNE_INTERVAL_S):
+                await _auto_prune_sessions(daemon, reason="watchdog")
+                last_session_prune_at = now
             if not idle_after:
                 continue
             for ctx in daemon.all_contexts():
                 if ctx.state.upstream_phase != UpstreamPhase.CONNECTED:
                     continue
-                idle_for = time.time() - ctx.state.last_activity_at
+                idle_for = now - ctx.state.last_activity_at
                 if idle_for >= idle_after:
                     logger.info("idle-watchdog: closing %s upstream after %.1fs",
                                 ctx.backend, idle_for)

@@ -17,6 +17,7 @@ import socket
 import time
 
 from ..errors import BrowserwrightError
+from .. import session_registry as reg
 from .protocol import (
     DEFAULT_TIMEOUT_MS,
     ExecuteRequest,
@@ -81,6 +82,12 @@ def run_on_executor(sess, code: str, *,
     connect_over_cdp + bind (moved off the control plane), which can add up to
     ~35s. The executor itself bounds the worker per-call timeout; this slack
     only prevents the CLIENT recv from giving up before the executor replies."""
+    sid = _session_id(sess)
+    # Session idle is "time since the last user/agent instruction", not
+    # executor process liveness. Touch before contacting the executor so a
+    # wedged or long-running executor cannot prevent the durable idle clock
+    # from reflecting that a new instruction arrived.
+    reg.touch(sid)
     sock_path = ensure_executor(sess)
     recv_timeout = max(timeout_ms, 1) / 1000.0 + _COLD_START_RECV_SLACK_S
     conn = _connect(sock_path, timeout=recv_timeout)

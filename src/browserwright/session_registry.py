@@ -124,6 +124,20 @@ def list_all() -> list[dict]:
     return [sessions[k] for k in sorted(sessions, key=int)]
 
 
+def stale(*, idle_seconds: float) -> list[dict]:
+    """Sessions idle longer than ``idle_seconds`` without removing them."""
+    now = time.time()
+    p = _ledger_path()
+    if not p.exists():
+        return []
+    sessions = json.loads(p.read_text())["sessions"]
+    records = [
+        e for e in sessions.values()
+        if now - e.get("last_seen", 0.0) >= idle_seconds
+    ]
+    return sorted(records, key=lambda e: int(e.get("id", 0)))
+
+
 def prune(*, idle_seconds: float) -> list[dict]:
     """Remove sessions idle longer than ``idle_seconds``; return removed records."""
     now = time.time()

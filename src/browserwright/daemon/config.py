@@ -131,6 +131,7 @@ class Config:
     cdp_url: str | None = None             # BD_CDP_URL / BU_CDP_URL — env backend uses this
     chrome_binary: str | None = None       # BD_CHROME_BINARY — launch-chrome
     idle_close_after: float | None = None  # seconds; None = never (default)
+    session_idle_prune: float | None = 24 * 3600  # ledger prune threshold
     # Playwright-facing CDP facade. `serve` binds an additional TCP ws+HTTP
     # endpoint that a real Playwright client can `connect_over_cdp` to.
     #
@@ -246,6 +247,9 @@ def load(
         cfg.backends.cloud.auth = dict(auth_subtables[cfg.backends.cloud.auth_kind])
     if "idle_close_after" in toml and isinstance(toml["idle_close_after"], (int, float)):
         cfg.idle_close_after = float(toml["idle_close_after"])
+    if "session_idle_prune" in toml and isinstance(toml["session_idle_prune"], (int, float)):
+        v = float(toml["session_idle_prune"])
+        cfg.session_idle_prune = v if v > 0 else None
     # Playwright facade port (phase A1). toml key `facade_port`.
     if "facade_port" in toml and isinstance(toml["facade_port"], int):
         cfg.facade_port = toml["facade_port"]
@@ -268,6 +272,15 @@ def load(
             from .errors import UserError
             raise UserError(
                 f"BD_IDLE_CLOSE_AFTER must be a number, got {e['BD_IDLE_CLOSE_AFTER']!r}")
+    if "BD_SESSION_IDLE_PRUNE" in e:
+        try:
+            v = float(e["BD_SESSION_IDLE_PRUNE"])
+            cfg.session_idle_prune = v if v > 0 else None
+        except ValueError:
+            from .errors import UserError
+            raise UserError(
+                f"BD_SESSION_IDLE_PRUNE must be a number, got "
+                f"{e['BD_SESSION_IDLE_PRUNE']!r}")
     if "BD_CDP_WS" in e:
         cfg.cdp_ws = e["BD_CDP_WS"]; cfg.cdp_ws_source = "BD_CDP_WS"
     elif "BU_CDP_WS" in e:

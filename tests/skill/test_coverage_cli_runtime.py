@@ -604,20 +604,44 @@ def test_session_create_run_returns_one_for_spawn_errors(monkeypatch):
     assert session_create._run(["browserwright-daemon", "end-session"]) == 1
 
 
-def test_session_create_reap_closes_only_create_owned_sessions(tmp_bs_home, monkeypatch):
+def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monkeypatch):
     from browserwright import session_create, session_registry as reg
 
     create_sid = reg.allocate(backend="rdp", owner="create", name="owned")
     attach_sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    ext_sid = reg.allocate(backend="extension", owner="attach", name="ext")
     reg._with_entry(create_sid, lambda e: e.update(last_seen=0.0))
     reg._with_entry(attach_sid, lambda e: e.update(last_seen=0.0))
+    reg._with_entry(ext_sid, lambda e: e.update(last_seen=0.0))
     closed = []
-    monkeypatch.setattr(session_create, "_close_browser", lambda rec: closed.append(rec["id"]))
+    reaped = []
+    ext_closed = []
+
+    def _close_browser(rec):
+        assert reg.get(rec["id"]) is not None
+        closed.append(rec["id"])
+
+    def _reap_executor(rec):
+        assert reg.get(rec["id"]) is not None
+        reaped.append(rec["id"])
+
+    def _end_extension(rec):
+        assert reg.get(rec["id"]) is not None
+        ext_closed.append(rec["id"])
+
+    monkeypatch.setattr(session_create, "_close_browser", _close_browser)
+    monkeypatch.setattr(session_create, "_reap_executor", _reap_executor)
+    monkeypatch.setattr(session_create, "_end_extension_workspace", _end_extension)
 
     pruned = session_create.reap(idle_seconds=1)
 
-    assert {rec["id"] for rec in pruned} == {create_sid, attach_sid}
+    assert {rec["id"] for rec in pruned} == {create_sid, attach_sid, ext_sid}
+    assert reaped == [create_sid, attach_sid, ext_sid]
     assert closed == [create_sid]
+    assert ext_closed == [ext_sid]
+    assert reg.get(create_sid) is None
+    assert reg.get(attach_sid) is None
+    assert reg.get(ext_sid) is None
 
 
 def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):

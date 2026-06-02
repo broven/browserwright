@@ -125,10 +125,17 @@ def reset_executor(record: dict) -> str:
 def reap(*, idle_seconds: float) -> list[dict]:
     """Prune idle sessions; for create-owned ones, also tear down the browser
     the daemon launched. Returns the pruned records."""
-    pruned = reg.prune(idle_seconds=idle_seconds)
-    for rec in pruned:
+    stale = reg.stale(idle_seconds=idle_seconds)
+    pruned: list[dict] = []
+    for rec in stale:
+        _reap_executor(rec)
+        if rec.get("backend") == "extension":
+            _end_extension_workspace(rec)
         if rec.get("owner") == "create":
             _close_browser(rec)
+        removed = reg.remove(str(rec.get("id")))
+        if removed is not None:
+            pruned.append(removed)
     return pruned
 
 
