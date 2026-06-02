@@ -500,6 +500,7 @@ class ExtensionUpstream:
         group_name: str | None = "Agent",
         session_id: str | None = None,
         background: bool = True,
+        skip_post_attach_commands: bool = False,
     ) -> dict:
         """Open a background tab in the session's tab group via the relay,
         fabricate a sessionId, and return
@@ -514,7 +515,12 @@ class ExtensionUpstream:
             gid = self._relay.session_group(session_id)
         self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
-            url, group_name=group_name, group_id=gid, background=background)
+            url,
+            group_name=group_name,
+            group_id=gid,
+            background=background,
+            skip_post_attach_commands=skip_post_attach_commands,
+        )
         group_id = getattr(gt, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
         if self._group_required(

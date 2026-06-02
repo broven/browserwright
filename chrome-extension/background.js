@@ -479,7 +479,9 @@ async function handleDaemonMessage(msg) {
     case "attachActive":
       return await doAttachActive(id, msg.groupId, msg.groupName);
     case "createTab":
-      return await doCreateTab(id, msg.url, msg.groupName, msg.groupId, msg.background);
+      return await doCreateTab(
+        id, msg.url, msg.groupName, msg.groupId, msg.background,
+        msg.skipPostAttachCommands);
     case "closeTab":
       return await doCloseTab(id, msg.tabId);
     case "queryGroup":
@@ -621,7 +623,8 @@ async function _resolveSessionGroup(groupId, groupName) {
   return -1;
 }
 
-async function doCreateTab(id, url, groupName, sessionGroupId, background) {
+async function doCreateTab(
+  id, url, groupName, sessionGroupId, background, skipPostAttachCommands) {
   try {
     if (typeof url !== "string" || !url) {
       throw new Error("createTab requires a url");
@@ -658,8 +661,10 @@ async function doCreateTab(id, url, groupName, sessionGroupId, background) {
       id,
       result: { tabId: tab.id, url: actualUrl, title: stripMarker(title), groupId },
     });
-    markTabAttached(tab.id);  // fire-and-forget; cosmetic
-    keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
+    if (!skipPostAttachCommands) {
+      markTabAttached(tab.id);  // fire-and-forget; cosmetic
+      keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
+    }
   } catch (e) {
     safeSend({
       type: "response",

@@ -349,6 +349,7 @@ async def test_create_target_opens_background_tab():
         res = await client.wait_for(lambda f: f.get("id") == 3 and "result" in f)
         tid = res["result"]["targetId"]
         assert tid.startswith("ext-tab-")
+        assert ext.create_tab_messages[-1]["skipPostAttachCommands"] is True
         # The new target is announced so Playwright attaches a Page.
         await client.wait_for(
             lambda f: f.get("method") == "Target.attachedToTarget"
