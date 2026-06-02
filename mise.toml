@@ -44,13 +44,11 @@ description = "Alias for dev-link; development only and not release-isolated"
 depends = ["dev-link"]
 
 [tasks.upgrade-global]
-description = "Upgrade the globally installed browserwright (uv tool) to the latest PyPI version, restart the daemon, sync the Chrome extension to the global load path, and verify"
+description = "Upgrade global browserwright from PyPI, install the matching GitHub Release Chrome extension artifact, restart the daemon, and verify"
 dir = "{{config_root}}"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-
-REPO="{{config_root}}"
 
 # `uv tool install --force` instead of `uv tool upgrade`: `upgrade` honors
 # whatever specifier landed in the receipt the last time the tool was
@@ -60,18 +58,15 @@ REPO="{{config_root}}"
 # PyPI latest each run with no specifier pin, costs ~500ms, and is idempotent,
 # which is what this task actually means ("always sync global to PyPI latest").
 uv tool install browserwright --force
-browserwright-daemon restart
-browserwright version check
-browserwright-daemon version check
 
-# --- Sync chrome-extension/ to the stable global load path. -----------------
-# Mirrors what `release_install.sync_chrome_extension` used to do for the
-# (now-retired) local release installer: copy the repo's chrome-extension/
-# into a fixed directory that Chrome can keep loaded as an unpacked extension
-# across browserwright upgrades. Override the target with
-# BROWSERWRIGHT_CHROME_EXTENSION_TARGET; default mirrors release_install.py.
-EXT_SRC="$REPO/chrome-extension"
+# --- Install the release-built Chrome extension artifact. -------------------
+# The extension is not distributed through PyPI. release.yml publishes a
+# browserwright-extension-<version>.zip asset beside each v<version> GitHub
+# Release. Download that artifact for the installed CLI version and unpack it
+# into a fixed directory that Chrome can keep loaded across upgrades. Override
+# the target with BROWSERWRIGHT_CHROME_EXTENSION_TARGET.
 EXT_TARGET="${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/etc/chrome-extension/browserwright}"
+GITHUB_REPO="${BROWSERWRIGHT_GITHUB_REPO:-broven/browserwright}"
 
 hash_ext_dir() {
   local dir="$1"
@@ -89,51 +84,77 @@ hash_ext_dir() {
   ) | shasum -a 256 | awk '{print $1}'
 }
 
-if [[ ! -d "$EXT_SRC" ]]; then
-  echo "Skipping chrome-extension sync: $EXT_SRC not found in repo checkout."
-elif [[ -z "${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-}" && "$(uname)" != "Darwin" ]]; then
-  echo "Skipping chrome-extension sync: set BROWSERWRIGHT_CHROME_EXTENSION_TARGET to enable on non-macOS."
-else
-  prev_hash="$(hash_ext_dir "$EXT_TARGET")"
-  mkdir -p "$(dirname "$EXT_TARGET")"
-  rsync -a --delete \\
-    --exclude '__pycache__' \\
-    --exclude '*.pyc' \\
-    --exclude '.DS_Store' \\
-    "$EXT_SRC/" "$EXT_TARGET/"
+download_extension_asset() {
+  local version="$1"
+  local dest="$2"
+  local asset="browserwright-extension-${version}.zip"
+  local tag="v${version}"
 
-  # Pin target manifest.json version to the installed CLI version. Today the
-  # PyPI release flow uses the git tag as the single source of truth for the
-  # package version, but it does NOT commit a matching bump back to
-  # chrome-extension/manifest.json in the repo. That means the source manifest
-  # we just rsync'd over can lag behind the published browserwright version
-  # (e.g., source says 0.6.2 while uv tool just upgraded to 0.6.4). Rewriting
-  # the version field here keeps the loaded extension's about-page version in
-  # lockstep with the daemon/CLI version users actually have on their machine.
-  cli_version="$(browserwright version)"
-  if [[ -f "$EXT_TARGET/manifest.json" && -n "$cli_version" ]]; then
-    python3 - "$EXT_TARGET/manifest.json" "$cli_version" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-version = sys.argv[2]
-text = path.read_text(encoding="utf-8")
-updated, count = re.subn(
-    r'("version"\\s*:\\s*)"[^"]+"',
-    lambda m: f'{m.group(1)}"{version}"',
-    text,
-    count=1,
-)
-if count != 1:
-    sys.exit(f"could not rewrite version field in {path}")
-path.write_text(updated, encoding="utf-8")
-PY
+  if command -v gh >/dev/null 2>&1; then
+    if gh release download "$tag" \
+      --repo "$GITHUB_REPO" \
+      --pattern "$asset" \
+      --dir "$(dirname "$dest")" \
+      --clobber; then
+      if [[ "$(dirname "$dest")/$asset" != "$dest" ]]; then
+        mv -f "$(dirname "$dest")/$asset" "$dest"
+      fi
+      return
+    fi
   fi
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL \
+      "https://github.com/${GITHUB_REPO}/releases/download/${tag}/${asset}" \
+      -o "$dest"
+    return
+  fi
+
+  echo "Need either gh or curl to download ${GITHUB_REPO} release asset ${asset}." >&2
+  return 1
+}
+
+if [[ -z "${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-}" && "$(uname)" != "Darwin" ]]; then
+  echo "Skipping chrome-extension install: set BROWSERWRIGHT_CHROME_EXTENSION_TARGET to enable on non-macOS."
+else
+  cli_version="$(browserwright version)"
+  if [[ -z "$cli_version" ]]; then
+    echo "Could not determine installed browserwright version." >&2
+    exit 1
+  fi
+
+  prev_hash="$(hash_ext_dir "$EXT_TARGET")"
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  zip_path="$tmp_dir/browserwright-extension-${cli_version}.zip"
+  unpack_dir="$tmp_dir/unpacked"
+
+  echo "Downloading Chrome extension artifact for browserwright ${cli_version}..."
+  download_extension_asset "$cli_version" "$zip_path"
+  mkdir -p "$unpack_dir"
+  unzip -q "$zip_path" -d "$unpack_dir"
+
+  if [[ -d "$unpack_dir/chrome-extension" ]]; then
+    EXT_SRC="$unpack_dir/chrome-extension"
+  elif [[ -f "$unpack_dir/manifest.json" ]]; then
+    EXT_SRC="$unpack_dir"
+  else
+    echo "Downloaded extension artifact did not contain chrome-extension/ or manifest.json." >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "$EXT_TARGET")"
+  rm -rf "$EXT_TARGET"
+  mkdir -p "$EXT_TARGET"
+  (cd "$EXT_SRC" && tar cf - .) | (cd "$EXT_TARGET" && tar xf -)
 
   new_hash="$(hash_ext_dir "$EXT_TARGET")"
   ext_version="$(python3 -c "import json,sys; print(json.load(open('$EXT_TARGET/manifest.json')).get('version',''))" 2>/dev/null || echo '?')"
+
+  if [[ "$ext_version" != "$cli_version" ]]; then
+    echo "Extension artifact version ${ext_version} does not match installed browserwright ${cli_version}." >&2
+    exit 1
+  fi
 
   echo ""
   if [[ -z "$prev_hash" ]]; then
@@ -150,8 +171,12 @@ PY
   fi
 fi
 
+browserwright-daemon restart
+browserwright version check
+browserwright-daemon version check
+
 echo ""
-echo "Done. Global browserwright is on $(browserwright version) and the daemon is restarted."
+echo "Done. Global browserwright is on $(browserwright version), the matching extension artifact is installed, and the daemon is restarted."
 """
 
 [tasks.version-check]
