@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Release
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  publish:
-    name: Build and publish
+  publish-pypi:
+    name: Build and publish to PyPI
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -75,3 +75,62 @@ jobs:
 
       - name: Publish distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-extension:
+    name: Package Chrome extension
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set extension version from git tag
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(
+              r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:[a-zA-Z0-9_.!+-]+)?",
+              tag,
+          )
+          if not match:
+              print(
+                  f"Tag {tag!r} is not a supported package version tag. "
+                  "Use tags like v0.6.3.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          version = tag[1:] if tag.startswith("v") else tag
+          path = Path("chrome-extension/manifest.json")
+          manifest = json.loads(path.read_text(encoding="utf-8"))
+          manifest["version"] = version
+          path.write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+          print(f"Extension version set from git tag: {version}")
+          PY
+
+      - name: Package extension
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          zip -r "dist/browserwright-extension-${version}.zip" chrome-extension
+
+      - name: Upload extension to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/browserwright-extension-*.zip
+          fail_on_unmatched_files: true

@@ -115,6 +115,11 @@ git push origin v0.6.3
 The GitHub Action only runs for `v*` tags. A tag like `v0.6.3` publishes package
 version `0.6.3`.
 
+Each `v*` GitHub Release also includes a
+`browserwright-extension-<version>.zip` asset. Use that zip as the official
+extension download path when installing outside PyPI or before the Chrome Web
+Store path is available.
+
 ### Local immutable release install
 
 From the repo root. If you have [`mise`](https://mise.jdx.dev/), install an immutable local release:
