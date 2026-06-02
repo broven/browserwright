@@ -56,6 +56,13 @@ let installId = null;
 const attachedTabs = new Set();
 let userscriptMemoryLog = [];
 
+const PING_INTERVAL_MS = 20000;
+const SERVER_PONG_STALE_MS = 25000;
+const LEGACY_PONG_STALE_MS = 45000;
+let lastPongTs = 0;
+let lastInboundFrameTs = 0;
+let seenServerPing = false;
+
 // ---- install id (stable across reloads) -----------------------------------
 
 async function getInstallId() {
@@ -91,6 +98,8 @@ function connect() {
   ws.onopen = async () => {
     try {
       reconnectIdx = 0;
+      lastPongTs = Date.now();
+      lastInboundFrameTs = lastPongTs;
       const id = await getInstallId();
       const manifest = chrome.runtime.getManifest();
       safeSend({
@@ -119,6 +128,7 @@ function connect() {
   };
 
   ws.onmessage = (ev) => {
+    lastInboundFrameTs = Date.now();
     let msg;
     try {
       msg = JSON.parse(ev.data);
@@ -139,12 +149,32 @@ function connect() {
 
   ws.onclose = () => {
     ws = null;
+    lastPongTs = 0;
+    lastInboundFrameTs = 0;
     // maintainLoop will retry; no setTimeout here (would die when SW idles).
   };
 
   ws.onerror = (ev) => {
     console.debug("[bd-relay] ws error:", ev);
   };
+}
+
+function wsLooksHealthy() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const now = Date.now();
+  const staleMs = seenServerPing ? SERVER_PONG_STALE_MS : LEGACY_PONG_STALE_MS;
+  return (now - Math.max(lastPongTs, lastInboundFrameTs)) <= staleMs;
+}
+
+function forceReconnect(reason) {
+  const old = ws;
+  ws = null;
+  lastPongTs = 0;
+  lastInboundFrameTs = 0;
+  try {
+    old && old.close(1011, reason || "stale relay connection");
+  } catch (_e) {}
+  connect();
 }
 
 function sleep(ms) {
@@ -160,7 +190,14 @@ async function maintainLoop() {
   // protocol-level PING the daemon's `websockets` lib emits.
   while (true) {
     const state = ws ? ws.readyState : WebSocket.CLOSED;
-    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+    if (state === WebSocket.OPEN) {
+      if (!wsLooksHealthy()) {
+        forceReconnect("server heartbeat stale");
+      }
+      await sleep(1000);
+      continue;
+    }
+    if (state === WebSocket.CONNECTING) {
       await sleep(1000);
       continue;
     }
@@ -187,7 +224,6 @@ async function maintainLoop() {
 // `onmessage` does the same. With <30s between events, the SW stays alive
 // indefinitely. `chrome.alarms` below is a recovery net for the case
 // where the SW dies anyway (memory pressure, browser update, etc.).
-const PING_INTERVAL_MS = 20000;
 async function pingLoop() {
   while (true) {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -458,10 +494,16 @@ async function handleDaemonMessage(msg) {
       return await doUserscriptToggle(id, msg.key, msg.enabled);
     case "userscript.logs":
       return await doUserscriptLogs(id, msg);
+    case "ping":
+      seenServerPing = true;
+      safeSend({ type: "pong", ts: msg.ts || Date.now() });
+      return;
     case "pong":
       // App-level keepalive reply (see pingLoop). The mere fact that this
       // onmessage fired is enough to reset Chrome's SW idle reaper — no
-      // further bookkeeping needed.
+      // further bookkeeping needed for the reaper, but lastPongTs lets the
+      // recovery net distrust a stale WebSocket that still claims OPEN.
+      lastPongTs = Date.now();
       return;
     default:
       console.warn("[bd-relay] unknown message type:", type);
@@ -1304,8 +1346,17 @@ chrome.runtime.onInstalled.addListener(() => {
 // etc.) this alarm will respawn it within 30s and reconnect.
 chrome.alarms.create("bd-relay-keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "bd-relay-keepalive" && !ws) {
+  if (alarm.name !== "bd-relay-keepalive") return;
+  if (!ws) {
     connect();
+    return;
+  }
+  if (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING) {
+    forceReconnect("alarm found closed relay socket");
+    return;
+  }
+  if (ws.readyState === WebSocket.OPEN && !wsLooksHealthy()) {
+    forceReconnect("alarm detected stale relay heartbeat");
   }
 });
 

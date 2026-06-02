@@ -78,6 +78,9 @@ DEFAULT_RELAY_PORT = 19989
 # with the playwriter / OpenCLI experience.
 ATTACH_RETRY_LIMIT = 3
 ATTACH_RETRY_BACKOFF = (0.1, 0.3, 0.8)  # seconds; len must equal ATTACH_RETRY_LIMIT
+APP_PING_INTERVAL = 5.0
+STALE_FRAME_AFTER = 30.0
+RECONNECT_WAIT_TIMEOUT = 35.0
 
 
 @dataclass
@@ -110,6 +113,8 @@ class _ExtensionConn:
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     pending: dict[int, asyncio.Future] = field(default_factory=dict)
     tabs: dict[int, GhostTarget] = field(default_factory=dict)
+    last_frame_ts: float = field(default_factory=time.monotonic)
+    app_ping_task: asyncio.Task | None = None
 
 
 class RelayServer:
@@ -275,12 +280,15 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             return None
+        ext = await self._ensure_extension_fresh(ext)
+        if ext is None:
+            return None
         return await self._request(ext, {"type": "queryActiveTab"},
                                    timeout=timeout)
 
     async def query_group_tabs(self, group_name: str | None = None, *,
                                group_id: int | None = None,
-                               timeout: float = 5.0) -> dict | None:
+                               timeout: float = 15.0) -> dict | None:
         """Live membership query: ask the extension for the tabs of the
         session's tab group. ``group_id`` is the durable primary key (the
         numeric Chrome groupId); ``group_name`` is accepted for older callers
@@ -291,6 +299,9 @@ class RelayServer:
         Returns None when no extension is connected (mirrors
         query_active_tab's caller-falls-back contract)."""
         ext = self._pick_active_extension()
+        if ext is None:
+            return None
+        ext = await self._ensure_extension_fresh(ext)
         if ext is None:
             return None
         body: dict = {"type": "queryGroup"}
@@ -322,6 +333,7 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
+        ext = await self._ensure_extension_fresh_or_raise(ext)
         last_err: Exception | None = None
         body: dict = {"type": "attachActive"}
         if group_name:
@@ -367,6 +379,7 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
+        ext = await self._ensure_extension_fresh_or_raise(ext)
         # Idempotency: extension may already hold chrome.debugger.attach on
         # this tab (popup click, prior daemon lifecycle — the SW survives
         # daemon restarts and re-announces attached tabs on reconnect, so
@@ -405,6 +418,9 @@ class RelayServer:
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             return
+        ext = await self._ensure_extension_fresh(ext)
+        if ext is None:
+            return
         try:
             await self._request(
                 ext, {"type": "detach", "tabId": tab_id}, timeout=timeout)
@@ -440,6 +456,7 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
+        ext = await self._ensure_extension_fresh_or_raise(ext)
         body: dict = {"type": "createTab", "url": url}
         if group_name:
             body["groupName"] = group_name
@@ -489,6 +506,7 @@ class RelayServer:
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             raise RuntimeError(f"no extension knows tab {tab_id}")
+        ext = await self._ensure_extension_fresh_or_raise(ext)
         try:
             await self._request(
                 ext, {"type": "closeTab", "tabId": tab_id}, timeout=timeout)
@@ -504,6 +522,7 @@ class RelayServer:
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             raise RuntimeError(f"no extension owns tab {tab_id}")
+        ext = await self._ensure_extension_fresh_or_raise(ext)
         return await self._request(ext, {
             "type": "command",
             "tabId": tab_id,
@@ -522,6 +541,7 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
+        ext = await self._ensure_extension_fresh_or_raise(ext)
         return await self._request(
             ext, {"type": f"userscript.{verb}", **payload}, timeout=timeout)
 
@@ -546,6 +566,106 @@ class RelayServer:
         self._next_cmd_id += 1
         return v
 
+    def _extension_is_stale(self, ext: _ExtensionConn) -> bool:
+        if not ext.hello_received.is_set():
+            return False
+        return (time.monotonic() - ext.last_frame_ts) > STALE_FRAME_AFTER
+
+    async def _ensure_extension_fresh(
+        self, ext: _ExtensionConn,
+    ) -> _ExtensionConn | None:
+        """Return a live extension connection, force-closing ghost sockets.
+
+        MV3 can suspend the SW while Chrome's network process keeps the TCP
+        websocket ESTABLISHED. Protocol pings still succeed there, but no app
+        frames arrive. The daemon treats missing app frames as authoritative
+        and tears down the ghost before sending a user command.
+        """
+        if not self._extension_is_stale(ext):
+            return ext
+        await self._force_close_extension(ext, reason="stale app-level heartbeat")
+        return await self._wait_for_replacement(ext, timeout=RECONNECT_WAIT_TIMEOUT)
+
+    async def _ensure_extension_fresh_or_raise(
+        self, ext: _ExtensionConn,
+    ) -> _ExtensionConn:
+        fresh = await self._ensure_extension_fresh(ext)
+        if fresh is None:
+            raise RuntimeError(
+                "extension relay connection appears stale and did not reconnect "
+                f"within {RECONNECT_WAIT_TIMEOUT:.0f}s")
+        return fresh
+
+    async def _force_close_extension(self, ext: _ExtensionConn, *, reason: str) -> None:
+        logger.warning(
+            "force-closing stale extension relay connection: install_id=%s reason=%s",
+            ext.install_id or "(pending)",
+            reason,
+        )
+        for fut in list(ext.pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError(f"extension relay closed: {reason}"))
+            if fut.cancelled():
+                continue
+            with contextlib.suppress(BaseException):
+                fut.exception()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                ext.conn.close(code=1011, reason=reason),
+                timeout=1.0,
+            )
+
+    async def _wait_for_replacement(
+        self, old_ext: _ExtensionConn, *, timeout: float,
+        allow_any_install: bool = False,
+    ) -> _ExtensionConn | None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        install_id = old_ext.install_id
+        while time.monotonic() < deadline:
+            candidates = [
+                ext for ext in self._extensions.values()
+                if ext is not old_ext and ext.hello_received.is_set()
+            ]
+            if install_id:
+                for ext in candidates:
+                    if ext.install_id == install_id:
+                        return ext
+            if allow_any_install and candidates:
+                return candidates[0]
+            await asyncio.sleep(0.1)
+        if install_id:
+            return None
+        if candidates := [
+            ext for ext in self._extensions.values()
+            if ext is not old_ext and ext.hello_received.is_set()
+        ]:
+            return candidates[0]
+        return None
+
+    async def _retry_request_on_replacement(
+        self,
+        ext: _ExtensionConn,
+        body: dict,
+        *,
+        timeout: float,
+        loop: asyncio.AbstractEventLoop,
+    ) -> dict | None:
+        await self._force_close_extension(ext, reason=f"{body.get('type')} request failed")
+        replacement = await self._wait_for_replacement(
+            ext, timeout=RECONNECT_WAIT_TIMEOUT)
+        if replacement is None:
+            raise ConnectionError(
+                "extension relay did not reconnect after request failure")
+        retry_id = self._alloc_id()
+        retry_body = {**{k: v for k, v in body.items() if k != "id"}, "id": retry_id}
+        retry_fut: asyncio.Future = loop.create_future()
+        replacement.pending[retry_id] = retry_fut
+        try:
+            await replacement.conn.send(json.dumps(retry_body))
+            return await asyncio.wait_for(retry_fut, timeout=timeout)
+        finally:
+            replacement.pending.pop(retry_id, None)
+
     async def _request(self, ext: _ExtensionConn, body: dict, *,
                        timeout: float) -> dict | None:
         cmd_id = self._alloc_id()
@@ -556,7 +676,18 @@ class RelayServer:
         try:
             await ext.conn.send(json.dumps(body))
             return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            if not self._extension_is_stale(ext):
+                raise
+            return await self._retry_request_on_replacement(
+                ext, body, timeout=timeout, loop=loop)
+        except (ConnectionError, websockets.exceptions.ConnectionClosed):
+            return await self._retry_request_on_replacement(
+                ext, body, timeout=timeout, loop=loop)
         finally:
+            if not fut.cancelled():
+                with contextlib.suppress(BaseException):
+                    fut.exception()
             ext.pending.pop(cmd_id, None)
 
     # ---- ws handlers -----------------------------------------------------
@@ -633,6 +764,7 @@ class RelayServer:
         self._extensions[temp_key] = ext
         try:
             async for raw in conn:
+                ext.last_frame_ts = time.monotonic()
                 if not isinstance(raw, (str, bytes)):
                     continue
                 text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
@@ -650,8 +782,12 @@ class RelayServer:
             logger.warning("extension handler crashed: %r", e)
         finally:
             key = ext.install_id or temp_key
-            self._extensions.pop(key, None)
-            self._extensions.pop(temp_key, None)
+            if self._extensions.get(key) is ext:
+                self._extensions.pop(key, None)
+            if self._extensions.get(temp_key) is ext:
+                self._extensions.pop(temp_key, None)
+            if ext.app_ping_task is not None:
+                ext.app_ping_task.cancel()
             for fut in list(ext.pending.values()):
                 if not fut.done():
                     fut.set_exception(ConnectionError("extension disconnected"))
@@ -673,6 +809,8 @@ class RelayServer:
             self._extensions.pop(temp_key, None)
             self._extensions[ext.install_id or temp_key] = ext
             ext.hello_received.set()
+            if ext.app_ping_task is None or ext.app_ping_task.done():
+                ext.app_ping_task = asyncio.create_task(self._app_ping_loop(ext))
             self._first_ready.set()
             if (
                 ext.extension_protocol_version
@@ -707,6 +845,9 @@ class RelayServer:
                 }))
             except Exception:
                 pass
+            return
+
+        if kind == "pong":
             return
 
         if kind == "attached":
@@ -761,6 +902,26 @@ class RelayServer:
             return
 
         logger.debug("extension sent unknown type %r: %s", kind, str(msg)[:100])
+
+    async def _app_ping_loop(self, ext: _ExtensionConn) -> None:
+        try:
+            while True:
+                await asyncio.sleep(APP_PING_INTERVAL)
+                if not ext.hello_received.is_set():
+                    continue
+                if self._extension_is_stale(ext):
+                    await self._force_close_extension(
+                        ext, reason="missing app-level frames")
+                    return
+                try:
+                    await ext.conn.send(json.dumps({
+                        "type": "ping",
+                        "ts": int(time.time() * 1000),
+                    }))
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _fanout_listeners(self, msg: dict) -> None:
         """Call every additional fan-out observer with the raw extension
