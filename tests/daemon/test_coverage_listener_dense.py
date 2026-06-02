@@ -417,6 +417,49 @@ async def test_relay_dispatch_handles_protocol_matrix_and_pending_errors():
 
 
 @pytest.mark.asyncio
+async def test_relay_handler_cleanup_does_not_remove_replacement_connection():
+    relay = RelayServer()
+    new_ext = _ExtensionConn(conn=SimpleNamespace())
+    new_ext.install_id = "same-install"
+    new_ext.hello_received.set()
+    captured_old: dict[str, _ExtensionConn] = {}
+
+    class FakeConn:
+        def __init__(self):
+            self.frames = [
+                json.dumps({
+                    "type": "hello",
+                    "installId": "same-install",
+                    "browser": "chrome",
+                    "version": "1",
+                }),
+            ]
+            self.sent: list[str] = []
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.frames:
+                old_ext = relay._extensions["same-install"]
+                captured_old["ext"] = old_ext
+                fut = asyncio.get_running_loop().create_future()
+                old_ext.pending[1] = fut
+                relay._extensions["same-install"] = new_ext
+                raise StopAsyncIteration
+            return self.frames.pop(0)
+
+        async def send(self, text: str):
+            self.sent.append(text)
+
+    await relay._handler(FakeConn())
+
+    assert relay._extensions["same-install"] is new_ext
+    old_ext = captured_old["ext"]
+    assert isinstance(old_ext.pending[1].exception(), ConnectionError)
+
+
+@pytest.mark.asyncio
 async def test_relay_request_cleanup_and_public_helpers_without_socket(monkeypatch):
     relay = RelayServer()
     sent: list[dict] = []

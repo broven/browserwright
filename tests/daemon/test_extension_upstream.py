@@ -54,6 +54,12 @@ class _MockExtension:
                 if isinstance(raw, (str, bytes)):
                     text = raw if isinstance(raw, str) else raw.decode()
                     msg = json.loads(text)
+                    if msg.get("type") == "ping":
+                        await self.ws.send(json.dumps({
+                            "type": "pong",
+                            "ts": msg.get("ts"),
+                        }))
+                        continue
                     self.received.append(msg)
                     await self._inbox.put(msg)
         except websockets.exceptions.ConnectionClosed:
@@ -100,6 +106,10 @@ class _MockExtension:
             await self.ws.close()
         if self.recv_task is not None:
             self.recv_task.cancel()
+
+    async def wait_closed(self, *, timeout: float = 2.0) -> None:
+        assert self.ws is not None
+        await asyncio.wait_for(self.ws.wait_closed(), timeout=timeout)
 
 
 # ---- helper: build a wired-up ExtensionUpstream -------------------------
@@ -165,6 +175,62 @@ async def test_target_get_targets_returns_ghosts_from_relay():
         assert resp["id"] == 100
         target_ids = {ti["targetId"] for ti in resp["result"]["targetInfos"]}
         assert target_ids == {"ext-tab-1", "ext-tab-2"}
+
+
+@pytest.mark.asyncio
+async def test_stale_extension_connection_is_closed_and_request_retries(monkeypatch):
+    async with _relay_running() as relay:
+        monkeypatch.setattr("browserwright.daemon.server.relay.STALE_FRAME_AFTER", 0.01)
+        monkeypatch.setattr("browserwright.daemon.server.relay.RECONNECT_WAIT_TIMEOUT", 2.0)
+        ext1 = _MockExtension()
+        await ext1.connect(relay.port, install_id="same-ext")
+        await relay.wait_ready(timeout=2.0)
+        await asyncio.sleep(0.03)
+
+        async def reconnect():
+            await ext1.wait_closed()
+            ext2 = _MockExtension()
+            await ext2.connect(relay.port, install_id="same-ext")
+            cmd = await ext2.next_command()
+            assert cmd["type"] == "queryActiveTab"
+            await ext2.respond(cmd["id"], result={"tabId": 9, "url": "https://fresh/"})
+            return ext2
+
+        reconnect_task = asyncio.create_task(reconnect())
+        result = await relay.query_active_tab(timeout=1.0)
+        ext2 = await reconnect_task
+        try:
+            assert result == {"tabId": 9, "url": "https://fresh/"}
+            assert ext1.ws is not None and ext1.ws.close_code is not None
+            active = relay._pick_active_extension()
+            assert active is not None
+            assert active.install_id == "same-ext"
+        finally:
+            await ext2.close()
+            await ext1.close()
+
+
+@pytest.mark.asyncio
+async def test_live_extension_request_timeout_does_not_retry(monkeypatch):
+    async with _relay_running() as relay:
+        monkeypatch.setattr("browserwright.daemon.server.relay.RECONNECT_WAIT_TIMEOUT", 0.2)
+        ext = _MockExtension()
+        await ext.connect(relay.port, install_id="live-ext")
+        await relay.wait_ready(timeout=2.0)
+
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await relay.query_active_tab(timeout=0.01)
+            await asyncio.sleep(0.05)
+            assert len([
+                msg for msg in ext.received
+                if msg.get("type") == "queryActiveTab"
+            ]) == 1
+            active = relay._pick_active_extension()
+            assert active is not None
+            assert active.install_id == "live-ext"
+        finally:
+            await ext.close()
 
 
 @pytest.mark.asyncio
