@@ -62,8 +62,11 @@ def patch_page_goto(page: Any) -> Any:
             response = orig_goto(url, timeout=timeout_ms,
                                  wait_until="commit", referer=referer)
         except Exception as exc:  # noqa: BLE001 - translate Playwright failures.
-            network.detach()
-            raise _page_load_failed(url, "commit", exc) from exc
+            if _looks_loaded(self):
+                response = None
+            else:
+                network.detach()
+                raise _page_load_failed(url, "commit", exc) from exc
 
         _wait_for_domcontentloaded(self, _remaining_timeout_ms(deadline))
         try:
@@ -113,6 +116,23 @@ def _wait_for_domcontentloaded(page: Any, remaining_timeout_ms: int) -> None:
         )
     except Exception:
         pass
+
+
+def _looks_loaded(page: Any) -> bool:
+    """Detect successful navigations masked by commit watcher races.
+
+    Some redirects/client transitions can leave Playwright's commit wait in an
+    error state even after the document is usable. Treat any probe failure as
+    not loaded so true failures still follow the existing PageLoadFailed path.
+    """
+    try:
+        url = page.url
+        if not url or url == "about:blank":
+            return False
+        ready_state = page.evaluate("() => document.readyState")
+        return ready_state != "loading"
+    except Exception:
+        return False
 
 
 def _smart_wait_settled(page: Any, deadline: float | None, network: "_NetworkMonitor") -> None:
