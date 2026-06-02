@@ -20,7 +20,7 @@ def _clean_env(monkeypatch):
     """Pop everything daemon-relevant. Some tests re-set what they need."""
     for var in [
         "BD_BACKEND", "BD_CDP_WS", "BD_CDP_URL", "BD_CONFIG", "BD_NAME",
-        "BD_TIMEOUT", "BD_CHROME_BINARY",
+        "BD_TIMEOUT", "BD_CHROME_BINARY", "BD_SESSION_IDLE_PRUNE",
         "BU_CDP_WS", "BU_CDP_URL",
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         "http_proxy", "https_proxy", "all_proxy", "no_proxy",

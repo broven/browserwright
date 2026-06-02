@@ -400,6 +400,151 @@ async def test_idle_watchdog_idle_reaps_when_configured(monkeypatch):
     assert calls["reap_idle"] >= 1
 
 
+@pytest.mark.asyncio
+async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypatch):
+    from browserwright import session_registry as reg
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server import listener
+
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    sid = reg.allocate(backend="rdp", owner="create", name="old")
+    reg._with_entry(sid, lambda e: e.update(last_seen=0.0))
+
+    class _Executors:
+        def __init__(self):
+            self.killed: list[str] = []
+
+        def kill(self, session_id):
+            self.killed.append(session_id)
+
+    class _Daemon:
+        cfg = Config(session_idle_prune=12.5)
+        executors = _Executors()
+        shared_context = None
+
+        def __init__(self):
+            self.torn_down: list[str] = []
+
+        async def teardown_rdp_context(self, session_id):
+            assert reg.get(session_id) is not None
+            self.torn_down.append(session_id)
+            return True
+
+    daemon = _Daemon()
+
+    pruned = await listener._auto_prune_sessions(daemon, reason="test")
+    assert len(pruned) == 1
+    assert pruned[0]["id"] == sid
+    assert pruned[0]["backend"] == "rdp"
+    assert pruned[0]["owner"] == "create"
+    assert daemon.executors.killed == [sid]
+    assert daemon.torn_down == [sid]
+    assert reg.get(sid) is None
+
+    daemon.cfg = Config(session_idle_prune=None)
+    assert await listener._auto_prune_sessions(daemon, reason="off") == []
+
+
+@pytest.mark.asyncio
+async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from browserwright import session_registry as reg
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server import listener
+
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    sid = reg.allocate(backend="extension", owner="attach", name="old-ext")
+    reg._with_entry(
+        sid,
+        lambda e: e.update(
+            last_seen=0.0,
+            runtime={"group_id": 17},
+        ),
+    )
+
+    class _Executors:
+        def __init__(self):
+            self.killed: list[str] = []
+
+        def kill(self, session_id):
+            self.killed.append(session_id)
+
+    class _Upstream:
+        def __init__(self):
+            self.ended: list[tuple[str, int | None]] = []
+
+        async def end_session(self, session_id, group_id=None):
+            assert reg.get(session_id) is not None
+            self.ended.append((session_id, group_id))
+            return {"closed": [], "kept": []}
+
+    upstream = _Upstream()
+    daemon = SimpleNamespace(
+        cfg=Config(session_idle_prune=1.0),
+        executors=_Executors(),
+        shared_context=SimpleNamespace(
+            holder=SimpleNamespace(upstream=upstream),
+        ),
+    )
+
+    pruned = await listener._auto_prune_sessions(daemon, reason="test")
+
+    assert [rec["id"] for rec in pruned] == [sid]
+    assert daemon.executors.killed == [sid]
+    assert upstream.ended == [(sid, 17)]
+    assert reg.get(sid) is None
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_periodically_prunes_sessions(monkeypatch):
+    import asyncio
+
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server import listener
+
+    calls = {"reap_dead": 0, "session_prune": 0}
+
+    class _Reg:
+        def reap_dead(self):
+            calls["reap_dead"] += 1
+            return []
+
+        def reap_idle(self, idle_after):
+            return []
+
+    class _Daemon:
+        cfg = Config(session_idle_prune=24.0)
+        executors = _Reg()
+
+        def all_contexts(self):
+            return []
+
+    times = iter([100.0, 3701.0])
+    monkeypatch.setattr(listener.time, "time", lambda: next(times, 3701.0))
+    async def fake_prune(daemon, *, reason):
+        calls["session_prune"] += 1
+        return []
+
+    monkeypatch.setattr(listener, "_auto_prune_sessions", fake_prune)
+
+    sleeps = 0
+
+    async def fake_sleep(delay):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(listener.asyncio, "sleep", fake_sleep)
+
+    await listener._idle_watchdog(
+        _Daemon(), None, session_idle_prune=24.0)
+
+    assert calls["reap_dead"] == 1
+    assert calls["session_prune"] == 1
+
+
 # ---- real signal discipline (one child, no stub) ---------------------------
 
 

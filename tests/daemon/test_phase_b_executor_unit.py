@@ -16,6 +16,7 @@ import socket
 
 import pytest
 
+from browserwright._executor import client as executor_client
 from browserwright._executor.client import ExecutorUnavailable
 from browserwright._executor import protocol
 from browserwright._executor.process import _LivePageHolder, _Worker
@@ -69,6 +70,31 @@ def test_executor_unavailable_fix_mentions_reset():
 
     assert "reset()" in err.fix
     assert "session reset" in err.fix
+
+
+def test_run_on_executor_touches_session_before_ensure(monkeypatch):
+    order: list[str] = []
+
+    class _Sess:
+        session_record = {"id": "sess-touch"}
+
+    monkeypatch.setattr(
+        executor_client.reg,
+        "touch",
+        lambda sid: order.append(f"touch:{sid}") or {"id": sid},
+    )
+    monkeypatch.setattr(
+        executor_client,
+        "ensure_executor",
+        lambda sess: order.append("ensure") or (_ for _ in ()).throw(
+            ExecutorUnavailable("stop after ensure")
+        ),
+    )
+
+    with pytest.raises(ExecutorUnavailable):
+        executor_client.run_on_executor(_Sess(), "page.url")
+
+    assert order == ["touch:sess-touch", "ensure"]
 
 
 # ---- wire framing ----------------------------------------------------------
