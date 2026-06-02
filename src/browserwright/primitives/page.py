@@ -224,7 +224,12 @@ def switch_tab(target) -> dict:
     return {"targetId": target_id}
 
 
-def open(url: str = "about:blank", *, background: bool = True) -> dict:
+def open(
+    url: str = "about:blank",
+    *,
+    background: bool = True,
+    skip_post_attach_commands: bool = False,
+) -> dict:
     """Open a new working tab in this session's browser, attach, bind as
     current. The unified tab-opening primitive (docs §Tier B) — replaces
     both ``new_tab`` and ``open_background``.
@@ -246,7 +251,10 @@ def open(url: str = "about:blank", *, background: bool = True) -> dict:
     try:
         payload = sess.cdp.send(
             "BrowserwrightDaemon.openBackgroundTab",
-            url=url, bsSession=sid, background=background,
+            url=url,
+            bsSession=sid,
+            background=background,
+            skipPostAttachCommands=skip_post_attach_commands,
         )
     except CDPError as e:
         raise CDPError(
@@ -400,7 +408,7 @@ def current_page() -> dict:
         return {"targetId": tabs[0]["targetId"], "url": tabs[0]["url"],
                 "title": tabs[0]["title"], "accuracy": "unknown"}
     # 4. Empty session — open a fresh working tab (NOT adopt).
-    return open("about:blank") | {"accuracy": "unknown"}
+    return open("about:blank", skip_post_attach_commands=True) | {"accuracy": "unknown"}
 
 
 def wait(seconds: float = 1.0) -> None:

@@ -299,8 +299,12 @@ def _run_execute(script: str, *, sid: str, runtime_dir: str,
     env["BD_CONFIG"] = ""
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
+    skill_bin = Path(sys.executable).with_name("browserwright")
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    if not skill_bin.exists():
+        skill_bin = Path("browserwright")
     return subprocess.run(
-        ["browserwright", "-s", sid, "-e", script],
+        [str(skill_bin), "-s", sid, "-e", script],
         text=True,
         capture_output=True,
         env=env,

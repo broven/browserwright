@@ -511,7 +511,8 @@ class ExtensionFacadeBridge:
             gt = await self._ext.open_background_tab(
                 url, group_name=group_name,
                 session_id=self._session_id,
-                background=True)
+                background=True,
+                skip_post_attach_commands=True)
             tab_id = int(gt["tabId"])
             created_group = gt.get("groupId")
             if isinstance(created_group, int) and created_group >= 0:

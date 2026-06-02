@@ -1171,10 +1171,12 @@ class Router:
         # extension backend; background=False opens the tab in the foreground.
         background = params.get("background")
         background = background if isinstance(background, bool) else True
+        skip_post_attach_commands = params.get("skipPostAttachCommands") is True
         try:
             result = await self._open_background_tab(
                 url, group_name=group_name, session_id=session,
-                background=background)
+                background=background,
+                skip_post_attach_commands=skip_post_attach_commands)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"openBackgroundTab failed: {e!r}"))

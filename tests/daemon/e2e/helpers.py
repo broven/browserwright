@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,14 +48,18 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
     if backend not in ("extension", "rdp"):
         raise ValueError(f"backend must be 'extension' or 'rdp', got {backend!r}")
 
-    skill_bin = shutil.which("browserwright")
-    if not skill_bin:
-        raise RuntimeError(
-            "browserwright not on PATH; install browserwright in editable mode: "
-            "`pip install -e browserwright[test]`"
-        )
+    skill_bin = Path(sys.executable).with_name("browserwright")
+    if not skill_bin.exists():
+        found = shutil.which("browserwright")
+        if not found:
+            raise RuntimeError(
+                "browserwright not on PATH; install browserwright in editable "
+                "mode: `pip install -e browserwright[test]`"
+            )
+        skill_bin = Path(found)
 
     env = scrubbed_env()
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     # Point the skill at the test daemon's fixed socket via its runtime dir.
     if runtime_dir is not None:
         env["XDG_RUNTIME_DIR"] = runtime_dir
@@ -106,7 +111,7 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
 
     try:
         proc = subprocess.run(
-            [skill_bin, "-s", env["BD_SESSION"], "--code-stdin"],
+            [str(skill_bin), "-s", env["BD_SESSION"], "--code-stdin"],
             input=script,
             text=True,
             capture_output=True,

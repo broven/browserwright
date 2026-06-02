@@ -448,6 +448,7 @@ async def test_open_background_tab_returns_fabricated_session():
             assert cmd["type"] == "createTab"
             assert cmd["url"] == "https://example.com/"
             assert cmd["groupName"] == "Agent"
+            assert "skipPostAttachCommands" not in cmd
             await ext.respond(cmd["id"], result={
                 "tabId": 12,
                 "url": "https://example.com/",
@@ -469,6 +470,30 @@ async def test_open_background_tab_returns_fabricated_session():
         assert sid.startswith("ext-sid-12-")
         # Session is registered for future relay routing.
         assert upstream._sessions[sid] == 12
+
+
+@pytest.mark.asyncio
+async def test_open_background_tab_can_skip_post_attach_commands():
+    async with _ext_upstream() as (_relay, upstream, _captured, ext):
+
+        async def respond():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "createTab"
+            assert cmd["skipPostAttachCommands"] is True
+            await ext.respond(cmd["id"], result={
+                "tabId": 12,
+                "url": "https://example.com/",
+                "title": "Example",
+                "groupId": 4,
+            })
+
+        r = asyncio.create_task(respond())
+        await upstream.open_background_tab(
+            "https://example.com/",
+            group_name="Agent",
+            skip_post_attach_commands=True,
+        )
+        await r
 
 
 @pytest.mark.asyncio

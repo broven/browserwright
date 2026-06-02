@@ -435,6 +435,7 @@ class RelayServer:
         group_name: str | None = "Agent",
         group_id: int | None = None,
         background: bool = True,
+        skip_post_attach_commands: bool = False,
         timeout: float = 10.0,
     ) -> GhostTarget:
         """Spec Phase B Feature 1: open a tab in the background (active=false)
@@ -467,6 +468,8 @@ class RelayServer:
         # is requested so existing extensions default to background.
         if not background:
             body["background"] = False
+        if skip_post_attach_commands:
+            body["skipPostAttachCommands"] = True
         result = await self._request(ext, body, timeout=timeout) or {}
         tab_id = int(result.get("tabId", -1))
         if tab_id < 0:
@@ -866,7 +869,7 @@ class RelayServer:
             # lifecycle so they can synthesize Target.targetCreated /
             # attachedToTarget for a live `connect_over_cdp` client. The agent
             # path ignores these (its `_on_event` only handles `event`).
-            await self._fanout_listeners(msg)
+            self._schedule_fanout_listeners(msg)
             return
 
         if kind == "detached":
@@ -874,7 +877,7 @@ class RelayServer:
             if tab_id < 0:
                 return
             ext.tabs.pop(tab_id, None)
-            await self._fanout_listeners(msg)
+            self._schedule_fanout_listeners(msg)
             return
 
         if kind == "response":
@@ -932,6 +935,28 @@ class RelayServer:
                 await listener(msg)
             except Exception as e:  # noqa: BLE001
                 logger.warning("relay fan-out listener raised: %r", e)
+
+    def _schedule_fanout_listeners(self, msg: dict) -> None:
+        """Notify secondary observers without blocking the relay reader.
+
+        An extension ``attached`` frame is often followed immediately by the
+        response to the create/attach request. Facade listeners may issue their
+        own relay requests for scoped visibility checks, so awaiting them inline
+        can deadlock the single websocket reader before it consumes the pending
+        response. Schedule the fan-out instead and keep draining extension
+        frames.
+        """
+        if not self._event_listeners:
+            return
+        task = asyncio.create_task(self._fanout_listeners(dict(msg)))
+
+        def _done(t: asyncio.Task) -> None:
+            try:
+                t.result()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("relay fan-out task raised: %r", e)
+
+        task.add_done_callback(_done)
 
 
 class _CommandError(Exception):
