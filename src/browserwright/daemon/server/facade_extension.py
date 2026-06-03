@@ -23,7 +23,7 @@ lives HERE, not inside `extension_upstream.py`):
 
   - We REUSE (not duplicate) the existing emulation in `ExtensionUpstream`:
     `Target.getTargets` / `Target.attachToTarget` / `Target.detachFromTarget` /
-    `Browser.getVersion` and the session-scoped `chrome.debugger` forwarding all
+    `Browser.getVersion` and most session-scoped `chrome.debugger` forwarding
     already live there. This bridge constructs a *dedicated* `ExtensionUpstream`
     over the SAME shared `RelayServer` (so all those methods work unchanged) and
     only ADDS:
@@ -37,6 +37,12 @@ lives HERE, not inside `extension_upstream.py`):
       * A4 — `Runtime.enable` execution-context barrier: forward, then wait
         (bounded) for `Runtime.executionContextCreated` so Playwright doesn't
         race ahead of the main-frame default context.
+
+Page-session `Target.setAutoAttach` is forwarded because Playwright expects the
+page-session auto-attach command to reach Chrome. The extension service worker
+pre-arms `Target.setDiscoverTargets` + auto-attach and owns resuming child
+sessions, while this facade keeps child Target.* lifecycle events hidden from
+Playwright until full child-session routing exists.
 
 `getTargets` scope policy: session-bound facade connections scope discovery to
 that session's tab group, while genuinely sessionless raw CDP clients keep the
@@ -392,17 +398,6 @@ class ExtensionFacadeBridge:
                               f"unknown sessionId {session_id!r}",
                               session_id=session_id)
             return
-        # PR3: page-session `Target.setAutoAttach` (id 13 in the CRPage init
-        # batch) is part of CRPage `_initialize`'s `Promise.all`; the agent path
-        # silent-acks it (it never drives child auto-attach), but for the
-        # Playwright high-level path we FORWARD it to the extension's
-        # chrome.debugger so the page session's auto-attach contract is honored.
-        # A plain about:blank page has no OOPIF children, so the forward
-        # resolves with `{}` either way — but forwarding (vs faking) means the
-        # init promise resolves against real Chrome state rather than a
-        # synthesized lie, which is the fidelity CRPage init depends on. Child
-        # `attachedToTarget` for real OOPIFs is out of scope here (phase A); the
-        # forward just must not error.
         # PR3: a command scoped to the synthetic main-frame id (which equals the
         # targetId we handed Playwright) must target the REAL Chrome frame id.
         self._rewrite_command_frame_id(tab_id, params)
@@ -855,6 +850,8 @@ class ExtensionFacadeBridge:
             method = ext_msg.get("method")
             params = ext_msg.get("params") or {}
             if not isinstance(method, str):
+                return
+            if method in ("Target.attachedToTarget", "Target.detachedFromTarget"):
                 return
             # PR3: keep the live top-frame url fresh and release the fresh-blank
             # normalization once the page actually navigates, so getTargetInfo
