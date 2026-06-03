@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from enum import Enum
 from importlib import metadata
 from pathlib import Path
 
@@ -70,6 +71,62 @@ __version__ = package_version()
 
 def is_semver(value: str) -> bool:
     return bool(_SEMVER_RE.match(value))
+
+
+class VersionDrift(str, Enum):
+    EQUAL = "equal"
+    PATCH = "patch"
+    MINOR = "minor"
+    MAJOR = "major"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class VersionComparison:
+    drift: VersionDrift
+    left: str
+    right: str
+    order: int | None
+
+    @property
+    def compatible(self) -> bool:
+        return self.drift in {
+            VersionDrift.EQUAL,
+            VersionDrift.PATCH,
+            VersionDrift.MINOR,
+        }
+
+
+def _semver_core(value: str) -> tuple[int, int, int] | None:
+    match = _SEMVER_RE.match(value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def compare_versions(left: str, right: str) -> VersionComparison:
+    """Compare two semver strings at the app-version drift level.
+
+    Pre-release/build metadata is accepted for validity but ignored for drift
+    classification. The daemon uses extensionProtocolVersion, not app semver,
+    as the hard protocol compatibility boundary.
+    """
+    left = str(left or "")
+    right = str(right or "")
+    a = _semver_core(left)
+    b = _semver_core(right)
+    if a is None or b is None:
+        return VersionComparison(VersionDrift.UNKNOWN, left, right, None)
+    order = (a > b) - (a < b)
+    if a == b:
+        drift = VersionDrift.EQUAL
+    elif a[0] != b[0]:
+        drift = VersionDrift.MAJOR
+    elif a[1] != b[1]:
+        drift = VersionDrift.MINOR
+    else:
+        drift = VersionDrift.PATCH
+    return VersionComparison(drift, left, right, order)
 
 
 def extension_manifest_path() -> Path | None:

@@ -60,6 +60,8 @@ class _MockExtension:
                             "ts": msg.get("ts"),
                         }))
                         continue
+                    if msg.get("type") == "helloAck":
+                        continue
                     self.received.append(msg)
                     await self._inbox.put(msg)
         except websockets.exceptions.ConnectionClosed:

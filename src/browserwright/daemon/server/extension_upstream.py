@@ -146,6 +146,17 @@ class ExtensionUpstream:
                                     timeout: float = 2.0) -> bool:
         return await self._relay.wait_session_announce(session_id, timeout)
 
+    async def reload_extensions(
+        self,
+        *,
+        reason: str = "manual",
+        expected_version: str | None = None,
+    ) -> dict:
+        return await self._relay.reload_extensions(
+            reason=reason,
+            expected_version=expected_version,
+        )
+
     # ---- per-session group binding helpers -------------------------------
 
     def _bind_group(self, session_id: str, group_id: int) -> None:

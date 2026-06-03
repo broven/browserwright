@@ -62,6 +62,8 @@ const LEGACY_PONG_STALE_MS = 45000;
 let lastPongTs = 0;
 let lastInboundFrameTs = 0;
 let seenServerPing = false;
+let daemonVersion = null;
+let versionDrift = "unknown";
 
 // ---- install id (stable across reloads) -----------------------------------
 
@@ -468,6 +470,18 @@ async function doUserscriptLogs(id, msg) {
 async function handleDaemonMessage(msg) {
   const { type, id } = msg || {};
   switch (type) {
+    case "helloAck":
+      daemonVersion = msg.daemonVersion || null;
+      versionDrift = msg.versionDrift || "unknown";
+      return;
+    case "reloadExtension":
+      console.info(
+        "[bd-relay] reloading extension",
+        msg.reason || "manual",
+        msg.expectedVersion || daemonVersion || "",
+      );
+      chrome.runtime.reload();
+      return;
     case "attach":
       return await doAttach(id, msg.tabId);
     case "detach":

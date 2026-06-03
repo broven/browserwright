@@ -67,6 +67,8 @@ uv tool install browserwright --force
 # the target with BROWSERWRIGHT_CHROME_EXTENSION_TARGET.
 EXT_TARGET="${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/etc/chrome-extension/browserwright}"
 GITHUB_REPO="${BROWSERWRIGHT_GITHUB_REPO:-broven/browserwright}"
+ext_changed=0
+ext_version=""
 
 hash_ext_dir() {
   local dir="$1"
@@ -162,9 +164,8 @@ else
     echo "  First time only: open chrome://extensions/, enable Developer mode,"
     echo "  click 'Load unpacked', and select the path above."
   elif [[ "$prev_hash" != "$new_hash" ]]; then
-    echo "🔁 chrome-extension changed (now $ext_version) — RELOAD REQUIRED"
-    echo "   1. Open chrome://extensions/"
-    echo "   2. Find 'browserwright-daemon relay' and click the reload (↻) icon"
+    ext_changed=1
+    echo "🔁 chrome-extension changed (now $ext_version); will trigger automatic reload."
     echo "   Extension path: $EXT_TARGET"
   else
     echo "✔ chrome-extension up to date (version $ext_version, no reload needed)"
@@ -172,6 +173,47 @@ else
 fi
 
 browserwright-daemon restart
+
+if [[ "$ext_changed" == "1" ]]; then
+  echo "Requesting Chrome extension reload..."
+  if browserwright-daemon extension reload; then
+    echo "Waiting for extension to reconnect on version $ext_version..."
+    python3 - "$ext_version" <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.request
+
+expected = sys.argv[1]
+port = int(os.environ.get("BD_EXTENSION_PORT") or "19989")
+deadline = time.monotonic() + 20.0
+last = "relay status unavailable"
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/__status__", timeout=1.0) as resp:
+            payload = json.load(resp)
+        details = payload.get("extension_details") or []
+        versions = sorted({
+            str(item.get("browserwright_version") or item.get("version") or "")
+            for item in details
+            if item.get("browserwright_version") or item.get("version")
+        })
+        if expected in versions:
+            print(f"Extension reconnected on {expected}.")
+            sys.exit(0)
+        last = f"connected extension versions: {versions or 'none'}"
+    except Exception as exc:
+        last = repr(exc)
+    time.sleep(0.5)
+print(f"Warning: extension reload was requested but not confirmed ({last}).", file=sys.stderr)
+sys.exit(0)
+PY
+  else
+    echo "Warning: extension reload command failed; if Chrome is open, reload the unpacked extension manually." >&2
+  fi
+fi
+
 browserwright version check
 browserwright-daemon version check
 

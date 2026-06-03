@@ -270,6 +270,7 @@ async def test_extension_upstream_success_wires_callbacks_and_ready_events(monke
             self.send_text = self.attach_active_tab = self.open_background_tab = object()
             self.close_tab = self.close_tab_by_target_id = self.end_session = object()
             self.recover_session = self.userscript_request = object()
+            self.reload_extensions = object()
             self.wait_session_announce = object()
             self.scoped_target_infos = object()
 
