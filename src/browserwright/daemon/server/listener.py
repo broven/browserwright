@@ -869,6 +869,7 @@ class _UpstreamHolder:
         self.router._recover_session = ext.recover_session
         self.router._wait_session_announce = ext.wait_session_announce
         self.router._userscript_request = ext.userscript_request
+        self.router._reload_extensions = ext.reload_extensions
         # Scope Target.getTargets to the requesting session's tab group so
         # extension sessions sharing one Chrome are mutually invisible.
         self.router._scoped_targets = ext.scoped_target_infos
@@ -934,6 +935,7 @@ class _UpstreamHolder:
         self.router._recover_session = None
         self.router._wait_session_announce = None
         self.router._userscript_request = None
+        self.router._reload_extensions = None
         # Phase 3: drop the rdp raw-CDP command channel (symmetric with the
         # extension callbacks above) so a post-close verb returns a clean error
         # instead of racing a torn-down upstream.

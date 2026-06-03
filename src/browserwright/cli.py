@@ -720,6 +720,10 @@ def _cmd_version(args: list[str]) -> int:
 
     info = version_info()
     if args and args[0] == "check":
+        relay_status = _extension_relay_status()
+        if relay_status:
+            info["daemon_version"] = relay_status.get("daemon_version")
+            info["running_extensions"] = relay_status.get("extension_details") or []
         if "--json" in args:
             sys.stdout.write(json.dumps(info, sort_keys=True) + "\n")
         elif info["ok"]:
@@ -727,12 +731,37 @@ def _cmd_version(args: list[str]) -> int:
         else:
             for issue in info["issues"]:
                 print(f"{issue['code']}: {issue['message']}", file=sys.stderr)
+        if "--json" not in args:
+            for ext in info.get("running_extensions") or []:
+                print(
+                    "extension "
+                    f"{ext.get('install_id') or '?'} "
+                    f"version={ext.get('browserwright_version') or ext.get('version') or '?'} "
+                    f"daemon={ext.get('daemon_version') or '?'} "
+                    f"drift={ext.get('version_drift') or '?'}"
+                )
         return 0 if info["ok"] else 1
     if args and args[0] == "--json":
         sys.stdout.write(json.dumps(info, sort_keys=True) + "\n")
         return 0
     print(__version__)
     return 0
+
+
+def _extension_relay_status() -> dict | None:
+    import os
+    import urllib.request
+
+    port = os.environ.get("BD_EXTENSION_PORT") or "19989"
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/__status__",
+            timeout=1.0,
+        ) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
 
 
 def _cmd_release(args: list[str]) -> int:

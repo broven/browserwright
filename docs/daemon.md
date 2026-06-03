@@ -127,6 +127,14 @@ ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 
 3. 装好后，扩展会自动连接 daemon —— 不需要点扩展图标，也不需要手动 attach 任何 tab。后续 daemon 重启 / Chrome 重启 / extension service worker idle 都由 `maintainLoop` + `chrome.alarms` + `chrome.runtime.onStartup` 自动恢复，**零手动操作**。
 
+升级已加载的 unpacked extension 时，先更新磁盘上的扩展目录并重启 daemon，然后运行：
+
+```bash
+browserwright-daemon extension reload
+```
+
+daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重新加载代码并自动重连。`mise run upgrade-global` 已经包含这一步；只有首次安装或 reload 未确认时才需要回到 `chrome://extensions/` 手动加载/刷新。
+
 ### 使用 / Agent-driven attach
 
 扩展默认**不**自动 attach 任何 tab —— Chrome 的"debugger 黄条"会出现在被 attach 的 tab 上，所以"装上扩展就自动 attach 所有 tab"会让每个 tab 都长出黄条。
