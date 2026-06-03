@@ -43,7 +43,8 @@
 // - We DON'T auto-attach all tabs (spec §8.4: user manual attach model).
 //   The popup explicitly drives `chrome.debugger.attach`.
 // - chrome.debugger events from attached tabs are funneled through `onEvent`
-//   straight to the ws. The daemon's relay then routes them per-session.
+//   straight to the ws. Child-session events are handled inside the extension:
+//   they exist only to resume Chromium-paused OOPIF/worker targets.
 
 const RELAY_URL = "ws://127.0.0.1:19989/";
 const BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION = "1";
@@ -62,6 +63,8 @@ const LEGACY_PONG_STALE_MS = 45000;
 let lastPongTs = 0;
 let lastInboundFrameTs = 0;
 let seenServerPing = false;
+let daemonVersion = null;
+let versionDrift = "unknown";
 
 // ---- install id (stable across reloads) -----------------------------------
 
@@ -243,7 +246,6 @@ function safeSend(obj) {
     return false;
   }
 }
-
 
 // ---- userscripts: store + chrome.userScripts registration ------------------
 
@@ -468,6 +470,18 @@ async function doUserscriptLogs(id, msg) {
 async function handleDaemonMessage(msg) {
   const { type, id } = msg || {};
   switch (type) {
+    case "helloAck":
+      daemonVersion = msg.daemonVersion || null;
+      versionDrift = msg.versionDrift || "unknown";
+      return;
+    case "reloadExtension":
+      console.info(
+        "[bd-relay] reloading extension",
+        msg.reason || "manual",
+        msg.expectedVersion || daemonVersion || "",
+      );
+      chrome.runtime.reload();
+      return;
     case "attach":
       return await doAttach(id, msg.tabId);
     case "detach":
@@ -516,6 +530,7 @@ async function doAttach(id, tabId) {
   try {
     await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
     attachedTabs.add(tabId);
+    await armAutoAttach(tabId);
     const tab = await chrome.tabs.get(tabId);
     safeSend({
       type: "response",
@@ -584,6 +599,7 @@ async function doAttachActive(id, groupId, groupName) {
     if (!attachedTabs.has(tab.id)) {
       await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
       attachedTabs.add(tab.id);
+      await armAutoAttach(tab.id);
     }
     await announceAttached(tab.id);
     safeSend({
@@ -646,6 +662,7 @@ async function doCreateTab(
     }
     await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
     attachedTabs.add(tab.id);
+    await armAutoAttach(tab.id);
     await announceAttached(tab.id);
     let title = tab.title || "";
     let actualUrl = tab.url || url;
@@ -769,6 +786,35 @@ async function doCommand(id, tabId, method, params) {
       id,
       error: { code: -32000, message: errMessage(e) },
     });
+  }
+}
+
+async function armAutoAttach(tabId) {
+  // With chrome.debugger attached, Chromium can pause new child targets
+  // (OOPIFs/workers/prerenders) until the debugger resumes them. Arm
+  // discovery + auto-attach before callers can navigate the tab. Chromium only
+  // surfaces OOPIF child targets reliably after discovery is enabled.
+  // Playwright may later send the same auto-attach command for its page
+  // session; that is fine and keeps Chrome's page-session contract satisfied.
+  try {
+    await chrome.debugger.sendCommand(
+      { tabId }, "Target.setDiscoverTargets", {
+        discover: true,
+        filter: [{}],
+      });
+  } catch (e) {
+    console.warn("[bd-relay] Target.setDiscoverTargets(" + tabId + ") failed:", e);
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: true,
+      flatten: true,
+      filter: [{}],
+    });
+    await sleep(50);
+  } catch (e) {
+    console.warn("[bd-relay] Target.setAutoAttach(" + tabId + ") failed:", e);
   }
 }
 
@@ -1150,6 +1196,32 @@ async function unmarkTabBeforeDetach(tabId) {
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source || typeof source.tabId !== "number") return;
+  if (method === "Target.attachedToTarget"
+      && typeof params?.sessionId === "string"
+      && params.sessionId) {
+    if (params.waitingForDebugger) {
+      const debuggerSession = { ...source, sessionId: params.sessionId };
+      chrome.debugger.sendCommand(
+        debuggerSession,
+        "Runtime.runIfWaitingForDebugger",
+        {},
+      ).catch((e) => {
+        console.warn(
+          "[bd-relay] runIfWaitingForDebugger(" + source.tabId + ") failed:",
+          e,
+        );
+      });
+    }
+    return;
+  }
+  if (method === "Target.detachedFromTarget"
+      && typeof params?.sessionId === "string"
+      && params.sessionId) {
+    return;
+  }
+  if (typeof source.sessionId === "string" && source.sessionId) {
+    return;
+  }
   safeSend({
     type: "event",
     tabId: source.tabId,
@@ -1270,6 +1342,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       try {
         await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
         attachedTabs.add(tab.id);
+        await armAutoAttach(tab.id);
         await announceAttached(tab.id);
         markTabAttached(tab.id);  // fire-and-forget; cosmetic
         keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering

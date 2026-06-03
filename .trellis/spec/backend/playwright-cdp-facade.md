@@ -126,7 +126,8 @@ Playwright's `CRPage.FrameSession._initialize()` rejects → `Target.closeTarget
   - `close_target` emits `detachedFromTarget`+`targetDestroyed`, response-before-destroy
     ordering, per-tab state eviction.
   - `Runtime.enable` disable→enable + context-event gate; page-session `setAutoAttach`
-    forwarded; `browserContextId` present.
+    forwarded while the extension pre-arms target discovery/auto-attach and
+    filters/resumes child `Target.*` events; `browserContextId` present.
 - `tests/daemon/test_facade_unit.py`: session query routing picks the session's
   `UpstreamContext` and uses its rdp config even when the shared daemon backend is
   extension; a missing session preserves shared-backend behavior.
