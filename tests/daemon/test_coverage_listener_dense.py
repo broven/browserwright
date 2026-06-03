@@ -384,9 +384,10 @@ async def test_relay_dispatch_handles_protocol_matrix_and_pending_errors():
     assert "install-2" in relay._extensions
     assert ext.hello_received.is_set()
     assert relay.is_ready
+    assert sent[0]["type"] == "helloAck"
 
     await relay._dispatch_from_extension(ext, "tmp", {"type": "ping", "ts": 123})
-    assert sent == [{"type": "pong", "ts": 123}]
+    assert sent[-1] == {"type": "pong", "ts": 123}
 
     await relay._dispatch_from_extension(
         ext,

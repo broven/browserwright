@@ -118,14 +118,27 @@ def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys)
     }
 
 
-def test_cmd_version_check_json_reports_consistent_versions(capsys):
+def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys):
     from browserwright import cli
 
+    monkeypatch.setattr(cli, "_extension_relay_status", lambda: {
+        "daemon_version": "9.9.9",
+        "extension_details": [
+            {
+                "install_id": "ext-1",
+                "browserwright_version": "9.9.8",
+                "daemon_version": "9.9.9",
+                "version_drift": "patch",
+            }
+        ],
+    })
     assert cli._cmd_version(["check", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["version"] == payload["extension_version"]
     assert payload["extension_protocol_version"] == "1"
+    assert payload["daemon_version"] == "9.9.9"
+    assert payload["running_extensions"][0]["version_drift"] == "patch"
 
 
 def test_cmd_release_status_json(monkeypatch, capsys):

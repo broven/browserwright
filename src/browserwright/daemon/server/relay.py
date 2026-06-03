@@ -60,7 +60,12 @@ from typing import Any, Awaitable, Callable
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
-from browserwright.version import EXTENSION_PROTOCOL_VERSION
+from browserwright.version import (
+    EXTENSION_PROTOCOL_VERSION,
+    VersionDrift,
+    __version__,
+    compare_versions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +115,7 @@ class _ExtensionConn:
     version: str = ""
     browserwright_version: str = ""
     extension_protocol_version: str = ""
+    version_drift: str = VersionDrift.UNKNOWN.value
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     pending: dict[int, asyncio.Future] = field(default_factory=dict)
     tabs: dict[int, GhostTarget] = field(default_factory=dict)
@@ -149,6 +155,7 @@ class RelayServer:
         # in-process truth they can all see immediately.
         self._session_groups: dict[str, int] = {}
         self._session_announce_events: dict[str, asyncio.Event] = {}
+        self._reload_attempts: set[tuple[str, str, str]] = set()
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -548,7 +555,141 @@ class RelayServer:
         return await self._request(
             ext, {"type": f"userscript.{verb}", **payload}, timeout=timeout)
 
+    def status_payload(self) -> dict:
+        extensions = [
+            self._extension_status(ext)
+            for ext in self._extensions.values()
+            if ext.hello_received.is_set()
+        ]
+        return {
+            "running": True,
+            "extensions": len(extensions),
+            "install_ids": [e["install_id"] for e in extensions],
+            "daemon_version": __version__,
+            "extension_protocol_version": EXTENSION_PROTOCOL_VERSION,
+            "extension_details": extensions,
+            "tab_count": sum(len(e.tabs) for e in self._extensions.values()),
+        }
+
+    async def reload_extensions(
+        self,
+        *,
+        reason: str = "manual",
+        expected_version: str | None = None,
+    ) -> dict:
+        """Ask every connected extension to reload from disk immediately.
+
+        ``chrome.runtime.reload()`` tears down the service worker, so this is a
+        best-effort one-way message rather than a request/response round trip.
+        """
+        details: list[dict] = []
+        for ext in list(self._extensions.values()):
+            if not ext.hello_received.is_set():
+                continue
+            ok = await self._send_reload_extension(
+                ext,
+                reason=reason,
+                expected_version=expected_version or __version__,
+                guard=False,
+            )
+            details.append({
+                "install_id": ext.install_id,
+                "browser": ext.browser,
+                "version": ext.browserwright_version or ext.version,
+                "sent": ok,
+            })
+        return {
+            "ok": True,
+            "sent": sum(1 for item in details if item["sent"]),
+            "extensions": details,
+        }
+
     # ---- internals -------------------------------------------------------
+
+    def _extension_status(self, ext: _ExtensionConn) -> dict:
+        ext_protocol = getattr(ext, "extension_protocol_version", "")
+        ext_version = getattr(ext, "version", "")
+        ext_browserwright_version = getattr(ext, "browserwright_version", "") or ext_version
+        protocol_compatible = (
+            ext_protocol in ("", EXTENSION_PROTOCOL_VERSION)
+        )
+        comparison = compare_versions(ext_browserwright_version, __version__)
+        recorded_drift = getattr(ext, "version_drift", VersionDrift.UNKNOWN.value)
+        drift = (
+            recorded_drift
+            if recorded_drift != VersionDrift.UNKNOWN.value
+            else comparison.drift.value
+        )
+        app_compatible = comparison.compatible
+        return {
+            "install_id": getattr(ext, "install_id", ""),
+            "browser": getattr(ext, "browser", ""),
+            "version": ext_version,
+            "browserwright_version": ext_browserwright_version,
+            "daemon_version": __version__,
+            "extension_protocol_version": ext_protocol,
+            "compatible": protocol_compatible and app_compatible,
+            "protocol_compatible": protocol_compatible,
+            "app_compatible": app_compatible,
+            "version_drift": drift,
+        }
+
+    async def _send_reload_extension(
+        self,
+        ext: _ExtensionConn,
+        *,
+        reason: str,
+        expected_version: str,
+        guard: bool,
+    ) -> bool:
+        ext_version = ext.browserwright_version or ext.version
+        key = (ext.install_id, ext_version, expected_version)
+        if guard and key in self._reload_attempts:
+            logger.warning(
+                "extension version drift persists after reload attempt: "
+                "install_id=%s extension=%s daemon=%s",
+                ext.install_id,
+                ext_version,
+                expected_version,
+            )
+            return False
+        if guard:
+            self._reload_attempts.add(key)
+        try:
+            await ext.conn.send(json.dumps({
+                "type": "reloadExtension",
+                "reason": reason,
+                "expectedVersion": expected_version,
+            }))
+            logger.info(
+                "requested extension reload: install_id=%s reason=%s "
+                "extension=%s daemon=%s",
+                ext.install_id,
+                reason,
+                ext_version,
+                expected_version,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 - explicit reload is best-effort.
+            logger.warning(
+                "extension reload request failed: install_id=%s error=%r",
+                ext.install_id,
+                e,
+            )
+            return False
+
+    async def _maybe_reload_for_version_drift(self, ext: _ExtensionConn) -> None:
+        comparison = compare_versions(ext.browserwright_version or ext.version, __version__)
+        if comparison.drift in {VersionDrift.EQUAL, VersionDrift.UNKNOWN}:
+            return
+        if comparison.order is None or comparison.order >= 0:
+            return
+        await self._send_reload_extension(
+            ext,
+            reason="version_drift",
+            expected_version=__version__,
+            guard=True,
+        )
 
     def _pick_active_extension(self) -> _ExtensionConn | None:
         for ext in self._extensions.values():
@@ -713,31 +854,7 @@ class RelayServer:
         """
         path = request.path or "/"
         if path.startswith("/__status__"):
-            extensions = [
-                {
-                    "install_id": getattr(e, "install_id", ""),
-                    "browser": getattr(e, "browser", ""),
-                    "version": getattr(e, "version", ""),
-                    "browserwright_version": getattr(e, "browserwright_version", ""),
-                    "extension_protocol_version": getattr(
-                        e, "extension_protocol_version", ""
-                    ),
-                    "compatible": (
-                        getattr(e, "extension_protocol_version", "")
-                        in ("", EXTENSION_PROTOCOL_VERSION)
-                    ),
-                }
-                for e in self._extensions.values()
-                if e.hello_received.is_set()
-            ]
-            body = json.dumps({
-                "running": True,
-                "extensions": len(self._extensions),
-                "install_ids": [e["install_id"] for e in extensions],
-                "extension_protocol_version": EXTENSION_PROTOCOL_VERSION,
-                "extension_details": extensions,
-                "tab_count": sum(len(e.tabs) for e in self._extensions.values()),
-            })
+            body = json.dumps(self.status_payload())
             resp = conn.respond(http.HTTPStatus.OK, body)
             resp.headers["Content-Type"] = "application/json"
             return resp
@@ -807,6 +924,8 @@ class RelayServer:
             ext.extension_protocol_version = str(
                 msg.get("extensionProtocolVersion") or ""
             )
+            comparison = compare_versions(ext.browserwright_version or ext.version, __version__)
+            ext.version_drift = comparison.drift.value
             # Re-key the extension by install_id (so multiple extensions don't
             # collide on temp_key collisions).
             self._extensions.pop(temp_key, None)
@@ -825,6 +944,21 @@ class RelayServer:
                     ext.extension_protocol_version,
                     EXTENSION_PROTOCOL_VERSION,
                 )
+            if comparison.drift == VersionDrift.PATCH:
+                logger.info(
+                    "extension version patch drift: install_id=%s extension=%s daemon=%s",
+                    ext.install_id,
+                    ext.browserwright_version or ext.version,
+                    __version__,
+                )
+            elif comparison.drift in {VersionDrift.MINOR, VersionDrift.MAJOR}:
+                logger.warning(
+                    "extension version %s drift: install_id=%s extension=%s daemon=%s",
+                    comparison.drift.value,
+                    ext.install_id,
+                    ext.browserwright_version or ext.version,
+                    __version__,
+                )
             logger.info(
                 "extension hello: install_id=%s browser=%s version=%s protocol=%s",
                 ext.install_id,
@@ -832,6 +966,20 @@ class RelayServer:
                 ext.version,
                 ext.extension_protocol_version or "legacy",
             )
+            try:
+                await ext.conn.send(json.dumps({
+                    "type": "helloAck",
+                    "daemonVersion": __version__,
+                    "extensionProtocolVersion": EXTENSION_PROTOCOL_VERSION,
+                    "versionDrift": comparison.drift.value,
+                }))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "failed to send extension helloAck: install_id=%s error=%r",
+                    ext.install_id,
+                    e,
+                )
+            await self._maybe_reload_for_version_drift(ext)
             return
 
         if kind == "ping":

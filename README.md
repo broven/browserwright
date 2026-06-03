@@ -141,7 +141,7 @@ pick up the latest published release:
 ```bash
 # 1. Install/upgrade browserwright from PyPI.
 # 2. Download the matching GitHub Release extension artifact.
-# 3. Restart the daemon and verify versions.
+# 3. Restart the daemon, reload the unpacked extension, and verify versions.
 mise run upgrade-global
 
 # 4. Optional explicit verification.
@@ -163,9 +163,11 @@ path:
 /Users/metajs/Library/Mobile Documents/com~apple~CloudDocs/etc/chrome-extension/browserwright
 ```
 
-If the task reports that the extension changed, open `chrome://extensions/` and
-reload the `browserwright` unpacked extension from that stable path. The path
-does not change across releases; the task overwrites its contents.
+If the task reports that the extension changed, it restarts the daemon, runs
+`browserwright-daemon extension reload`, and waits for Chrome to reconnect with
+the new extension version. The stable path does not change across releases; the
+task overwrites its contents. If the reload cannot be confirmed, fall back to
+Chrome's manual reload button in `chrome://extensions/`.
 Reload any existing tab that already shows a duplicated `👀` attach marker so
 the extension can normalize the title marker after the upgrade.
 
@@ -182,11 +184,12 @@ After installing a release:
 browserwright version check
 browserwright-daemon version check
 browserwright-daemon restart   # when installed as the macOS LaunchAgent
+browserwright-daemon extension reload
 ```
 
-Chrome does not allow this repo to refresh an unpacked extension automatically.
-If `mise run upgrade-global` reports that the extension changed, reload it in
-Chrome.
+The extension reload command asks connected unpacked extensions to call
+`chrome.runtime.reload()`. Reload is immediate; the extension reconnect loop
+restores the relay connection after the service worker restarts.
 
 ## Smoke test
 

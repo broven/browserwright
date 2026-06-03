@@ -126,11 +126,24 @@ def test_cmd_status_json_marks_transient_probe_failure(monkeypatch, tmp_path, ca
     assert len(calls) > 1
 
 
-def test_cmd_daemon_version_check_json_reports_consistent_versions(capsys):
+def test_cmd_daemon_version_check_json_reports_consistent_versions(monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "_extension_relay_status", lambda cfg: {
+        "daemon_version": "9.9.9",
+        "extension_details": [
+            {
+                "install_id": "ext-1",
+                "browserwright_version": "9.9.8",
+                "daemon_version": "9.9.9",
+                "version_drift": "patch",
+            }
+        ],
+    })
     assert cli_mod.main(["version", "check", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["version"] == payload["extension_version"]
+    assert payload["daemon_version"] == "9.9.9"
+    assert payload["running_extensions"][0]["version_drift"] == "patch"
 
 
 @pytest.mark.parametrize("json_mode", [False, True])

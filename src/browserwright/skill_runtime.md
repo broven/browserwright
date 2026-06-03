@@ -15,7 +15,7 @@ browserwright-daemon version check
 browserwright-daemon status --json
 ```
 
-If `version check` reports an extension mismatch, reload the unpacked `chrome-extension/` directory in Chrome after installing the matching package. If a daemon is already running after an upgrade, restart it with `browserwright-daemon restart` when it is installed as a LaunchAgent, or `browserwright-daemon stop` followed by the normal `serve` command for a foreground daemon.
+If `version check` reports an extension mismatch after installing the matching package, restart the daemon and run `browserwright-daemon extension reload`. With a LaunchAgent daemon use `browserwright-daemon restart`; for a foreground daemon, use `browserwright-daemon stop` followed by the normal `serve` command. Manual Chrome reload is only the fallback when no connected extension confirms the reload.
 
 `status --json` also reports the Playwright facade endpoint (`facade.ws`). The facade is **on by default** — inline browser calls connect through it automatically. A null `facade.ws` means the daemon is down or was started with `--facade-port 0`.
 

@@ -139,6 +139,8 @@ class Router:
             Callable[[str, float], Awaitable[bool]] | None) = None
         self._userscript_request: (
             Callable[[str, dict], Awaitable[dict | None]] | None) = None
+        self._reload_extensions: (
+            Callable[..., Awaitable[dict]] | None) = None
         # Extension-backend-only: scope Target.getTargets to a session's tab
         # group so sessions sharing the one Chrome are mutually invisible.
         # listener wires this to ExtensionUpstream.scoped_target_infos.
@@ -962,6 +964,37 @@ class Router:
                 "browserwright_daemon_version": __version__,
                 "schema_version": 1,
             }))
+            return
+        if method == "BrowserwrightDaemon.extension.reload":
+            if self._reload_extensions is None:
+                if (self._ensure_upstream is not None
+                        and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                    try:
+                        await self._ensure_upstream()
+                    except Exception as e:
+                        await self._send_to_client(client.client_id, _error_response(
+                            req_id, -32603,
+                            f"extension reload failed (upstream open): {e!r}"))
+                        return
+            if self._reload_extensions is None:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32601,
+                    "BrowserwrightDaemon.extension.reload requires the extension backend"))
+                return
+            try:
+                result = await self._reload_extensions(
+                    reason=str(params.get("reason") or "manual"),
+                    expected_version=(
+                        str(params.get("expectedVersion"))
+                        if params.get("expectedVersion") else None
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32000, f"extension reload failed: {e!r}"))
+                return
+            await self._send_to_client(
+                client.client_id, _result_response(req_id, result or {}))
             return
         if method == "BrowserwrightDaemon.attachActiveTab":
             # Unified verb. On extension this adopts the user's focused-window

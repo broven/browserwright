@@ -64,6 +64,8 @@ class _MockExtension:
                     continue
                 text = raw if isinstance(raw, str) else raw.decode()
                 msg = json.loads(text)
+                if msg.get("type") == "helloAck":
+                    continue
                 await self._handle(msg)
         except websockets.exceptions.ConnectionClosed:
             pass

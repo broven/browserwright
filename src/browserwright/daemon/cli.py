@@ -226,6 +226,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--json", action="store_true")
     p_ver.add_argument("action", nargs="?", choices=["check"])
 
+    # extension
+    p_ext = sub.add_parser("extension", help="manage connected Chrome extensions")
+    _add_name(p_ext)
+    ext_sub = p_ext.add_subparsers(dest="extension_cmd", metavar="<action>")
+    p_ext_reload = ext_sub.add_parser(
+        "reload",
+        help="ask connected unpacked extensions to reload from disk",
+    )
+    p_ext_reload.add_argument("--json", action="store_true")
+
     # stats (v0.5 observability)
     p_stats = sub.add_parser("stats", help="dump in-process metrics counters")
     _add_name(p_stats)
@@ -891,19 +901,74 @@ def _cmd_version(args, cfg: Config) -> int:
 
     info = version_info()
     if getattr(args, "action", None) == "check":
+        relay_status = _extension_relay_status(cfg)
+        if relay_status:
+            info["daemon_version"] = relay_status.get("daemon_version")
+            info["running_extensions"] = relay_status.get("extension_details") or []
         if args.json:
             print(json.dumps(info, sort_keys=True))
-        elif info["ok"]:
-            print(f"browserwright-daemon {__version__} (versions ok)")
         else:
-            for issue in info["issues"]:
-                print(f"{issue['code']}: {issue['message']}", file=sys.stderr)
+            if info["ok"]:
+                print(f"browserwright-daemon {__version__} (versions ok)")
+            else:
+                for issue in info["issues"]:
+                    print(f"{issue['code']}: {issue['message']}", file=sys.stderr)
+            for ext in info.get("running_extensions") or []:
+                print(
+                    "extension "
+                    f"{ext.get('install_id') or '?'} "
+                    f"version={ext.get('browserwright_version') or ext.get('version') or '?'} "
+                    f"daemon={ext.get('daemon_version') or '?'} "
+                    f"drift={ext.get('version_drift') or '?'}"
+                )
         return 0 if info["ok"] else 1
     if getattr(args, "json", False):
         print(json.dumps(info, sort_keys=True))
         return 0
     print(f"browserwright-daemon {__version__}")
     return 0
+
+
+def _extension_relay_status(cfg: Config) -> dict | None:
+    import httpx
+
+    host, port = cfg.backends.extension.resolved_host_port()
+    try:
+        with httpx.Client(timeout=1.0, trust_env=False, mounts={}) as client:
+            resp = client.get(f"http://{host}:{port}/__status__")
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _cmd_extension(args, cfg: Config) -> int:
+    action = getattr(args, "extension_cmd", None)
+    if action == "reload":
+        try:
+            result = _run(_rpc_via_ws(
+                cfg,
+                "BrowserwrightDaemon.extension.reload",
+                {"reason": "manual"},
+                client_label="cli-extension-reload",
+                timeout=8.0,
+            ))
+        except Unavailable as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        except DaemonError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 3
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            sent = int(result.get("sent", 0) or 0)
+            print(f"reload requested for {sent} extension(s)")
+        return 0
+    print("usage: browserwright-daemon extension reload", file=sys.stderr)
+    return 1
 
 
 async def _rpc_via_ws(cfg: Config, method: str, params: dict,
@@ -1404,6 +1469,7 @@ _DISPATCH = {
     "active-tab": _cmd_active_tab,
     "launch-chrome": _cmd_launch_chrome,
     "version": _cmd_version,
+    "extension": _cmd_extension,
     # v0.2
     "serve": _cmd_serve,
     "stop": _cmd_stop,
