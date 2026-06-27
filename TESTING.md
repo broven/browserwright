@@ -38,6 +38,14 @@ python3 evals/run.py --mock
 
 `tests/skill/agent-e2e` has its own dependencies and should be run separately.
 
+> Working from a fresh checkout on a host that already runs a global
+> `browserwright` install plus a loaded Chrome extension? Read
+> [ONBOARDING.md → Independent local dev — never touch global
+> state](ONBOARDING.md#independent-local-dev--never-touch-global-state)
+> first. It covers daemon socket / port isolation, loading a patched
+> copy of the extension into a throwaway Chrome profile, and the env
+> overrides every command below assumes.
+
 ## Daemon Tests
 
 Use this when changing `src/browserwright/daemon/`, backend resolution, proxy
