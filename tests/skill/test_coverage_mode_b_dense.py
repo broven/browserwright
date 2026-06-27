@@ -470,7 +470,11 @@ def test_open_unix_websocket_uses_synthetic_http_upgrade(monkeypatch):
         "ws+unix:///tmp/browserwright.sock?client=skill-s1&session=1",
         connect_timeout=0.25,
     ) == "ws-object"
-    assert raw.timeout == 0.25
+    # GH #18: the connect-phase timeout must be CLEARED before handing the
+    # socket to websockets — otherwise it leaks into steady state as a per-recv
+    # read timeout and a slow RPC reply (> connect_timeout) drops the transport
+    # with "no close frame received or sent". Liveness is ws keepalive's job.
+    assert raw.timeout is None
     assert raw.connected_to == "/tmp/browserwright.sock"
     assert ws_connect_calls[0][0] == "ws://browserwright/?client=skill-s1&session=1"
     assert isinstance(ws_connect_calls[0][1]["sock"], cdp._UnixSocketAdapter)

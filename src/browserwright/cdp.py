@@ -71,6 +71,17 @@ def _open_unix_websocket(ws_unix_url: str, *, connect_timeout: float):
     raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
     raw.settimeout(connect_timeout)
     raw.connect(path)
+    # CRITICAL: clear the connect-phase timeout before handing the socket to
+    # websockets. `settimeout(connect_timeout)` only bounds `connect()`; if it
+    # leaks into steady state it becomes a per-recv read timeout, so any RPC
+    # whose reply takes longer than `connect_timeout` (e.g. the extension
+    # `ensureExecutor` blocking on a slow upstream open) makes the socket
+    # read time out and websockets tears the connection down as
+    # "ConnectionClosedError: no close frame received or sent" — surfacing the
+    # confusing `ws closed` error instead of the real RPC result/timeout.
+    # Liveness is websockets' job (ping_interval/ping_timeout), not a stray
+    # connect deadline. Reset to blocking so reads wait for real frames.
+    raw.settimeout(None)
     sock = _UnixSocketAdapter(raw)
     # Build a synthetic ws:// URL for the upgrade handshake; websockets parses
     # this for the HTTP path + Host header.

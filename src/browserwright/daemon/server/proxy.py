@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import time
 from typing import Awaitable, Callable
@@ -40,6 +41,37 @@ from .state import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# How long the executor control plane (`ensureExecutor`) waits for an extension
+# to (re)connect to the relay before failing with an actionable error. Kept WELL
+# under the client's CDP reply deadline (cdp.py ~30s) so the real cause reaches
+# the agent instead of a `ws closed` / `timeout` (GH #18) — and with margin for
+# the executor spawn that follows (`_SPAWN_READY_TIMEOUT_S`) on the ready path.
+# The full interactive extension grace (listener `_open_extension_upstream`,
+# ~60s) is unchanged — it governs paths a human drives, not the agent hot path.
+# Env-overridable (`BW_EXT_READY_BUDGET_S`) so out-of-process tests can shrink
+# the wait and operators can tune it; falls back to 10s on a bad value.
+def _ext_ready_budget_s() -> float:
+    try:
+        return float(os.environ.get("BW_EXT_READY_BUDGET_S", "") or 10.0)
+    except (TypeError, ValueError):
+        return 10.0
+
+
+_EXT_READY_BUDGET_S = _ext_ready_budget_s()
+
+# Actionable message when an extension session has no extension connected to the
+# daemon relay. Names the concrete next action — the #1 real cause is a stale
+# service worker after a browserwright upgrade (the extension must reconnect).
+_NO_EXTENSION_CONNECTED_MSG = (
+    "no browserwright extension is connected to the daemon (session {sid}). "
+    "Open the browser where the extension is installed and ensure it is "
+    "enabled; if you just installed or upgraded browserwright, reload the "
+    "extension at chrome://extensions so its service worker reconnects to the "
+    "daemon relay. Then retry. (Use --backend=rdp --create for an isolated "
+    "Chrome that needs no extension.)"
+)
 
 
 # ---- helpers --------------------------------------------------------------
@@ -198,6 +230,19 @@ class Router:
                 f"{client.session_id!r}, request asked for {requested!r}"))
             return None
         return client.session_id
+
+    def _shared_relay(self):
+        """Best-effort handle to the daemon's extension relay, or None.
+
+        Extension sessions multiplex onto the shared context, whose holder owns
+        the single RelayServer. Reached defensively (the daemon back-ref is
+        ``object | None``) so a missing/partly-wired daemon never raises here —
+        the caller treats None as "can't tell, fall through to the normal
+        path"."""
+        daemon = self.daemon
+        shared = getattr(daemon, "shared_context", None)
+        holder = getattr(shared, "holder", None)
+        return getattr(holder, "relay", None)
 
     # ---- listener wiring -------------------------------------------------
 
@@ -1494,6 +1539,28 @@ class Router:
                 req_id, -32603,
                 "ensureExecutor unavailable: daemon has no executor registry"))
             return
+        # Extension backend fast-fail: if no extension is connected to the
+        # relay, the blocking `_ensure_upstream` below would wait the full
+        # 60s extension grace — far longer than the control-plane CDP reply
+        # deadline (cdp.py ~30s) — so the client's facade ws gives up first
+        # and the agent sees an unhelpful `ws closed` / `timeout` instead of
+        # the real cause (GH #18). Surface an actionable error WITHIN the
+        # deadline. We give the service worker a short grace to (re)connect
+        # (it may be mid-reconnect after a daemon restart / upgrade), then
+        # fail fast if still absent. This never mutates the upstream state
+        # machine (no `ensure_open`), so a later reconnect still works.
+        if (self.state.backend_name == "extension"
+                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+            relay = self._shared_relay()
+            if relay is not None and not relay.is_ready:
+                try:
+                    await relay.wait_ready(timeout=_EXT_READY_BUDGET_S)
+                except Exception:  # noqa: BLE001 - TimeoutError + any relay hiccup
+                    pass
+                if not relay.is_ready:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603, _NO_EXTENSION_CONNECTED_MSG.format(sid=session)))
+                    return
         # Failure #4 fix: ensure the session's UPSTREAM (rdp Chrome) is launched
         # + ready BEFORE we spawn the executor. The executor's cold-start
         # `connect_over_cdp(facade)` resolves the rdp Chrome's DYNAMIC port,
