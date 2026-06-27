@@ -1,4 +1,0 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
-{"file": "tests/daemon/e2e/test_l3_parity.py", "reason": "existing backend parity e2e"}
-{"file": "tests/daemon/e2e/conftest.py", "reason": "real Chrome daemon fixtures"}
-{"file": "tests/daemon/e2e/helpers.py", "reason": "skill runner and session ledger setup"}

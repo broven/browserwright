@@ -1,5 +1,0 @@
-{"file": ".trellis/tasks/05-24-tab-handle-model-for-code-agents/prd.md", "reason": "任务定义、分期、阶段 A 子项与验收;实现总纲"}
-{"file": ".trellis/tasks/05-24-tab-handle-model-for-code-agents/research/playwright-over-extension-bridge.md", "reason": "阶段 A 精确工作量依据:Playwright×扩展桥接逐方法对照 + 我们 relay 的 delta(facade ws、setAutoAttach 事件合成、createTarget 映射、Runtime.enable 屏障)"}
-{"file": ".trellis/tasks/05-24-tab-handle-model-for-code-agents/research/playwriter-exposure.md", "reason": "照抄目标的完整暴露面;facade 要满足的 Playwright 握手语义参照"}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "daemon async-first、代码组织约定:facade 落在 daemon/server 哪层"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "CDP/daemon 错误处理风格(facade 的 -32601/-32602 与既有 CDPError 一致)"}

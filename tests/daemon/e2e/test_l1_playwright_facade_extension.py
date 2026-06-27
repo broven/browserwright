@@ -29,7 +29,8 @@ backend too — see `test_high_level_new_page_and_goto_over_extension`. The
 facade synthesizes the CRPage `_initialize` contract: a stable browserContextId
 + initial-empty-document ':' url on a fresh blank target, an event-gated
 Runtime.enable barrier (disable→enable + wait for the default
-executionContextCreated), and forwarded page-session Target.setAutoAttach. The
+executionContextCreated), forwarded page-session Target.setAutoAttach with
+extension-owned child-target resume. The
 older `test_connect_over_cdp_drives_extension_page` retains the CDP-level drive
 as a lower-level regression anchor.
 """
@@ -245,7 +246,9 @@ def test_high_level_new_page_and_goto_over_extension(ext_facade_ready):
         a fresh blank tab (so isInitialEmptyPage matches real Chrome),
       - Runtime.enable does disable→enable and gates on the default
         executionContextCreated event,
-      - page-session Target.setAutoAttach is forwarded, not silent-acked.
+      - page-session Target.setAutoAttach is forwarded so Chrome surfaces
+        child targets, while the extension resumes them and the facade filters
+        their Target.* events.
 
     This is the playwriter-parity acceptance on the user's PRIMARY backend."""
     playwright_api = pytest.importorskip("playwright.sync_api")

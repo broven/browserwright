@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Testing and quality gates for backend/extension changes."}
-{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "Extension backend title metadata flows through the CDP facade."}

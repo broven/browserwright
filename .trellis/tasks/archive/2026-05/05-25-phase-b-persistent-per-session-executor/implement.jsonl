@@ -1,7 +1,0 @@
-{"file": ".trellis/tasks/05-25-phase-b-persistent-per-session-executor/prd.md", "reason": "phase B 总纲:D1 子进程/D2 完整范围决策、7 个待定分叉、验收、技术落点"}
-{"file": ".trellis/tasks/archive/2026-05/05-24-tab-handle-model-for-code-agents/research/playwriter-exposure.md", "reason": "头号蓝本:playwriter Map<sessionId,executor> 常驻进程、state 跨 call 持久机制、reset()、瘦客户端 CLI POST 模型、skill.md tab 纪律"}
-{"file": ".trellis/tasks/05-25-phase-b-persistent-per-session-executor/research/phase-b-forks.md", "reason": "Fork 1-7 收敛结论 + rdp-Chrome 监管孪生 file:line 索引 + PR 切片依据 + 新增风险;实现直接照此落地"}
-{"file": ".trellis/spec/backend/agent-playwright-surface.md", "reason": "phase C agent 面契约:executor 进程内复用其 page/context/snapshot 注入模型,新增 state"}
-{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "executor 经 facade connect_over_cdp 接入(长活连接);facade 端点/data: 限制/daemon 重启断连恢复依据"}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "daemon(listener/daemon/_ipc)↔skill(repl/inline/_namespace/playwright_handle)↔session(runtime/registry/ledger)分层边界:executor registry/RPC/瘦客户端改动落位"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "executor 崩溃/facade 断连/heredoc 异常隔离与既有 CDPError/exit-code 约定一致"}

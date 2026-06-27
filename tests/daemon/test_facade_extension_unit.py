@@ -612,19 +612,55 @@ async def test_attached_target_carries_browser_context_id():
 
 
 async def test_page_session_set_auto_attach_is_forwarded():
-    """PR3 fix #4: a SESSION-scoped Target.setAutoAttach (CRPage init id 13)
-    must be FORWARDED to the extension's chrome.debugger, not silent-acked, so
-    the page session's auto-attach contract resolves against real Chrome."""
+    """ZER-123: page-session Target.setAutoAttach is required to make Chrome
+    surface OOPIF child targets to chrome.debugger. The extension handles the
+    child sessions and the facade keeps their lifecycle events hidden."""
     async with _wired() as (relay, ext, client, bridge):
         sid = await _attach_one(ext, client, tab_id=8)
+        ext.commands_seen.clear()
         client.feed({"id": 30, "sessionId": sid,
                      "method": "Target.setAutoAttach",
                      "params": {"autoAttach": True, "flatten": True,
                                 "waitForDebuggerOnStart": True}})
-        await client.wait_for(lambda f: f.get("id") == 30 and "result" in f)
-        assert (8, "Target.setAutoAttach") in ext.commands_seen, (
-            f"page-session setAutoAttach not forwarded; "
-            f"seen={ext.commands_seen}")
+        await client.wait_for(lambda f: f.get("id") == 30
+                              and f.get("sessionId") == sid
+                              and "result" in f)
+        assert (8, "Target.setAutoAttach") in ext.commands_seen
+
+
+async def test_child_target_lifecycle_events_are_not_forwarded_to_playwright():
+    """ZER-123: if the extension ever relays child Target.* events, the facade
+    must not expose them as page-session events until child-session routing is
+    implemented."""
+    async with _wired() as (relay, ext, client, bridge):
+        sid = await _attach_one(ext, client, tab_id=8)
+        assert sid
+        before = len(client.sent)
+        await ext.push_event(
+            tab_id=8,
+            method="Target.attachedToTarget",
+            params={
+                "sessionId": "child-session",
+                "targetInfo": {
+                    "targetId": "child-target",
+                    "type": "iframe",
+                    "url": "https://child.example/",
+                },
+                "waitingForDebugger": True,
+            },
+        )
+        await ext.push_event(
+            tab_id=8,
+            method="Target.detachedFromTarget",
+            params={"sessionId": "child-session", "targetId": "child-target"},
+        )
+        await asyncio.sleep(0.1)
+        new_frames = client.sent[before:]
+        assert not any(
+            f.get("method") in (
+                "Target.attachedToTarget", "Target.detachedFromTarget")
+            for f in new_frames
+        ), new_frames
 
 
 async def test_runtime_enable_does_disable_enable_dance_and_gates_on_event():
