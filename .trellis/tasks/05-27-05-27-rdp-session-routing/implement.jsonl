@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/backend/agent-executor-model.md", "reason": "executor control-plane session scoping"}
-{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "facade must route by browserwright session id"}

@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Understand repository layout and release/install boundaries before updating mise tasks."}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "Keep shell task failure behavior explicit and actionable."}

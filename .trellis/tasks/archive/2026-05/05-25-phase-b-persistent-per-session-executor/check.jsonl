@@ -1,7 +1,0 @@
-{"file": ".trellis/tasks/05-25-phase-b-persistent-per-session-executor/prd.md", "reason": "核对验收(state/page 跨 call 存活、单 executor/单 tab、reset、endSession/idle 回收、daemon 重启恢复、并发隔离、双后端)与 out-of-scope"}
-{"file": ".trellis/tasks/05-25-phase-b-persistent-per-session-executor/research/phase-b-forks.md", "reason": "核对实现是否照收敛结论落地(混合传输/串行队列/重启自杀冷启/静态预检共存)、新增风险是否处理"}
-{"file": ".trellis/spec/backend/agent-playwright-surface.md", "reason": "核对 executor 注入面与 phase C agent 面契约一致、未回归"}
-{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "核对长活 facade 连接与契约一致、未回归 phase A 不变量(fan-out await-ordering 等)"}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "核对 executor/RPC/瘦客户端改动落在正确分层、未越界污染 daemon 纯代理职责"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "代码质量基线 + uv/pytest fast-gate 门禁"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对 executor 崩溃/断连/heredoc 异常隔离与 exit-code 约定一致"}

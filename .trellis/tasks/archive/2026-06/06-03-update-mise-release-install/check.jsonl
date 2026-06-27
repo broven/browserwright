@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Use the project's verification expectations for backend/tooling changes."}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "Check that install-task errors remain clear for users."}

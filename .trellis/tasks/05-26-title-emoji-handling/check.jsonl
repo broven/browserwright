@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verification expectations and relevant pytest gates."}
-{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "Check extension title metadata remains clean for CDP/Playwright consumers."}
