@@ -1,3 +1,64 @@
+# Tool runtimes pinned for this repo. `cd` here auto-activates; `mise install`
+# installs them. Migrated from .python-version (3.11); uv drives all deps.
+[tools]
+python = "3.11"
+uv = "latest"
+
+# ---------------------------------------------------------------------------
+# Standard repo-harness verbs. Heavy/operational tasks (dev-link, upgrade-global,
+# version-check, restart-daemon) live further down; these three are the contract
+# every harnessed repo exposes: clone -> `mise run install` -> `mise run test`.
+# ---------------------------------------------------------------------------
+
+[tasks.install]
+description = "Install all repo dependencies (clone's first command)"
+dir = "{{config_root}}"
+run = "uv sync --extra ux"
+
+[tasks.dev]
+# No long-running dev server: browserwright is a CLI + background daemon + an
+# agent-facing skill, driven on demand. The local dev loop is `mise run install`
+# then exercise the CLI/REPL, or `mise run dev-link` to symlink this checkout
+# into your global PATH/skill dirs. See ONBOARD.md "Run it". Left without a
+# `run` on purpose so nobody hardcodes the wrong entrypoint.
+description = "No dev server — use the CLI/REPL after install, or `mise run dev-link`. See ONBOARD.md."
+
+# test — fast local gate (mocked; no real Chrome, no network). Heavy suites
+# (e2e real-Chrome, agent-e2e promptfoo) are separate, opt-in tasks below.
+[tasks."test:daemon"]
+description = "Daemon/CDP/proxy/backend/relay unit tests"
+dir = "{{config_root}}"
+run = "uv run pytest tests/daemon -q"
+
+[tasks."test:skill"]
+description = "Agent-layer tests (CLI, sessions, primitives, memory, install flows)"
+dir = "{{config_root}}"
+run = "uv run pytest tests/skill --ignore=tests/skill/agent-e2e -q"
+
+[tasks."test:evals"]
+description = "Mocked skill command-choice evals (zero-cost, deterministic)"
+dir = "{{config_root}}"
+run = "uv run python evals/run.py --mock"
+
+[tasks.test]
+description = "Run the fast local gate (daemon + skill + skill evals)"
+depends = ["test:daemon", "test:skill", "test:evals"]
+
+[tasks."test:e2e"]
+description = "Real-Chrome + unpacked-extension E2E (needs Chrome for Testing; opt-in)"
+dir = "{{config_root}}"
+run = "tests/daemon/e2e/run.sh -v"
+
+[tasks.lint]
+description = "Static checks: ruff lint + format check"
+dir = "{{config_root}}"
+run = "uvx ruff check . && uvx ruff format --check ."
+
+[tasks.build]
+description = "Build the wheel/sdist with uv"
+dir = "{{config_root}}"
+run = "uv build"
+
 [tasks.dev-link]
 description = "Development only: link this checkout into global PATH/skill dirs; a broken checkout can break global agents"
 dir = "{{config_root}}"
