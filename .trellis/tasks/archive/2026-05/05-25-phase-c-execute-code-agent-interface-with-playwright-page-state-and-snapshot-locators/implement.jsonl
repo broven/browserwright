@@ -1,5 +1,0 @@
-{"file": ".trellis/tasks/05-25-phase-c-execute-code-agent-interface-with-playwright-page-state-and-snapshot-locators/prd.md", "reason": "phase C 总纲:4 个分叉决策、非分叉设计判断、小 PR 拆分、验收"}
-{"file": ".trellis/spec/backend/playwright-cdp-facade.md", "reason": "phase C 经 facade connect_over_cdp 接入;facade 端点/CRPage 契约/data: 限制/auto-enable 依据"}
-{"file": ".trellis/tasks/05-24-tab-handle-model-for-code-agents/research/playwriter-exposure.md", "reason": "照抄目标:playwriter agent 暴露面(execute/注入 page/context/state、snapshot 行即 locator、skill.md tab 纪律 prose)"}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "skill 层(repl/_namespace、repl/inline、primitives、api.py EXPORTS)与 daemon 的边界:注入点与改动落位"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "Playwright 连接/绑定失败的错误处理与既有 CDPError/exit-code 约定一致"}
