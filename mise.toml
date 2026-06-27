@@ -118,7 +118,10 @@ set -euo pipefail
 # that version ("Nothing to upgrade"). `install --force` re-resolves against
 # PyPI latest each run with no specifier pin, costs ~500ms, and is idempotent,
 # which is what this task actually means ("always sync global to PyPI latest").
-uv tool install browserwright --force
+# `--refresh` busts uv's index cache: right after a release uv otherwise
+# resolves to the cached previous version and silently installs the OLD wheel
+# (e.g. re-installing 0.6.13 minutes after 0.6.14 went live). See RELEASING.md.
+uv tool install browserwright --force --refresh
 
 # --- Install the release-built Chrome extension artifact. -------------------
 # The extension is not distributed through PyPI. release.yml publishes a
