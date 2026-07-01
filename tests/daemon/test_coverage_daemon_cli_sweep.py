@@ -183,6 +183,10 @@ def test_status_list_and_stop_error_branches(monkeypatch, capsys, tmp_path):
     assert cli._cmd_stop(_ns(timeout=0), Config()) == 0
 
     monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: (None, None))
+    # Isolate the control socket to a non-existent path so the issue #15 (2.1)
+    # port-held-zombie probe is skipped — otherwise this unit test would pick up
+    # a real daemon holding the default relay/facade ports on the dev machine.
+    monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "dead.sock")
     monkeypatch.setattr(_ipc, "endpoint_describe", lambda: {
         "transport": "unix",
         "path": str(tmp_path / "dead.sock"),

@@ -75,6 +75,61 @@ def make_context(*, backend: str, cfg: Config,
 # ---- top-level entry -------------------------------------------------------
 
 
+def _reclaim_stale_daemon_ports(cfg: Config) -> None:
+    """Reclaim the relay/facade ports from a *confirmed* stale browserwright
+    daemon (issue #15, 2.2). No-op when the ports are free or held by an
+    unconfirmed process (we never SIGTERM a stranger)."""
+    from .. import _stale
+    ports = _stale.daemon_tcp_ports(cfg)
+    held = [p for p in ports if _stale.port_is_listening("127.0.0.1", p)]
+    if not held:
+        return
+    pid = _stale.confirmed_stale_holder(held)
+    if pid is None:
+        logger.warning(
+            "ports %s are in use but no confirmed browserwright daemon holds "
+            "them; leaving them alone (bind will surface a clear error)", held)
+        return
+    logger.warning(
+        "reclaiming ports %s from stale browserwright daemon pid %d (issue #15)",
+        held, pid)
+    if _stale.reclaim_ports(pid, held):
+        logger.info("reclaimed ports %s from pid %d", held, pid)
+    else:
+        logger.warning("could not free ports %s from pid %d; bind may fail",
+                       held, pid)
+
+
+async def _control_socket_watchdog(sock_ident: tuple, stop: asyncio.Event,
+                                   *, interval: float = 2.0) -> None:
+    """Self-exit when our control socket disappears or is replaced by a
+    different inode — i.e. another daemon took over, or the socket was removed
+    (issue #15, 2.4). Setting ``stop`` runs the normal graceful shutdown, which
+    releases the relay/facade ports instead of lingering as a port-holding
+    zombie. A single stat error is ignored (transient FS hiccup); only a
+    definitive gone/replaced verdict self-exits."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return  # stop was set elsewhere (signal / another watchdog)
+        except asyncio.TimeoutError:
+            pass
+        try:
+            st = os.stat(_ipc.sock_path())
+        except FileNotFoundError:
+            logger.warning("control socket removed; self-exiting to release "
+                           "ports (issue #15)")
+            stop.set()
+            return
+        except OSError:
+            continue  # transient — don't self-exit on one error
+        if (st.st_dev, st.st_ino) != sock_ident:
+            logger.warning("control socket replaced (another daemon took over); "
+                           "self-exiting to release ports (issue #15)")
+            stop.set()
+            return
+
+
 async def run_serve(cfg: Config) -> int:
     """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code.
 
@@ -100,6 +155,12 @@ async def run_serve(cfg: Config) -> int:
         )
         return 1
     _ipc.cleanup_endpoint()
+    # issue #15 (2.2): the control-socket ping above was negative, but a
+    # half-alive prior daemon can still hold the relay/facade TCP ports and
+    # crash-loop us on EADDRINUSE. Reclaim them before binding — but only from a
+    # process lsof confirms holds the port AND whose cmdline is a browserwright
+    # daemon (never a stranger).
+    _reclaim_stale_daemon_ports(cfg)
 
     # Phase 3 (C2 ephemeral): rdp Chrome processes are daemon children and die
     # with us — but a hard crash / SIGKILL can leave orphan Chrome processes
@@ -159,6 +220,19 @@ async def run_serve(cfg: Config) -> int:
     handler = _ClientHandler(daemon, cfg)
     server = await _open_server(handler)
 
+    # issue #15 (2.4): watch our own control socket. If another `serve` (or a
+    # manual `rm`) removes/replaces it, self-exit so we release the relay/facade
+    # ports instead of lingering as a port-holding zombie. POSIX only — Windows
+    # uses a port file, not a unix socket inode.
+    sock_watch_task: asyncio.Task | None = None
+    if not _ipc.IS_WINDOWS:
+        try:
+            _st = os.stat(_ipc.sock_path())
+            sock_watch_task = asyncio.create_task(
+                _control_socket_watchdog((_st.st_dev, _st.st_ino), stop))
+        except OSError:
+            pass
+
     # v0.4: for the extension shared context, start the relay ws server eagerly
     # so `browserwright-daemon doctor` can probe `__status__` even before any
     # Skill client connects. The relay belongs to the shared context's holder
@@ -173,8 +247,21 @@ async def run_serve(cfg: Config) -> int:
             port = await shared_context.holder.relay.start()
             logger.info("extension relay started on port %d", port)
         except OSError as e:
+            # issue #15 (2.2): if we still can't bind after the reclaim pass, the
+            # port is held by something we couldn't confirm as our daemon (lsof
+            # missing, or a genuine stranger). Point the user at the exact port +
+            # how to find the holder rather than a bare errno.
+            hint = ""
+            with contextlib.suppress(Exception):
+                _, rport = cfg.backends.extension.resolved_host_port()
+                hint = (
+                    f" — port {rport} is held by another process. Run "
+                    f"`lsof -nP -iTCP:{rport} -sTCP:LISTEN` to find it, then "
+                    f"`browserwright-daemon restart` (reclaims a stale "
+                    f"browserwright daemon) or kill that pid."
+                )
             print(
-                f"browserwright-daemon failed to bind extension relay: {e}",
+                f"browserwright-daemon failed to bind extension relay: {e}{hint}",
                 file=sys.stderr,
             )
             server.close()
@@ -235,6 +322,10 @@ async def run_serve(cfg: Config) -> int:
         logger.info("browserwright-daemon shutdown requested")
         await _graceful_shutdown(daemon)
     finally:
+        if sock_watch_task is not None:
+            sock_watch_task.cancel()
+            with contextlib.suppress(Exception):
+                await sock_watch_task
         if idle_task is not None:
             idle_task.cancel()
             with contextlib.suppress(Exception):

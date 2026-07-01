@@ -615,9 +615,12 @@ async def _run_stats(args, cfg: Config) -> int:
 
 def _cmd_status(args, cfg: Config) -> int:
     """Report endpoint + liveness. JSON shape used by Skill for status pings."""
-    from . import _ipc
+    from . import _ipc, _stale
     pid, version = _ipc.ping_status_sync(timeout=1.0)
     probe_state = "ok" if pid is not None else "not_running"
+    # issue #15 (2.1): pid of the process holding the relay/facade ports when
+    # the control socket is dead but its file lingers — a half-alive daemon.
+    port_holder_pid = None
     if pid is None and _ipc.sock_path().exists():
         deadline = time.monotonic() + 0.6
         while time.monotonic() < deadline:
@@ -628,6 +631,20 @@ def _cmd_status(args, cfg: Config) -> int:
                 break
         else:
             probe_state = "transient_probe_failed"
+            # Still unresponsive, but its socket file is present — a half-alive
+            # daemon may be holding the relay/facade ports. Report the truth
+            # instead of a bare "not_running" that loops the user through
+            # restarts that crash on EADDRINUSE.
+            ports = _stale.daemon_tcp_ports(cfg)
+            if any(_stale.port_is_listening("127.0.0.1", p) for p in ports):
+                probe_state = "port_held_by_unresponsive_process"
+                port_holder_pid = _stale.confirmed_stale_holder(ports)
+                if port_holder_pid is None:
+                    # lsof unavailable / non-daemon holder — surface the
+                    # pid-file pid as a best-effort hint (never a kill target).
+                    fp = _ipc.read_pid()
+                    if fp and _stale.pid_alive(fp):
+                        port_holder_pid = fp
     ep = _ipc.endpoint_describe()
     facade_ws, facade_port = _ipc.read_facade_file()
     status = {
@@ -635,6 +652,10 @@ def _cmd_status(args, cfg: Config) -> int:
         "alive": pid is not None,
         "probe_state": probe_state,
         "pid": pid,
+        # issue #15 (2.1): pid of the process holding the relay/facade ports
+        # when the daemon is unresponsive. Actionable: `browserwright-daemon
+        # restart` reclaims it, or kill it manually.
+        "port_holder_pid": port_holder_pid,
         "version": version,
         "endpoint": ep,
         # Playwright facade discovery (Phase C). None when the facade is
@@ -649,7 +670,14 @@ def _cmd_status(args, cfg: Config) -> int:
         print(json.dumps(status, sort_keys=True))
     else:
         if pid is None:
-            print("daemon not running")
+            if probe_state == "port_held_by_unresponsive_process":
+                held = f" (pid {port_holder_pid})" if port_holder_pid else ""
+                print("daemon unresponsive but holding its ports"
+                      f"{held} — a half-alive daemon.")
+                print("  fix: `browserwright-daemon restart` reclaims the "
+                      "ports; or kill the pid above manually.")
+            else:
+                print("daemon not running")
         else:
             print(f"daemon alive (pid {pid})")
             if ep["transport"] == "unix":
