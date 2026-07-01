@@ -48,6 +48,10 @@ _OPTIONS: list[Tuple[str, str, str, str]] = [
      "Cloud/Remote browser (Browser Use / Browserless / Hyperbrowser)",
      "远程 Chrome 服务，通过 daemon 内置 AuthProvider 抽象处理 \n"
      "     Bearer / Basic / mTLS 鉴权。零本地 Chrome 进程。"),
+    ("5", "env",
+     "External CDP endpoint (anti-detect / fingerprint profile, e.g. CloakBrowser)",
+     "你自己起好的浏览器，暴露一个 browser-level CDP ws；daemon 用 BD_CDP_WS 连它。\n"
+     "     attach 语义：session end 不会关这个浏览器。多 profile 请起多个隔离 daemon。"),
 ]
 
 
@@ -469,7 +473,7 @@ def run() -> int:
             print(f"     {ln}")
     print()
 
-    choice = _prompt("Choose 1 / 2 / 3 / 4", default="1")
+    choice = _prompt("Choose 1 / 2 / 3 / 4 / 5", default="1")
     match = next((o for o in _OPTIONS if o[0] == choice), None)
     if match is None:
         print(f"unknown choice: {choice!r}", file=sys.stderr)
@@ -535,6 +539,29 @@ def run() -> int:
             print(f"cloud setup aborted: {e}", file=sys.stderr)
             return 1
         extra_note = f"{label}, provider={provider}, auth={auth_kind}"
+
+    if choice == "5":
+        # env has no config.toml section — the daemon reads BD_CDP_WS /
+        # BD_CDP_URL from its environment at serve time, so the wizard can only
+        # record the preference and echo the ready-to-run command. We store the
+        # endpoint (if given) in the note for the user's own reference.
+        cdp = _prompt(
+            "External CDP ws or http URL "
+            "(BD_CDP_WS / BD_CDP_URL; blank to set it later)",
+            default="",
+        ).strip()
+        extra_note = f"{label}, cdp={cdp}" if cdp else label
+        var = "BD_CDP_URL" if cdp.startswith("http") else "BD_CDP_WS"
+        example = cdp or "ws://127.0.0.1:8080/api/profiles/<id>/cdp"
+        print()
+        print("env is driven by an env var at daemon-serve time. Start the "
+              "daemon against your browser:")
+        print(f"    {var}={example} browserwright-daemon serve --backend env")
+        print("then bind an agent session:")
+        print("    browserwright session new --backend=env --name=<label>")
+        print("For N profiles run N isolated daemons (each its own "
+              "XDG_RUNTIME_DIR + --facade-port + BD_CDP_WS) — see "
+              "docs/session-workspaces.md §\"Env Backend\".")
 
     print()
     print(f"Selected: {label}")

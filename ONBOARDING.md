@@ -304,8 +304,13 @@ Are you running scripted / iterative tests?
         └── do you have a special browser source?
             ├── fingerprint browser (AdsPower / MultiLogin / GoLogin /
             │   比特浏览器) → option 2, supply the port your tool exposes
-            └── cloud / remote Chrome (Browser Use, Browserless,
-                Hyperbrowser, generic CDP-compatible) → option 4
+            ├── cloud / remote Chrome (Browser Use, Browserless,
+            │   Hyperbrowser, generic CDP-compatible) → option 4
+            └── an externally-owned browser exposing a browser-level CDP ws
+                (anti-detect profile, e.g. CloakBrowser) → option 5 (env):
+                `BD_CDP_WS=ws://… browserwright-daemon serve --backend env`,
+                then `browserwright session new --backend=env`. Attach-owned —
+                `session end` never closes it. N profiles → N isolated daemons.
 ```
 
 The install wizard codifies this same decision tree —
