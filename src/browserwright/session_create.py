@@ -168,6 +168,19 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
                            owner="attach", name=name)
         _ensure_daemon_running()
         return sid
+    if backend == "env":
+        # env binds the agent surface to the daemon's shared upstream — the
+        # externally-owned browser the daemon was started against (BD_CDP_WS /
+        # BD_CDP_URL + `--backend env`). Like extension it is attach-owned, so
+        # end()/reap never close that external browser; unlike extension there
+        # is no tab group (env speaks real browser-level CDP, not the relay).
+        # workspace is None: env sessions route to the shared daemon context
+        # (docs/session-workspaces.md §"Routing And Facade"), not a per-session
+        # UpstreamContext. Driving N external profiles → one env-backed daemon
+        # (isolated XDG_RUNTIME_DIR + --facade-port + BD_CDP_WS) per profile.
+        sid = reg.allocate(backend="env", owner="attach", name=name)
+        _ensure_daemon_running()
+        return sid
     if backend == "rdp":
         owner = "create" if create else "attach"
         # workspace["port"]: for --create pick a free port the daemon launches
@@ -182,7 +195,7 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
                            name=name, workspace=workspace)
         _ensure_daemon_running()
         return sid
-    raise ValueError(f"unknown backend {backend!r} (use extension|rdp)")
+    raise ValueError(f"unknown backend {backend!r} (use extension|rdp|env)")
 
 
 def choose(situation: str) -> dict:

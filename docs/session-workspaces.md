@@ -24,6 +24,7 @@ The word "workspace" is backend-specific:
 | `extension` | One Chrome tab group inside the user's real Chrome | The set of tabs in that group only | Required: exactly one group per session |
 | `rdp` create | One daemon-owned Chrome instance/profile for that session | The browser instance/profile | Never create or simulate tab groups |
 | `rdp` attach | One externally-owned browser instance exposed on the recorded port | That browser instance | Never create or simulate tab groups |
+| `env` | The externally-owned browser the daemon resolved (BD_CDP_WS / BD_CDP_URL) | That browser instance | Never create or simulate tab groups |
 
 ## Extension Backend
 
@@ -73,6 +74,33 @@ Hard invariants:
 - Do not make RDP session routing depend on the shared extension relay.
 - `--name` is only a session label in RDP. It is not a Chrome tab group title.
 
+## Env Backend
+
+The env backend binds a session's agent surface to a browser the daemon did not
+launch — an external browser-level CDP endpoint the daemon resolved from
+`BD_CDP_WS` (verbatim) or `BD_CDP_URL` (via `/json/version`). Its workspace is
+that browser instance, not a tab group.
+
+An env session is **attach-owned**: ending it reaps the session's executor but
+never closes the external browser (same teardown as `rdp --attach`). It has no
+per-session `workspace` — it routes to the daemon's shared upstream, so the
+externally-owned browser is whatever that one daemon was started against.
+
+Hard invariants:
+
+- Do not create Chrome tab groups for env sessions.
+- The unified tab-lifecycle verbs (`openBackgroundTab` / `closeTab` /
+  `recoverSession` / `attachActiveTab` / userscript) run their **raw
+  browser-level CDP** implementation (`Target.createTarget` / `closeTarget`,
+  etc.) for env — the same path as rdp, driven through the shared context's
+  `_upstream_command`. env is not the extension relay; never route it through
+  the relay-callback synthesis. The discriminator is `Router._raw_cdp_backend`
+  ("backend is not `extension`"), not a name check against `rdp`.
+- Ending an env session must not close the external browser.
+- To drive N external profiles concurrently, run N isolated daemons (each with
+  its own `XDG_RUNTIME_DIR` + `--facade-port` + `BD_CDP_WS`), one env session
+  per daemon. A single daemon has one shared upstream, hence one env browser.
+
 ## Routing And Facade
 
 Layer 2 calls and daemon IPC carry `session_id`. The daemon resolves the
@@ -85,8 +113,8 @@ context:
 
 The Playwright facade has backend-specific behavior:
 
-- For `rdp`, the facade is a byte-for-byte browser-level CDP passthrough to the
-  session's real Chrome endpoint.
+- For `rdp` and `env`, the facade is a byte-for-byte browser-level CDP
+  passthrough to the session's real Chrome / external CDP endpoint.
 - For `extension`, the facade is a synthesis layer over the extension relay. It
   maps browser-level CDP concepts onto the session's tab group and must refresh
   group state before creating targets.
@@ -102,6 +130,7 @@ Ending a session follows ownership:
   user's real Chrome running.
 - RDP create-owned sessions close the daemon-owned Chrome.
 - RDP attach sessions leave the external browser running.
+- Env sessions (always attach-owned) leave the external browser running.
 
 Executor cleanup is separate from browser ownership and may run for any session.
 

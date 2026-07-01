@@ -100,6 +100,13 @@ class UpstreamConnection:
                 # doesn't speak it, and websockets v15 sometimes negotiates
                 # extensions that break the handshake.
                 "compression": None,
+                # Never route the daemon→browser CDP control channel through the
+                # user's ambient web proxy. websockets v15 honors
+                # http_proxy/all_proxy by default, which breaks any non-loopback
+                # upstream (LAN / Tailscale / an env-backed CloakBrowser profile)
+                # that the loopback-only NO_PROXY bypass above can't cover. Same
+                # fix as the Playwright facade bridge. (issue #20)
+                "proxy": None,
                 # Keep the upstream alive with ws-level pings; CDP-level
                 # Browser.getVersion heartbeat is layered on top for protocol
                 # liveness.

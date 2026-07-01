@@ -556,12 +556,13 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
 
     if sub == "new":
         backend = kw.get("backend")
-        if backend not in ("extension", "rdp"):
-            print("usage: browserwright session new --backend=<extension|rdp> "
+        if backend not in ("extension", "rdp", "env"):
+            print("usage: browserwright session new --backend=<extension|rdp|env> "
                   "--name=SESSION_LABEL [--create | --attach=PORT]", file=sys.stderr)
             print("--name is a short task-specific session label. Extension sessions "
-                  "use it as the Chrome tab group title; RDP sessions use it only "
-                  "to label the isolated browser session.",
+                  "use it as the Chrome tab group title; RDP and env sessions use it "
+                  "only to label the browser session. env binds the agent surface to "
+                  "the daemon's externally-owned upstream (BD_CDP_WS + --backend env).",
                   file=sys.stderr)
             return 1
         try:

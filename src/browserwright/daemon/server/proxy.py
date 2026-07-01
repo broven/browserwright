@@ -195,6 +195,21 @@ class Router:
         # (asyncio warning), and so we can cancel them on shutdown.
         self._open_tasks: set[asyncio.Task] = set()
 
+    @property
+    def _raw_cdp_backend(self) -> bool:
+        """True when this context speaks real browser-level CDP (rdp / env /
+        cloud) rather than the extension relay.
+
+        The unified tab-lifecycle verbs (openBackgroundTab / closeTab /
+        recoverSession / userscript / attachActiveTab) dispatch to their
+        raw-CDP implementation via ``_upstream_command`` for every such backend;
+        only the extension relay uses the callback-synthesis path. extension is
+        the sole LOCAL_RELAY backend, so "not extension" is exactly "raw
+        browser-level CDP". (issue #20: env joined this family — it resolves
+        BD_CDP_WS and shares ``_open_chrome_upstream``'s raw command channel,
+        same as rdp/cloud.)"""
+        return self.state.backend_name != "extension"
+
     def _session_group_name(
         self, client: ClientState, session_id: str,
         explicit: str | None = None,
@@ -877,7 +892,7 @@ class Router:
             # daemon-owned Chrome. Provide an honest shim via
             # Page.addScriptToEvaluateOnNewDocument (see _rdp_userscript). Never
             # -32601 on rdp.
-            if self.state.backend_name == "rdp":
+            if self._raw_cdp_backend:
                 await self._rdp_userscript(client, req_id, verb, params)
                 return
             if self._userscript_request is None:
@@ -1055,7 +1070,7 @@ class Router:
                 client, req_id, method, attach_params)
             if attach_session is None:
                 return
-            if self.state.backend_name == "rdp":
+            if self._raw_cdp_backend:
                 if (self._upstream_command is None and self._ensure_upstream is not None):
                     try:
                         await self._ensure_upstream()
@@ -1212,7 +1227,7 @@ class Router:
         # implement the verb with raw CDP (Target.createTarget + attach). Every
         # rdp tab is "background" (no human focus to protect), so `background`
         # is a no-op and `groupId` is -1 (tab groups are an extension concept).
-        if self.state.backend_name == "rdp":
+        if self._raw_cdp_backend:
             if self._upstream_command is None and self._ensure_upstream is not None:
                 try:
                     await self._ensure_upstream()
@@ -1313,7 +1328,7 @@ class Router:
         # is an honest no-op here — NEVER -32601 (revised Rule: same-shape,
         # honest, nearest equivalent). This runs before param validation so the
         # schema-lock smoke test (no params) sees a result, not an error.
-        if self.state.backend_name == "rdp":
+        if self._raw_cdp_backend:
             await self._send_to_client(client.client_id, _result_response(
                 req_id, {"recovered": [], "groupId": -1, "tabs": []}))
             return
@@ -1646,7 +1661,7 @@ class Router:
             return
         # rdp dispatch: close via Target.closeTarget. Resolve the targetId from
         # the local sessionId binding when only a sessionId was given.
-        if self.state.backend_name == "rdp":
+        if self._raw_cdp_backend:
             if self._upstream_command is None and self._ensure_upstream is not None:
                 try:
                     await self._ensure_upstream()

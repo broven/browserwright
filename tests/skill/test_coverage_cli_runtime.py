@@ -359,7 +359,7 @@ def test_cmd_session_usage_errors(capsys, tmp_bs_home):
     assert "usage: browserwright session" in capsys.readouterr().err
 
     assert cli._cmd_session(["new", "--backend=bogus", "--name=x"]) == 1
-    assert "--backend=<extension|rdp>" in capsys.readouterr().err
+    assert "--backend=<extension|rdp|env>" in capsys.readouterr().err
 
     assert cli._cmd_session(["bogus"]) == 1
     assert "unknown session subcommand" in capsys.readouterr().err
@@ -455,6 +455,21 @@ def test_cmd_session_new_stderr_keeps_stdout_bare(monkeypatch, tmp_bs_home, caps
     streams = capsys.readouterr()
     assert streams.out == "17\n"
     assert streams.err == "OK: session 17 created\n"
+
+
+def test_cmd_session_new_accepts_env_backend(monkeypatch, tmp_bs_home, capsys):
+    """issue #20: `session new --backend=env` is accepted and routed to
+    session_create.new (previously rejected — the gate only allowed
+    extension|rdp)."""
+    from browserwright import cli, session_create
+
+    seen = {}
+    monkeypatch.setattr(session_create, "new",
+                        lambda **kw: seen.update(kw) or "7")
+
+    assert cli._cmd_session(["new", "--backend=env", "--name=cloak"]) == 0
+    assert seen["backend"] == "env"
+    assert capsys.readouterr().out == "7\n"
 
 
 def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, capsys):
@@ -760,6 +775,43 @@ def test_session_create_end_reap_tolerates_dead_daemon(tmp_bs_home, monkeypatch)
 
     # Must not raise even though the daemon is unreachable.
     message = session_create.end(reg.get(sid))
+    assert "still running" in message
+    assert reg.get(sid) is None
+
+
+def test_session_create_new_env_is_attach_shared_context(tmp_bs_home, monkeypatch):
+    """issue #20: `session new --backend=env` allocates an attach-owned,
+    workspace-less session. attach-owned so end()/reap never close the external
+    browser; workspace=None so it routes to the daemon's shared env upstream
+    (BD_CDP_WS), not a per-session UpstreamContext."""
+    from browserwright import session_create, session_registry as reg
+
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+
+    sid = session_create.new(backend="env", name="cloak")
+    rec = reg.get(sid)
+    assert rec["backend"] == "env"
+    assert rec["owner"] == "attach"
+    assert rec["workspace"] is None
+    assert rec["name"] == "cloak"
+
+
+def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch):
+    """An env session is attach-owned: end() reaps only the resident executor
+    (kill-executor) and leaves the externally-owned browser running (issue
+    #20) — never _close_browser."""
+    from browserwright import session_create, session_registry as reg
+
+    sid = reg.allocate(backend="env", owner="attach", name="cloak")
+    calls = []
+    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    # The external browser must NOT be closed for an env (attach) session.
+    monkeypatch.setattr(session_create, "_close_browser",
+                        lambda rec: calls.append(["CLOSE_BROWSER", rec["id"]]))
+
+    message = session_create.end(reg.get(sid))
+
+    assert calls == [["browserwright-daemon", "kill-executor", "--session", sid]]
     assert "still running" in message
     assert reg.get(sid) is None
 

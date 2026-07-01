@@ -622,6 +622,45 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
 
 
 @pytest.mark.asyncio
+async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
+    """issue #20: an env session speaks real browser-level CDP (like rdp), so
+    the unified tab verbs must dispatch to raw CDP via `_upstream_command` —
+    NOT return -32601 "requires the extension backend". Locks in
+    `Router._raw_cdp_backend` covering env, not only rdp."""
+    state, router, cap, (client,) = setup_router(backend="env")
+
+    calls: list[str] = []
+
+    async def env_cmd(method: str, params=None, session_id=None):
+        calls.append(method)
+        if method == "Target.createTarget":
+            return {"id": -1, "result": {"targetId": "T"}}
+        if method == "Target.attachToTarget":
+            return {"id": -1, "result": {"sessionId": "UP"}}
+        if method == "Target.closeTarget":
+            return {"id": -1, "result": {}}
+        raise AssertionError(method)
+
+    router._upstream_command = env_cmd
+    await router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "BrowserwrightDaemon.openBackgroundTab",
+        "params": {"url": "https://x/"},
+    }))
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert calls[0] == "Target.createTarget"  # raw CDP, not the relay callback
+    local_sid = result["sessionId"]
+
+    await router.route_from_client(client, json.dumps({
+        "id": 2,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"sessionId": local_sid},
+    }))
+    assert "Target.closeTarget" in calls  # closeTab also raw CDP for env
+    assert local_sid not in client.sessions
+
+
+@pytest.mark.asyncio
 async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targets():
     state, router, cap, (client,) = setup_router(backend="rdp")
     state.bind_session(client.client_id, "local", "UP", "T", readonly=False)
