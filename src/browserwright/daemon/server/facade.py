@@ -340,6 +340,14 @@ class PlaywrightFacade:
                 compression=None,
                 ping_interval=20,
                 ping_timeout=20,
+                # The daemon→browser CDP control channel must never traverse the
+                # user's ambient web proxy (http_proxy/all_proxy). `websockets`
+                # 15.x honors those env vars by default, which breaks any
+                # non-loopback upstream (LAN / Tailscale / CloakBrowser) — the
+                # loopback-only NO_PROXY augmentation above can't cover it.
+                # proxy=None disables proxying entirely; per-page proxying is
+                # applied downstream by Chrome/CloakBrowser itself. (issue #20)
+                proxy=None,
             )
         c2u = asyncio.create_task(self._pump(client, upstream, "c->u"))
         u2c = asyncio.create_task(self._pump(upstream, client, "u->c"))
