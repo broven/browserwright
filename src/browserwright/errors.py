@@ -94,7 +94,7 @@ class NoSession(BrowserwrightError):
 
     exit_code = 2
     default_fix = (
-        "run `browserwright session new --backend=<extension|rdp> --name=SESSION_LABEL` "
+        "run `browserwright session new --backend=<extension|rdp|env> --name=SESSION_LABEL` "
         "then pass `-s <id>` to browserwright commands, for example "
         "`browserwright -s <id> -e 'print(snapshot())'` or "
         "`browserwright -s <id> task <site>/<name>`"
@@ -103,7 +103,7 @@ class NoSession(BrowserwrightError):
     def __init__(self, detail: str = "", fix: str = ""):
         self.detail = detail
         super().__init__(
-            "no session: run `browserwright session new --backend=<extension|rdp> "
+            "no session: run `browserwright session new --backend=<extension|rdp|env> "
             "--name=SESSION_LABEL` first (use the `=` form; --name is a short "
             "session label), then pass -s <id> on every execute call. "
             + detail,

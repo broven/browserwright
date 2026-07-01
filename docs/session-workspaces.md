@@ -97,9 +97,38 @@ Hard invariants:
   the relay-callback synthesis. The discriminator is `Router._raw_cdp_backend`
   ("backend is not `extension`"), not a name check against `rdp`.
 - Ending an env session must not close the external browser.
-- To drive N external profiles concurrently, run N isolated daemons (each with
-  its own `XDG_RUNTIME_DIR` + `--facade-port` + `BD_CDP_WS`), one env session
-  per daemon. A single daemon has one shared upstream, hence one env browser.
+
+### Scaling env to N profiles
+
+A single daemon has exactly one shared upstream, hence one env browser. To drive
+N external profiles (e.g. N anti-detect / CloakBrowser profiles) concurrently,
+run **N isolated daemons** — one per profile — each with its own:
+
+- `XDG_RUNTIME_DIR` → a distinct daemon socket (the isolation key that replaced
+  `BD_NAME`; two daemons cannot share one socket);
+- `--facade-port` → a distinct Playwright-facade port;
+- `BD_CDP_WS` (or `BD_CDP_URL`) → that profile's CDP endpoint.
+
+Each daemon holds one `env` session bound to its own profile. A minimal fleet
+launcher:
+
+```bash
+# profiles: "ws://127.0.0.1:8080/api/profiles/<id>/cdp" per anti-detect profile
+i=0
+for ws in "${PROFILE_WS_URLS[@]}"; do
+  rt="$(mktemp -d)"; fp=$((19990 + ++i))
+  XDG_RUNTIME_DIR="$rt" BD_CDP_WS="$ws" \
+    browserwright-daemon serve --backend env --facade-port "$fp" &
+  # bind an agent session on THIS daemon (same XDG_RUNTIME_DIR reaches its socket)
+  sid=$(XDG_RUNTIME_DIR="$rt" browserwright session new --backend=env --name="profile-$i")
+  # drive it: XDG_RUNTIME_DIR="$rt" browserwright -s "$sid" -e '...'
+done
+```
+
+The daemons are independent processes; scale up/down by adding/removing them.
+This is the substrate for the probe→site-memory→batch pattern: an Opus probe
+session `remember()`s a playbook on one profile; Sonnet batch sessions
+`load_site_skill()` and replay it on their own profile's daemon.
 
 ## Routing And Facade
 

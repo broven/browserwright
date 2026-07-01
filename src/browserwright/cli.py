@@ -30,7 +30,7 @@ Usage:
   browserwright -s <session-id> -f script.py
   browserwright -s <session-id> --code-stdin < script.py
 
-  browserwright session new --backend=<extension|rdp> --name=SESSION_LABEL [--create | --attach=PORT]
+  browserwright session new --backend=<extension|rdp|env> --name=SESSION_LABEL [--create | --attach=PORT]
   browserwright session reset <id>
   browserwright session end --session=ID
   browserwright session list [--json]

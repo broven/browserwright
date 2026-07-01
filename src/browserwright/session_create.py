@@ -202,7 +202,7 @@ def choose(situation: str) -> dict:
     """Decide how to start a session for ``situation``.
 
     Hit → return the recorded decision (auto-start). Miss → raise
-    :class:`NeedsUserConfirm` carrying a proposal that lists the three modes,
+    :class:`NeedsUserConfirm` carrying a proposal that lists the backend modes,
     so the agent asks the user and then records the answer.
     """
     from .errors import NeedsUserConfirm
@@ -222,6 +222,10 @@ def choose(situation: str) -> dict:
                  "desc": "launch a fresh isolated Chrome the session owns"},
                 {"backend": "rdp", "mode": "attach", "target": "<port|recipe>",
                  "desc": "attach to an already-running browser (e.g. a fingerprint browser)"},
+                {"backend": "env", "mode": "attach",
+                 "desc": "bind to an externally-owned CDP endpoint the daemon "
+                         "resolved from BD_CDP_WS / BD_CDP_URL (e.g. an "
+                         "anti-detect profile); the browser is never closed"},
             ],
             "after_choice": "record it via memory.session_decisions.record(situation, decision)",
         },

@@ -32,7 +32,7 @@ print(page.title())
 browserwright session end --session=$sid
 ```
 
-Use `--backend=extension` for the user's daily Chrome. Use `--backend=rdp --create` for an isolated Chrome that the daemon owns.
+Use `--backend=extension` for the user's daily Chrome. Use `--backend=rdp --create` for an isolated Chrome that the daemon owns. Use `--backend=env` to bind to an externally-owned browser the daemon was started against (`BD_CDP_WS=ws://... browserwright-daemon serve --backend env`) — e.g. an anti-detect / fingerprint profile; ending the session never closes it.
 
 For multi-line code, heredocs, JSON literals, or complex quoting, prefer a file
 or stdin over a dense one-liner:
