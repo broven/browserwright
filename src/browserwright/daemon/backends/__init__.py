@@ -9,8 +9,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .base import Backend
-from .env import EnvBackend
-from .rdp import RdpBackend
+from .cdp import EnvBackend, RdpBackend
 from .extension import ExtensionBackend
 
 

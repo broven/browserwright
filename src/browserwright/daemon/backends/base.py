@@ -65,9 +65,10 @@ class DoctorResult:
 # ---- Protocol ---------------------------------------------------------------
 
 class Backend(Protocol):
-    """All four v0.1 backends implement this. The Protocol is structural; no
-    ABC inheritance required — a duck-typed class works (mirrors browser-harness
-    style: protocols, not registries).
+    """All registered backends implement this (the two real-CDP ids share one
+    implementation in `cdp.py`). The Protocol is structural; no ABC inheritance
+    required — a duck-typed class works (mirrors browser-harness style:
+    protocols, not registries).
     """
 
     name: str
