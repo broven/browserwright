@@ -12,4 +12,3 @@ from .site_mem import (  # noqa: F401
     site_dir,
     site_memory,
 )
-from .repl_mem import ReplMemory, repl_memory  # noqa: F401

@@ -6,27 +6,12 @@ otherwise aggregate per-backend failure reasons and raise Unavailable. When
 
 Importantly: resolve() never opens a ws. It only does HTTP discovery and
 filesystem reads. The Skill opens the ws downstream. (§2.3 banner sync.)
-
-The `caller_context` ContextVar communicates to backends whether the resolve
-is happening on the Mode A short-conn path or inside the Mode B long-running
-daemon. Reserved for future backends that need to diverge per call site.
-Async-safe by virtue of contextvars.
 """
 from __future__ import annotations
-
-import contextvars
 
 from .backends import all_backends, get_backend
 from .config import Config
 from .errors import Unavailable
-
-
-# Values: "mode_a" (default — Mode A CLI invocation) or "mode_b_serve"
-# (called from inside `browserwright-daemon serve`). Extend with care; backends
-# read this and may diverge behavior.
-caller_context: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "bd_caller", default="mode_a"
-)
 
 
 async def resolve(cfg: Config):

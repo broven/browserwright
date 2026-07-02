@@ -34,7 +34,6 @@ from .errors import (
     NetworkError,
     PageLoadFailed,
 )
-from .multitask import run_tasks_concurrent
 from .primitives import (
     bootstrap_site,
     http_get,
@@ -53,10 +52,9 @@ EXPORTS = [
     # memory + site
     "bootstrap_site", "remember", "remember_global", "remember_preference",
     "memory_read",
-    # task / fan-out (site-skills run on the Playwright surface — see
+    # task (site-skills run on the Playwright surface — see
     # task_runner.run_task, which injects page/context into the task module)
     "list_site_skills", "load_site_skill", "run_task",
-    "run_tasks_concurrent",
     # errors
     "BrowserwrightError", "PageLoadFailed", "ElementNotFound", "AuthWall",
     "Captcha", "NetworkError", "DaemonUnavailable", "CDPError",

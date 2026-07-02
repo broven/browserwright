@@ -744,20 +744,13 @@ class _UpstreamHolder:
                 logger.warning("drain pre-open buffers failed: %r", e)
 
     async def _open_chrome_upstream(self, cfg: Config) -> None:
-        # Mark this resolve as Mode-B-originated. Reserved for future
-        # backends that need to diverge per call site (Mode A short-conn
-        # vs Mode B long-running daemon).
-        from .. import resolver as _resolver_mod
-        ctx_token = _resolver_mod.caller_context.set("mode_b_serve")
         try:
             rr = await resolve(cfg)
         except Unavailable as e:
             logger.warning("upstream resolve failed: %s", e)
             self.state.last_close_reason = "backend_lost"
             await self.state.set_disconnected()
-            _resolver_mod.caller_context.reset(ctx_token)
             raise
-        _resolver_mod.caller_context.reset(ctx_token)
 
         # v0.5: when backend=cloud, ask the cloud config's AuthProvider to
         # produce headers + ssl_context for the upstream ws handshake. For

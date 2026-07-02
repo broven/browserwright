@@ -200,27 +200,22 @@ def test_discovery_iter_site_dirs_precedence_and_filters(monkeypatch, tmp_path):
 
     project = tmp_path / "project"
     home = tmp_path / "home"
-    subscription = tmp_path / "sub"
     bundled = tmp_path / "bundled"
-    for root in (project, home, subscription, bundled):
+    for root in (project, home, bundled):
         root.mkdir()
     (project / "example.com" / "tasks").mkdir(parents=True)
     (home / "example.com" / "tasks").mkdir(parents=True)
-    (subscription / "subsite.test").mkdir()
-    (subscription / "subsite.test" / "memory.md").write_text("# sub\n", encoding="utf-8")
+    (home / "memsite.test").mkdir()
+    (home / "memsite.test" / "memory.md").write_text("# mem\n", encoding="utf-8")
     (bundled / "bundled.test").mkdir()
     (bundled / "bundled.test" / "SKILL.md").write_text("# ignored without tasks/memory\n", encoding="utf-8")
 
     monkeypatch.setattr(discovery, "site_skills_roots", lambda: [project, home])
     monkeypatch.setattr(discovery, "_bundled_root", lambda: bundled)
-    monkeypatch.setattr(
-        "browserwright.subscriptions.iter_subscription_site_roots",
-        lambda: [subscription],
-    )
 
     dirs = discovery._iter_site_dirs()
 
-    assert [d.name for d in dirs] == ["example.com", "subsite.test"]
+    assert [d.name for d in dirs] == ["example.com", "memsite.test"]
     assert dirs[0].parent == project
 
 

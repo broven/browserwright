@@ -1,7 +1,7 @@
 """Reusable daemon + Chrome for Testing launch logic.
 
-Extracted from conftest.py so both v1 fixtures and v2 agent-e2e hooks can
-call the same functions without duplicating code.
+Extracted from conftest.py so fixtures can call the same functions without
+duplicating code.
 """
 from __future__ import annotations
 

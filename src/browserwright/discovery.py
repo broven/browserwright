@@ -17,15 +17,12 @@ def _bundled_root() -> Path:
 
 
 def _iter_site_dirs() -> list[Path]:
-    """Project → ``$BS_HOME`` → subscriptions → bundled, dedup by site name.
+    """Project → ``$BS_HOME`` → bundled, dedup by site name.
 
     The order encodes the precedence promise: project workspace is always
-    king, then per-user, then explicit subscriptions (the user opted in to
-    them by ``browserwright sub add``), then the bundled starter set as
-    fallback.
+    king, then per-user, then the bundled starter set as fallback.
     """
-    from .subscriptions import iter_subscription_site_roots
-    roots = [*site_skills_roots(), *iter_subscription_site_roots(), _bundled_root()]
+    roots = [*site_skills_roots(), _bundled_root()]
     seen: set[str] = set()
     out: list[Path] = []
     for root in roots:
@@ -187,7 +184,7 @@ def list_tasks(*, site: Optional[str] = None, query: Optional[str] = None,
 
 def find_task_path(site: str, name: str) -> Path:
     """Return absolute path to ``site-skills/<site>/tasks/<name>.py``,
-    consulting project → $BS_HOME → subscriptions → bundled in that order.
+    consulting project → $BS_HOME → bundled in that order.
     Raises ``FileNotFoundError``.
 
     Site-name normalisation (Bug 1, v0.3.1): if the literal ``site`` arg
@@ -196,11 +193,8 @@ def find_task_path(site: str, name: str) -> Path:
     invocation) and still hit the eTLD+1-named bundled directory
     (``ycombinator.com``).
     """
-    from .subscriptions import iter_subscription_site_roots
     from .memory.site_mem import host_stem
-    roots = (*site_skills_roots(),
-             *iter_subscription_site_roots(),
-             _bundled_root())
+    roots = (*site_skills_roots(), _bundled_root())
     candidates: list[str] = [site]
     stem = host_stem(site)
     if stem and stem != site:
