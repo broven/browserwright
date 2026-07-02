@@ -23,8 +23,6 @@ Chrome / extension / RDP / cloud browser
 - `tests/skill/` covers the agent-facing CLI, sessions, primitives, memory,
   tasks, install flows, and skill guidance.
 - `tests/daemon/e2e/` covers real Chrome plus the unpacked extension and daemon.
-- `tests/skill/agent-e2e/` covers promptfoo/Claude SDK agent workflows and the
-  local harness around them.
 - `evals/` covers text-level command-choice behavior for the skill docs.
 
 ## Fast Local Gate
@@ -32,16 +30,14 @@ Chrome / extension / RDP / cloud browser
 Run this before handing off ordinary code changes:
 
 ```bash
-uv run pytest tests/daemon tests/skill --ignore=tests/skill/agent-e2e -q
+uv run pytest tests/daemon tests/skill -q
 python3 evals/run.py --mock
 ```
 
-`tests/skill/agent-e2e` has its own dependencies and should be run separately.
-
 > Working from a fresh checkout on a host that already runs a global
 > `browserwright` install plus a loaded Chrome extension? Read
-> [ONBOARDING.md → Independent local dev — never touch global
-> state](ONBOARDING.md#independent-local-dev--never-touch-global-state)
+> [docs/architecture.md → Independent local dev — never touch global
+> state](docs/architecture.md#independent-local-dev--never-touch-global-state)
 > first. It covers daemon socket / port isolation, loading a patched
 > copy of the extension into a throwaway Chrome profile, and the env
 > overrides every command below assumes.
@@ -73,7 +69,7 @@ Use this when changing `src/browserwright/` outside the daemon, the skill-facing
 CLI, session registry/runtime, primitives, memory, tasks, or install flows:
 
 ```bash
-uv run pytest tests/skill --ignore=tests/skill/agent-e2e -q
+uv run pytest tests/skill -q
 ```
 
 Representative areas:
@@ -107,24 +103,6 @@ Prerequisite if Chrome for Testing is not already installed:
 npx @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing
 ```
 
-## Agent E2E
-
-Use this when changing the skill instructions, agent harness, promptfoo cases,
-or high-level agent workflow expectations:
-
-```bash
-cd tests/skill/agent-e2e
-PROMPTFOO_PYTHON=.venv-agent-e2e/bin/python \
-PROMPTFOO_PYTHON_TIMEOUT=600000 \
-  npx promptfoo eval -c promptfooconfig.yaml --no-cache
-```
-
-View results with:
-
-```bash
-npx promptfoo view
-```
-
 ## Skill Evals
 
 Use this when changing `skill/SKILL.md`, examples, command-choice guidance, or
@@ -145,7 +123,7 @@ python3 evals/run.py --case cu-01
 For most changes:
 
 ```bash
-uv run pytest tests/daemon tests/skill --ignore=tests/skill/agent-e2e -q
+uv run pytest tests/daemon tests/skill -q
 python3 evals/run.py --mock
 ```
 
@@ -155,5 +133,5 @@ For daemon/proxy/extension changes, add:
 tests/daemon/e2e/run.sh -v
 ```
 
-For release-like confidence, run the fast gate, real Chrome E2E, skill evals,
-and the agent E2E suite.
+For release-like confidence, run the fast gate, real Chrome E2E, and the skill
+evals.

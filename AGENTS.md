@@ -11,7 +11,7 @@ mise run install             # uv sync --extra ux (deps + dev group)
 mise run test                # fast gate: daemon + skill + skill evals
 ```
 
-See **[ONBOARD.md](ONBOARD.md)** for the full local dev loop, **[ONBOARDING.md](ONBOARDING.md)**
+See **[ONBOARD.md](ONBOARD.md)** for the full local dev loop, **[docs/architecture.md](docs/architecture.md)**
 for architecture orientation, **[TESTING.md](TESTING.md)** for the test-suite map, and
 **[RELEASING.md](RELEASING.md)** for cutting a release, fixing the PyPI publish, and updating the global install.
 `mise tasks` lists every verb (install / dev / test[:daemon|:skill|:evals|:e2e] / lint / build / dev-link / upgrade-global / …).

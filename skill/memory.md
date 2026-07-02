@@ -11,7 +11,6 @@ The agent reads this file on every browserwright invocation. It carries two thin
 |---|---|---|
 | `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=rdp --create --name=task-label)` then run `browserwright -s "$sid" -e '...'` |
 | `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve` (one global daemon) then load the bundled `chrome-extension/` directory |
-| `cloud` | Hosted/remote Chrome (Browser Use, Browserless, Hyperbrowser) | `browserwright-daemon serve --provider <name>` + provider auth env vars |
 | `env` | An externally-owned browser via a CDP URL you supply (e.g. an anti-detect / fingerprint profile) — attach-owned, never closed on `session end` | Start the daemon against it: `BD_CDP_WS=ws://... browserwright-daemon serve --backend env` (or `BD_CDP_URL=http://host:port` for `/json/version` discovery), then `sid=$(browserwright session new --backend=env --name=task-label)` and `browserwright -s "$sid" -e '...'` |
 
 ## User preference
