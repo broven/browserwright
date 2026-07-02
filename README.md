@@ -179,6 +179,16 @@ external profiles with N isolated daemons — each with its own `XDG_RUNTIME_DIR
 (distinct socket), `--facade-port`, and `BD_CDP_WS`, one `env` session apiece.
 See [docs/session-workspaces.md](docs/session-workspaces.md) §"Env Backend".
 
+**Reaching the facade from another machine (Tailscale/LAN):** the Playwright
+facade binds `127.0.0.1` by default and is *never* exposed off-box unless you
+opt in. Pass `--facade-host <tailnet-ip>` (or `BD_FACADE_HOST` / `facade_host`
+in config.toml; `0.0.0.0` to bind all interfaces) and a remote client can
+`connect_over_cdp("http://<tailnet-ip>:19990/cdp")` — the facade's
+`/json/version` bootstrap rewrites the advertised `webSocketDebuggerUrl` from
+the request's `Host` header, so the ws URL points back at the address the
+client actually used. No auth is added, so only bind an interface you trust
+(a Tailscale IP is private to your tailnet).
+
 ### Userscripts
 
 Author Tampermonkey-style scripts the `extension` backend injects on matching sites:

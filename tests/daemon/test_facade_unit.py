@@ -57,6 +57,45 @@ async def test_json_list_payload(facade):
             f"ws://127.0.0.1:{port}{FACADE_WS_PATH}")
 
 
+async def test_json_version_uses_request_host_header(facade):
+    # Feature 2: a client that reached us over Tailscale/LAN gets a ws URL that
+    # points back at the authority IT used (the Host header), not the bound
+    # loopback host. Mirrors CloakBrowser's discovery rewrite.
+    port = facade.port
+    tailnet = "100.72.20.32:29990"
+    body = await _get_json(
+        f"http://127.0.0.1:{port}/json/version", host=tailnet)
+    assert body["webSocketDebuggerUrl"] == f"ws://{tailnet}{FACADE_WS_PATH}"
+
+
+async def test_json_list_uses_request_host_header(facade):
+    port = facade.port
+    tailnet = "100.72.20.32:29990"
+    for path in ("/json", "/json/list"):
+        body = await _get_json(f"http://127.0.0.1:{port}{path}", host=tailnet)
+        assert body[0]["webSocketDebuggerUrl"] == f"ws://{tailnet}{FACADE_WS_PATH}"
+
+
+async def test_json_version_tolerates_trailing_slash(facade):
+    # Playwright's `connect_over_cdp("http://host:port")` probes
+    # `/json/version/` (trailing slash) — the bootstrap must still answer it.
+    port = facade.port
+    body = await _get_json(f"http://127.0.0.1:{port}/json/version/")
+    assert body["webSocketDebuggerUrl"] == f"ws://127.0.0.1:{port}{FACADE_WS_PATH}"
+
+
+def test_ws_url_falls_back_to_configured_host_when_no_authority():
+    # No Host header (e.g. a hand-rolled probe) → fall back to the configured
+    # bind host:port so the advertised URL is still well-formed.
+    f = PlaywrightFacade(cfg=Config(backend="rdp"), port=29990, host="0.0.0.0")
+    assert f._ws_url() == f"ws://0.0.0.0:29990{FACADE_WS_PATH}"
+    assert f._version_payload()["webSocketDebuggerUrl"] == (
+        f"ws://0.0.0.0:29990{FACADE_WS_PATH}")
+    # An explicit authority (from the Host header) always wins.
+    assert f._ws_url(authority="host.example:1234") == (
+        f"ws://host.example:1234{FACADE_WS_PATH}")
+
+
 async def test_stop_is_idempotent(facade):
     await facade.stop()
     await facade.stop()  # second stop is a no-op, must not raise
@@ -155,11 +194,16 @@ async def test_facade_unknown_session_fails_closed():
     assert conn.closed == [(1008, "unknown browserwright session")]
 
 
-async def _get_json(url: str):
+async def _get_json(url: str, host: str | None = None):
     import asyncio
 
     def _fetch():
-        with urllib.request.urlopen(url, timeout=2) as resp:
+        # An explicit `host` overrides the Host header the facade reads to
+        # rewrite the advertised ws URL (simulates a remote/Tailscale client).
+        req = urllib.request.Request(url)
+        if host is not None:
+            req.add_header("Host", host)
+        with urllib.request.urlopen(req, timeout=2) as resp:
             assert resp.status == 200
             return json.loads(resp.read().decode("utf-8"))
 

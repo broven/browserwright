@@ -177,6 +177,12 @@ port = 9222
 # 覆盖 daemon 内 extension relay ws server 的绑定地址（默认 ws://127.0.0.1:19989）
 # 默认 19989 是为了跟 playwriter (19988) 共存；如需进一步避冲突再调整
 relay_url = "ws://127.0.0.1:19989"
+
+# Playwright facade 的绑定 host/port（默认 127.0.0.1:19990，loopback，绝不会误暴露）。
+# 想让别的机器（例如经 Tailscale）`connect_over_cdp` 进来时，把 facade_host 设成
+# 对应网卡 IP 或 0.0.0.0。优先级：CLI `--facade-host` > `BD_FACADE_HOST` > 此 toml key。
+facade_host = "127.0.0.1"
+facade_port = 19990
 ```
 
 > **fallback_chain 已撤掉**：v0.1 README 曾文档化 `fallback_chain = [...]`
@@ -200,6 +206,8 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
 | `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
 | `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988；e2e 测试用它隔离（29989）|
+| `BD_FACADE_PORT` | Playwright facade 的绑定端口。优先级：CLI `--facade-port` > `BD_FACADE_PORT` > toml `facade_port` > 默认 19990。`0` = 显式关闭 facade |
+| `BD_FACADE_HOST` | Playwright facade 的绑定 host（默认 `127.0.0.1`，loopback）。优先级：CLI `--facade-host` > `BD_FACADE_HOST` > toml `facade_host` > 默认。设成 Tailscale/LAN IP 或 `0.0.0.0` 让别的机器 `connect_over_cdp` 进来；facade 的 `/json/version` 会按请求的 `Host` 头回填 `webSocketDebuggerUrl`，远端拿到的就是它自己用的地址 |
 | `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE` | EXPERT ESCAPE：绕过 launch-chrome 拒绝用户 default profile 的 guard。truthy 值 `1`/`true`/`yes`/`on`/`y`（case-insensitive）unlock。**仅当你完全理解会永久暴露日常 Chrome 给 CDP popup hazard 时** |
 | `BD_LOG_JSON` | `1` / `true` / `yes` → daemon log 输出 JSON 行（`{ts, level, logger, msg, extra?, exc_info?}`），方便日志聚合器消费。默认 plaintext |
 

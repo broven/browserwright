@@ -119,7 +119,8 @@ which port is which:
 |---|---|---|---|
 | extension relay port | 19989 | 29989 | `BD_EXTENSION_PORT` / `--extension-port` |
 | rdp port | 9222 | 29990 | `BD_RDP_PORT` / `--port` |
-| Playwright facade port | 19990 | 29993 (extension) / 29994 (rdp) | `--facade-port` |
+| Playwright facade port | 19990 | 29993 (extension) / 29994 (rdp) | `--facade-port` / `BD_FACADE_PORT` |
+| Playwright facade host | `127.0.0.1` (loopback) | tailnet/LAN IP or `0.0.0.0` to reach off-box | `--facade-host` / `BD_FACADE_HOST` |
 | daemon socket dir | `${XDG_RUNTIME_DIR:-/tmp}` | `$(mktemp -d)` | `XDG_RUNTIME_DIR` |
 | daemon TOML config | `~/.config/browserwright-daemon/config.toml` | none | `BD_CONFIG=""` |
 | skill home | `~/.browserwright/` | tmpdir | `BS_HOME` |

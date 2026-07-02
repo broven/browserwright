@@ -14,7 +14,12 @@ import json
 from datetime import timedelta
 
 from browserwright.daemon import _ipc
-from browserwright.daemon.config import DEFAULT_FACADE_PORT, Config
+from browserwright.daemon.config import (
+    DEFAULT_FACADE_HOST,
+    DEFAULT_FACADE_PORT,
+    Config,
+    load,
+)
 
 
 # ---- Config.resolved_facade_port() tri-state -------------------------------
@@ -45,6 +50,37 @@ def test_facade_port_load_default_is_none(monkeypatch):
     assert cfg_off.resolved_facade_port() is None
     cfg_ov = load(env={"BD_FACADE_PORT": "29991"})
     assert cfg_ov.resolved_facade_port() == 29991
+
+
+# ---- facade_host config precedence -----------------------------------------
+
+
+def test_facade_host_defaults_to_loopback():
+    # Never exposed by accident: the default bind host stays loopback.
+    assert Config().facade_host == DEFAULT_FACADE_HOST == "127.0.0.1"
+    assert load(env={}).facade_host == "127.0.0.1"
+
+
+def test_facade_host_precedence_cli_over_env_over_toml(tmp_path):
+    # Mirrors facade_port: CLI > env > toml > default.
+    cfg_path = tmp_path / "daemon.toml"
+    cfg_path.write_text('facade_host = "10.0.0.1"\n')
+
+    # toml only
+    cfg_toml = load(cli_config_path=str(cfg_path), env={})
+    assert cfg_toml.facade_host == "10.0.0.1"
+
+    # env tops toml
+    cfg_env = load(cli_config_path=str(cfg_path), env={"BD_FACADE_HOST": "10.0.0.2"})
+    assert cfg_env.facade_host == "10.0.0.2"
+
+    # CLI tops env + toml
+    cfg_cli = load(
+        cli_config_path=str(cfg_path),
+        cli_facade_host="100.72.20.32",
+        env={"BD_FACADE_HOST": "10.0.0.2"},
+    )
+    assert cfg_cli.facade_host == "100.72.20.32"
 
 
 def test_session_idle_prune_loads_from_toml_and_env(tmp_path):

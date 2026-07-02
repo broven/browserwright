@@ -158,13 +158,25 @@ class PlaywrightFacade:
         `webSocketDebuggerUrl: ws://host/cdp`; `connect_over_cdp("ws://...")`
         also accepts an `http://` URL it resolves via this route. We answer
         `/json/version`, `/json`, and `/json/list` (the latter two are cheap
-        and some CDP clients probe them)."""
+        and some CDP clients probe them).
+
+        The advertised `webSocketDebuggerUrl` is derived from the incoming
+        request's `Host` header so a client that reached us over Tailscale/LAN
+        gets a ws URL that points back at the same authority it just used —
+        exactly what CloakBrowser does. We only fall back to the configured
+        `host:port` when no Host header is present (e.g. a hand-rolled probe)."""
         path = (request.path or "/").split("?", 1)[0]
+        # Playwright's `connect_over_cdp("http://host:port")` probes
+        # `.../json/version/` WITH a trailing slash; normalize it away so the
+        # http bootstrap form works, not just the direct `ws://.../cdp` form.
+        if len(path) > 1:
+            path = path.rstrip("/")
         session_id = self._session_for_request(request)
+        authority = self._authority_from_request(request)
         if path == "/json/version":
-            return self._http_json(conn, self._version_payload(session_id))
+            return self._http_json(conn, self._version_payload(session_id, authority))
         if path in ("/json", "/json/list"):
-            return self._http_json(conn, self._list_payload(session_id))
+            return self._http_json(conn, self._list_payload(session_id, authority))
         # Anything else (e.g. the /cdp ws upgrade) falls through to the ws
         # handler. Return None to allow the upgrade.
         return None
@@ -180,22 +192,40 @@ class PlaywrightFacade:
         qs = parse_qs(urlparse(request.path or "/").query)
         return (qs.get("session") or [None])[0]
 
-    def _ws_url(self, session_id: str | None = None) -> str:
+    def _authority_from_request(self, request) -> str | None:
+        """Return the `Host` header (``host[:port]``) the client used to reach
+        us, or None when absent. Drives the advertised ws so a remote client
+        that connected over Tailscale/LAN gets a ws URL that points back at the
+        same authority (not a hardcoded loopback it can't reach)."""
+        try:
+            host = request.headers.get("Host")
+        except (AttributeError, KeyError):
+            return None
+        host = (host or "").strip()
+        return host or None
+
+    def _ws_url(self, session_id: str | None = None,
+                authority: str | None = None) -> str:
+        # Prefer the incoming request's Host (already `host[:port]`); fall back
+        # to the configured bind host:port when no Host header was sent.
+        netloc = authority or f"{self._host}:{self._port}"
         suffix = ""
         if session_id:
             from urllib.parse import quote
             suffix = f"?session={quote(session_id, safe='')}"
-        return f"ws://{self._host}:{self._port}{FACADE_WS_PATH}{suffix}"
+        return f"ws://{netloc}{FACADE_WS_PATH}{suffix}"
 
-    def _version_payload(self, session_id: str | None = None) -> dict:
+    def _version_payload(self, session_id: str | None = None,
+                         authority: str | None = None) -> dict:
         return {
             "Browser": f"Browserwright/{__version__}",
             "Protocol-Version": "1.3",
             "User-Agent": f"Browserwright facade {__version__}",
-            "webSocketDebuggerUrl": self._ws_url(session_id),
+            "webSocketDebuggerUrl": self._ws_url(session_id, authority),
         }
 
-    def _list_payload(self, session_id: str | None = None) -> list:
+    def _list_payload(self, session_id: str | None = None,
+                      authority: str | None = None) -> list:
         # The browser-level endpoint is what Playwright wants; per-page targets
         # are discovered via Target.* over the ws once connected. We advertise a
         # single synthetic "browser" entry pointing at our ws.
@@ -203,7 +233,7 @@ class PlaywrightFacade:
             "type": "browser",
             "title": "Browserwright",
             "url": "",
-            "webSocketDebuggerUrl": self._ws_url(session_id),
+            "webSocketDebuggerUrl": self._ws_url(session_id, authority),
         }]
 
     # ---- ws passthrough --------------------------------------------------

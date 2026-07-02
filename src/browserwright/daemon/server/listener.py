@@ -290,10 +290,15 @@ async def run_serve(cfg: Config) -> int:
                 return shared_context.holder.relay
 
             facade = PlaywrightFacade(cfg=cfg, port=facade_port,
+                                      host=cfg.facade_host,
                                       relay_getter=_shared_relay,
                                       daemon=daemon)
             bound = await facade.start()
-            facade_ws = f"ws://127.0.0.1:{bound}/cdp"
+            # Advertise the bound host so `status`/skill discovery report a
+            # reachable ws (loopback by default; a tailnet/LAN IP when
+            # `--facade-host` opts in). Remote clients still get the real
+            # incoming Host echoed back via the facade's HTTP bootstrap.
+            facade_ws = f"ws://{cfg.facade_host}:{bound}/cdp"
             # Advertise the bound ws so the skill layer can discover it (Phase C
             # auto-enable). Best-effort: a write failure must not abort serving.
             with contextlib.suppress(Exception):

@@ -108,6 +108,16 @@ def _build_parser() -> argparse.ArgumentParser:
               "(default: ON at 19990; pass 0 to disable). Lets a real "
               "Playwright client `connect_over_cdp(ws://127.0.0.1:N/cdp)` and "
               "the skill heredoc `page`/`context` drive the resolved Chrome."))
+    # Facade bind host. Defaults to loopback (127.0.0.1) — the facade is NEVER
+    # reachable off-box unless you opt in here. Set a Tailscale/LAN IP (or
+    # 0.0.0.0) to let a remote Playwright client connect_over_cdp. Equivalent to
+    # BD_FACADE_HOST env or `facade_host` in config.toml.
+    p_serve.add_argument(
+        "--facade-host", type=str, default=None, metavar="HOST",
+        help=("bind the Playwright-facing CDP facade on this host "
+              "(default: 127.0.0.1 / loopback). Set a Tailscale/LAN IP or "
+              "0.0.0.0 to reach it from another machine. Equivalent to "
+              "BD_FACADE_HOST env or `facade_host` in config.toml."))
 
     # stop (v0.2)
     p_stop = sub.add_parser("stop", help="stop the running daemon")
@@ -283,6 +293,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         help=argparse.SUPPRESS)
     p_inst.add_argument("--extension-port", type=int, default=None, metavar="N",
                         help="override the relay ws port (default 19989)")
+    p_inst.add_argument("--facade-port", type=int, default=None, metavar="N",
+                        help="override the Playwright facade port (default 19990)")
+    p_inst.add_argument(
+        "--facade-host", type=str, default=None, metavar="HOST",
+        help=("bind the Playwright facade on this host (default 127.0.0.1 / "
+              "loopback). Set a Tailscale/LAN IP or 0.0.0.0 to reach the "
+              "installed daemon's facade from another machine."))
     p_inst.add_argument("--force", action="store_true",
                         help="replace an existing LaunchAgent with the same name")
 
@@ -329,6 +346,7 @@ def _cfg_from_args(args) -> Config:
         # per subcommand, so getattr-with-default keeps non-serve calls clean.
         cli_extension_port=getattr(args, "extension_port", None),
         cli_facade_port=getattr(args, "facade_port", None),
+        cli_facade_host=getattr(args, "facade_host", None),
     )
 
 
@@ -949,7 +967,9 @@ def _resolve_browserwright_daemon_bin() -> str:
     )
 
 
-def _build_plist(*, extension_port: int | None) -> str:
+def _build_plist(*, extension_port: int | None,
+                 facade_host: str | None = None,
+                 facade_port: int | None = None) -> str:
     """Emit the plist content. Kept inline (no XML lib) — the schema is
     fixed + tiny, and we avoid a dependency. Every interpolated value passes
     through ``xml.sax.saxutils.escape``. Pure: no side effects — the caller is
@@ -959,6 +979,10 @@ def _build_plist(*, extension_port: int | None) -> str:
     args = [bin_path, "serve"]
     if extension_port is not None:
         args += ["--extension-port", str(extension_port)]
+    if facade_port is not None:
+        args += ["--facade-port", str(facade_port)]
+    if facade_host is not None:
+        args += ["--facade-host", str(facade_host)]
     log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
     stdout_path = f"{log_dir}/browserwright-daemon.stdout.log"
     stderr_path = f"{log_dir}/browserwright-daemon.stderr.log"
@@ -1030,7 +1054,11 @@ def _cmd_install(args, cfg: Config) -> int:
     # `_build_plist` so the generator stays pure / unit-testable (N-1).
     log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
     os.makedirs(log_dir, exist_ok=True)
-    content = _build_plist(extension_port=args.extension_port)
+    content = _build_plist(
+        extension_port=args.extension_port,
+        facade_host=getattr(args, "facade_host", None),
+        facade_port=getattr(args, "facade_port", None),
+    )
     # If --force and the plist exists, unload the old one first so launchctl
     # picks up the new ProgramArguments cleanly.
     if plist_path.exists():
@@ -1049,6 +1077,8 @@ def _cmd_install(args, cfg: Config) -> int:
         "label": label,
         "plist": str(plist_path),
         "extension_port": args.extension_port,
+        "facade_host": getattr(args, "facade_host", None),
+        "facade_port": getattr(args, "facade_port", None),
     }, sort_keys=True))
     return 0
 

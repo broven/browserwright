@@ -29,6 +29,12 @@ _NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 # re-exports it for backwards compat.
 DEFAULT_FACADE_PORT = 19990
 
+# Default bind host for the Playwright-facing CDP facade. Stays loopback so the
+# facade is NEVER reachable off-box by accident; override via `--facade-host` /
+# `BD_FACADE_HOST` / `facade_host` in config.toml to bind a Tailscale/LAN
+# interface (e.g. `0.0.0.0` or a specific tailnet IP) for remote CDP clients.
+DEFAULT_FACADE_HOST = "127.0.0.1"
+
 
 def check_name(name: str) -> str:
     """Path-traversal guard for filesystem-bound names (e.g. `--profile`)."""
@@ -116,6 +122,11 @@ class Config:
     #   - >0            -> explicit override port (CLI/env/toml).
     # Use `resolved_facade_port()` to collapse this to "bind / don't bind".
     facade_port: int | None = None
+    # Bind host for the Playwright facade. Defaults to loopback (never exposed by
+    # accident); set to a Tailscale/LAN IP or `0.0.0.0` to reach it off-box.
+    # Precedence mirrors facade_port: CLI `--facade-host` > `BD_FACADE_HOST` env
+    # > toml `facade_host` > DEFAULT_FACADE_HOST.
+    facade_host: str = DEFAULT_FACADE_HOST
     backends: BackendsConfig = field(default_factory=BackendsConfig)
     # Provenance for `env`: which alias key actually fired. Diagnostic-only.
     cdp_ws_source: str | None = None       # "BD_CDP_WS" | "BU_CDP_WS" | None
@@ -156,6 +167,7 @@ def load(
     cli_config_path: str | None = None,
     cli_extension_port: int | None = None,
     cli_facade_port: int | None = None,
+    cli_facade_host: str | None = None,
     env: dict[str, str] | None = None,
 ) -> Config:
     """Build a Config from CLI flags + env + optional toml file.
@@ -213,6 +225,9 @@ def load(
     # Playwright facade port (phase A1). toml key `facade_port`.
     if "facade_port" in toml and isinstance(toml["facade_port"], int):
         cfg.facade_port = toml["facade_port"]
+    # Playwright facade bind host. toml key `facade_host`.
+    if "facade_host" in toml and isinstance(toml["facade_host"], str):
+        cfg.facade_host = toml["facade_host"]
 
     # env level — BD_* wins over BU_*
     if "BD_TIMEOUT" in e:
@@ -317,6 +332,10 @@ def load(
             from .errors import UserError
             raise UserError(
                 f"BD_FACADE_PORT must be an integer, got {e['BD_FACADE_PORT']!r}")
+    # Playwright facade bind host via env. Symmetric to BD_FACADE_PORT — set
+    # BD_FACADE_HOST=<tailnet-ip>/0.0.0.0 to reach the facade off-box.
+    if "BD_FACADE_HOST" in e:
+        cfg.facade_host = e["BD_FACADE_HOST"]
 
     # CLI level — last word
     if cli_backend is not None:
@@ -333,5 +352,8 @@ def load(
     if cli_facade_port is not None:
         # Phase A1: CLI `--facade-port` tops env / toml.
         cfg.facade_port = cli_facade_port
+    if cli_facade_host is not None:
+        # CLI `--facade-host` tops env / toml.
+        cfg.facade_host = cli_facade_host
 
     return cfg
