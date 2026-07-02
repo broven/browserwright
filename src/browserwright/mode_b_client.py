@@ -30,7 +30,6 @@ import json
 import os
 import socket
 import subprocess
-import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -244,34 +243,6 @@ class ModeBClient:
     # (subscribeFocus, uiState) require a live ws and are handled inside
     # CDPSession instead.
 
-    def active_tab(self) -> Optional[dict]:
-        """Best-guess user-active tab via the ``browserwright-daemon active-tab``
-        CLI subcommand; the ws-based ``BrowserwrightDaemon.getActiveTab`` RPC is
-        wired into ``Session`` when a CDP connection is up."""
-        if not self._session_id:
-            return None
-        try:
-            proc = subprocess.run(
-                ["browserwright-daemon", "active-tab", "--json",
-                 "--session", self._session_id],
-                capture_output=True, text=True, timeout=8,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return None
-        try:
-            data = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return None
-        return {
-            "targetId": data.get("targetId"),
-            "url": data.get("url", ""),
-            "title": data.get("title", ""),
-            "accuracy": data.get("accuracy", "unknown"),
-            "since_seconds": data.get("since_seconds"),
-        }
-
     def attach_active(self) -> Optional[dict]:
         """v0.5.4: ask the daemon's extension backend to attach the
         currently-focused-window active tab — bypasses the popup click.
@@ -298,21 +269,6 @@ class ModeBClient:
             return json.loads(proc.stdout)
         except json.JSONDecodeError:
             return None
-
-    def disconnect_upstream(self, reason: str = "skill_idle") -> bool:
-        """Ask the daemon to close its upstream ws (banner disappears) but
-        keep our socket alive. Used by REPL idle policy."""
-        if not self._session_id:
-            return False
-        try:
-            proc = subprocess.run(
-                ["browserwright-daemon", "disconnect",
-                 "--reason", reason, "--session", self._session_id],
-                capture_output=True, text=True, timeout=5,
-            )
-            return proc.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
 
     # ---- Phase B: open_background / close_tab CLI shims ---------------
 

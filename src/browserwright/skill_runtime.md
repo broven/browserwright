@@ -175,7 +175,7 @@ These run without driving the browser:
 
 - `http_get(url, ...)` — fetch a URL directly (escape hatch, no tab).
 - `remember(...)`, `remember_global(...)`, `remember_preference(...)`, `memory_read(...)` — site / global memory.
-- `list_site_skills(...)`, `load_site_skill(...)`, `run_task(...)`, `run_tasks_concurrent(...)`, `bootstrap_site(...)` — the task / site-skill layer.
+- `list_site_skills(...)`, `load_site_skill(...)`, `run_task(...)`, `bootstrap_site(...)` — the task / site-skill layer.
 
 ## Site Memory
 

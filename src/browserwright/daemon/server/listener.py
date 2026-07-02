@@ -637,7 +637,7 @@ class _UpstreamHolder:
         # profile `bs-s{id}`). We record the launched process's pid + profile
         # dir here so teardown can SIGTERM it and so orphan-cleanup can spot
         # leftover `bs-s*` profiles after a crash. None on every other backend
-        # (the extension/env/cloud holders never own a Chrome process).
+        # (the extension/env holders never own a Chrome process).
         self.session_id: str | None = session_id
         self.rdp_pid: int | None = None
         self.rdp_profile_dir: str | None = None
@@ -713,7 +713,7 @@ class _UpstreamHolder:
                     # Phase 3: an rdp context owns its Chrome. Launch it (once)
                     # BEFORE the resolve/connect path runs, so the cfg's pinned
                     # rdp port is actually listening when `_open_chrome_upstream`
-                    # → resolve() probes it. Other rdp callers (env/cloud share
+                    # → resolve() probes it. Other rdp callers (env shares
                     # `_open_chrome_upstream` too) skip this — only a holder with
                     # a session_id + rdp backend owns a Chrome.
                     if (cfg.backend == "rdp" and self.session_id is not None
@@ -744,41 +744,20 @@ class _UpstreamHolder:
                 logger.warning("drain pre-open buffers failed: %r", e)
 
     async def _open_chrome_upstream(self, cfg: Config) -> None:
-        # Mark this resolve as Mode-B-originated. Reserved for future
-        # backends that need to diverge per call site (Mode A short-conn
-        # vs Mode B long-running daemon).
-        from .. import resolver as _resolver_mod
-        ctx_token = _resolver_mod.caller_context.set("mode_b_serve")
         try:
             rr = await resolve(cfg)
         except Unavailable as e:
             logger.warning("upstream resolve failed: %s", e)
             self.state.last_close_reason = "backend_lost"
             await self.state.set_disconnected()
-            _resolver_mod.caller_context.reset(ctx_token)
             raise
-        _resolver_mod.caller_context.reset(ctx_token)
-
-        # v0.5: when backend=cloud, ask the cloud config's AuthProvider to
-        # produce headers + ssl_context for the upstream ws handshake. For
-        # every other backend (env/rdp) the provider is None and connect
-        # runs unchanged.
-        additional_headers: dict[str, str] = {}
-        ssl_context = None
-        if cfg.backend == "cloud":
-            additional_headers, ssl_context = await self._build_cloud_auth(cfg)
 
         try:
             conn = UpstreamConnection(
                 on_frame=self.router.forward_from_upstream,
                 on_close=self._on_upstream_closed,
             )
-            await conn.open(
-                rr.ws_url,
-                timeout=cfg.timeout,
-                additional_headers=additional_headers or None,
-                ssl_context=ssl_context,
-            )
+            await conn.open(rr.ws_url, timeout=cfg.timeout)
         except Exception as e:
             logger.warning("upstream open failed: %r", e)
             self.state.last_close_reason = "backend_lost"
@@ -875,28 +854,6 @@ class _UpstreamHolder:
                         pid, self.session_id)
         except (ProcessLookupError, PermissionError, OSError) as e:
             logger.debug("rdp Chrome pid %s already gone: %r", pid, e)
-
-    async def _build_cloud_auth(self, cfg: Config) -> tuple[dict[str, str], Any]:
-        """Build (headers, ssl_context) for the cloud backend's upstream
-        ws handshake. Pulls the AuthProvider from `cfg.backends.cloud`.
-
-        Errors at this layer are logged and converted to "no auth"
-        gracefully — the connect itself will then 401, which surfaces a
-        clear `backend_lost` close reason to clients.
-        """
-        from ..auth import build_auth_provider
-        from ..errors import UserError
-        cc = cfg.backends.cloud
-        if not cc.auth_kind:
-            return {}, None
-        try:
-            provider = build_auth_provider(cc.auth_kind, cc.auth)
-            headers = await provider.headers()
-            ssl_ctx = provider.ssl_context()
-            return headers, ssl_ctx
-        except UserError as e:
-            logger.warning("cloud auth misconfigured: %s", e)
-            return {}, None
 
     async def _open_extension_upstream(self, cfg: Config) -> None:
         """v0.4 extension backend: the daemon IS the upstream.

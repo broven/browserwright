@@ -4,8 +4,8 @@
 Feeds [skill content + a "you have browserwright loaded" preamble] + [a task
 prompt] to an agent runner, captures the agent's TEXT reply, and scores it with
 the two-tier gate in judge.py. It does NOT launch a real browser — that cheap,
-deterministic text scoring is the point, complementary to the live e2e suites
-(browserwright-daemon/tests/e2e, browserwright/tests/agent-e2e).
+deterministic text scoring is the point, complementary to the live e2e suite
+(tests/daemon/e2e).
 
 Usage:
     python3 evals/run.py                       # real run via codex (default)

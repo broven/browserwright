@@ -9,23 +9,16 @@ from __future__ import annotations
 from typing import Callable
 
 from .base import Backend
-from .env import EnvBackend
-from .rdp import RdpBackend
+from .cdp import EnvBackend, RdpBackend
 from .extension import ExtensionBackend
-from .cloud import CloudBackend
 
 
 # (name, factory) — factories take a Config and return a Backend instance.
 # Order is the documented fallback order: cheapest + most explicit first.
-# `cloud` requires explicit config (endpoint + auth_kind) so we register it
-# at the end — `resolver.resolve()` skips it in the fallback chain via
-# the same exclusion list that also covers `extension`. Users must opt
-# in with `--backend cloud` or `BD_BACKEND=cloud`.
 _REGISTRY: list[tuple[str, Callable[..., Backend]]] = [
     ("env", EnvBackend),
     ("rdp", RdpBackend),
     ("extension", ExtensionBackend),
-    ("cloud", CloudBackend),
 ]
 
 

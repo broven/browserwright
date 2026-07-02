@@ -407,7 +407,7 @@ async def test_graceful_shutdown_closes_every_context_despite_errors(caplog):
 
 
 @pytest.mark.asyncio
-async def test_upstream_open_passes_headers_ssl_and_heartbeat_failure(monkeypatch):
+async def test_upstream_open_and_heartbeat_failure(monkeypatch):
     connect_calls: list[tuple[str, dict]] = []
     created: list[object] = []
 
@@ -430,20 +430,13 @@ async def test_upstream_open_passes_headers_ssl_and_heartbeat_failure(monkeypatc
     monkeypatch.setattr(upstream_mod.asyncio, "create_task", fake_create_task)
 
     conn = upstream_mod.UpstreamConnection(lambda text: asyncio.sleep(0), lambda reason: asyncio.sleep(0))
-    await conn.open(
-        "ws://localhost:9222/devtools/browser/x",
-        timeout=0.5,
-        additional_headers={"Authorization": "Bearer token"},
-        ssl_context="ssl-context",
-    )
+    await conn.open("ws://localhost:9222/devtools/browser/x", timeout=0.5)
 
     assert conn.is_open is True
     assert conn.ws_url == "ws://localhost:9222/devtools/browser/x"
     assert len(created) == 2
     assert connect_calls[0][0] == "ws://localhost:9222/devtools/browser/x"
     kwargs = connect_calls[0][1]
-    assert kwargs["additional_headers"] == [("Authorization", "Bearer token")]
-    assert kwargs["ssl"] == "ssl-context"
     assert kwargs["compression"] is None
     assert kwargs["max_size"] == 100 * 1024 * 1024
     assert upstream_mod.os.environ["NO_PROXY"] == "example.com"

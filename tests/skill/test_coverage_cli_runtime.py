@@ -252,63 +252,6 @@ def test_cmd_index_rejects_unknown_subcommand(capsys):
 @pytest.mark.parametrize(
     "args, expected",
     [
-        ([], "usage: browserwright sub"),
-        (["add"], "usage: browserwright sub add"),
-        (["remove"], "usage: browserwright sub remove"),
-        (["bogus"], "unknown sub subcommand"),
-    ],
-)
-def test_cmd_sub_usage_errors(args, expected, capsys):
-    from browserwright import cli
-
-    assert cli._cmd_sub(args) == 1
-    assert expected in capsys.readouterr().err
-
-
-def test_cmd_sub_surfaces_subscription_errors(monkeypatch, capsys):
-    from browserwright import cli, subscriptions
-
-    monkeypatch.setattr(
-        subscriptions,
-        "add",
-        lambda *a, **k: (_ for _ in ()).throw(subscriptions.SubscriptionError("bad clone")),
-    )
-    assert cli._cmd_sub(["add", "https://example.test/repo.git"]) == 1
-    assert "sub add failed: bad clone" in capsys.readouterr().err
-
-    monkeypatch.setattr(
-        subscriptions,
-        "update",
-        lambda *a, **k: (_ for _ in ()).throw(subscriptions.SubscriptionError("no git")),
-    )
-    assert cli._cmd_sub(["update"]) == 1
-    assert "sub update failed: no git" in capsys.readouterr().err
-
-    monkeypatch.setattr(
-        subscriptions,
-        "remove",
-        lambda *a, **k: (_ for _ in ()).throw(subscriptions.SubscriptionError("missing")),
-    )
-    assert cli._cmd_sub(["remove", "--name=old"]) == 1
-    assert "sub remove failed: missing" in capsys.readouterr().err
-
-
-def test_cmd_sub_update_error_status_returns_nonzero(monkeypatch, capsys):
-    from browserwright import cli, subscriptions
-
-    monkeypatch.setattr(
-        subscriptions,
-        "update",
-        lambda names=None: [{"name": "starter", "status": "error", "detail": "conflict"}],
-    )
-
-    assert cli._cmd_sub(["update", "--name=starter"]) == 1
-    assert "conflict" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    "args, expected",
-    [
         ([], "usage: browserwright memory"),
         (["show"], "specify --site=SITE or --global"),
         (["forget", "--global"], "usage: memory forget"),
@@ -504,12 +447,34 @@ def test_cmd_userscript_verify_binds_bd_session(monkeypatch, tmp_bs_home, capsys
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr("browserwright.mode_b_client.ModeBClient.is_alive", lambda self: False)
-    monkeypatch.setattr("browserwright.primitives.page.reload", lambda: {"ok": True})
-    monkeypatch.setattr("browserwright.primitives.inspect.capture_screenshot", lambda: "/tmp/shot.png")
+
+    # --verify drives the Playwright path: reload the bound page, screenshot
+    # it, print the path, and ALWAYS close the handle.
+    events = []
+
+    class FakePage:
+        def reload(self, *, wait_until=None):
+            events.append(("reload", wait_until))
+
+        def screenshot(self, *, path):
+            events.append(("screenshot", path))
+
+    class FakeHandle:
+        page = FakePage()
+
+        def close(self):
+            events.append(("close", None))
+
+    monkeypatch.setattr(
+        "browserwright.repl.playwright_handle.PlaywrightHandle", FakeHandle)
+    monkeypatch.setattr(cli, "_fresh_screenshot_path", lambda: "/tmp/shot.png")
 
     assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 0
     assert calls == [["browserwright-daemon", "userscript", "push", "script.js"]]
     assert capsys.readouterr().out == "/tmp/shot.png\n"
+    assert events == [
+        ("reload", "load"), ("screenshot", "/tmp/shot.png"), ("close", None),
+    ]
 
 
 def test_daemon_doctor_synthetic_for_spawn_failure(monkeypatch):
@@ -843,44 +808,6 @@ def test_session_registry_backend_immutability_leaves_record_unchanged(tmp_bs_ho
     assert rec["owner"] == "attach"
 
 
-def test_subscriptions_load_metadata_recovers_from_invalid_json(tmp_bs_home):
-    from browserwright import subscriptions
-
-    subscriptions.metadata_path().parent.mkdir(parents=True)
-    subscriptions.metadata_path().write_text("{bad json", encoding="utf-8")
-
-    assert subscriptions._load_metadata() == {"version": 1, "subs": {}}
-    assert subscriptions.list_all() == []
-
-
-def test_subscriptions_add_clone_failure_removes_partial_target(tmp_bs_home, monkeypatch):
-    from browserwright import subscriptions
-
-    monkeypatch.setattr(subscriptions, "_git_available", lambda: True)
-
-    def failed_clone(argv, **kwargs):
-        target = argv[-1]
-        subscriptions.Path(target).mkdir(parents=True)
-        return SimpleNamespace(returncode=9, stdout="", stderr="network down")
-
-    monkeypatch.setattr(subscriptions.subprocess, "run", failed_clone)
-
-    with pytest.raises(subscriptions.SubscriptionError) as exc:
-        subscriptions.add("https://example.test/repo.git", name="repo")
-
-    assert "git clone failed" in str(exc.value)
-    assert not (tmp_bs_home / "subscriptions" / "repo").exists()
-
-
-def test_subscriptions_update_missing_subscription_is_nonfatal(tmp_bs_home, monkeypatch):
-    from browserwright import subscriptions
-
-    monkeypatch.setattr(subscriptions, "_git_available", lambda: True)
-    subscriptions._save_metadata({"version": 1, "subs": {"gone": {"url": "u"}}})
-
-    assert subscriptions.update(["gone"]) == [{"name": "gone", "status": "missing"}]
-
-
 def test_task_runner_validate_args_defaults_and_required():
     from browserwright import task_runner
 
@@ -951,37 +878,17 @@ def test_task_runner_isolated_session_closes_after_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "isolated_session", lambda: fake_session)
     monkeypatch.setattr(session_mod, "with_session", lambda sess: FakeContext())
-    monkeypatch.setattr("browserwright.primitives.page.open", lambda url: events.append(("open", url)))
+    monkeypatch.setattr(
+        "browserwright.session_runtime.open_session_tab",
+        lambda sess, url: events.append(("open", sess, url)),
+    )
 
     assert task_runner.run_task("site", "ok", isolated=True) == "ok"
     assert events[0] == "enter"
     assert events[1][0] == "open"
-    assert events[1][1].startswith("data:text/html;charset=utf-8,<title>browserwright-isolated-")
+    assert events[1][1] is fake_session
+    assert events[1][2].startswith("data:text/html;charset=utf-8,<title>browserwright-isolated-")
     assert events[2:] == ["exit", "close"]
-
-
-def test_run_tasks_concurrent_uses_isolated_task_runner(monkeypatch):
-    from browserwright import multitask
-
-    calls = []
-
-    def fake_run_task(site, name, **kwargs):
-        calls.append((site, name, kwargs))
-        return f"{site}/{name}"
-
-    monkeypatch.setattr(multitask, "run_task", fake_run_task)
-
-    rows = multitask.run_tasks_concurrent([
-        ("a.test", "one", {"x": 1}),
-        ("b.test", "two", {"y": 2}),
-    ], max_workers=2)
-
-    assert [row["ok"] for row in rows] == [True, True]
-    assert [row["value"] for row in rows] == ["a.test/one", "b.test/two"]
-    assert calls == [
-        ("a.test", "one", {"isolated": True, "x": 1}),
-        ("b.test", "two", {"isolated": True, "y": 2}),
-    ]
 
 
 class _RuntimeCDP:

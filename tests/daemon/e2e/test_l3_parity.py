@@ -59,28 +59,29 @@ def _remove_session(ledger: Path, session_id: str) -> None:
     ledger.write_text(json.dumps(data), encoding="utf-8")
 
 
-# Phase C PR3 removed the page/tab primitives from the agent EXPORTS surface
-# (Playwright `page`/`context` now). This test still verifies the DAEMON's
-# cross-backend bookkeeping parity (targetId/groupId/tabId, current_tab,
-# list_tabs, close_tab), so it drives those via the internal primitive modules.
+# The legacy CDP primitives are deleted (the agent surface is Playwright
+# `page`/`context` now). This test still verifies the DAEMON's cross-backend
+# bookkeeping parity (targetId/groupId/tabId, current tab, tab enumeration,
+# closeTab), so it drives those via the internal session_runtime helpers.
 PARITY_SCRIPT = (
     "import json\n"
     "from browserwright.session import current_session\n"
-    "from browserwright.primitives.interact import js\n"
-    "from browserwright.primitives.page import (\n"
-    "    close_tab, current_tab, list_tabs, open, wait_for_load,\n"
+    "from browserwright.session_runtime import (\n"
+    "    close_session_tab, eval_js, open_session_tab, session_tabs,\n"
+    "    wait_for_ready,\n"
     ")\n"
-    "from browserwright.primitives.inspect import page_info\n"
-    f"tab = open({PAGE!r})\n"
-    "wait_for_load()\n"
-    "before = js(\"document.getElementById('h').textContent\")\n"
-    "js(\"document.getElementById('h').textContent = 'Q'; document.body.dataset.parity = 'yes'\")\n"
-    "after = js(\"document.getElementById('h').textContent\")\n"
-    "marker = js(\"document.body.dataset.parity\")\n"
-    "info = page_info()\n"
-    "current = current_tab()\n"
-    "tabs_before_close = list_tabs(include_chrome=False)\n"
-    "close = close_tab(target_id=tab['targetId'])\n"
+    "sess = current_session()\n"
+    f"tab = open_session_tab(sess, {PAGE!r})\n"
+    "wait_for_ready(sess)\n"
+    "before = eval_js(sess, \"document.getElementById('h').textContent\")\n"
+    "eval_js(sess, \"document.getElementById('h').textContent = 'Q'; document.body.dataset.parity = 'yes'\")\n"
+    "after = eval_js(sess, \"document.getElementById('h').textContent\")\n"
+    "marker = eval_js(sess, \"document.body.dataset.parity\")\n"
+    "info = eval_js(sess, \"({url: location.href, title: document.title, ready: document.readyState})\")\n"
+    "current = next((t for t in session_tabs(sess)"
+    " if t['targetId'] == sess.current_target_id), None)\n"
+    "tabs_before_close = session_tabs(sess, include_internal=False)\n"
+    "close = close_session_tab(sess, target_id=tab['targetId'])\n"
     "end_result = None\n"
     "if current_session().session_record.get('owner') == 'create':\n"
     "    from browserwright import session_create\n"

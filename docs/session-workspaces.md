@@ -136,7 +136,7 @@ Layer 2 calls and daemon IPC carry `session_id`. The daemon resolves the
 session record, reads its immutable backend, and chooses the correct upstream
 context:
 
-- `extension`, `env`, and `cloud` sessions use the shared daemon context.
+- `extension` and `env` sessions use the shared daemon context.
 - `rdp` sessions use a per-session `UpstreamContext`, created lazily from the
   ledger record.
 

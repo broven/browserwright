@@ -25,8 +25,11 @@ lives HERE, not inside `extension_upstream.py`):
     `Target.getTargets` / `Target.attachToTarget` / `Target.detachFromTarget` /
     `Browser.getVersion` and most session-scoped `chrome.debugger` forwarding
     already live there. This bridge constructs a *dedicated* `ExtensionUpstream`
-    over the SAME shared `RelayServer` (so all those methods work unchanged) and
-    only ADDS:
+    over the SAME shared `RelayServer` (so all those methods work unchanged),
+    drives its shared synthesis kernels (`make_target_info`, `attach_target`,
+    `register_session`, `resolve_tab_id`, `session_for_tab`,
+    `evict_tab_sessions`, `close_tab_by_target_id`) rather than re-implementing
+    them, and only ADDS:
       * A2 — `Target.setAutoAttach`/`setDiscoverTargets`: ack + replay
         `Target.targetCreated` + `Target.attachedToTarget` for every connected
         tab (mirrors playwriter's relay replay). Also pushes these when a tab is
@@ -62,8 +65,8 @@ from websockets.asyncio.server import ServerConnection
 from ... import session_registry
 from .extension_upstream import (
     ExtensionUpstream,
-    _new_upstream_session_id,
     _tab_id_from_target_id,
+    make_target_info,
 )
 from .relay import RelayServer, _CommandError
 
@@ -389,10 +392,7 @@ class ExtensionFacadeBridge:
                                        params: dict) -> None:
         """Forward a session-scoped command to the tab's chrome.debugger and
         echo `{id, sessionId, result|error}`."""
-        tab_id = self._ext._sessions.get(session_id)  # noqa: SLF001
-        if tab_id is None:
-            from .extension_upstream import _tab_id_from_session_id
-            tab_id = _tab_id_from_session_id(session_id)
+        tab_id = self._ext.resolve_tab_id(session_id)
         if tab_id is None:
             await self._error(req_id, -32602,
                               f"unknown sessionId {session_id!r}",
@@ -449,12 +449,12 @@ class ExtensionFacadeBridge:
         # auto-attach replay + an explicit attachToTarget agree on one session.
         if tab_id is not None and tab_id in self._tab_sessions:
             sid = self._tab_sessions[tab_id]
-            # Re-register the sid in the upstream's table (it may differ from
-            # ours if this is the first explicit attach) so session-scoped
-            # commands resolve the tab.
-            self._ext._sessions[sid] = tab_id  # noqa: SLF001 — intra-package
             try:
-                await self._relay.attach_tab(tab_id, timeout=10.0)
+                # Shared attach core: relay attach + (re-)registering the sid
+                # in the upstream's table (it may differ from ours if this is
+                # the first explicit attach) so session-scoped commands
+                # resolve the tab.
+                await self._ext.attach_target(tab_id, sid=sid, timeout=10.0)
             except _CommandError as e:
                 await self._error(req_id, e.code, e.message)
                 return
@@ -470,8 +470,7 @@ class ExtensionFacadeBridge:
             "id": req_id, "method": "Target.attachToTarget", "params": params,
         }))
         if tab_id is not None:
-            sid = next((s for s, t in self._ext._sessions.items()  # noqa: SLF001
-                        if t == tab_id), None)
+            sid = self._ext.session_for_tab(tab_id)
             if sid is not None:
                 self._tab_sessions[tab_id] = sid
 
@@ -535,25 +534,11 @@ class ExtensionFacadeBridge:
             self._creating -= 1
         await self._respond(req_id, {"targetId": gt["targetId"]})
 
-    def _persist_session_group(self, group_id: Any) -> None:
-        """Best-effort: make facade-created tabs durable for session end."""
-        if self._session_id is None or not isinstance(group_id, int) or group_id < 0:
-            return
-        try:
-            from ... import session_registry
-            rec = session_registry.get(self._session_id)
-            runtime = (rec.get("runtime") or {}) if isinstance(rec, dict) else {}
-            runtime = dict(runtime) if isinstance(runtime, dict) else {}
-            runtime["group_id"] = group_id
-            runtime["updated_at"] = time.time()
-            session_registry.update(self._session_id, runtime=runtime)
-        except Exception:  # noqa: BLE001
-            pass
-
     async def _handle_close_target(self, req_id: int | None,
                                    params: dict) -> None:
-        """Browser-level Target.closeTarget → close the tab via the relay
-        (derive tabId from the ext-tab-<id> targetId; no session needed)."""
+        """Browser-level Target.closeTarget → close the tab via the shared
+        close-by-target-id path (derive tabId from the ext-tab-<id> targetId;
+        no session needed)."""
         target_id = params.get("targetId")
         tab_id = (_tab_id_from_target_id(target_id)
                   if isinstance(target_id, str) else None)
@@ -563,10 +548,12 @@ class ExtensionFacadeBridge:
             return
         sid = self._tab_sessions.get(tab_id)
         try:
-            await self._relay.close_tab(tab_id)
+            # Same core as the agent path's closeTab-by-targetId verb: evicts
+            # the upstream's fabricated sessions for the tab + relay close.
+            await self._ext.close_tab_by_target_id(f"ext-tab-{tab_id}")
         except Exception as e:  # noqa: BLE001
             logger.debug("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
-        # Evict local + upstream session state for the closed tab.
+        # Evict the facade-local per-tab state too.
         self._evict_tab(tab_id)
         await self._respond(req_id, {"success": True})
         # Real Chrome ALWAYS emits detachedFromTarget + targetDestroyed after a
@@ -577,17 +564,7 @@ class ExtensionFacadeBridge:
         # otherwise (e.g. when CRPage `_initialize` rejects and Playwright closes
         # the freshly-created target) `new_page()` hangs forever waiting for the
         # destroy that never arrives. Mirrors the `detached` relay-event path.
-        await self._send_to_client(json.dumps({
-            "method": "Target.detachedFromTarget",
-            "params": {
-                "sessionId": sid or "",
-                "targetId": f"ext-tab-{tab_id}",
-            },
-        }))
-        await self._send_to_client(json.dumps({
-            "method": "Target.targetDestroyed",
-            "params": {"targetId": f"ext-tab-{tab_id}"},
-        }))
+        await self._emit_target_detached(tab_id, sid)
 
     async def _handle_runtime_enable(self, req_id: int | None,
                                      session_id: str, params: dict) -> None:
@@ -618,10 +595,7 @@ class ExtensionFacadeBridge:
         AND already observes the extension event fan-out via `_on_relay_event` —
         so it is the one place that can both drive the re-subscribe and watch
         for the resulting event without a second transport hop."""
-        tab_id = self._ext._sessions.get(session_id)  # noqa: SLF001
-        if tab_id is None:
-            from .extension_upstream import _tab_id_from_session_id
-            tab_id = _tab_id_from_session_id(session_id)
+        tab_id = self._ext.resolve_tab_id(session_id)
         if tab_id is None:
             await self._error(req_id, -32602,
                               f"unknown sessionId {session_id!r}",
@@ -715,11 +689,12 @@ class ExtensionFacadeBridge:
         async with self._lock:
             already = tab_id in self._tab_sessions
             if sid is None:
-                sid = self._tab_sessions.get(tab_id) or _new_upstream_session_id(tab_id)
+                sid = self._tab_sessions.get(tab_id)
+            # Shared sid fabrication + upstream session-table registration, so
+            # session-scoped commands Playwright sends for this sid resolve to
+            # the tab.
+            sid = self._ext.register_session(tab_id, sid)
             self._tab_sessions[tab_id] = sid
-            # Keep the upstream's session table in sync so session-scoped
-            # commands Playwright sends for this sid resolve to the tab.
-            self._ext._sessions[sid] = tab_id  # noqa: SLF001
             if already:
                 return
             # Make sure the extension actually has chrome.debugger attached so
@@ -759,15 +734,11 @@ class ExtensionFacadeBridge:
     def _browser_target_info(self) -> dict:
         """Synthetic targetInfo for the browser itself (type=browser). Some
         handshake steps query it before any page target exists."""
-        return {
-            "targetId": "browserwright-extension-browser",
-            "type": "browser",
-            "title": "Browserwright",
-            "url": "",
-            "attached": True,
-            "canAccessOpener": False,
-            "browserContextId": "",
-        }
+        return make_target_info(
+            target_id="browserwright-extension-browser",
+            type="browser",
+            title="Browserwright",
+        )
 
     def _target_info(self, tab_id: int) -> dict:
         """Build a CDP targetInfo from the relay's current ghost view, kept
@@ -787,20 +758,18 @@ class ExtensionFacadeBridge:
             url = ":"
         elif tab_id in self._tab_url:
             url = self._tab_url[tab_id]
-        return {
-            "targetId": f"ext-tab-{tab_id}",
-            "type": "page",
-            "title": title,
-            "url": url,
-            "attached": True,
-            "canAccessOpener": False,
+        return make_target_info(
+            target_id=f"ext-tab-{tab_id}",
+            type="page",
+            title=title,
+            url=url,
             # Playwright's `_onAttachedToTarget` asserts a TRUTHY browserContextId
             # and looks it up in its known contexts, falling back to the default
             # context when not found. A stable synthetic id satisfies the assert
             # and routes the page into Playwright's default context (the
             # extension backend has no real browser contexts — P4).
-            "browserContextId": _SYNTHETIC_BROWSER_CONTEXT_ID,
-        }
+            browser_context_id=_SYNTHETIC_BROWSER_CONTEXT_ID,
+        )
 
     # ---- relay fan-out (new tabs + async page events) -------------------
 
@@ -833,17 +802,7 @@ class ExtensionFacadeBridge:
             if self._session_id is not None and sid is None:
                 return
             self._evict_tab(tab_id)
-            await self._send_to_client(json.dumps({
-                "method": "Target.detachedFromTarget",
-                "params": {
-                    "sessionId": sid or "",
-                    "targetId": f"ext-tab-{tab_id}",
-                },
-            }))
-            await self._send_to_client(json.dumps({
-                "method": "Target.targetDestroyed",
-                "params": {"targetId": f"ext-tab-{tab_id}"},
-            }))
+            await self._emit_target_detached(tab_id, sid)
             return
 
         if kind == "event":
@@ -885,6 +844,24 @@ class ExtensionFacadeBridge:
             return
 
     # ---- helpers ---------------------------------------------------------
+
+    async def _emit_target_detached(self, tab_id: int,
+                                    sid: str | None) -> None:
+        """Synthesize the CDP teardown pair for a gone tab —
+        `Target.detachedFromTarget` then `Target.targetDestroyed` — exactly as
+        real Chrome orders them. Used by both the relay `detached` fan-out and
+        the daemon-initiated `Target.closeTarget` path."""
+        await self._send_to_client(json.dumps({
+            "method": "Target.detachedFromTarget",
+            "params": {
+                "sessionId": sid or "",
+                "targetId": f"ext-tab-{tab_id}",
+            },
+        }))
+        await self._send_to_client(json.dumps({
+            "method": "Target.targetDestroyed",
+            "params": {"targetId": f"ext-tab-{tab_id}"},
+        }))
 
     def _rewrite_event_frame_id(self, tab_id: int, method: str,
                                 params: dict) -> None:
@@ -929,9 +906,8 @@ class ExtensionFacadeBridge:
     def _evict_tab(self, tab_id: int) -> None:
         """Drop all per-tab state for a closed/detached tab and wake any
         outstanding Runtime.enable barrier so it doesn't hang on a dead tab."""
-        sid = self._tab_sessions.pop(tab_id, None)
-        if sid:
-            self._ext._sessions.pop(sid, None)  # noqa: SLF001
+        self._tab_sessions.pop(tab_id, None)
+        self._ext.evict_tab_sessions(tab_id)
         self._tab_url.pop(tab_id, None)
         self._fresh_blank_tabs.discard(tab_id)
         self._tab_main_frame.pop(tab_id, None)

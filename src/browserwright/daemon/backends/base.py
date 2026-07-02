@@ -19,13 +19,11 @@ from typing import Literal, Protocol
 BackendKind = Literal["UPSTREAM_WS", "LOCAL_RELAY"]
 Mode = Literal["A", "B"]
 # §5.2 enum (locked under schema_version=1).
-# v0.5 added "auth-required" for the cloud backend (header/mTLS auth must be
-# configured before connect). Adding values to this enum is a minor schema
-# bump — Skill code matches by value, so new entries don't break old skills,
-# they just appear as "unknown ux_cost" until skill catches up.
+# Adding values to this enum is a minor schema bump — Skill code matches by
+# value, so new entries don't break old skills, they just appear as
+# "unknown ux_cost" until skill catches up.
 UxCost = Literal[
-    "none", "banner", "popup-per-ws+banner",
-    "extension-permission", "auth-required",
+    "none", "banner", "popup-per-ws+banner", "extension-permission",
 ]
 
 
@@ -67,9 +65,10 @@ class DoctorResult:
 # ---- Protocol ---------------------------------------------------------------
 
 class Backend(Protocol):
-    """All four v0.1 backends implement this. The Protocol is structural; no
-    ABC inheritance required — a duck-typed class works (mirrors browser-harness
-    style: protocols, not registries).
+    """All registered backends implement this (the two real-CDP ids share one
+    implementation in `cdp.py`). The Protocol is structural; no ABC inheritance
+    required — a duck-typed class works (mirrors browser-harness style:
+    protocols, not registries).
     """
 
     name: str
@@ -83,38 +82,4 @@ class Backend(Protocol):
 
     async def resolve(self, timeout: float) -> ResolveResult:
         """Return a ws URL, or raise `Unavailable`. Still no ws open."""
-        ...
-
-    # ---- session-model capability verbs (P4) --------------------------------
-    # caps() is implemented now; the workspace_*/page_* verbs are filled in by
-    # Phase 5 (extension per-session bucketing) and Phase 6 (rdp per-session
-    # daemon). They live on the Protocol so the session layer can dispatch
-    # backend-agnostically.
-
-    def caps(self) -> dict:
-        """Static capability flags:
-        ``{"owns_browser": bool, "supports_browser_context": bool}``.
-
-        ``owns_browser`` — this backend launches/owns the Chrome process (rdp
-        --create) vs. attaches to the user's existing browser (extension).
-        ``supports_browser_context`` — can isolate sessions via real
-        browser contexts rather than tab groups.
-        """
-        ...
-
-    async def workspace_create(self, session_id: str) -> dict:
-        """Create a per-session workspace (extension: a tab group; rdp: noop/
-        launch). Phase 5/6."""
-        ...
-
-    async def workspace_attach(self, session_id: str, target) -> dict:
-        """Attach an existing workspace/browser to a session. Phase 5/6."""
-        ...
-
-    async def page_new(self, session_id: str, url: str) -> dict:
-        """Open a new page inside the session's workspace. Phase 5/6."""
-        ...
-
-    async def page_attach_active(self, session_id: str) -> dict:
-        """Pull the focused tab into the session's workspace. Phase 5/6."""
         ...

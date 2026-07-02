@@ -23,21 +23,24 @@ def _last_json(stdout: str) -> dict:
 
 def test_background_tab_reports_visible_and_focused(ext_ready, e2e_daemon):
     """A backgrounded tab we never switch to should still look focused+visible."""
-    # `open_background` is a daemon/extension feature (chrome.debugger attaches a
-    # never-focused tab); it has no agent-surface Playwright equivalent and was
-    # removed from EXPORTS in Phase C PR3. Drive it via the internal primitive
-    # module to keep covering the extension's keepTabRendered behavior.
+    # Background-tab open is a daemon/extension feature (chrome.debugger
+    # attaches a never-focused tab); it has no agent-surface Playwright
+    # equivalent. Drive it via the internal session_runtime helpers to keep
+    # covering the extension's keepTabRendered behavior.
     script = (
         "import json\n"
-        "from browserwright.primitives.page import open_background, wait_for_load\n"
-        "from browserwright.primitives.interact import js\n"
-        "open_background('about:blank')\n"
-        "wait_for_load()\n"
-        "state = js('''return {\n"
+        "from browserwright.session import current_session\n"
+        "from browserwright.session_runtime import (\n"
+        "    eval_js, open_session_tab, wait_for_ready,\n"
+        ")\n"
+        "sess = current_session()\n"
+        "open_session_tab(sess, 'about:blank')\n"
+        "wait_for_ready(sess)\n"
+        "state = eval_js(sess, '''({\n"
         "  visibility: document.visibilityState,\n"
         "  hidden: document.hidden,\n"
         "  hasFocus: document.hasFocus(),\n"
-        "}''')\n"
+        "})''')\n"
         "print(json.dumps(state))\n"
     )
     result = run_skill(script=script, backend="extension",
@@ -66,13 +69,16 @@ def test_background_tab_raf_keeps_advancing(ext_ready, e2e_daemon):
     )
     script = (
         "import json, time\n"
-        "from browserwright.primitives.page import open_background, wait_for_load\n"
-        "from browserwright.primitives.interact import js\n"
-        f"open_background('data:text/html,{html}')\n"
-        "wait_for_load()\n"
-        "first = int(js(\"document.getElementById('n').textContent\"))\n"
+        "from browserwright.session import current_session\n"
+        "from browserwright.session_runtime import (\n"
+        "    eval_js, open_session_tab, wait_for_ready,\n"
+        ")\n"
+        "sess = current_session()\n"
+        f"open_session_tab(sess, 'data:text/html,{html}')\n"
+        "wait_for_ready(sess)\n"
+        "first = int(eval_js(sess, \"document.getElementById('n').textContent\"))\n"
         "time.sleep(1.0)\n"
-        "second = int(js(\"document.getElementById('n').textContent\"))\n"
+        "second = int(eval_js(sess, \"document.getElementById('n').textContent\"))\n"
         "print(json.dumps({'first': first, 'second': second}))\n"
     )
     result = run_skill(script=script, backend="extension", timeout=60,

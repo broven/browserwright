@@ -53,34 +53,37 @@ def _payload(result: SkillResult) -> dict:
     return json.loads(line)
 
 
-# `open_background` is a daemon/extension feature with no agent-surface
-# Playwright equivalent (removed from EXPORTS in Phase C PR3); the recovery
-# tests still seed a background tab via the internal primitive.
+# Background-tab open is a daemon feature with no agent-surface Playwright
+# equivalent; the recovery tests seed a background tab via the internal
+# session_runtime helper.
 _OPEN_SCRIPT = (
     "import json\n"
     "from urllib.parse import quote\n"
-    "from browserwright.primitives.page import open_background, wait_for_load\n"
+    "from browserwright.session import current_session\n"
+    "from browserwright.session_runtime import open_session_tab, wait_for_ready\n"
+    "sess = current_session()\n"
     "html='<!doctype html><title>{title}</title><main>hi</main>'\n"
-    "tab=open_background('data:text/html;charset=utf-8,'+quote(html))\n"
-    "wait_for_load()\n"
+    "tab=open_session_tab(sess, 'data:text/html;charset=utf-8,'+quote(html))\n"
+    "wait_for_ready(sess)\n"
     "print(json.dumps({{'targetId':tab['targetId'],'groupId':tab['groupId']}}))\n"
 )
 
 # A fresh process that does NOT open or attach anything — it just operates the
 # session's "current" tab. This is a DAEMON-capability test: it verifies the
 # daemon transparently re-binds the session's recovered target (ledger fast path
-# / group-id fallback). It deliberately observes through the internal `js`
-# primitive (the agent CDP path that drives the recovered target directly) — NOT
-# the Phase C Playwright `page`. The Playwright handle correlates a `Page` to
-# the agent target by URL, which is ambiguous for the `data:`-content recovery
-# fixture here; the daemon recovery contract under test is the agent-path bind,
-# so we assert it on that path (same pattern as the multisession / parity /
-# userscript daemon-capability e2e tests). `js` was removed from the EXPORTS
-# agent surface in Phase C PR3 but survives as an internal primitive.
+# / group-id fallback). It deliberately observes through the internal
+# `eval_js` helper (the agent CDP path that drives the recovered target
+# directly, via `ensure_session_target`) — NOT the Playwright `page`. The
+# Playwright handle correlates a `Page` to the agent target by URL, which is
+# ambiguous for the `data:`-content recovery fixture here; the daemon recovery
+# contract under test is the agent-path bind, so we assert it on that path
+# (same pattern as the multisession / parity / userscript daemon-capability
+# e2e tests).
 _OPERATE_SCRIPT = (
     "import json\n"
-    "from browserwright.primitives.interact import js\n"
-    "print(json.dumps({'title': js('document.title')}))\n"
+    "from browserwright.session import current_session\n"
+    "from browserwright.session_runtime import eval_js\n"
+    "print(json.dumps({'title': eval_js(current_session(), 'document.title')}))\n"
 )
 
 

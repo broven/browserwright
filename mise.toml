@@ -23,8 +23,8 @@ run = "uv sync --extra ux"
 # `run` on purpose so nobody hardcodes the wrong entrypoint.
 description = "No dev server — use the CLI/REPL after install, or `mise run dev-link`. See ONBOARD.md."
 
-# test — fast local gate (mocked; no real Chrome, no network). Heavy suites
-# (e2e real-Chrome, agent-e2e promptfoo) are separate, opt-in tasks below.
+# test — fast local gate (mocked; no real Chrome, no network). The heavy
+# real-Chrome e2e suite is a separate, opt-in task below.
 [tasks."test:daemon"]
 description = "Daemon/CDP/proxy/backend/relay unit tests"
 dir = "{{config_root}}"
@@ -33,7 +33,7 @@ run = "uv run pytest tests/daemon -q"
 [tasks."test:skill"]
 description = "Agent-layer tests (CLI, sessions, primitives, memory, install flows)"
 dir = "{{config_root}}"
-run = "uv run pytest tests/skill --ignore=tests/skill/agent-e2e -q"
+run = "uv run pytest tests/skill -q"
 
 [tasks."test:evals"]
 description = "Mocked skill command-choice evals (zero-cost, deterministic)"

@@ -163,15 +163,16 @@ import threading
 import traceback
 from urllib.parse import quote
 
-# Phase C PR3 removed the page/tab driving primitives from the agent EXPORTS
-# surface (it's Playwright `page`/`context` now). This test exercises the
-# DAEMON's concurrent multi-session bookkeeping across several in-process
-# Session objects/threads — not the single-process injected `page` — so it
-# drives the daemon directly via the still-present internal primitive functions.
-from browserwright.primitives.interact import js
-from browserwright.primitives.page import close_tab, open, wait_for_load
+# The legacy CDP primitives are deleted (the agent surface is Playwright
+# `page`/`context` now). This test exercises the DAEMON's concurrent
+# multi-session bookkeeping across several in-process Session objects/threads
+# — not the single-process injected `page` — so it drives the daemon directly
+# via the internal session_runtime helpers (explicit `sess` per thread).
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
+from browserwright.session_runtime import (
+    close_session_tab, eval_js, open_session_tab, wait_for_ready,
+)
 
 # browserwright inline requires an explicit ledger session. The harness injects
 # BD_SESSION and the two Session objects below intentionally share that
@@ -199,13 +200,13 @@ def worker(name, initial_text):
                 f"<main id='value'>{initial_text}</main>"
                 "<script>window.e2eReady = true</script>"
             )
-            tab = open(
-                "data:text/html;charset=utf-8," + quote(html),
+            tab = open_session_tab(
+                sess, "data:text/html;charset=utf-8," + quote(html),
             )
             target_id = tab["targetId"]
-            wait_for_load()
+            wait_for_ready(sess)
 
-            before = js("document.getElementById('value').textContent")
+            before = eval_js(sess, "document.getElementById('value').textContent")
 
             # Do not let the first worker finish and close before the second
             # has a live tab + attached daemon session. This makes the test a
@@ -213,14 +214,15 @@ def worker(name, initial_text):
             # one-session smoke tests.
             both_open.wait(timeout=20)
 
-            js(
+            eval_js(
+                sess,
                 "document.body.dataset.session = " + json.dumps(name) + ";"
                 "document.getElementById('value').textContent = "
                 "document.getElementById('value').textContent + ' / operated';"
             )
-            after = js("document.getElementById('value').textContent")
-            marker = js("document.body.dataset.session")
-            title = js("document.title")
+            after = eval_js(sess, "document.getElementById('value').textContent")
+            marker = eval_js(sess, "document.body.dataset.session")
+            title = eval_js(sess, "document.title")
 
             with lock:
                 results[name] = {
@@ -240,8 +242,7 @@ def worker(name, initial_text):
     finally:
         if target_id:
             try:
-                with with_session(sess):
-                    close_tab(target_id=target_id)
+                close_session_tab(sess, target_id=target_id)
             except BaseException:
                 pass
         sess.close()
@@ -294,67 +295,6 @@ if errors:
     assert "session-b" in b["title"]
 
 
-def test_rdp_isolated_tasks_do_not_attach_parent_warm_target(e2e_rdp_daemon):
-    """Regression: isolated task sessions must not all fast-path attach the
-    parent ledger target. RDP proxy allows only one primary owner per target, so
-    this used to fail with -32602 when several workers bound the warm parent tab.
-    """
-    script = r'''
-import json
-import os
-import tempfile
-import textwrap
-import traceback
-from pathlib import Path
-
-from browserwright import task_runner
-from browserwright.multitask import run_tasks_concurrent
-from browserwright.primitives.page import open as open_tab
-
-root = Path(tempfile.mkdtemp(prefix="bd-task-e2e-"))
-task_dir = root / "site.test" / "tasks"
-task_dir.mkdir(parents=True)
-(task_dir / "worker.py").write_text(textwrap.dedent("""
-    ARGS = {}
-    def run(args, ctx=None):
-        page.goto(args["url"])
-        return {"title": page.title(), "url": page.url}
-"""), encoding="utf-8")
-
-task_runner.find_task_path = lambda site, name: task_dir / f"{name}.py"
-
-# Warm the parent session's ledger runtime with a real target before fan-out.
-# The bug path made every isolated worker recover and attach this same target.
-parent = open_tab("about:blank")
-
-try:
-    rows = run_tasks_concurrent([
-        ("site.test", "worker", {"url": "data:text/html,<title>one</title>"}),
-        ("site.test", "worker", {"url": "data:text/html,<title>two</title>"}),
-        ("site.test", "worker", {"url": "data:text/html,<title>three</title>"}),
-    ], max_workers=3)
-    print(json.dumps({"parent": parent["targetId"], "rows": rows}, sort_keys=True))
-except BaseException:
-    print(json.dumps({"error": traceback.format_exc()}))
-    raise
-'''
-    result = run_skill(
-        script=script,
-        backend="rdp",
-        runtime_dir=e2e_rdp_daemon,
-        timeout=120,
-    )
-    assert result.returncode == 0, (
-        f"skill exited {result.returncode};\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
-    )
-    payload = _extract_payload(result)
-    assert [row["ok"] for row in payload["rows"]] == [True, True, True], json.dumps(
-        payload, indent=2, sort_keys=True
-    )
-    titles = [row["value"]["title"] for row in payload["rows"]]
-    assert titles == ["one", "two", "three"]
-
-
 def test_extension_backend_three_sessions_get_named_groups_and_scoped_tabs(
     ext_ready,
     e2e_daemon,
@@ -374,17 +314,17 @@ import threading
 import traceback
 from urllib.parse import quote
 
-# Phase C PR3: daemon multi-session coverage via the internal primitives (the
+# Daemon multi-session coverage via the internal session_runtime helpers (the
 # agent surface is Playwright now — see the note in the two-session test).
-from browserwright.primitives.interact import js
-from browserwright.primitives.page import (
-    close_tab,
-    list_tabs,
-    open,
-    wait_for_load,
-)
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
+from browserwright.session_runtime import (
+    close_session_tab,
+    eval_js,
+    open_session_tab,
+    session_tabs,
+    wait_for_ready,
+)
 
 SESSION_IDS = [
     "e2e-three-a",
@@ -417,22 +357,23 @@ def worker(session_id):
                 f"<main id='value'>{session_id}</main>"
                 "<script>window.e2eReady = true</script>"
             )
-            tab = open("data:text/html;charset=utf-8," + quote(html))
+            tab = open_session_tab(sess, "data:text/html;charset=utf-8," + quote(html))
             target_id = tab["targetId"]
-            wait_for_load()
-            before = js("document.getElementById('value').textContent")
-            visible_before = list_tabs(include_chrome=False)
+            wait_for_ready(sess)
+            before = eval_js(sess, "document.getElementById('value').textContent")
+            visible_before = session_tabs(sess, include_internal=False)
 
             all_open.wait(timeout=30)
 
-            js(
+            eval_js(
+                sess,
                 "document.body.dataset.session = " + json.dumps(session_id) + ";"
                 "document.getElementById('value').textContent = "
                 "document.getElementById('value').textContent + ' / operated';"
             )
-            after = js("document.getElementById('value').textContent")
-            marker = js("document.body.dataset.session")
-            visible_after = list_tabs(include_chrome=False)
+            after = eval_js(sess, "document.getElementById('value').textContent")
+            marker = eval_js(sess, "document.body.dataset.session")
+            visible_after = session_tabs(sess, include_internal=False)
 
             with lock:
                 results[session_id] = {
@@ -440,7 +381,7 @@ def worker(session_id):
                     "targetId": target_id,
                     "tabId": tab["tabId"],
                     "groupId": tab["groupId"],
-                    "title": js("document.title"),
+                    "title": eval_js(sess, "document.title"),
                     "before": before,
                     "after": after,
                     "marker": marker,
@@ -458,8 +399,7 @@ def worker(session_id):
     finally:
         if failed and target_id:
             try:
-                with with_session(sess):
-                    close_tab(target_id=target_id)
+                close_session_tab(sess, target_id=target_id)
             except BaseException:
                 pass
         sess.close()

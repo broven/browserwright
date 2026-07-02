@@ -120,12 +120,12 @@ def run_task(site: str, name: str, *, isolated: bool = False, **kwargs) -> Any:
     try:
         with with_session(sess):
             import uuid
-            from .primitives.page import open as _open_tab
+            from .session_runtime import open_session_tab
             prebind_url = (
                 "data:text/html;charset=utf-8,"
                 f"<title>browserwright-isolated-{uuid.uuid4().hex}</title>"
             )
-            _open_tab(prebind_url)
+            open_session_tab(sess, prebind_url)
             return _run_inner()
     finally:
         # The isolated Session owns the CDP it lazily opened during this run;

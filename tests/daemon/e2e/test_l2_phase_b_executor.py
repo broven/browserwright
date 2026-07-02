@@ -116,8 +116,9 @@ def test_single_executor_single_tab_rdp(rdp_autofacade_daemon):
 
     We assert STABILITY, not an absolute count: a daemon-launched rdp Chrome
     starts with its own built-in `about:blank` launcher tab, and
-    `bind_current_page`→`current_page()` opens the session's working tab WITHOUT
-    adopting that launcher tab ("auto-open, NOT adopt", `primitives/page.py`).
+    `bind_current_page`→`resolve_current_target()` opens the session's working
+    tab WITHOUT adopting that launcher tab ("auto-open, NOT adopt",
+    `session_runtime.py`).
     So `context.pages` is stably 2 (launcher blank + session tab), not 1. The
     proven phase-C sibling (`test_l2_heredoc_playwright_page.py`) likewise
     asserts stability + growth-by-exactly-1-only-on-`new_page()`, never an

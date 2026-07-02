@@ -1,8 +1,4 @@
-"""Focused offline coverage for REPL/misc low-coverage modules.
-
-These tests deliberately stay in one file so the curated unit set can pick a
-small number of high-signal nodeids without pulling in browser/daemon work.
-"""
+"""Focused offline coverage for REPL/misc low-coverage modules."""
 from __future__ import annotations
 
 import io
@@ -138,14 +134,15 @@ def test_skill_doc_documents_state_and_reset_surface():
     assert "daemon restart" in doc.lower()
 
 
-def test_skill_doc_lists_importable_internal_primitives():
+def test_skill_doc_no_longer_advertises_legacy_cdp_primitives():
+    # The legacy CDP-driving primitives were deleted; the doc must not point
+    # agents at them anymore (the browser surface is page/context/snapshot).
     from browserwright import skill_doc
 
     doc = skill_doc.render()
-    assert "Importable internal primitives" in doc
-    assert "capture_screenshot" in doc
-    assert "diff_snapshot" in doc
-    assert "click_at_xy" in doc
+    assert "Importable internal primitives" not in doc
+    assert "capture_screenshot" not in doc
+    assert "click_at_xy" not in doc
 
 
 def test_snapshot_default_max_chars_is_less_aggressive():
@@ -200,27 +197,22 @@ def test_discovery_iter_site_dirs_precedence_and_filters(monkeypatch, tmp_path):
 
     project = tmp_path / "project"
     home = tmp_path / "home"
-    subscription = tmp_path / "sub"
     bundled = tmp_path / "bundled"
-    for root in (project, home, subscription, bundled):
+    for root in (project, home, bundled):
         root.mkdir()
     (project / "example.com" / "tasks").mkdir(parents=True)
     (home / "example.com" / "tasks").mkdir(parents=True)
-    (subscription / "subsite.test").mkdir()
-    (subscription / "subsite.test" / "memory.md").write_text("# sub\n", encoding="utf-8")
+    (home / "memsite.test").mkdir()
+    (home / "memsite.test" / "memory.md").write_text("# mem\n", encoding="utf-8")
     (bundled / "bundled.test").mkdir()
     (bundled / "bundled.test" / "SKILL.md").write_text("# ignored without tasks/memory\n", encoding="utf-8")
 
     monkeypatch.setattr(discovery, "site_skills_roots", lambda: [project, home])
     monkeypatch.setattr(discovery, "_bundled_root", lambda: bundled)
-    monkeypatch.setattr(
-        "browserwright.subscriptions.iter_subscription_site_roots",
-        lambda: [subscription],
-    )
 
     dirs = discovery._iter_site_dirs()
 
-    assert [d.name for d in dirs] == ["example.com", "subsite.test"]
+    assert [d.name for d in dirs] == ["example.com", "memsite.test"]
     assert dirs[0].parent == project
 
 

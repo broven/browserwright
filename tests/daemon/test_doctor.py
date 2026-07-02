@@ -24,8 +24,7 @@ EXPECTED_BACKEND_KEYS = {
     "ux_warning", "needs_user_action", "ux_cost", "extras",
 }
 EXPECTED_TOP_KEYS = {"schema_version", "recommended", "backends"}
-KNOWN_UX_COSTS = {"none", "banner",
-                  "extension-permission", "auth-required"}
+KNOWN_UX_COSTS = {"none", "banner", "extension-permission"}
 
 
 @pytest.mark.asyncio
@@ -48,7 +47,7 @@ async def test_doctor_every_backend_has_full_key_set(monkeypatch):
     _patch_all_unavailable(monkeypatch)
     out = await doctor_mod.doctor(load(env={}))
     seen_names = {entry["name"] for entry in out["backends"]}
-    assert seen_names == {"env", "rdp", "extension", "cloud"}
+    assert seen_names == {"env", "rdp", "extension"}
     for entry in out["backends"]:
         assert set(entry.keys()) == EXPECTED_BACKEND_KEYS, (
             f"backend {entry['name']!r} schema drift: {set(entry.keys()) ^ EXPECTED_BACKEND_KEYS}"
@@ -64,7 +63,6 @@ async def test_doctor_recommended_picks_lowest_ux_cost(monkeypatch):
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
-        "cloud":       DoctorResult("cloud", available=False, ux_cost="auth-required"),
     })
     out = await doctor_mod.doctor(load(env={}))
     assert out["recommended"] == "rdp"
@@ -118,12 +116,11 @@ async def test_doctor_backend_filter_keeps_full_shape(monkeypatch):
         "env":         DoctorResult("env", available=True, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
         "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
-        "cloud":       DoctorResult("cloud", available=False, ux_cost="none"),
     })
     out = await doctor_mod.doctor(load(env={}), backend="rdp")
-    # all 5 backends still appear, but the non-rdp ones say "skipped"
+    # all backends still appear, but the non-rdp ones say "skipped"
     names = {e["name"] for e in out["backends"]}
-    assert names == {"env", "rdp", "extension", "cloud"}
+    assert names == {"env", "rdp", "extension"}
     other_entries = [e for e in out["backends"] if e["name"] != "rdp"]
     for e in other_entries:
         assert e["available"] is False
@@ -138,7 +135,6 @@ def _patch_all_unavailable(monkeypatch):
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=False, ux_cost="none"),
         "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
-        "cloud":       DoctorResult("cloud", available=False, ux_cost="none"),
     })
 
 
@@ -161,7 +157,7 @@ def _patch_each(monkeypatch, probes: dict[str, DoctorResult]):
             raise AssertionError("doctor should never call resolve()")
 
     stubs = [_Stub(probes[name]) for name in
-             ["env", "rdp", "extension", "cloud"]]
+             ["env", "rdp", "extension"]]
     monkeypatch.setattr(doctor_mod, "all_backends", lambda cfg: stubs)
 
 
@@ -177,7 +173,6 @@ async def test_recommended_picks_extension_when_only_one_available(monkeypatch):
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=False, ux_cost="none"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
-        "cloud":       DoctorResult("cloud", available=False, ux_cost="auth-required"),
     })
     out = await doctor_mod.doctor(load(env={}))
     assert out["recommended"] == "extension"
@@ -191,7 +186,6 @@ async def test_recommended_rdp_still_beats_extension_on_ux_cost(monkeypatch):
         "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
-        "cloud":       DoctorResult("cloud", available=False, ux_cost="auth-required"),
     })
     out = await doctor_mod.doctor(load(env={}))
     assert out["recommended"] == "rdp"
@@ -209,12 +203,6 @@ def test_needs_action_extension_hint_no_longer_says_planned_v04():
     # Should point at the unpacked-extension install flow.
     assert "unpacked" in hint.lower() or "browserwright install" in hint
 
-
-def test_needs_action_cloud_row_exists():
-    """v0.5.3 F-11: cloud was missing from _needs_action entirely."""
-    hint = doctor_mod._needs_action("cloud")
-    assert hint is not None
-    assert "[backends.cloud]" in hint or "browserwright install" in hint
 
 
 def test_needs_action_unknown_backend_still_none():

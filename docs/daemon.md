@@ -1,12 +1,12 @@
 # browserwright-daemon
 
-一个轻量的 CLI 工具，把 Chrome 的多种"远程调试入口"统一抽象成一个**本地 CDP WebSocket URL provider**。上层（REPL、固化脚本、MCP server 等）只需要问一句"给我一个能用的 ws URL"，不关心底层是 `--remote-debugging-port`、AutoConnect 还是浏览器插件 relay。
+**一个长驻的全局 daemon**，把 Chrome 的多种"远程调试入口"统一抽象成一个本地 CDP 代理。它监听固定的 unix socket（`${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`），同时服务多个 session：extension session 共享一条 relay upstream（用户日常 Chrome），rdp session 各自拿到 daemon 启动并持有的隔离 Chrome。上层（`browserwright` skill CLI、固化脚本等）只连 daemon socket，不关心底层是 `--remote-debugging-port` 还是浏览器插件 relay。
 
-> **关于名字**：当前版本并没有长驻进程，本质是一个一次性的 resolver CLI（类似 `git config --get`）。保留 "daemon" 是预留给后续版本——届时会加入连接缓存、session 共享、health check 等真正需要长驻的能力。详见 [design.md](./design.md#naming)。
+daemon 只有长驻的 `serve` 模式：所有调用方（skill、固化脚本）都连 daemon socket，daemon 代理 CDP 流量。（旧的一次性 resolver 用法 `browserwright-daemon url`（Mode A）已移除；需要外部脚本直连时用 Playwright facade `ws://127.0.0.1:19990/cdp`。）
 
 ## Why
 
-详见同目录的 [`../browser-connection.md`](../browser-connection.md)。简单说：
+背景详见 [`archive/browser-connection.md`](./archive/browser-connection.md)。简单说：
 
 - `--remote-debugging-port=9222` 是经典做法，但 Chrome 新版本对默认 profile 越来越严格。
 - Chrome AutoConnect / DevTools MCP 的新通道走的是 `DevToolsActivePort` 文件 + 用户授权弹窗。
@@ -45,60 +45,44 @@ ws://127.0.0.1:9333/devtools/browser/abc-...
 ## Quickstart
 
 ```bash
-# 自动选择最佳可用 backend
-$ browserwright-daemon url
-ws://127.0.0.1:9222/devtools/browser/abc-123...
+# 启动单全局 daemon（通常注册成 LaunchAgent，见下文）
+$ browserwright-daemon serve
 
-# 强制使用 remote-debug-port
-$ browserwright-daemon url --backend rdp
-
-# 列出所有 backend + 当前可达性
-$ browserwright-daemon list-backends
+# daemon 活着吗？endpoint 在哪？
+$ browserwright-daemon status --json
 
 # 诊断（每个 backend 为什么能/不能用）
 $ browserwright-daemon doctor
-```
-
-典型 shell 用法：
-
-```bash
-export BD_CDP_WS="$(browserwright-daemon url)"
-python my-script.py    # 脚本内直接读 BD_CDP_WS 连 CDP
-```
-
-Python 调用方（暂不导出 SDK，统一走 CLI subprocess）：
-
-```python
-import subprocess
-ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 ```
 
 ## CLI 总览
 
 | 命令 | 作用 |
 |---|---|
-| `browserwright-daemon url [--backend NAME] [--timeout SEC]` | 解析并输出 ws URL 到 stdout |
-| `browserwright-daemon list-backends` | 列出已注册 backend 及当前可达性 |
+| `browserwright-daemon serve` | 运行单全局 daemon（shared extension relay + per-session rdp） |
+| `browserwright-daemon status [--json]` | 报告 daemon 存活状态、socket endpoint、facade 端口 |
+| `browserwright-daemon stop` / `restart` | 停止 / 重启 daemon（restart 走 LaunchAgent） |
 | `browserwright-daemon doctor` | 详细诊断每个 backend 状态（端口、文件路径、HTTP 响应等） |
-| `browserwright-daemon version` | 输出版本号 |
+| `browserwright-daemon logs [-f]` | 打印 log 文件路径或 tail 之 |
+| `browserwright-daemon launch-chrome` | 启动隔离 profile 的 Chrome 并输出其 ws URL |
+| `browserwright-daemon version` | 输出版本号（`version check` 校验版本一致性） |
 
 ### Exit codes
 
 | 码 | 含义 |
 |---|---|
-| 0 | 成功，stdout 有 ws URL |
+| 0 | 成功 |
 | 1 | 用户错误（参数非法、未知 backend 名等） |
 | 2 | 所有 backend 都不可用（Chrome 没开远程调试 / extension relay 没运行 / 等等） |
 | 3 | 内部错误（崩溃、未预期异常） |
 
-## 内置 Backend（MVP）
+## 内置 Backend
 
-| name | 说明 | 优先级（默认 fallback chain 中） |
+| name | 说明 | 选择方式 |
 |---|---|---|
-| `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析） | 1（最高） |
-| `rdp` | 假设 Chrome 启动时带了 `--remote-debugging-port=9222`，HTTP 探测 `/json/version` | 2 |
+| `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析），绑定一个外部持有的浏览器（如 anti-detect profile） | shared upstream 通过 `--backend env` / `BD_BACKEND` / `default_backend` 选择 |
+| `rdp` | 真实 browser-level CDP 端口。session `--create` 时 daemon 自己启动并持有隔离 Chrome；`--attach` 时连接外部暴露的端口 | 按 session ledger 分流（`browserwright session new --backend=rdp`） |
 | `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**驱动用户日常 Chrome 的唯一路径**。 | `browserwright-daemon serve` 默认启动这个 shared relay；具体 session 仍用 `browserwright session new --backend=extension` 选择 |
-| `cloud` | 远程托管浏览器（Browser Use / Browserless / Hyperbrowser），daemon Mode B 自连 upstream ws 时按 AuthProvider 注入 `Authorization: Bearer ...` / mTLS client cert（v0.1 `env` backend 只能 URL-embedded token，所以专门拆这条）。**v0.5 起真实装**。 | shared upstream 可通过 `--backend cloud` / `BD_BACKEND` / `default_backend` 选择；rdp session 仍按 session ledger 分流 |
 
 ## v0.4 extension backend
 
@@ -145,7 +129,7 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 - `open(url, background=True)` — 统一开页动词，开新 tab 进本 session 的 group（`background=True` 在 extension 下 `active:false` 不抢焦点，rdp 下无人争焦点故为 no-op）。黄条出现在那个 tab 上但你看不见。`open_background`/`new_tab` 仍作为 deprecated 别名保留
 - `close_tab(target_id=...)` — Agent 操作完后显式关闭
 
-对应 CLI：`browserwright-daemon attach-active` / `open --url X` / `close-tab --target-id ext-tab-N`。
+对应 CLI：`browserwright-daemon attach-active` / `open-background --url X` / `close-tab --target-id ext-tab-N`。
 
 用户还可以走 popup 手动 attach（点扩展图标），跟 Agent 路径并存。
 
@@ -163,84 +147,9 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 
 `Browser.crash` / `Browser.close` 等浏览器级别命令在 extension backend 下返回 `-32601 "method not implemented in extension backend"`——`chrome.debugger` API 没有对应的 hook。Page-level / Target-level 命令全部支持。
 
-## v0.5 cloud backend
+## Observability
 
-云端托管浏览器（Browser Use / Browserless / Hyperbrowser 等）的接入路径。**v0.1 `env` backend** 已经能覆盖 URL-embedded auth（`?api_key=...` / `wss://user:pass@host/`）；v0.5 `cloud` backend 专门加 **HTTP header auth 和 mTLS** 这两条 env backend 实现不了的。
-
-### 配置示例
-
-```toml
-[backends.cloud]
-endpoint = "wss://api.browser-use.com/cdp/session"
-auth_kind = "bearer"      # "bearer" | "basic" | "mtls" | "oauth2"
-provider_hint = "browser-use"
-
-[backends.cloud.auth.bearer]
-token_env = "BROWSER_USE_API_KEY"   # 推荐：把 API key 放 env 而不是 toml
-header_name = "Authorization"        # 可选，默认就是 "Authorization"
-header_prefix = "Bearer "            # 可选，默认就是 "Bearer "
-
-# 或者 mTLS：
-# [backends.cloud.auth.mtls]
-# cert_file = "~/.config/browserwright-daemon/client.crt"
-# key_file  = "~/.config/browserwright-daemon/client.key"
-# ca_file   = "~/.config/browserwright-daemon/ca.pem"   # 可选自定义 CA
-# key_password_env = "MY_KEY_PASSWORD"            # 可选加密 key 的密码
-
-# 或者 basic：
-# [backends.cloud.auth.basic]
-# username_env = "PROVIDER_USERNAME"
-# password_env = "PROVIDER_PASSWORD"
-# embed_in_url = false   # true → 用 user:pass@host 替代 header（旧云厂商兼容）
-```
-
-### Env 覆盖
-
-| 变量 | 含义 |
-|---|---|
-| `BD_CLOUD_ENDPOINT` | 等同 `[backends.cloud].endpoint` |
-| `BD_CLOUD_AUTH_KIND` | 等同 `[backends.cloud].auth_kind` |
-| `BD_CLOUD_PROVIDER_HINT` | 等同 `[backends.cloud].provider_hint` |
-
-具体 auth payload 仍走 provider 自己的 env 变量（`token_env` / `username_env` 等），不再多加一层 `BD_CLOUD_TOKEN`——会跟 AuthProvider 的 explicit resolution 路径冲突。
-
-### Mode B vs Mode A 取舍
-
-- **Mode B（`browserwright-daemon serve --provider <cloud>`）**：daemon 自己连上游 ws，AuthProvider 在握手时注入 header / SSLContext。**Skill 端无需感知 auth**——只连 daemon socket，daemon 帮它完成认证。**Skill（Layer 2）一律走 Mode B**——通过 daemon socket 操作，永不自己开 upstream ws
-- **Mode A（`browserwright-daemon url --backend cloud`）**：daemon 把 ws URL 透传给调用方，调用方自己开 ws。**仅供自带 ws 客户端的外部脚本使用，不是 Skill 的连接路径**；**只对 URL-embedded auth 形态有意义**（basic / URL-token）。header / mTLS 在 Mode A 下不能用——调用方没有 header 注入点
-
-### `OAuth2Auth` 状态
-
-`auth_kind = "oauth2"` 是 **v0.6 占位**。调用任意方法 raise `UserError("...placeholder...")`。v0.5 用户用 BearerTokenAuth 手动管 access token。
-
-### doctor 三态
-
-| `available` | `detail` 形如 | 含义 |
-|---|---|---|
-| `false` | "no cloud endpoint configured ..." | toml 没填 `[backends.cloud].endpoint` |
-| `false` | "401 — auth rejected by upstream" | 配置好了但 token 无效 |
-| `true` | "provider=browser-use, auth=bearer, ... OK" | 健康 |
-
-## v0.5 observability
-
-`browserwright-daemon stats` 子命令查活 daemon 的进程内计数器：
-
-```bash
-# 默认 tab-separated key\tvalue
-$ browserwright-daemon stats
-client_connected_total       3
-proxy_pre_open_buffered_total 0
-upstream_open_succeeded_total 1
-upstream_frame_received_total 247
-uptime_seconds                127.451
-...
-
-# JSON
-$ browserwright-daemon stats --json | jq '.proxy_pre_open_overflow_total'
-0
-```
-
-计数器分四组（`client_*` / `upstream_*` / `proxy_*` / `auth_*`）+ `uptime_seconds`。新增 / 重命名 counter 是 stats schema 的次版本 bump。
+daemon 进程内维护一组计数器（`client_*` / `upstream_*` / `proxy_*` / `auth_*` + `uptime_seconds`），已连接的 ws 客户端可通过 `BrowserwrightDaemon.stats` RPC 拉取快照。（旧的 `browserwright-daemon stats` CLI 子命令已移除。）
 
 ### JSON 日志
 
@@ -252,7 +161,7 @@ $ browserwright-daemon stats --json | jq '.proxy_pre_open_overflow_total'
 
 字段：`ts`（ISO-8601 UTC）、`level`、`logger`、`msg`，可选 `extra`（来自 `logger.info(..., extra={...})`）、可选 `exc_info`。
 
-`browserwright-daemon serve` 是单全局 daemon：无 `--backend` 时启动默认 shared `extension` relay，rdp sessions 根据 session ledger 懒创建自己的 upstream context。`--backend` 只用于覆盖 shared upstream（例如 cloud/env 调试），不是安装或启动一个“只服务某 backend”的 daemon。
+`browserwright-daemon serve` 是单全局 daemon：无 `--backend` 时启动默认 shared `extension` relay，rdp sessions 根据 session ledger 懒创建自己的 upstream context。`--backend` 只用于覆盖 shared upstream（例如 env 调试），不是安装或启动一个“只服务某 backend”的 daemon。
 
 ## 配置（可选）
 
@@ -270,9 +179,6 @@ port = 9222
 # 覆盖 daemon 内 extension relay ws server 的绑定地址（默认 ws://127.0.0.1:19989）
 # 默认 19989 是为了跟 playwriter (19988) 共存；如需进一步避冲突再调整
 relay_url = "ws://127.0.0.1:19989"
-
-[backends.cloud]
-# 云端浏览器配置详见上文 §v0.5 cloud backend
 ```
 
 > **fallback_chain 已撤掉**：v0.1 README 曾文档化 `fallback_chain = [...]`
@@ -296,39 +202,23 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
 | `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
 | `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988；e2e 测试用它隔离（29989）|
-| `BD_CLOUD_ENDPOINT` / `BD_CLOUD_AUTH_KIND` / `BD_CLOUD_PROVIDER_HINT` | cloud backend 配置 env shortcut（v0.5 起），等价 `[backends.cloud].*` toml key |
 | `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE` | EXPERT ESCAPE：绕过 launch-chrome 拒绝用户 default profile 的 guard。truthy 值 `1`/`true`/`yes`/`on`/`y`（case-insensitive）unlock。**仅当你完全理解会永久暴露日常 Chrome 给 CDP popup hazard 时** |
 | `BD_LOG_JSON` | `1` / `true` / `yes` → daemon log 输出 JSON 行（`{ts, level, logger, msg, extra?, exc_info?}`），方便日志聚合器消费。默认 plaintext |
 
-## 范围（MVP 不做的事）
+## 范围（Layer 1 不做的事）
 
-- ❌ **不**内嵌任何 CDP 客户端逻辑。`browserwright-daemon` 只输出 URL，连接和 send/recv 由上层负责（cdp-use / playwright / 自己实现都行）。
-- ❌ **不**启动 Chrome。Chrome 由用户自己运行。
-- ❌ **不**做长驻进程、连接缓存、health monitor。这些是 v0.x 之后的事。
-- ❌ **不**做截图、点击、DOM 读取。这些属于 Layer 2 的 skill。
-
-## 状态
-
-| 阶段 | 状态 |
-|---|---|
-| 设计文档 | v2 完成，见 [design-v2.md](./design-v2.md) |
-| v0.1 Mode A MVP | ✅ |
-| v0.2 Mode B 单 client serve | ✅ |
-| v0.3 Mode B 多 client mux + sessionId 翻译表 + 单 attacher | ✅ |
-| v0.4 extension backend (LOCAL_RELAY) + Chrome MV3 扩展 | ✅ |
-| v0.5 `cloud` backend (Bearer / Basic / mTLS / OAuth2 stub) + observability (`stats` CLI + JSON logs) | ✅ |
-| v0.6+ `OAuth2Auth` 真实装 / daemon-as-a-service / metrics push | ⏳ 未排期 |
-
-详细设计见 [design-v2.md](./design-v2.md)。
+- ❌ **不**做截图、点击、DOM 读取、snapshot。这些属于 Layer 2 的 skill（`browserwright` CLI）。
+- ❌ **不**做 session 语义之上的业务逻辑（site skills / tasks / memory）——同样是 Layer 2。
 
 ## End-to-end tests with a real Chrome
 
 If you edit the extension (`chrome-extension/background.js`) or daemon
 internals, validate against a real Chrome:
 
-    uv run pytest tests/e2e/
+    tests/daemon/e2e/run.sh -v
 
-This spawns an isolated Chrome with a patched copy of the extension, talking
-to a test daemon on port 29989. It will not touch your daily Chrome.
+This spawns an isolated Chrome for Testing with a patched copy of the
+extension, talking to a test daemon on port 29989. It will not touch your
+daily Chrome.
 
-See `tests/e2e/README.md` for details.
+See `tests/daemon/e2e/README.md` for details.

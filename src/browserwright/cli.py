@@ -41,10 +41,6 @@ Usage:
   browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
 
-  browserwright sub add <git-url> [--name NAME]
-  browserwright sub list [--json]
-  browserwright sub update [--name NAME]
-  browserwright sub remove --name NAME
   browserwright release {install-local|status|list|activate} ...
 
   browserwright install
@@ -384,76 +380,6 @@ def _cmd_index(args: list[str]) -> int:
     return 1
 
 
-def _cmd_sub(args: list[str]) -> int:
-    """``browserwright sub {add|list|update|remove} ...``."""
-    if not args:
-        print("usage: browserwright sub {add|list|update|remove} ...", file=sys.stderr)
-        return 1
-    sub = args[0]
-    rest = args[1:]
-    from . import subscriptions
-
-    if sub == "add":
-        if not rest or rest[0].startswith("--"):
-            print("usage: browserwright sub add <git-url> [--name NAME]", file=sys.stderr)
-            return 1
-        url = rest[0]
-        kw = _parse_kv_args(rest[1:])
-        try:
-            r = subscriptions.add(url, name=kw.get("name"))
-        except subscriptions.SubscriptionError as e:
-            print(f"sub add failed: {e}", file=sys.stderr)
-            return 1
-        if kw.get("json"):
-            sys.stdout.write(json.dumps(r, default=str) + "\n")
-        else:
-            print(f"{r['status']}: {r['name']} → {r['path']}")
-        return 0
-
-    if sub == "list":
-        kw = _parse_kv_args(rest)
-        rows = subscriptions.list_all()
-        if kw.get("json"):
-            sys.stdout.write(json.dumps(rows, indent=2, default=str) + "\n")
-            return 0
-        if not rows:
-            print("(no subscriptions)")
-            return 0
-        for r in rows:
-            tag = "" if r["exists"] else " [MISSING]"
-            print(f"  {r['name']:24s} {r['url']}{tag}")
-        return 0
-
-    if sub == "update":
-        kw = _parse_kv_args(rest)
-        names = [kw["name"]] if kw.get("name") else None
-        try:
-            results = subscriptions.update(names)
-        except subscriptions.SubscriptionError as e:
-            print(f"sub update failed: {e}", file=sys.stderr)
-            return 1
-        for r in results:
-            print(f"  {r['name']:24s} {r['status']}: {r.get('detail','')}")
-        return 0 if all(r["status"] in ("updated", "missing") for r in results) else 1
-
-    if sub == "remove":
-        kw = _parse_kv_args(rest)
-        name = kw.get("name")
-        if not name:
-            print("usage: browserwright sub remove --name NAME", file=sys.stderr)
-            return 1
-        try:
-            subscriptions.remove(name)
-        except subscriptions.SubscriptionError as e:
-            print(f"sub remove failed: {e}", file=sys.stderr)
-            return 1
-        print(f"removed {name}")
-        return 0
-
-    print(f"unknown sub subcommand: {sub}", file=sys.stderr)
-    return 1
-
-
 def _cmd_memory(args: list[str]) -> int:
     if not args:
         print("usage: browserwright memory {show|forget|replace} ...", file=sys.stderr)
@@ -623,6 +549,16 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     return 1
 
 
+def _fresh_screenshot_path() -> str:
+    """A non-colliding /tmp png path for the userscript --verify screenshot."""
+    i = 0
+    while True:
+        cand = Path("/tmp") / f"browserwright-shot-{os.getpid()}-{i}.png"
+        if not cand.exists():
+            return str(cand)
+        i += 1
+
+
 def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int:
     if not args or args[0] in {"-h", "--help"}:
         sys.stdout.write(USERSCRIPT_HELP)
@@ -661,14 +597,20 @@ def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int
                 raise RuntimeError(
                     "no drivable session bound; pass -s <id> or set BD_SESSION"
                 )
-            # These are internal driving helpers (no longer on the agent
-            # EXPORTS surface — Phase C PR3); the userscript --verify
-            # convenience still uses them directly from the primitive modules.
-            from .primitives.inspect import capture_screenshot
-            from .primitives.page import reload
+            # Drive the verify through the same Playwright path the agent
+            # uses (the legacy CDP primitives are gone): bind the session's
+            # current tab, reload it, screenshot it, print the path.
+            from .repl.playwright_handle import PlaywrightHandle
 
-            reload()
-            print(capture_screenshot())
+            handle = PlaywrightHandle()
+            try:
+                page = handle.page
+                page.reload(wait_until="load")
+                shot = _fresh_screenshot_path()
+                page.screenshot(path=shot)
+                print(shot)
+            finally:
+                handle.close()
         except Exception as e:
             print(f"pushed OK — --verify skipped (no drivable tab): {e}",
                   file=sys.stderr)
@@ -897,8 +839,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_index(rest))
     if cmd == "memory":
         sys.exit(_cmd_memory(rest))
-    if cmd == "sub":
-        sys.exit(_cmd_sub(rest))
     if cmd == "release":
         sys.exit(_cmd_release(rest))
     if cmd == "session":

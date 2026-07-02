@@ -1,37 +1,68 @@
-# browserwright — onboarding for new contributors
+# browserwright — architecture & contributor orientation
 
-Stuck inside this repo for the first time? Read this once, top to bottom.
-It's the shortest path to "I know what to touch and what to leave alone."
+New to this repo? Read [ONBOARD.md](../ONBOARD.md) first for the
+clone → install → test loop. This document is the deeper tour: how the layers
+fit together, how to develop without touching the machine's global install, and
+the operating principles that keep the codebase safe to change.
 
-## TL;DR
+## The layers
 
-- **`design.md`** is the spec authority. Disagreements between code and
-  design.md → footnote design.md, don't drift the code silently.
-- **Talk to the daemon, not the browser.** Skill is Layer 2; raw CDP
-  calls live in `browserwright-daemon`. If you find yourself opening a ws to
-  Chrome in this repo, you're either writing a test (mock it) or making
-  a mistake (don't).
-- **Test policy is non-negotiable.** Chrome 144+ accumulates "Allow"
-  popups until it freezes. Two related rules:
+```text
+AI agent / Claude Code
+        ↓
+skill/                    Agent-facing skill shell (points at `browserwright --print-skill`)
+        ↓
+src/browserwright/        Layer 2: agent CLI, sessions, primitives, site skills, memory
+        ↓
+src/browserwright/daemon/ Layer 1: the global daemon — CDP proxy, backends, extension relay,
+        ↓                 Playwright facade
+Chrome (daily via extension relay / daemon-owned isolated via rdp / external via env)
+```
+
+- **One long-lived global daemon** on the fixed socket
+  `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`. It serves all sessions
+  at once: extension sessions share one relay upstream (the user's real
+  Chrome), each rdp session gets its own daemon-owned Chrome, env sessions
+  bind to an externally-owned CDP endpoint.
+- **A session is the isolation key.** Its backend is chosen at
+  `browserwright session new` and immutable afterwards; the daemon routes each
+  client by reading the session ledger. On extension the session's workspace is
+  a Chrome tab group; on rdp/env it is the browser instance.
+
+Authoritative references — read before changing session routing, backend
+semantics, tab creation, facade behavior, or teardown:
+
+- [`session-workspaces.md`](session-workspaces.md) — the load-bearing session
+  workspace model (invariants, teardown/ownership rules, facade behavior).
+- [`refactor-single-daemon.md`](refactor-single-daemon.md) — the design record
+  of the single-global-daemon refactor (why `BD_NAME` is gone, the unified
+  downstream verbs).
+- [`daemon.md`](daemon.md) — Layer 1 backends, env vars, `config.toml`.
+
+## TL;DR rules
+
+- **Talk to the daemon, not the browser.** The skill is Layer 2; raw CDP
+  lives in Layer 1. If you find yourself opening a ws to Chrome from Layer 2
+  code, you're either writing a test (mock it) or making a mistake (don't).
+- **Test policy is non-negotiable.** Chrome 144+ accumulates "Allow remote
+  debugging?" popups until it freezes. Two related rules:
   1. *Chrome*: iterative tests go through `browserwright-daemon launch-chrome
-     --port <X> --profile /tmp/...`. Never short-connect to the user's
-     daily Chrome.
+     --port <X> --profile /tmp/...` or the e2e harness. Never short-connect to
+     the user's daily Chrome.
   2. *Filesystem*: any code path that writes outside the temp dir
      (e.g. `~/.config/browserwright-daemon/config.toml`) must accept a
-     `*_PATH` env override so tests can redirect to `tmp_path`. The
-     wizard's `BS_DAEMON_CONFIG_PATH` is the canonical example.
+     `*_PATH` env override so tests can redirect to `tmp_path`. The wizard's
+     `BS_DAEMON_CONFIG_PATH` is the canonical example.
 - **Develop without touching global state.** The host machine very likely
-  already runs a global `browserwright`/`browserwright-daemon` plus a
-  loaded Chrome extension; this checkout must coexist with that, not
-  fight it. See [Independent local dev — never touch global
-  state](#independent-local-dev--never-touch-global-state) below for the
-  full setup. The short version: `uv sync`, then prefix everything with
-  `uv run`, and run real-Chrome work through `tests/daemon/e2e/run.sh`,
-  which already isolates ports, sockets, profile, and the extension.
+  already runs a global `browserwright`/`browserwright-daemon` plus a loaded
+  Chrome extension; this checkout must coexist with that, not fight it. The
+  short version: `uv sync`, then prefix everything with `uv run`, and run
+  real-Chrome work through `tests/daemon/e2e/run.sh`, which already isolates
+  ports, sockets, profile, and the extension. Full setup below.
 
 ## Independent local dev — never touch global state
 
-This section is the cold-start path for a contributor (or a Code Agent)
+This section is the cold-start path for a contributor (or a code agent)
 who just cloned the repo on a machine where:
 
 - `browserwright` / `browserwright-daemon` are already installed globally
@@ -101,7 +132,7 @@ do not try to bring those back, they no longer exist.
 ### Step 3: run the fast mocked suite (no Chrome, no daemon, no extension)
 
 ```bash
-uv run pytest tests/daemon tests/skill --ignore=tests/skill/agent-e2e -q
+uv run pytest tests/daemon tests/skill -q
 uv run python evals/run.py --mock
 ```
 
@@ -140,7 +171,7 @@ Common pitfall: `BD_BACKEND=rdp` without an explicit `BD_PORT` /
 `BD_RDP_PORT` falls back to `9222`, which is your daily Chrome's
 discovery port whenever that Chrome is running. Always pin the port.
 
-### Step 5: run the extension backend against the real Chrome — use the e2e harness
+### Step 5: run the extension backend against a real Chrome — use the e2e harness
 
 The extension backend has two hard collision points with the global
 setup, both already solved by the e2e harness:
@@ -283,7 +314,7 @@ If `lsof :19989` and `lsof :29989` print **different** PIDs (or
 | `browserwright` resolves to the global binary | you dropped the `uv run` prefix | reinstate it; `uv run which browserwright` must point at `.venv/` |
 
 For deeper context on the e2e harness, see
-[`tests/daemon/e2e/README.md`](tests/daemon/e2e/README.md) — its
+[`tests/daemon/e2e/README.md`](../tests/daemon/e2e/README.md) — its
 "Isolation matrix" and "When this fails" sections are authoritative for
 the real-Chrome path.
 
@@ -298,16 +329,14 @@ Are you running scripted / iterative tests?
 │         `browserwright-daemon launch-chrome --port 9333 --profile /tmp/bs-dev`
 │         then `BD_PORT=9333 BD_BACKEND=rdp browserwright ...`
 └── no → are you driving the user's daily Chrome?
-        ├── yes → option 3 (extension backend) — load the unpacked relay
+        ├── yes → extension backend — load the unpacked relay
         │         extension once; subsequent calls reuse the same ws,
         │         zero popups.
         └── do you have a special browser source?
             ├── fingerprint browser (AdsPower / MultiLogin / GoLogin /
-            │   比特浏览器) → option 2, supply the port your tool exposes
-            ├── cloud / remote Chrome (Browser Use, Browserless,
-            │   Hyperbrowser, generic CDP-compatible) → option 4
+            │   比特浏览器) → rdp attach, supply the port your tool exposes
             └── an externally-owned browser exposing a browser-level CDP ws
-                (anti-detect profile, e.g. CloakBrowser) → option 5 (env):
+                (anti-detect profile, e.g. CloakBrowser) → env:
                 `BD_CDP_WS=ws://… browserwright-daemon serve --backend env`,
                 then `browserwright session new --backend=env`. Attach-owned —
                 `session end` never closes it. N profiles → N isolated daemons.
@@ -322,60 +351,45 @@ The install wizard codifies this same decision tree —
 src/browserwright/
 ├── cli.py                ← argv dispatch — start here when wiring a new subcommand
 ├── api.py                ← `from browserwright import *` surface
-├── install.py            ← the wizard (~550 LOC; doctor-driven option detection)
+├── install.py            ← the wizard (doctor-driven option detection)
 ├── mode_b_client.py      ← Mode B socket client + client_for_session() resolver
-├── repl/
-│   ├── inline.py         ← P0 #75 popup-cost abort gate; reads doctor JSON
-│   └── server.py         ← long-lived REPL daemon
+├── session_create.py / session_registry.py / session_runtime.py
+│                         ← session ledger: creation, immutable backend, runtime state
+├── repl/                 ← inline heredoc execution + long-lived REPL daemon
 ├── primitives/           ← agent-facing API surface (page / interact / inspect / site)
-├── memory/
-│   ├── global_mem.py     ← `~/.browserwright/global.md` + dotted-key set_preference
-│   └── site_mem.py       ← per-host memory; eTLD+1 stems (with legacy fallback)
-├── multitask.py          ← run_tasks_concurrent fan-out
+├── memory/               ← `~/.browserwright/global.md` + per-site memory
+├── daemon/               ← Layer 1: the global daemon, backends, relay, facade
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
 tests/
-├── test_install_extension_v04.py        v0.4 wizard wire (12 tests)
-├── test_install_cloud_v05.py            v0.5 cloud wizard + config writer (17 tests)
-├── test_e2e_bugs_v031.py                4 AI-E2E bug regressions (22 tests)
-├── test_memory.py / test_multitask.py / ...
-└── conftest.py                          ← shared fixtures (tmp_bs_home, fresh_modules)
+├── daemon/               ← Layer 1 tests (+ e2e/ real-Chrome harness)
+├── skill/                ← Layer 2 tests (CLI, sessions, primitives, memory, install)
+└── conftest.py           ← shared fixtures (tmp_bs_home, fresh_modules)
 ```
 
-When in doubt, `uv run pytest -q` runs the full suite (140 tests as of
-v0.5 first wave). Tests are entirely mocked — no real daemon, no real
-Chrome.
+When in doubt, `uv run pytest tests/daemon tests/skill -q` runs the mocked
+suite — no real daemon, no real Chrome. See [TESTING.md](../TESTING.md) for
+the full test-suite map.
 
 ## Operating principles (skim, then refer back)
 
-### 1. Doctor as contract (spec H3)
+### 1. Doctor as contract
 
 `browserwright-daemon doctor --json` is contract-bound to **zero ws side
-effects**. Every wizard option-availability helper
-(`_extension_backend_available()`, `_cloud_backend_available()`, future
-v0.6+) must consume the doctor JSON dict only. Don't open a CDP ws,
-don't subprocess a backend-specific `--probe`, don't curl a cloud
-provider. If you need richer signal than doctor provides, extend the
-daemon's doctor schema first.
+effects**. Every wizard option-availability helper (e.g.
+`_extension_backend_available()`) must consume the doctor JSON dict only.
+Don't open a CDP ws, don't subprocess a backend-specific `--probe`, don't
+probe a remote provider. If you need richer signal than doctor provides,
+extend the daemon's doctor schema first.
 
-`test_install_cloud_v05.py::test_doctor_probe_is_the_only_detection_channel`
-enforces this — it patches `socket.socket` to a tripwire. Any new helper
-that touches the network outside doctor will trip this test immediately.
+The install-wizard tests enforce this with a `socket.socket` tripwire — any
+new helper that touches the network outside doctor trips it immediately.
 
-### 2. Spec authority + footnote-as-you-go
-
-When a behaviour evolves, footnote `design.md` instead of letting the
-code drift silently. Example: spec §A.1 originally said "auto-suggest
-`repl start`"; P0 #75 strengthened that to "abort with exit 2". The
-codebase tracks the new behaviour, and the spec entry got expanded so
-readers don't have to guess which version of the contract holds.
-
-### 3. Test filesystem isolation
+### 2. Test filesystem isolation
 
 The wizard writes outside the test tree (`~/.config/browserwright-daemon/...`
 for the daemon TOML). Tests must override these paths via env vars
-*before* the wizard runs. Established pattern in
-`tests/test_install_cloud_v05.py::_drive_wizard`:
+*before* the wizard runs, e.g.:
 
 ```python
 monkeypatch.setenv("BS_DAEMON_CONFIG_PATH",
@@ -386,14 +400,14 @@ Every env override the production code accepts is a deliberate seam for
 this purpose. Add a `*_PATH` env override whenever you add a new writer
 that targets the user's home — it's not optional.
 
-(This rule is the filesystem analogue of `chrome-popup-test-policy` —
+(This rule is the filesystem analogue of the Chrome popup test policy —
 tests must not pollute user state, period.)
 
-### 4. Forward-compat wizard options
+### 3. Forward-compat wizard options
 
 A new daemon backend that lists itself in `doctor --json` is
 auto-surfaceable by the wizard if you pattern after
-`_extension_backend_available()` / `_cloud_backend_available()`:
+`_extension_backend_available()`:
 
 1. Add a new entry to `_OPTIONS` with a `(coming vX.Y)` suffix.
 2. Add `_<name>_backend_available()` that returns
@@ -402,31 +416,25 @@ auto-surfaceable by the wizard if you pattern after
    on `<name>_live`.
 4. Implement per-option prompt collection + memory schema extension.
 
-No Skill release is needed to surface the option once daemon reports it
-as `available=true`. This is the v0.4 / v0.5 design that made the
-two-wave delivery model work, and it's the model future backends should
-follow.
+No skill release is needed to surface the option once the daemon reports it
+as `available=true`.
 
 ## Common failure modes (and the fix)
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `inline heredoc fails with `Target.createTarget requires sessionId in extension backend`` | `new_tab()` doesn't support the extension backend | use `open_background(url)` or `attach_active()` to bind to an existing tab; or run against `BD_BACKEND=rdp` with an isolated profile |
 | `memory show --site=news.ycombinator.com` returns empty but bundled dir exists | pre-v0.3.1 user-written `~/.browserwright/site-skills/news/` shadowing the eTLD+1 stem | The `_read_candidates()` fallback should pick it up automatically; if not, run `browserwright index rebuild` |
 | `run_task` rejects a task whose args-schema is flat (`{"q": "str"}`) | flat shape not supported | Use the dict shape: `{"q": {"type": "str", "required": True}}` — `_validate_args_schema` rejects the flat form with a clear `ValueError` |
 | Tests pollute `~/.config/browserwright-daemon/` | new code path writes outside tmp_path without an env override | follow the `BS_DAEMON_CONFIG_PATH` pattern; add a `*_PATH` env override to the production code |
-| Wizard option 4 / 5 still says "coming vX.Y" after the daemon was upgraded | stale doctor probe cache, or daemon binary not on `PATH` | rerun the wizard; `browserwright-daemon doctor --json` must report `available=true` for the option |
+| Wizard option still says "coming vX.Y" after the daemon was upgraded | stale doctor probe cache, or daemon binary not on `PATH` | rerun the wizard; `browserwright-daemon doctor --json` must report `available=true` for the option |
 
 ## "I'm new — what should I read first?"
 
 In this order:
 
-1. This file (you're here).
-2. `design.md` §0 (user stories) + §A.1 (REPL invocation forms).
-3. `HANDOFF-v0.5.md` for the version-by-version delivery history.
-4. One existing test file matching the area you're touching — e.g.
-   `test_install_cloud_v05.py` if you're adding a wizard option.
-5. The CHANGELOG-style sections in `README.md` (`v0.4`, `v0.5`) for the
-   user-visible shape of recent work.
-
-Then open an issue or grep `TODO(agent)` for tasks looking for hands.
+1. [ONBOARD.md](../ONBOARD.md) — the run-it-locally quickstart.
+2. This file.
+3. [`session-workspaces.md`](session-workspaces.md) — the session model
+   invariants (mandatory before touching routing/teardown/facade code).
+4. [TESTING.md](../TESTING.md) — which suite to run for which change.
+5. One existing test file matching the area you're touching.

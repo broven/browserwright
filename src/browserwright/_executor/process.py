@@ -192,7 +192,7 @@ class _Worker:
         Reuses the shared connect+bind free functions (single source of truth
         for the FATAL "no Playwright CDP session over the extension facade"
         constraint). Bind the session FIRST so ``current_session()`` /
-        ``current_page()`` resolve the right ledger record."""
+        ``resolve_current_target()`` resolve the right ledger record."""
         if self._connected:
             return
         from ..session import Session, set_session

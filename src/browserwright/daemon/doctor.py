@@ -12,15 +12,13 @@ the flag but the v0.1 scope (§7) does not include real ws handshake.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 
-from .backends import all_backends, get_backend, names
+from .backends import all_backends, names
 from .config import Config
 from .errors import UserError
 
 
 # schema_version bumped to 2 in v0.5.3 (REVIEW.md F-1+F-2). v2 contract:
-#   - `ux_cost` enum gained "auth-required" for the cloud backend
 #   - `DoctorResult` gained `extras: dict` (free-form per-backend payload)
 # v1 clients that strict-check `ux_cost in {none,banner,popup,extension-permission}`
 # or that count backend-entry keys (==7) will break against v0.5+ daemons —
@@ -70,23 +68,6 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
     }
 
 
-async def list_backends(cfg: Config) -> dict:
-    """Static, no-probe view — spec §5.3."""
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "backends": [
-            {
-                "name": b.name,
-                "kind": b.kind,
-                "recommended_mode": b.recommended_mode,
-                "ux_cost": b.ux_cost,
-                "needs_user_action": _needs_action(b.name),
-            }
-            for b in all_backends(cfg)
-        ],
-    }
-
-
 # ---- helpers ---------------------------------------------------------------
 
 
@@ -114,9 +95,8 @@ def _asdict(r) -> dict:
     fails this function — that's the schema_version=1 trip-wire.
 
     `extras` (v0.5) is a per-backend free-form sub-dict. It's part of the
-    serialized output because the cloud backend's install-wizard contract
-    requires `provider` / `endpoint` / `auth_kind` / `configured` to be
-    readable by skill code. Empty dict = no extras (e.g. env / rdp).
+    serialized output so install-wizard contracts can read per-backend
+    details from skill code. Empty dict = no extras (e.g. env / rdp).
     """
     return {
         "name": r.name,
@@ -133,7 +113,7 @@ def _asdict(r) -> dict:
 def _pick_recommended(entries: list[dict]) -> str | None:
     """Pick the available backend with the lowest UX cost.
 
-    Tie-break: registry order (env before rdp before extension, then cloud)
+    Tie-break: registry order (env before rdp before extension)
     via Python's stable `min`.
 
     v0.5.3 REVIEW.md F-10: dropped the `!= "extension"` exclusion. v0.1 had
@@ -163,7 +143,6 @@ def _needs_action(backend_name: str) -> str | None:
     v0.5.3 REVIEW.md F-11:
       - `extension` row updated from the stale "planned v0.4" placeholder
         to the v0.4-shipped install path.
-      - `cloud` row added (v0.5 ship — was missing entirely).
     """
     if backend_name == "env":
         return "set BD_CDP_WS or BD_CDP_URL to your CDP endpoint"
@@ -173,7 +152,4 @@ def _needs_action(backend_name: str) -> str | None:
         return ("load the unpacked extension from browserwright-daemon/chrome-extension/ "
                 "(chrome://extensions/ → enable Developer mode → Load unpacked); "
                 "or run `browserwright install` option 3")
-    if backend_name == "cloud":
-        return ("configure [backends.cloud] in config.toml (endpoint + auth_kind + "
-                "auth subtable); or run `browserwright install` option 4")
     return None
