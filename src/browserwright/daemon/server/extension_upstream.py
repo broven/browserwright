@@ -26,11 +26,9 @@ from the session-id naming convention (`ext-sid-<tabId>-<random>`).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import secrets
-import time
 from typing import Any, Awaitable, Callable
 
 from .. import __version__
@@ -106,6 +104,31 @@ def _tab_id_from_target_id(target_id: str) -> int | None:
         return int(target_id[len("ext-tab-"):])
     except ValueError:
         return None
+
+
+def make_target_info(*, target_id: str, type: str = "page", url: str = "",
+                     title: str = "", attached: bool = True,
+                     browser_context_id: str = "") -> dict:
+    """The ONE builder for the CDP ``targetInfo`` shape the extension backend
+    reports. Both the agent path (`Target.getTargets` interception,
+    `scoped_target_infos`) and the Playwright facade (`facade_extension.py`)
+    synthesize targetInfos through this, so the shape can't drift between the
+    two paths."""
+    return {
+        "targetId": target_id,
+        "type": type,
+        "url": url,
+        "title": title,
+        "attached": attached,
+        "canAccessOpener": False,
+        "browserContextId": browser_context_id,
+    }
+
+
+def _ghost_target_info(g: GhostTarget) -> dict:
+    """targetInfo for a relay ghost target, as enumerated by the agent path."""
+    return make_target_info(
+        target_id=g.target_id, type=g.type, url=g.url, title=g.title)
 
 
 class ExtensionUpstream:
@@ -207,6 +230,41 @@ class ExtensionUpstream:
         })
         return (live_gid, list(tabs))
 
+    # ---- fabricated CDP-session helpers (shared with the facade) ----------
+
+    def register_session(self, tab_id: int, sid: str | None = None) -> str:
+        """Bind (fabricating if needed) an upstream sessionId for ``tab_id``.
+        Every path that hands out a session — Target.attachToTarget emulation,
+        attach_active_tab, open_background_tab, recover_session, and the
+        Playwright facade's announce — goes through here."""
+        if sid is None:
+            sid = _new_upstream_session_id(tab_id)
+        self._sessions[sid] = tab_id
+        return sid
+
+    async def attach_target(self, tab_id: int, *, sid: str | None = None,
+                            timeout: float = 10.0) -> str:
+        """chrome.debugger attach (idempotent in the relay) + session binding —
+        the single Target.attachToTarget core both the agent path and the
+        Playwright facade drive. Raises `_CommandError` / other exceptions from
+        the relay; callers map them to CDP errors."""
+        await self._relay.attach_tab(tab_id, timeout=timeout)
+        return self.register_session(tab_id, sid)
+
+    def resolve_tab_id(self, session_id: str) -> int | None:
+        """tabId for an upstream sessionId: the session table first, else the
+        ``ext-sid-<tabId>-…`` naming convention."""
+        return self._sessions.get(session_id) or _tab_id_from_session_id(session_id)
+
+    def session_for_tab(self, tab_id: int) -> str | None:
+        """A sessionId previously handed out for ``tab_id``, if any."""
+        return next((s for s, t in self._sessions.items() if t == tab_id), None)
+
+    def evict_tab_sessions(self, tab_id: int) -> None:
+        """Drop every fabricated session bound to a (closed) tab."""
+        for sid in [s for s, t in self._sessions.items() if t == tab_id]:
+            self._sessions.pop(sid, None)
+
     def session_info(self, session_id: str) -> dict:
         """Live view of a session's browser: its bound group id, the number of
         tabs we currently track for it (best-effort, in-memory), and a sample
@@ -243,8 +301,7 @@ class ExtensionUpstream:
             except Exception:  # noqa: BLE001 — best-effort teardown
                 pass
             # Evict any fabricated CDP sessions bound to a closed tab.
-            for sid in [s for s, t in self._sessions.items() if t == tab_id]:
-                self._sessions.pop(sid, None)
+            self.evict_tab_sessions(tab_id)
             self._tab_url.pop(tab_id, None)
         return {"closed": closed, "kept": []}
 
@@ -290,15 +347,7 @@ class ExtensionUpstream:
             tab_id = _tab_id_from_target_id(g.target_id)
             if tab_id is None or tab_id not in members:
                 continue
-            out.append({
-                "targetId": g.target_id,
-                "type": g.type,
-                "url": g.url,
-                "title": g.title,
-                "attached": True,
-                "canAccessOpener": False,
-                "browserContextId": "",
-            })
+            out.append(_ghost_target_info(g))
         return out
 
     @property
@@ -361,17 +410,7 @@ class ExtensionUpstream:
         if method == "Target.getTargets":
             ghosts = self._relay.list_ghost_targets()
             await self._respond(req_id, {
-                "targetInfos": [
-                    {
-                        "targetId": g.target_id,
-                        "type": g.type,
-                        "url": g.url,
-                        "title": g.title,
-                        "attached": True,
-                        "canAccessOpener": False,
-                        "browserContextId": "",
-                    } for g in ghosts
-                ],
+                "targetInfos": [_ghost_target_info(g) for g in ghosts],
             })
             return
 
@@ -383,15 +422,13 @@ class ExtensionUpstream:
                                   f"unknown extension target {target_id!r}")
                 return
             try:
-                await self._relay.attach_tab(tab_id, timeout=10.0)
+                sid = await self.attach_target(tab_id, timeout=10.0)
             except _CommandError as e:
                 await self._error(req_id, e.code, e.message)
                 return
             except Exception as e:
                 await self._error(req_id, -32603, f"attach failed: {e!r}")
                 return
-            sid = _new_upstream_session_id(tab_id)
-            self._sessions[sid] = tab_id
             await self._respond(req_id, {"sessionId": sid})
             return
 
@@ -455,7 +492,7 @@ class ExtensionUpstream:
                               _build_requires_session_error(method or "<unknown>"))
             return
 
-        tab_id = self._sessions.get(session_id) or _tab_id_from_session_id(session_id)
+        tab_id = self.resolve_tab_id(session_id)
         if tab_id is None:
             await self._error(req_id, -32602, _build_unknown_session_error(session_id))
             return
@@ -489,8 +526,7 @@ class ExtensionUpstream:
         if self._group_required(
             group_name=group_name, group_id=gid, session_id=session_id):
             self._require_group_result(group_id, op="attachActive")
-        sid = _new_upstream_session_id(ghost.tab_id)
-        self._sessions[sid] = ghost.tab_id
+        sid = self.register_session(ghost.tab_id)
         if session_id is not None:
             self._bind_group(session_id, group_id)
             if ghost.url:
@@ -537,8 +573,7 @@ class ExtensionUpstream:
         if self._group_required(
             group_name=group_name, group_id=gid, session_id=session_id):
             self._require_group_result(group_id, op="createTab")
-        sid = _new_upstream_session_id(gt.tab_id)
-        self._sessions[sid] = gt.tab_id
+        sid = self.register_session(gt.tab_id)
         if session_id is not None:
             self._bind_group(session_id, group_id)
             if gt.url:
@@ -583,10 +618,11 @@ class ExtensionUpstream:
             if not isinstance(tab_id, int):
                 continue
             # Idempotent: re-attaches the debugger (relay short-circuits if the
-            # ghost already exists from a popup attach / re-announce).
+            # ghost already exists from a popup attach / re-announce). NOTE:
+            # deliberately NOT `attach_target` — recovery keeps the relay's
+            # default attach timeout, not the emulation path's 10s.
             await self._relay.attach_tab(tab_id)
-            sid = _new_upstream_session_id(tab_id)
-            self._sessions[sid] = tab_id
+            sid = self.register_session(tab_id)
             url = str(tab.get("url", ""))
             if session_id:
                 self._bind_group(session_id, group_id)
@@ -637,8 +673,7 @@ class ExtensionUpstream:
             raise ValueError(f"unknown targetId {target_id!r}")
         # Drop any sessions that still reference this tab so the upstream
         # doesn't hold stale entries.
-        for sid in [s for s, t in self._sessions.items() if t == tab_id]:
-            self._sessions.pop(sid, None)
+        self.evict_tab_sessions(tab_id)
         await self._relay.close_tab(tab_id)
         return {"ok": True, "tabId": tab_id}
 
@@ -683,11 +718,7 @@ class ExtensionUpstream:
         if not isinstance(tab_id, int) or not isinstance(method, str):
             return
         # Find a sessionId we previously handed out for this tab.
-        sid = None
-        for s, t in self._sessions.items():
-            if t == tab_id:
-                sid = s
-                break
+        sid = self.session_for_tab(tab_id)
         out: dict[str, Any] = {"method": method, "params": params}
         if sid is not None:
             out["sessionId"] = sid
