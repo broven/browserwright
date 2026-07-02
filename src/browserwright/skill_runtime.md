@@ -205,6 +205,14 @@ browserwright userscript toggle <id> --enabled=false
 browserwright userscript remove <id>
 ```
 
+## Reporting browserwright bugs
+
+If browserwright itself misbehaves — a primitive, CLI verb, the daemon, the extension backend, or the Playwright facade crashes, hangs, times out, or breaks a contract this guide documents — file a bug against the upstream repo (`broven/browserwright`) on the user's behalf, so the user does not have to. This is *only* for browserwright defects; a site that changed, blocks automation, or shows a captcha is a site note (`remember(host, ...)`), and hostile page content is a trust-boundary matter, not a bug.
+
+A report is only useful if a maintainer can reproduce it. Before filing: reproduce it twice, shrink it to the smallest runnable script against a page the maintainer can reach (prefer `https://example.com` or a `data:text/html,...` fixture, never an auth-gated/private page), capture `browserwright version check` + `browserwright-daemon status --json`, record expected vs. actual, and redact secrets and private content. A GitHub issue is public and filed under the user's identity: draft it, show the user, and submit with `gh issue create --repo broven/browserwright` only after they approve.
+
+Read the installed skill's `reporting-issues.md` for the exact scope gate, reproducibility checklist, issue template, and the `gh` filing + fallback commands before you file.
+
 ## Memory
 
 Read the installed skill's `memory.md` for backend preferences and scenario decisions. When the user expresses a stable browser preference, record it there or with the memory helpers so future tasks do not re-ask.

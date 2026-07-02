@@ -20,6 +20,8 @@ Follow the generated `browserwright --print-skill` output for command forms, ses
 
 Also read `memory.md` in this skill directory before choosing a backend. It records the user's backend preferences and scenario decisions.
 
+If browserwright itself misbehaves (a primitive, the daemon, the extension backend, or the Playwright facade crashes, hangs, or breaks its documented contract), read `reporting-issues.md` in this skill directory and file a reproducible bug against `broven/browserwright` on the user's behalf — don't make the user report it.
+
 Use `page.evaluate(...)` or `page.locator(...).inner_text()` for bulk text extraction; `snapshot()` is for deciding and verifying actions. For multi-line code, heredocs, JSON literals, or complex quoting, use `browserwright -s "$sid" -f script.py` or `--code-stdin` rather than a dense `-e` one-liner.
 
 When you discover stable, reusable behavior for a specific site, record a short sanitized note with `remember(host_or_url, text, section=...)`. This creates or updates that site's `site-skills/<site>/memory.md`; do not wait until you are writing a reusable task. Never store secrets, tokens, passwords, or private page content.
