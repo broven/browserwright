@@ -1,8 +1,4 @@
-"""Focused offline coverage for REPL/misc low-coverage modules.
-
-These tests deliberately stay in one file so the curated unit set can pick a
-small number of high-signal nodeids without pulling in browser/daemon work.
-"""
+"""Focused offline coverage for REPL/misc low-coverage modules."""
 from __future__ import annotations
 
 import io

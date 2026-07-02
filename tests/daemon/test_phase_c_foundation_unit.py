@@ -98,7 +98,14 @@ def test_facade_ws_url_carries_bound_browserwright_session(tmp_path, monkeypatch
     _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "rdp 7")
 
-    assert ph._facade_ws_url() == "ws://127.0.0.1:19990/cdp?session=rdp%207"
+    # The daemon parses the query with parse_qs, which decodes both `+` and
+    # `%20` as a space — assert the decoded value, not the exact encoding.
+    from urllib.parse import parse_qs, urlsplit
+
+    url = ph._facade_ws_url()
+    parts = urlsplit(url)
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == "ws://127.0.0.1:19990/cdp"
+    assert parse_qs(parts.query)["session"] == ["rdp 7"]
 
 
 def test_facade_ws_url_preserves_existing_query(tmp_path, monkeypatch):
