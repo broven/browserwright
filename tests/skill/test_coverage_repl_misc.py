@@ -134,14 +134,15 @@ def test_skill_doc_documents_state_and_reset_surface():
     assert "daemon restart" in doc.lower()
 
 
-def test_skill_doc_lists_importable_internal_primitives():
+def test_skill_doc_no_longer_advertises_legacy_cdp_primitives():
+    # The legacy CDP-driving primitives were deleted; the doc must not point
+    # agents at them anymore (the browser surface is page/context/snapshot).
     from browserwright import skill_doc
 
     doc = skill_doc.render()
-    assert "Importable internal primitives" in doc
-    assert "capture_screenshot" in doc
-    assert "diff_snapshot" in doc
-    assert "click_at_xy" in doc
+    assert "Importable internal primitives" not in doc
+    assert "capture_screenshot" not in doc
+    assert "click_at_xy" not in doc
 
 
 def test_snapshot_default_max_chars_is_less_aggressive():

@@ -549,6 +549,16 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     return 1
 
 
+def _fresh_screenshot_path() -> str:
+    """A non-colliding /tmp png path for the userscript --verify screenshot."""
+    i = 0
+    while True:
+        cand = Path("/tmp") / f"browserwright-shot-{os.getpid()}-{i}.png"
+        if not cand.exists():
+            return str(cand)
+        i += 1
+
+
 def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int:
     if not args or args[0] in {"-h", "--help"}:
         sys.stdout.write(USERSCRIPT_HELP)
@@ -587,14 +597,20 @@ def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int
                 raise RuntimeError(
                     "no drivable session bound; pass -s <id> or set BD_SESSION"
                 )
-            # These are internal driving helpers (no longer on the agent
-            # EXPORTS surface — Phase C PR3); the userscript --verify
-            # convenience still uses them directly from the primitive modules.
-            from .primitives.inspect import capture_screenshot
-            from .primitives.page import reload
+            # Drive the verify through the same Playwright path the agent
+            # uses (the legacy CDP primitives are gone): bind the session's
+            # current tab, reload it, screenshot it, print the path.
+            from .repl.playwright_handle import PlaywrightHandle
 
-            reload()
-            print(capture_screenshot())
+            handle = PlaywrightHandle()
+            try:
+                page = handle.page
+                page.reload(wait_until="load")
+                shot = _fresh_screenshot_path()
+                page.screenshot(path=shot)
+                print(shot)
+            finally:
+                handle.close()
         except Exception as e:
             print(f"pushed OK — --verify skipped (no drivable tab): {e}",
                   file=sys.stderr)

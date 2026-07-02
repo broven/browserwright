@@ -163,15 +163,16 @@ import threading
 import traceback
 from urllib.parse import quote
 
-# Phase C PR3 removed the page/tab driving primitives from the agent EXPORTS
-# surface (it's Playwright `page`/`context` now). This test exercises the
-# DAEMON's concurrent multi-session bookkeeping across several in-process
-# Session objects/threads — not the single-process injected `page` — so it
-# drives the daemon directly via the still-present internal primitive functions.
-from browserwright.primitives.interact import js
-from browserwright.primitives.page import close_tab, open, wait_for_load
+# The legacy CDP primitives are deleted (the agent surface is Playwright
+# `page`/`context` now). This test exercises the DAEMON's concurrent
+# multi-session bookkeeping across several in-process Session objects/threads
+# — not the single-process injected `page` — so it drives the daemon directly
+# via the internal session_runtime helpers (explicit `sess` per thread).
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
+from browserwright.session_runtime import (
+    close_session_tab, eval_js, open_session_tab, wait_for_ready,
+)
 
 # browserwright inline requires an explicit ledger session. The harness injects
 # BD_SESSION and the two Session objects below intentionally share that
@@ -199,13 +200,13 @@ def worker(name, initial_text):
                 f"<main id='value'>{initial_text}</main>"
                 "<script>window.e2eReady = true</script>"
             )
-            tab = open(
-                "data:text/html;charset=utf-8," + quote(html),
+            tab = open_session_tab(
+                sess, "data:text/html;charset=utf-8," + quote(html),
             )
             target_id = tab["targetId"]
-            wait_for_load()
+            wait_for_ready(sess)
 
-            before = js("document.getElementById('value').textContent")
+            before = eval_js(sess, "document.getElementById('value').textContent")
 
             # Do not let the first worker finish and close before the second
             # has a live tab + attached daemon session. This makes the test a
@@ -213,14 +214,15 @@ def worker(name, initial_text):
             # one-session smoke tests.
             both_open.wait(timeout=20)
 
-            js(
+            eval_js(
+                sess,
                 "document.body.dataset.session = " + json.dumps(name) + ";"
                 "document.getElementById('value').textContent = "
                 "document.getElementById('value').textContent + ' / operated';"
             )
-            after = js("document.getElementById('value').textContent")
-            marker = js("document.body.dataset.session")
-            title = js("document.title")
+            after = eval_js(sess, "document.getElementById('value').textContent")
+            marker = eval_js(sess, "document.body.dataset.session")
+            title = eval_js(sess, "document.title")
 
             with lock:
                 results[name] = {
@@ -240,8 +242,7 @@ def worker(name, initial_text):
     finally:
         if target_id:
             try:
-                with with_session(sess):
-                    close_tab(target_id=target_id)
+                close_session_tab(sess, target_id=target_id)
             except BaseException:
                 pass
         sess.close()
@@ -313,17 +314,17 @@ import threading
 import traceback
 from urllib.parse import quote
 
-# Phase C PR3: daemon multi-session coverage via the internal primitives (the
+# Daemon multi-session coverage via the internal session_runtime helpers (the
 # agent surface is Playwright now — see the note in the two-session test).
-from browserwright.primitives.interact import js
-from browserwright.primitives.page import (
-    close_tab,
-    list_tabs,
-    open,
-    wait_for_load,
-)
 from browserwright.session import Session, with_session
 from browserwright.session_ctx import resolve_session
+from browserwright.session_runtime import (
+    close_session_tab,
+    eval_js,
+    open_session_tab,
+    session_tabs,
+    wait_for_ready,
+)
 
 SESSION_IDS = [
     "e2e-three-a",
@@ -356,22 +357,23 @@ def worker(session_id):
                 f"<main id='value'>{session_id}</main>"
                 "<script>window.e2eReady = true</script>"
             )
-            tab = open("data:text/html;charset=utf-8," + quote(html))
+            tab = open_session_tab(sess, "data:text/html;charset=utf-8," + quote(html))
             target_id = tab["targetId"]
-            wait_for_load()
-            before = js("document.getElementById('value').textContent")
-            visible_before = list_tabs(include_chrome=False)
+            wait_for_ready(sess)
+            before = eval_js(sess, "document.getElementById('value').textContent")
+            visible_before = session_tabs(sess, include_internal=False)
 
             all_open.wait(timeout=30)
 
-            js(
+            eval_js(
+                sess,
                 "document.body.dataset.session = " + json.dumps(session_id) + ";"
                 "document.getElementById('value').textContent = "
                 "document.getElementById('value').textContent + ' / operated';"
             )
-            after = js("document.getElementById('value').textContent")
-            marker = js("document.body.dataset.session")
-            visible_after = list_tabs(include_chrome=False)
+            after = eval_js(sess, "document.getElementById('value').textContent")
+            marker = eval_js(sess, "document.body.dataset.session")
+            visible_after = session_tabs(sess, include_internal=False)
 
             with lock:
                 results[session_id] = {
@@ -379,7 +381,7 @@ def worker(session_id):
                     "targetId": target_id,
                     "tabId": tab["tabId"],
                     "groupId": tab["groupId"],
-                    "title": js("document.title"),
+                    "title": eval_js(sess, "document.title"),
                     "before": before,
                     "after": after,
                     "marker": marker,
@@ -397,8 +399,7 @@ def worker(session_id):
     finally:
         if failed and target_id:
             try:
-                with with_session(sess):
-                    close_tab(target_id=target_id)
+                close_session_tab(sess, target_id=target_id)
             except BaseException:
                 pass
         sess.close()

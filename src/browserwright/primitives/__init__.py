@@ -1,17 +1,17 @@
-"""v0.5.1 primitive surface (spec §A.2).
+"""Non-browser-driving primitive surface.
 
-This module is what the REPL / inline / task entry points pull into
-their exec globals. Keep it boring — no decorators, no metaprogramming —
-so the agent gets stable, greppable names.
+The legacy CDP browser-driving primitives (``open`` / ``goto_url`` /
+``click_at_xy`` / ``js`` / ``cdp`` / ``capture_screenshot`` / ``snapshot`` /
+the whole page/tab interaction stack) are DELETED — the agent drives the
+browser with real Playwright via the injected ``page`` / ``context`` and
+observes with ``snapshot()`` (see ``repl/_namespace.build_globals``). The
+internal tab lifecycle that binding glue still needs lives in
+``browserwright.session_runtime``.
 
-v0.5.1 (F-4 catch-up) added 13 primitives previously documented but not
-re-exported: type_text / press_key / scroll / fill_input / dispatch_key
-/ upload_file / wait_for_element / wait_for_network_idle / drain_events
-/ ensure_real_tab / iframe_target / http_get plus three Layer-3 helpers
-(list_site_skills / load_site_skill / run_task). Three primitives remain
-deferred to v0.6 with explicit footnotes in design.md §A.2:
-handle_dialog, try_recover_from_drift, plus the broader Layer-3 drift
-recovery scaffold.
+What remains here is exactly the set re-exported by ``browserwright.api``:
+``http_get`` (no-browser escape hatch), the site/memory verbs, and the
+site-skill discovery/task layer. Keep it boring — no decorators, no
+metaprogramming — so the agent gets stable, greppable names.
 """
 from .discovery_api import (  # noqa: F401
     list_site_skills,
@@ -19,45 +19,6 @@ from .discovery_api import (  # noqa: F401
     run_task,
 )
 from .http import http_get  # noqa: F401
-from .inspect import (  # noqa: F401
-    capture_screenshot,
-    cdp,
-    describe_page,
-    diff_snapshot,
-    page_info,
-    snapshot,
-)
-from .interact import (  # noqa: F401
-    click_at_xy,
-    dispatch_key,
-    drain_events,
-    fill_input,
-    js,
-    press_key,
-    scroll,
-    type_text,
-    upload_file,
-    wait_for_element,
-    wait_for_network_idle,
-)
-from .page import (  # noqa: F401
-    attach_active,
-    attach_readonly,
-    close_tab,
-    current_page,
-    current_tab,
-    ensure_real_tab,
-    goto_url,
-    iframe_target,
-    list_tabs,
-    new_tab,
-    open,
-    open_background,
-    reload,
-    switch_tab,
-    wait,
-    wait_for_load,
-)
 from .site import (  # noqa: F401
     bootstrap_site,
     memory_read,
@@ -69,15 +30,6 @@ from .site import (  # noqa: F401
 __all__ = [
     "list_site_skills", "load_site_skill", "run_task",
     "http_get",
-    "capture_screenshot", "cdp", "describe_page", "diff_snapshot",
-    "page_info", "snapshot",
-    "click_at_xy", "dispatch_key", "drain_events", "fill_input", "js",
-    "press_key", "scroll", "type_text", "upload_file",
-    "wait_for_element", "wait_for_network_idle",
-    "attach_active", "attach_readonly", "close_tab", "current_page",
-    "current_tab", "ensure_real_tab", "goto_url", "iframe_target",
-    "list_tabs", "new_tab", "open", "open_background", "reload",
-    "switch_tab", "wait", "wait_for_load",
     "bootstrap_site", "memory_read", "remember", "remember_global",
     "remember_preference",
 ]

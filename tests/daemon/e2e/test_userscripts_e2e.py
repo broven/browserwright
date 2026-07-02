@@ -216,18 +216,19 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
     identity = pushed_payload["identity"]
 
     with _local_page_server() as url:
-        # `open_background`/`js` are daemon/extension features (no agent-surface
-        # Playwright equivalent — removed from EXPORTS in Phase C PR3); driven
-        # here via the internal primitive modules to navigate a real tab so the
-        # userscript injects on load.
+        # Background-tab open / raw evaluate are daemon features (no
+        # agent-surface Playwright equivalent); driven here via the internal
+        # session_runtime helpers to navigate a real tab so the userscript
+        # injects on load.
         probe = run_skill(
             script=(
                 "import json\n"
-                "from browserwright.primitives.page import open_background, wait_for_load\n"
-                "from browserwright.primitives.interact import js\n"
-                f"open_background({url!r})\n"
-                "wait_for_load()\n"
-                'print(json.dumps({"sentinel": js("document.documentElement && document.documentElement.getAttribute(\'data-us-e2e\')")}))\n'
+                "from browserwright.session import current_session\n"
+                "from browserwright.session_runtime import eval_js, open_session_tab, wait_for_ready\n"
+                "sess = current_session()\n"
+                f"open_session_tab(sess, {url!r})\n"
+                "wait_for_ready(sess)\n"
+                'print(json.dumps({"sentinel": eval_js(sess, "document.documentElement && document.documentElement.getAttribute(\'data-us-e2e\')")}))\n'
             ),
             backend="extension",
             timeout=60,
@@ -253,11 +254,12 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
         disabled_probe = run_skill(
             script=(
                 "import json\n"
-                "from browserwright.primitives.page import open_background, wait_for_load\n"
-                "from browserwright.primitives.interact import js\n"
-                f"open_background({url!r})\n"
-                "wait_for_load()\n"
-                'print(json.dumps({"sentinel": js("document.documentElement && document.documentElement.getAttribute(\'data-us-e2e\')")}))\n'
+                "from browserwright.session import current_session\n"
+                "from browserwright.session_runtime import eval_js, open_session_tab, wait_for_ready\n"
+                "sess = current_session()\n"
+                f"open_session_tab(sess, {url!r})\n"
+                "wait_for_ready(sess)\n"
+                'print(json.dumps({"sentinel": eval_js(sess, "document.documentElement && document.documentElement.getAttribute(\'data-us-e2e\')")}))\n'
             ),
             backend="extension",
             timeout=60,

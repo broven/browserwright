@@ -15,7 +15,7 @@ against an injected ``page`` (and ``context``). The handle:
     ``current_target_id`` (ledger fast-path via ``ensure_session_target``) and
     selects the Playwright ``Page`` whose CDP ``targetId`` matches it. If the
     session has no current tab it opens one (``about:blank``) and binds it —
-    mirroring ``primitives/page.py:current_page()``'s "auto-open, NOT adopt"
+    ``session_runtime.resolve_current_target``'s "auto-open, NOT adopt"
     rule. The bound target is persisted back to the ledger so the NEXT call
     resolves the SAME tab (cross-call tab reuse — the whole point of Phase
     C). ``context.new_page()`` is the explicit "new tab" escape hatch.
@@ -198,12 +198,13 @@ def context_for_browser(browser: Any) -> Any:
 def bind_current_page(context: Any, sess: Any) -> Any:
     """Bind the Playwright ``Page`` to the session's current tab.
 
-    The tab itself is resolved/created via the AGENT primitive
-    ``current_page()`` — NOT ``context.new_page()``. This is deliberate:
+    The tab itself is resolved/created via the AGENT path
+    (``session_runtime.resolve_current_target``) — NOT ``context.new_page()``.
+    This is deliberate:
 
-      - ``current_page()`` owns the reuse/recovery/auto-open discipline
-        (reuse the ledger target, recover via the tab group, else open a
-        fresh tab in THIS session's group, NOT adopt) and PERSISTS the
+      - ``resolve_current_target()`` owns the reuse/recovery/auto-open
+        discipline (reuse the ledger target, recover via the tab group, else
+        open a fresh tab in THIS session's group, NOT adopt) and PERSISTS the
         chosen target to the ledger, so the next cold-start resolves the same
         tab — the cross-call reuse acceptance.
       - It also creates the tab inside the session's tab group (extension
@@ -220,13 +221,13 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     → a Playwright-driver assert kills the connection). We correlate by URL via
     the AGENT path instead.
     """
-    from ..primitives.page import current_page
+    from ..session_runtime import resolve_current_target
     from ._smart_goto import patch_context_pages, patch_page_goto
 
     patch_context_pages(context)
 
     # Resolve/create + persist the session's current tab via the agent path.
-    info = current_page()
+    info = resolve_current_target(sess)
     target_id = info.get("targetId") if isinstance(info, dict) else None
 
     if target_id:

@@ -9,7 +9,7 @@ from collections import deque
 
 import pytest
 
-from browserwright.errors import CDPError, ElementNotFound, PageLoadFailed
+from browserwright.errors import CDPError
 
 
 class _StubDaemon:
@@ -68,8 +68,6 @@ def fake_session(fresh_modules):
     fake = _FakeCDP(
         {
             "Runtime.evaluate": {"result": {"value": True}},
-            "DOM.getDocument": {"root": {"nodeId": 9}},
-            "DOM.querySelector": {"nodeId": 0},
             "Target.getTargets": {
                 "targetInfos": [
                     {
@@ -95,232 +93,165 @@ def fake_session(fresh_modules):
         yield sess, fake
 
 
-def test_interact_js_error_and_serialization_paths(fake_session):
-    from browserwright.primitives import interact
-
-    _, fake = fake_session
-    fake.responses["Runtime.evaluate"] = [
-        {"result": {"value": 7}},
-        {"result": {"type": "undefined"}},
-        {
-            "exceptionDetails": {
-                "text": "Uncaught",
-                "exception": {"description": "ReferenceError: missing"},
-            }
-        },
-        {"result": {"type": "object", "description": "HTMLDivElement"}},
-        CDPError(method="Runtime.evaluate", cdp_message="syntax blew up"),
-        {"result": {"value": "frame-ok"}},
-    ]
-
-    assert interact.js("return 7") == 7
-    assert fake.calls[-1][1]["expression"].startswith("(function(){ return 7")
-    assert interact.js("return 8", raw=True) is None
-    assert fake.calls[-1][1]["expression"] == "return 8"
-    with pytest.raises(CDPError, match="ReferenceError: missing"):
-        interact.js("return missing")
-    with pytest.raises(CDPError, match="non-serializable JS result"):
-        interact.js("document.body")
-    with pytest.raises(CDPError) as exc:
-        interact.js("return (")
-    assert exc.value.params == {"expression": "return ("}
-    assert exc.value.cdp_message == "syntax blew up"
-    assert interact.js("return location.href", target_id="frame-1") == "frame-ok"
-    assert fake.attached[-1] == "frame-1"
-
-
-def test_interact_input_fill_click_upload_and_dispatch_paths(fake_session, monkeypatch):
-    from browserwright.primitives import interact
-
-    _, fake = fake_session
-    monkeypatch.setattr(interact.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(interact, "wait_for_element", lambda selector, timeout: False)
-    with pytest.raises(ElementNotFound):
-        interact.fill_input("#late", "x", timeout=0.1)
-
-    monkeypatch.setattr(interact, "wait_for_element", lambda selector, timeout: True)
-    fake.responses["Runtime.evaluate"] = {"result": {"value": False}}
-    with pytest.raises(ElementNotFound):
-        interact.fill_input("#missing", "x", timeout=0.1)
-
-    fake.calls.clear()
-    fake.responses["Runtime.evaluate"] = {"result": {"value": True}}
-    monkeypatch.setattr(interact.sys, "platform", "darwin")
-    interact.click_at_xy(1.5, 2.5, button="right", clicks=2)
-    interact.type_text("hello")
-    interact.press_key("Enter", modifiers=8)
-    interact.scroll(10, 20, dy=-99, dx=4)
-    interact.fill_input("input[name=q]", "az", clear_first=True, timeout=0.1)
-    interact.dispatch_key(".submit", key="Escape", event="keydown")
-
-    mouse_types = [p["type"] for m, p in fake.calls if m == "Input.dispatchMouseEvent"]
-    assert mouse_types == ["mousePressed", "mouseReleased", "mousePressed", "mouseReleased", "mouseWheel"]
-    key_types = [p["type"] for m, p in fake.calls if m == "Input.dispatchKeyEvent"]
-    assert "rawKeyDown" in key_types
-    assert key_types.count("char") >= 3
-    expressions = [p["expression"] for m, p in fake.calls if m == "Runtime.evaluate"]
-    assert any("focus()" in expression for expression in expressions)
-    assert any("KeyboardEvent" in expression and "keydown" in expression for expression in expressions)
-    assert any("'input'" in expression and "'change'" in expression for expression in expressions)
-    assert any(p.get("text") == "hello" for m, p in fake.calls if m == "Input.insertText")
-
-    fake.responses["DOM.querySelector"] = {"nodeId": 0}
-    with pytest.raises(ElementNotFound):
-        interact.upload_file("#missing-file", "/tmp/nope")
-    fake.responses["DOM.querySelector"] = {"nodeId": 42}
-    interact.upload_file("input[type=file]", ["/tmp/a.txt", "/tmp/b.txt"])
-    assert fake.calls[-1] == (
-        "DOM.setFileInputFiles",
-        {"session": "sid-target-1", "files": ["/tmp/a.txt", "/tmp/b.txt"], "nodeId": 42},
-    )
-
-
-def test_interact_waits_and_network_idle_cover_errors_and_timeout(fake_session, monkeypatch):
-    from browserwright.primitives import interact
-
-    _, fake = fake_session
-    outcomes = [
-        CDPError(method="Runtime.evaluate", cdp_message="navigating"),
-        True,
-        False,
-        False,
-    ]
-    expressions = []
-
-    def fake_js(expression):
-        expressions.append(expression)
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-    real_monotonic = interact.time.monotonic
-    monkeypatch.setattr(interact, "js", fake_js)
-    monkeypatch.setattr(interact.time, "sleep", lambda _seconds: None)
-    assert interact.wait_for_element("#ready", timeout=1, visible=True) is True
-    assert "checkVisibility" in expressions[0]
-    ticks = iter([0.0, 0.0, 1.0])
-    monkeypatch.setattr(interact.time, "monotonic", lambda: next(ticks))
-    assert interact.wait_for_element("#never", timeout=0.01) is False
-    monkeypatch.setattr(interact.time, "monotonic", real_monotonic)
-
-    fake._drain_batches = [
-        [{"method": "Network.requestWillBeSent", "params": {"requestId": "r1"}}],
-        [{"method": "Network.dataReceived", "params": {"requestId": "r1"}}],
-        [{"method": "Network.loadingFailed", "params": {"requestId": "r1"}}],
-        [],
-    ]
-    assert interact.wait_for_network_idle(timeout=1, idle_ms=0) is True
-    assert interact.wait_for_network_idle(timeout=0) is False
-
-    fake_session[0].current_target_id = None
-    fake._drain_batches = []
-    fake._events[None] = deque([{"method": "Target.targetCreated"}], maxlen=4)
-    assert interact.drain_events() == [{"method": "Target.targetCreated"}]
-
-
-def test_page_open_current_goto_reload_close_error_sweep(fake_session, monkeypatch):
-    from browserwright.primitives import page
+def test_session_tabs_filters_internal_and_bind_target_activates(fake_session):
+    from browserwright import session_runtime as rt
 
     sess, fake = fake_session
-    monkeypatch.setattr(page, "_session_name_and_id", lambda sess: ("job", "sid-job"))
-    monkeypatch.setattr("browserwright.session_runtime.register_recovered", lambda *a, **k: None)
-    monkeypatch.setattr("browserwright.session_runtime.persist_target", lambda *a, **k: None)
+    all_tabs = rt.session_tabs(sess)
+    assert [t["targetId"] for t in all_tabs] == ["target-1", "chrome-1"]
+    real_tabs = rt.session_tabs(sess, include_internal=False)
+    assert [t["targetId"] for t in real_tabs] == ["target-1"]
 
+    assert rt.bind_target(sess, "target-1") == {"targetId": "target-1"}
+    assert fake.attached[-1] == "target-1"
+    assert sess.current_target_id == "target-1"
+    assert fake.calls[-1] == (
+        "Target.activateTarget", {"session": None, "targetId": "target-1"},
+    )
+
+    # activateTarget failures are tolerated (best-effort focus).
+    fake.responses["Target.activateTarget"] = CDPError(
+        method="Target.activateTarget", cdp_message="nope")
+    assert rt.bind_target(sess, "target-1") == {"targetId": "target-1"}
+
+
+def test_open_session_tab_error_and_success_paths(fake_session):
+    from browserwright import session_runtime as rt
+
+    sess, fake = fake_session
     fake.responses["BrowserwrightDaemon.openBackgroundTab"] = CDPError(
         method="BrowserwrightDaemon.openBackgroundTab", cdp_message="daemon down"
     )
     with pytest.raises(CDPError, match="open failed: daemon down"):
-        page.open("https://open-fails.test/")
+        rt.open_session_tab(sess, "https://open-fails.test/")
 
     fake.responses["BrowserwrightDaemon.openBackgroundTab"] = {}
     with pytest.raises(CDPError, match="empty payload"):
-        page.open("https://empty.test/")
+        rt.open_session_tab(sess, "https://empty.test/")
+
     fake.responses["BrowserwrightDaemon.openBackgroundTab"] = {"targetId": "new"}
     with pytest.raises(CDPError, match="incomplete payload"):
-        page.open("https://incomplete.test/")
+        rt.open_session_tab(sess, "https://incomplete.test/")
 
+    fake.responses["BrowserwrightDaemon.openBackgroundTab"] = {
+        "targetId": "fresh", "sessionId": "sid-fresh", "tabId": 7,
+        "url": "https://ok.test/", "groupId": 3,
+    }
+    out = rt.open_session_tab(sess, "https://ok.test/")
+    assert out == {
+        "targetId": "fresh", "tabId": 7, "url": "https://ok.test/",
+        "title": "", "groupId": 3,
+    }
+    # register_recovered wired the daemon-minted session into local state.
+    assert sess.current_target_id == "fresh"
+    assert fake._sessions["fresh"] == "sid-fresh"
+
+
+def test_resolve_current_target_reuse_recover_adopt_open(fake_session, monkeypatch):
+    from browserwright import session_runtime as rt
+
+    sess, fake = fake_session
+
+    # 1. Cached current target still live → exact.
+    assert rt.resolve_current_target(sess)["accuracy"] == "exact"
+
+    # 2. Stale cache + recovery finds a target not in the tab list.
     sess.current_target_id = "stale"
-    monkeypatch.setattr(page, "list_tabs", lambda include_chrome=True: [])
-    monkeypatch.setattr("browserwright.session_runtime.ensure_session_target", lambda sess: "recovered")
-    assert page.current_page() == {"targetId": "recovered", "accuracy": "exact"}
+    monkeypatch.setattr(rt, "ensure_session_target", lambda s: "recovered")
+    monkeypatch.setattr(rt, "session_tabs", lambda s, **k: [])
+    assert rt.resolve_current_target(sess) == {
+        "targetId": "recovered", "accuracy": "exact"}
     assert sess.current_target_id is None
 
-    monkeypatch.setattr("browserwright.session_runtime.ensure_session_target", lambda sess: None)
-    opened_payload = {"targetId": "fresh", "sessionId": "sid-fresh", "url": "about:blank"}
-    fake.responses["BrowserwrightDaemon.openBackgroundTab"] = opened_payload
-    assert page.current_page()["targetId"] == "fresh"
+    # 3. No recovery, an existing real tab is adopted (bound).
+    monkeypatch.setattr(rt, "ensure_session_target", lambda s: None)
+    monkeypatch.setattr(
+        rt, "session_tabs",
+        lambda s, **k: [{"targetId": "real", "url": "https://real.test/",
+                         "title": "Real", "attached": False}],
+    )
+    out = rt.resolve_current_target(sess)
+    assert out == {"targetId": "real", "url": "https://real.test/",
+                   "title": "Real", "accuracy": "unknown"}
+    assert sess.current_target_id == "real"
 
+    # 4. Empty session → open a fresh working tab (NOT adopt).
     sess.current_target_id = None
-    monkeypatch.setattr(page, "list_tabs", lambda include_chrome=True: [])
-    monkeypatch.setattr(page, "new_tab", lambda url: {"targetId": "brand-new", "url": url})
-    assert page.goto_url("https://new.test/") == {"targetId": "brand-new", "url": "https://new.test/"}
+    monkeypatch.setattr(rt, "session_tabs", lambda s, **k: [])
+    fake.responses["BrowserwrightDaemon.openBackgroundTab"] = {
+        "targetId": "fresh", "sessionId": "sid-fresh", "url": "about:blank",
+    }
+    out = rt.resolve_current_target(sess)
+    assert out["targetId"] == "fresh"
+    assert out["accuracy"] == "unknown"
 
-    sess.current_target_id = "target-1"
-    fake.responses["Page.navigate"] = CDPError(method="Page.navigate", cdp_message="blocked")
-    with pytest.raises(PageLoadFailed, match="blocked"):
-        page.goto_url("https://blocked.test/")
 
-    monkeypatch.setattr("browserwright.primitives.inspect.cdp", lambda *a, **k: (_ for _ in ()).throw(
-        CDPError(method="Page.reload", cdp_message="reload refused")
-    ))
-    with pytest.raises(PageLoadFailed, match="reload refused"):
-        page.reload(hard=True)
+def test_close_session_tab_error_paths_and_state_cleanup(fake_session):
+    from browserwright import session_runtime as rt
 
+    sess, fake = fake_session
     sess.current_target_id = None
     with pytest.raises(CDPError, match="no current attached tab"):
-        page.close_tab()
+        rt.close_session_tab(sess)
+
     sess.current_target_id = "target-1"
     fake._sessions["target-1"] = "sid-target-1"
     fake.responses["BrowserwrightDaemon.closeTab"] = CDPError(
         method="BrowserwrightDaemon.closeTab", cdp_message="no backend"
     )
-    with pytest.raises(CDPError, match="close_tab failed: no backend"):
-        page.close_tab()
+    with pytest.raises(CDPError, match="close tab failed: no backend"):
+        rt.close_session_tab(sess)
+
     fake.responses["BrowserwrightDaemon.closeTab"] = {}
     with pytest.raises(CDPError, match="empty close-tab payload"):
-        page.close_tab(target_id="target-1")
-
-
-def test_page_success_paths_current_goto_reload_and_close_cleanup(fake_session, monkeypatch):
-    from browserwright.primitives import page
-
-    sess, fake = fake_session
-    switched = []
-    monkeypatch.setattr(
-        page,
-        "list_tabs",
-        lambda include_chrome=True: [
-            {"targetId": "real", "url": "https://real.test/", "title": "Real", "attached": False}
-        ],
-    )
-
-    def fake_switch(tab):
-        switched.append(tab)
-        sess.current_target_id = tab["targetId"]
-        fake.attach(tab["targetId"])
-        return {"targetId": tab["targetId"]}
-
-    monkeypatch.setattr(page, "switch_tab", fake_switch)
-    sess.current_target_id = None
-    assert page.current_page()["accuracy"] == "unknown"
-    assert switched[-1]["targetId"] == "real"
-    assert page.goto_url("https://next.test/") == {"url": "https://next.test/"}
-
-    monkeypatch.setattr("browserwright.primitives.inspect.cdp", lambda method, **kwargs: fake.calls.append((method, kwargs)) or {})
-    monkeypatch.setattr("browserwright.primitives.inspect.page_info", lambda: {"ready": "complete"})
-    monkeypatch.setattr(page, "wait_for_load", lambda: True)
-    assert page.reload(hard=True) == {"ready": "complete"}
-    assert fake.calls[-1] == ("Page.reload", {"session_id": "sid-real", "ignoreCache": True})
+        rt.close_session_tab(sess, target_id="target-1")
 
     fake.responses["BrowserwrightDaemon.closeTab"] = {"ok": False, "tabId": 55}
-    fake._sessions["real"] = "sid-real"
-    fake._events["sid-real"] = deque([{"method": "Network.requestWillBeSent"}])
-    sess.current_target_id = "real"
-    assert page.close_tab() == {"ok": False, "tabId": 55}
-    assert "real" not in fake._sessions
-    assert "sid-real" not in fake._events
+    fake._events["sid-target-1"] = deque([{"method": "Network.requestWillBeSent"}])
+    assert rt.close_session_tab(sess) == {"ok": False, "tabId": 55}
+    assert "target-1" not in fake._sessions
+    assert "sid-target-1" not in fake._events
     assert sess.current_target_id is None
+
+
+def test_eval_js_value_exception_and_no_tab_paths(fake_session, monkeypatch):
+    from browserwright import session_runtime as rt
+
+    sess, fake = fake_session
+    fake.responses["Runtime.evaluate"] = {"result": {"value": "Title!"}}
+    assert rt.eval_js(sess, "document.title") == "Title!"
+    method, params = fake.calls[-1]
+    assert method == "Runtime.evaluate"
+    assert params["expression"] == "document.title"
+    assert params["returnByValue"] is True
+
+    fake.responses["Runtime.evaluate"] = {
+        "exceptionDetails": {
+            "text": "Uncaught",
+            "exception": {"description": "ReferenceError: missing"},
+        }
+    }
+    with pytest.raises(CDPError, match="ReferenceError: missing"):
+        rt.eval_js(sess, "missing")
+
+    sess.current_target_id = None
+    monkeypatch.setattr(rt, "ensure_session_target", lambda s: None)
+    with pytest.raises(CDPError, match="no current tab"):
+        rt.eval_js(sess, "1 + 1")
+
+
+def test_wait_for_ready_completes_and_times_out(fake_session, monkeypatch):
+    from browserwright import session_runtime as rt
+
+    sess, fake = fake_session
+    fake.responses["Runtime.evaluate"] = {"result": {"value": "complete"}}
+    assert rt.wait_for_ready(sess, timeout=1.0) is True
+
+    fake.responses["Runtime.evaluate"] = {"result": {"value": "loading"}}
+    monkeypatch.setattr(rt.time, "sleep", lambda _s: None)
+    ticks = iter([0.0, 0.0, 99.0])
+    monkeypatch.setattr(rt.time, "monotonic", lambda: next(ticks))
+    assert rt.wait_for_ready(sess, timeout=0.01) is False
 
 
 def test_http_get_fetch_fallback_gzip_and_headers(monkeypatch):
@@ -373,22 +304,16 @@ def test_http_get_fetch_fallback_gzip_and_headers(monkeypatch):
 
 
 def test_site_memory_host_resolution_confirm_and_reads(tmp_bs_home, fake_session, monkeypatch):
-    from browserwright.primitives import page, site
+    from browserwright.primitives import site
     from browserwright.errors import NeedsUserConfirm
 
     sess, _ = fake_session
     assert site._resolve_host("https://sub.example.co.uk/path") == "example.co.uk"
 
+    # Current-tab inference goes through session_runtime.session_tabs (the
+    # fake CDP's Target.getTargets has target-1 → https://example.test/start).
     sess.current_target_id = "target-1"
-    monkeypatch.setattr(
-        page,
-        "list_tabs",
-        lambda: [
-            {"targetId": "target-1", "url": "https://docs.python.org/3/", "title": "Docs"},
-            {"targetId": "other", "url": "https://ignored.test/", "title": "Other"},
-        ],
-    )
-    assert site._resolve_host(None) == "python.org"
+    assert site._resolve_host(None) == "example.test"
 
     sess.current_target_id = None
     with pytest.raises(ValueError, match="no host given"):

@@ -367,8 +367,9 @@ def test_one_group_agent_first_extension(ext_autofacade_ready, e2e_chrome,
         chrome=e2e_chrome,
         extension_id=extension_id,
         script=(
-            "from browserwright.primitives.page import open\n"
-            "tab = open('about:blank')\n"
+            "from browserwright.session import current_session\n"
+            "from browserwright.session_runtime import open_session_tab\n"
+            "tab = open_session_tab(current_session(), 'about:blank')\n"
             "print(tab['targetId'])\n"
         ),
     )
@@ -386,8 +387,9 @@ def test_one_group_mixed_extension(ext_autofacade_ready, e2e_chrome,
         chrome=e2e_chrome,
         extension_id=extension_id,
         script=(
-            "from browserwright.primitives.page import open\n"
-            "open('about:blank')\n"
+            "from browserwright.session import current_session\n"
+            "from browserwright.session_runtime import open_session_tab\n"
+            "open_session_tab(current_session(), 'about:blank')\n"
             "page.goto('about:blank', wait_until='load')\n"
             "print('ok')\n"
         ),
@@ -483,15 +485,15 @@ def test_memory_only_heredoc_does_not_connect_rdp(rdp_autofacade_daemon):
     page bind, and (belt + suspenders) that no extra tab was created."""
     runtime_dir, _facade_ws = rdp_autofacade_daemon
     sid = _seed_session(runtime_dir, "rdp")
-    # Count tabs WITHOUT binding a `page`. The agent `list_tabs` primitive was
-    # removed from the EXPORTS surface in Phase C PR3, but it survives as an
-    # internal function — and unlike touching `context`/`page` (which connects
-    # the facade and auto-binds/opens the session's tab via current_page), the
-    # internal `list_tabs` is a pure read that does NOT open a tab. That is what
-    # makes it a valid bracket for the lazy memory-only heredoc.
+    # Count tabs WITHOUT binding a `page`. Unlike touching `context`/`page`
+    # (which connects the facade and auto-binds/opens the session's tab via
+    # resolve_current_target), the internal `session_tabs` helper is a pure
+    # read that does NOT open a tab. That is what makes it a valid bracket for
+    # the lazy memory-only heredoc.
     count_probe = (
-        "from browserwright.primitives.page import list_tabs\n"
-        "print('NTABS=' + str(len(list_tabs())))"
+        "from browserwright.session import current_session\n"
+        "from browserwright.session_runtime import session_tabs\n"
+        "print('NTABS=' + str(len(session_tabs(current_session()))))"
     )
     try:
         before = run_skill(count_probe,

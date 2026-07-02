@@ -29,8 +29,8 @@ def _resolve_host(host_or_url: Optional[str]) -> str:
     sess = current_session()
     if sess.current_target_id:
         # Look it up via the tab list (cheap, single CDP call).
-        from .page import list_tabs
-        for t in list_tabs():
+        from ..session_runtime import session_tabs
+        for t in session_tabs(sess):
             if t["targetId"] == sess.current_target_id and t.get("url"):
                 return host_stem(t["url"])
     raise ValueError("remember(): no host given and no current tab to infer from")

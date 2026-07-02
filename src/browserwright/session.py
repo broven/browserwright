@@ -215,9 +215,8 @@ def with_session(sess: Session) -> Iterator[Session]:
 
         from browserwright.session import isolated_session, with_session
         with with_session(isolated_session()) as sess:
-            goto_url("https://example.com")
-            # this block's primitives operate on `sess`, not the default
-        # outside the `with`, primitives revert to the default singleton.
+            ...  # this block's helpers operate on `sess`, not the default
+        # outside the `with`, callers revert to the default singleton.
 
     The session's CDP transport is *not* closed automatically — callers that
     spin a Session for a one-shot task should call ``sess.close()`` after

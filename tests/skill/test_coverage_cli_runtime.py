@@ -447,12 +447,34 @@ def test_cmd_userscript_verify_binds_bd_session(monkeypatch, tmp_bs_home, capsys
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr("browserwright.mode_b_client.ModeBClient.is_alive", lambda self: False)
-    monkeypatch.setattr("browserwright.primitives.page.reload", lambda: {"ok": True})
-    monkeypatch.setattr("browserwright.primitives.inspect.capture_screenshot", lambda: "/tmp/shot.png")
+
+    # --verify drives the Playwright path: reload the bound page, screenshot
+    # it, print the path, and ALWAYS close the handle.
+    events = []
+
+    class FakePage:
+        def reload(self, *, wait_until=None):
+            events.append(("reload", wait_until))
+
+        def screenshot(self, *, path):
+            events.append(("screenshot", path))
+
+    class FakeHandle:
+        page = FakePage()
+
+        def close(self):
+            events.append(("close", None))
+
+    monkeypatch.setattr(
+        "browserwright.repl.playwright_handle.PlaywrightHandle", FakeHandle)
+    monkeypatch.setattr(cli, "_fresh_screenshot_path", lambda: "/tmp/shot.png")
 
     assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 0
     assert calls == [["browserwright-daemon", "userscript", "push", "script.js"]]
     assert capsys.readouterr().out == "/tmp/shot.png\n"
+    assert events == [
+        ("reload", "load"), ("screenshot", "/tmp/shot.png"), ("close", None),
+    ]
 
 
 def test_daemon_doctor_synthetic_for_spawn_failure(monkeypatch):
@@ -856,12 +878,16 @@ def test_task_runner_isolated_session_closes_after_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "isolated_session", lambda: fake_session)
     monkeypatch.setattr(session_mod, "with_session", lambda sess: FakeContext())
-    monkeypatch.setattr("browserwright.primitives.page.open", lambda url: events.append(("open", url)))
+    monkeypatch.setattr(
+        "browserwright.session_runtime.open_session_tab",
+        lambda sess, url: events.append(("open", sess, url)),
+    )
 
     assert task_runner.run_task("site", "ok", isolated=True) == "ok"
     assert events[0] == "enter"
     assert events[1][0] == "open"
-    assert events[1][1].startswith("data:text/html;charset=utf-8,<title>browserwright-isolated-")
+    assert events[1][1] is fake_session
+    assert events[1][2].startswith("data:text/html;charset=utf-8,<title>browserwright-isolated-")
     assert events[2:] == ["exit", "close"]
 
 

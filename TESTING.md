@@ -100,8 +100,7 @@ What lives there today:
 ```text
 tests/skill/test_coverage_cli_runtime.py       CLI parsing/dispatch, sessions, tasks, memory commands
 tests/skill/test_coverage_mode_b_dense.py      daemon discovery/client, CDP transport
-tests/skill/test_coverage_primitives.py        screenshot capture
-tests/skill/test_coverage_primitives_sweep.py  interact/page/http/site-memory/cdp primitives
+tests/skill/test_coverage_primitives_sweep.py  session-runtime tab helpers, http/site-memory, cdp transport
 tests/skill/test_coverage_repl_misc.py         inline run, discovery, schemas, errors, CDP loop
 tests/skill/test_cdp_slow_rpc_regression.py    slow-RPC timeout regression
 tests/skill/test_install_extension_v04.py      install wizard + extension availability

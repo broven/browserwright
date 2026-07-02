@@ -29,7 +29,7 @@ class BrowserwrightError(Exception):
 class PageLoadFailed(BrowserwrightError):
     exit_code = 3
     default_fix = (
-        "retry with new_tab(url) then wait_for_load(); if it persists, "
+        "retry with page.goto(url); if it persists, "
         "check the URL and network with http_get(url)"
     )
 
@@ -41,8 +41,8 @@ class PageLoadFailed(BrowserwrightError):
 class ElementNotFound(BrowserwrightError):
     exit_code = 3
     default_fix = (
-        "capture_screenshot() to confirm the element is visible, then "
-        "click_at_xy(x, y); use snapshot() to list interactive elements"
+        "use snapshot() to list interactive elements and their [ref=eN] "
+        "handles, then act via page.locator(\"aria-ref=eN\")"
     )
 
     def __init__(self, selector: str = "", timeout: float = 0.0, fix: str = ""):
