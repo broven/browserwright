@@ -73,22 +73,8 @@ class UpstreamConnection:
     def is_open(self) -> bool:
         return self._ws is not None
 
-    async def open(
-        self,
-        ws_url: str,
-        *,
-        timeout: float = 30.0,
-        additional_headers: dict[str, str] | None = None,
-        ssl_context: Any = None,
-    ) -> None:
-        """Connect to upstream. Raises on failure; caller transitions state.
-
-        v0.5: `additional_headers` + `ssl_context` parameterize the upstream
-        handshake so the `cloud` backend's AuthProvider can inject
-        `Authorization: Bearer ...` headers or pass a client-cert
-        `ssl.SSLContext` for mTLS. Both are None for the v0.1-v0.4 use
-        cases (local Chrome — no auth needed, ws:// is plaintext).
-        """
+    async def open(self, ws_url: str, *, timeout: float = 30.0) -> None:
+        """Connect to upstream. Raises on failure; caller transitions state."""
         if self._ws is not None:
             raise RuntimeError("upstream already open")
         with _localhost_bypass_proxy(ws_url):
@@ -113,13 +99,6 @@ class UpstreamConnection:
                 "ping_interval": 20,
                 "ping_timeout": 20,
             }
-            if additional_headers:
-                # websockets v15 accepts `additional_headers=` for client
-                # connections (older `extra_headers=` is deprecated). The
-                # keyword name is part of websockets' public API.
-                connect_kwargs["additional_headers"] = list(additional_headers.items())
-            if ssl_context is not None:
-                connect_kwargs["ssl"] = ssl_context
             self._ws = await asyncio.wait_for(
                 websockets.connect(ws_url, **connect_kwargs),
                 timeout=timeout,

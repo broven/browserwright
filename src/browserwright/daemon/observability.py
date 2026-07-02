@@ -49,7 +49,7 @@ class Metrics:
     accessed via `metrics()` singleton.
 
     Naming convention: `<area>_<event>` (snake_case). Areas are stable —
-    `client`, `upstream`, `proxy`, `auth` (four groups; v0.5.3 F-14 dropped
+    `client`, `upstream`, `proxy` (three groups; v0.5.3 F-14 dropped
     the stale `relay_*` mention from this docstring — relay activity is
     counted under `proxy_*` / `upstream_*` instead). Adding a counter is a
     minor version bump for the `stats --json` schema; renaming one is
@@ -62,7 +62,7 @@ class Metrics:
     client_disconnected_total: int = 0
     client_frame_received_total: int = 0
 
-    # ---- upstream (Chrome / cloud / relay) ----
+    # ---- upstream (Chrome / relay) ----
     upstream_open_attempts_total: int = 0
     upstream_open_succeeded_total: int = 0
     upstream_open_failed_total: int = 0
@@ -76,10 +76,6 @@ class Metrics:
     proxy_pre_open_buffered_total: int = 0
     proxy_pre_open_overflow_total: int = 0
     proxy_pre_open_drained_total: int = 0
-
-    # ---- auth (v0.5 cloud backend) ----
-    auth_headers_resolved_total: int = 0
-    auth_resolution_failures_total: int = 0
 
     def snapshot(self) -> dict:
         """Return a flat dict suitable for JSON serialization.

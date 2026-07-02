@@ -15,7 +15,7 @@ src/browserwright/        Layer 2: agent API, sessions, memory, primitives
         ↓
 src/browserwright/daemon/ Layer 1: browser/CDP connection, proxy, backends
         ↓
-Chrome / extension / RDP / cloud browser
+Chrome / extension / RDP browser
 ```
 
 - `tests/daemon/` covers the daemon, CDP proxy, backends, IPC, extension relay,
@@ -59,7 +59,6 @@ tests/daemon/test_relay.py
 tests/daemon/test_extension_upstream.py
 tests/daemon/test_serve.py
 tests/daemon/test_launch_chrome.py
-tests/daemon/test_cloud_backend.py
 tests/daemon/test_userscripts_parse.py
 ```
 

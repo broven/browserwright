@@ -182,7 +182,7 @@ class Router:
             Callable[[str | None], Awaitable[list[dict]]] | None) = None
         # Phase 3 (docs/refactor-single-daemon.md): rdp raw-CDP command channel.
         # Set by listener._open_chrome_upstream to the UpstreamConnection's
-        # daemon-internal `send_command` when this is an rdp (or env/cloud)
+        # daemon-internal `send_command` when this is an rdp (or env)
         # context. The unified session verbs (openBackgroundTab / closeTab /
         # userscript) dispatch to a CDP implementation through this when the
         # context's backend is rdp, instead of the extension callbacks (which
@@ -197,8 +197,8 @@ class Router:
 
     @property
     def _raw_cdp_backend(self) -> bool:
-        """True when this context speaks real browser-level CDP (rdp / env /
-        cloud) rather than the extension relay.
+        """True when this context speaks real browser-level CDP (rdp / env)
+        rather than the extension relay.
 
         The unified tab-lifecycle verbs (openBackgroundTab / closeTab /
         recoverSession / userscript / attachActiveTab) dispatch to their
@@ -207,7 +207,7 @@ class Router:
         the sole LOCAL_RELAY backend, so "not extension" is exactly "raw
         browser-level CDP". (issue #20: env joined this family — it resolves
         BD_CDP_WS and shares ``_open_chrome_upstream``'s raw command channel,
-        same as rdp/cloud.)"""
+        same as rdp.)"""
         return self.state.backend_name != "extension"
 
     def _session_group_name(
@@ -1408,7 +1408,7 @@ class Router:
         The backend is read from the ledger (NOT a param) by the dispatcher in
         listener / Daemon, so by the time a client reaches this Router it must
         already be routed to the right context:
-          - extension/env/cloud → the shared context (this Router). The client
+          - extension/env → the shared context (this Router). The client
             is attached; ensureSession is a no-op success.
           - rdp → a per-session context. `Daemon.context_for(session_id)`
             already created the context (its state/router/holder) when this
@@ -1437,7 +1437,7 @@ class Router:
         if daemon is not None:
             try:
                 # Idempotent get-or-create of the session's context. For
-                # extension/env/cloud this returns the shared context (no-op);
+                # extension/env this returns the shared context (no-op);
                 # for rdp it ensures the per-session context exists.
                 daemon.context_for(client.session_id)  # type: ignore[attr-defined]
             except Exception as e:

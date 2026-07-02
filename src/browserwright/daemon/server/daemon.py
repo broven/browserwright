@@ -77,7 +77,7 @@ class Daemon:
     `shared_context` is the always-on, real-browser upstream (backend ==
     `cfg.backend`, default `extension`); for the extension backend its holder
     owns the always-on `RelayServer` started eagerly in `run_serve`. Every
-    extension/env/cloud session routes here.
+    extension/env session routes here.
 
     `contexts` holds one `UpstreamContext` per rdp session, created lazily on
     first reference (Phase 3 makes the holder actually launch the per-session
@@ -118,7 +118,7 @@ class Daemon:
 
         - None / empty session       → the shared (real-browser) context.
         - ledger backend == "rdp"     → a per-session context (created lazily).
-        - extension/env/cloud         → the shared context.
+        - extension/env         → the shared context.
         - unknown explicit session    → raises when `require_known=True`.
 
         The backend is the ledger's immutable `backend` field — never a client
@@ -136,7 +136,7 @@ class Daemon:
         backend = record.get("backend")
         if backend == "rdp":
             return self._ensure_rdp_context(session_id, record)
-        # extension / env / cloud → shared upstream.
+        # extension / env → shared upstream.
         return self.shared_context
 
     def context_for_required(self, session_id: str) -> UpstreamContext:

@@ -90,34 +90,8 @@ class ExtensionConfig:
 
 
 @dataclass
-class CloudConfig:
-    """v0.5 cloud backend config.
-
-    `endpoint` is the upstream URL. Two shapes accepted:
-      - `wss://host/path` → used directly as the ws URL
-      - `https://host`    → daemon HTTP-GETs `/json/version` and reads
-                             `webSocketDebuggerUrl` (same trick as the `env`
-                             backend's `BD_CDP_URL` path)
-
-    `auth_kind` picks one of the registered AuthProvider impls in
-    `browserwright.daemon.auth`. The kind-specific config dict is `auth` (raw
-    toml subtable, dispatched by `build_auth_provider`).
-
-    `provider_hint` is purely informational — surfaces in doctor output
-    ("connected to provider=browser-use, auth=bearer"). The daemon doesn't
-    behave differently per provider.
-    """
-
-    endpoint: str | None = None
-    auth_kind: str | None = None  # "bearer" | "basic" | "mtls" | "oauth2"
-    auth: dict = field(default_factory=dict)  # raw, fed to build_auth_provider
-    provider_hint: str | None = None  # display name, e.g. "browser-use"
-
-
-@dataclass
 class BackendsConfig:
     rdp: RdpConfig = field(default_factory=RdpConfig)
-    cloud: CloudConfig = field(default_factory=CloudConfig)
     extension: ExtensionConfig = field(default_factory=ExtensionConfig)
 
 
@@ -231,20 +205,6 @@ def load(
         cfg.backends.extension.relay_url = ext["relay_url"]
     if isinstance(ext.get("port"), int):
         cfg.backends.extension.port = ext["port"]
-    cloud = backends.get("cloud", {}) if isinstance(backends.get("cloud"), dict) else {}
-    if "endpoint" in cloud and isinstance(cloud["endpoint"], str):
-        cfg.backends.cloud.endpoint = cloud["endpoint"]
-    if "auth_kind" in cloud and isinstance(cloud["auth_kind"], str):
-        cfg.backends.cloud.auth_kind = cloud["auth_kind"]
-    if "provider_hint" in cloud and isinstance(cloud["provider_hint"], str):
-        cfg.backends.cloud.provider_hint = cloud["provider_hint"]
-    # `[backends.cloud.auth.<kind>]` subtables are passed verbatim to
-    # `build_auth_provider`. We pick out the subtable matching `auth_kind`
-    # so the config-time schema stays per-kind validated downstream.
-    auth_subtables = cloud.get("auth", {}) if isinstance(cloud.get("auth"), dict) else {}
-    if cfg.backends.cloud.auth_kind and isinstance(
-            auth_subtables.get(cfg.backends.cloud.auth_kind), dict):
-        cfg.backends.cloud.auth = dict(auth_subtables[cfg.backends.cloud.auth_kind])
     if "idle_close_after" in toml and isinstance(toml["idle_close_after"], (int, float)):
         cfg.idle_close_after = float(toml["idle_close_after"])
     if "session_idle_prune" in toml and isinstance(toml["session_idle_prune"], (int, float)):
@@ -336,14 +296,6 @@ def load(
                 f"applied to rdp.port.)",
                 file=sys.stderr,
             )
-    # v0.5 cloud backend env overrides — useful for one-off CLI calls
-    # without writing a config.toml. Each maps to the equivalent toml key.
-    if "BD_CLOUD_ENDPOINT" in e:
-        cfg.backends.cloud.endpoint = e["BD_CLOUD_ENDPOINT"]
-    if "BD_CLOUD_AUTH_KIND" in e:
-        cfg.backends.cloud.auth_kind = e["BD_CLOUD_AUTH_KIND"]
-    if "BD_CLOUD_PROVIDER_HINT" in e:
-        cfg.backends.cloud.provider_hint = e["BD_CLOUD_PROVIDER_HINT"]
     # v0.5.3 Task #24: extension relay port via env. Symmetric to BD_RDP_PORT
     # — useful when the default 19989 is occupied by a stale daemon process
     # and the user can't write a config.toml on the fly. (playwriter sits on
@@ -365,14 +317,6 @@ def load(
             from .errors import UserError
             raise UserError(
                 f"BD_FACADE_PORT must be an integer, got {e['BD_FACADE_PORT']!r}")
-    # The auth payload itself is read from kind-specific env vars that the
-    # AuthProvider already knows about (`token_env`, `cert_file`, etc).
-    # The env-override layer here is just for endpoint/kind selection; we
-    # deliberately don't have `BD_CLOUD_TOKEN` style shortcuts because
-    # that would mean either (a) silently overwriting `auth.bearer.token`
-    # without provenance tracking, or (b) inventing a parallel resolution
-    # path the AuthProvider can't see. Better to use `BROWSER_USE_API_KEY`
-    # + `token_env="BROWSER_USE_API_KEY"` in config.toml.
 
     # CLI level — last word
     if cli_backend is not None:

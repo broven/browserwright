@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from browserwright.daemon import _ipc, auth as auth_mod
+from browserwright.daemon import _ipc
 from browserwright.daemon.config import Config
-from browserwright.daemon.errors import Unavailable, UserError
+from browserwright.daemon.errors import Unavailable
 from browserwright.daemon.server import listener as listener_mod
 from browserwright.daemon.server import relay as relay_mod
 from browserwright.daemon.server import upstream as upstream_mod
@@ -150,30 +150,6 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
     assert state.upstream_ws_url == "ws://127.0.0.1/devtools/browser/fake"
     assert router.upstream_senders[-1].__self__ is holder.upstream
     assert router._upstream_command.__self__ is holder.upstream
-
-
-@pytest.mark.asyncio
-async def test_upstream_holder_cloud_auth_success_and_user_error(monkeypatch):
-    cfg = Config(backend="cloud")
-    cfg.backends.cloud.auth_kind = "bearer"
-    cfg.backends.cloud.auth = {"token_env": "NOPE"}
-    holder = listener_mod._UpstreamHolder(DaemonState("cloud"), _FakeRouter(), cfg)
-
-    class GoodProvider:
-        async def headers(self):
-            return {"Authorization": "Bearer ok"}
-
-        def ssl_context(self):
-            return "ssl-context"
-
-    monkeypatch.setattr(auth_mod, "build_auth_provider", lambda kind, auth: GoodProvider())
-    assert await holder._build_cloud_auth(cfg) == ({"Authorization": "Bearer ok"}, "ssl-context")
-
-    def bad_provider(kind, auth):
-        raise UserError("bad cloud auth")
-
-    monkeypatch.setattr(auth_mod, "build_auth_provider", bad_provider)
-    assert await holder._build_cloud_auth(cfg) == ({}, None)
 
 
 @pytest.mark.asyncio
@@ -504,16 +480,7 @@ async def test_relay_request_cleanup_and_public_helpers_without_socket(monkeypat
     }
 
 
-@pytest.mark.asyncio
-async def test_auth_and_ipc_edges_cover_url_quoting_factory_and_pid(monkeypatch, tmp_path):
-    basic = auth_mod.BasicAuth(username="a@b", password="p:q")
-    url = await basic.url_with_auth("wss://example.com:443/path?x=1#frag")
-    assert url == "wss://a%40b:p%3Aq@example.com:443/path?x=1#frag"
-
-    oauth = auth_mod.build_auth_provider("oauth2", {"scopes": ["openid", "profile"]})
-    assert oauth.scopes == ("openid", "profile")
-    assert oauth.supports_websocket_auth() is False
-
+def test_ipc_edges_cover_pid_read_write(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     _ipc.write_pid(321)
     assert _ipc.read_pid() == 321

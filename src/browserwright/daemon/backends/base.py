@@ -19,13 +19,11 @@ from typing import Literal, Protocol
 BackendKind = Literal["UPSTREAM_WS", "LOCAL_RELAY"]
 Mode = Literal["A", "B"]
 # §5.2 enum (locked under schema_version=1).
-# v0.5 added "auth-required" for the cloud backend (header/mTLS auth must be
-# configured before connect). Adding values to this enum is a minor schema
-# bump — Skill code matches by value, so new entries don't break old skills,
-# they just appear as "unknown ux_cost" until skill catches up.
+# Adding values to this enum is a minor schema bump — Skill code matches by
+# value, so new entries don't break old skills, they just appear as
+# "unknown ux_cost" until skill catches up.
 UxCost = Literal[
-    "none", "banner", "popup-per-ws+banner",
-    "extension-permission", "auth-required",
+    "none", "banner", "popup-per-ws+banner", "extension-permission",
 ]
 
 

@@ -537,7 +537,7 @@ async def test_resolver_records_unavailable_without_attempts(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolver_auto_chain_skips_extension_and_cloud(monkeypatch):
+async def test_resolver_auto_chain_skips_extension(monkeypatch):
     import browserwright.daemon.resolver as resolver_mod
 
     called: list[str] = []
@@ -555,106 +555,11 @@ async def test_resolver_auto_chain_skips_extension_and_cloud(monkeypatch):
 
     chain = [
         Backend("extension"),
-        Backend("cloud"),
         Backend("env", ResolveResult("ws://env/", "env")),
     ]
     monkeypatch.setattr(resolver_mod, "all_backends", lambda cfg: chain)
     assert (await resolver_mod.resolve(load(env={}))).backend == "env"
     assert called == ["env"]
-
-
-@pytest.mark.asyncio
-async def test_cloud_provider_is_cached(monkeypatch):
-    from browserwright.daemon.backends import cloud as cloud_mod
-    from browserwright.daemon.backends.cloud import CloudBackend
-
-    calls = []
-
-    class Provider:
-        pass
-
-    monkeypatch.setattr(cloud_mod, "build_auth_provider", lambda kind, auth: calls.append((kind, auth)) or Provider())
-    cfg = load(env={})
-    cfg.backends.cloud.auth_kind = "bearer"
-    cfg.backends.cloud.auth = {"token": "x"}
-    backend = CloudBackend(cfg)
-    assert backend._provider() is backend._provider()
-    assert calls == [("bearer", {"token": "x"})]
-
-
-@pytest.mark.asyncio
-async def test_cloud_resolve_header_user_error_becomes_unavailable(monkeypatch):
-    from browserwright.daemon.backends.cloud import CloudBackend
-
-    class Provider:
-        async def headers(self):
-            raise UserError("token missing")
-
-    cfg = load(env={})
-    cfg.backends.cloud.endpoint = "https://cloud.example"
-    backend = CloudBackend(cfg)
-    monkeypatch.setattr(backend, "_provider", lambda: Provider())
-    with pytest.raises(Unavailable) as exc:
-        await backend.resolve(timeout=1)
-    assert exc.value.attempts == {"cloud": "token missing"}
-
-
-@pytest.mark.asyncio
-async def test_cloud_resolve_http_client_error_becomes_unavailable(monkeypatch):
-    from browserwright.daemon.backends import cloud as cloud_mod
-    from browserwright.daemon.backends.cloud import CloudBackend
-
-    class Client:
-        def __init__(self, *a, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def get(self, *a, **kw):
-            raise OSError("network off")
-
-    monkeypatch.setattr(cloud_mod.httpx, "AsyncClient", Client)
-    cfg = load(env={})
-    cfg.backends.cloud.endpoint = "https://cloud.example"
-    with pytest.raises(Unavailable) as exc:
-        await CloudBackend(cfg).resolve(timeout=1)
-    assert "OSError" in exc.value.attempts["cloud"]
-
-
-@pytest.mark.asyncio
-async def test_cloud_resolve_invalid_json_counts_as_missing_ws(monkeypatch):
-    from browserwright.daemon.backends import cloud as cloud_mod
-    from browserwright.daemon.backends.cloud import CloudBackend
-
-    class Response:
-        status_code = 200
-
-        def json(self):
-            raise ValueError("not json")
-
-    class Client:
-        def __init__(self, *a, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def get(self, *a, **kw):
-            return Response()
-
-    monkeypatch.setattr(cloud_mod.httpx, "AsyncClient", Client)
-    cfg = load(env={})
-    cfg.backends.cloud.endpoint = "https://cloud.example"
-    with pytest.raises(Unavailable) as exc:
-        await CloudBackend(cfg).resolve(timeout=1)
-    assert "webSocketDebuggerUrl" in str(exc.value)
 
 
 def test_userscript_payload_contains_chrome_registration_fields():
