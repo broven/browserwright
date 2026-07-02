@@ -76,23 +76,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="browserwright-daemon",
         description=(
-            "Resolve a browser-level CDP WebSocket from any local Chrome. "
-            "v0.1 is Mode A only (one-shot CLI). Mode B socket arrives in v0.2."
+            "Long-lived local CDP proxy daemon: one global `serve` process "
+            "that routes browserwright sessions to any local Chrome "
+            "(extension relay, rdp, or an env-supplied CDP endpoint)."
         ),
     )
     sub = p.add_subparsers(dest="cmd", metavar="<subcommand>")
 
-    # url
-    p_url = sub.add_parser("url", help="resolve a CDP ws URL and print it")
-    _add_common(p_url)
-    _add_port(p_url)
-    p_url.add_argument("--json", action="store_true", help="emit a JSON object instead of a bare URL")
-    p_url.add_argument("--mode-b-proxy", action="store_true",
-                       help="instead of upstream ws, output the daemon socket endpoint (v0.2)")
-    _add_name(p_url)
-
     # serve (v0.2)
-    p_serve = sub.add_parser("serve", help="run the long-lived Mode B daemon (v0.2)")
+    p_serve = sub.add_parser("serve", help="run the long-lived global daemon")
     _add_common(p_serve)
     _add_port(p_serve)
     _add_name(p_serve)
@@ -136,15 +128,6 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_name(p_status)
     p_status.add_argument("--json", action="store_true")
 
-    # disconnect (v0.2 §6.6)
-    p_disc = sub.add_parser("disconnect",
-        help="ask the running daemon to close its upstream ws (banner goes away)")
-    _add_name(p_disc)
-    p_disc.add_argument("--session", default=os.environ.get("BD_SESSION"),
-                        help="browserwright session id (defaults to BD_SESSION)")
-    p_disc.add_argument("--reason", default="skill_disconnect",
-                        help="reason string surfaced in upstreamClosed event")
-
     # logs (v0.2)
     p_logs = sub.add_parser("logs", help="print the daemon log file path or tail it")
     _add_name(p_logs)
@@ -157,27 +140,13 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="opt-in: actually open a ws on each available backend (NOT IMPLEMENTED in v0.1)")
     p_doc.add_argument("--json", action="store_true", help="emit JSON instead of pretty text")
 
-    # list-backends
-    p_lb = sub.add_parser("list-backends", help="enumerate backends statically (no probe)")
-    _add_common(p_lb)
-    p_lb.add_argument("--json", action="store_true")
-
-    # active-tab
-    p_at = sub.add_parser("active-tab", help="best-guess user-active tab (heuristic, opens ws)")
-    _add_common(p_at)
-    _add_port(p_at)
-    p_at.add_argument("--session", default=os.environ.get("BD_SESSION"),
-                      help="browserwright session id (defaults to BD_SESSION)")
-    p_at.add_argument("--json", action="store_true")
-
     # backend-info — what backend is the running daemon serving?
-    # Mode B Skill clients shell out to this to decide whether the current
+    # Skill clients shell out to this to decide whether the current
     # daemon matches their expected backend (refused-mismatch guard) and to
     # branch primitives on backend-specific quirks (e.g. extension's "0
-    # attached tabs is actionable, not empty Chrome").
-    p_bi = sub.add_parser(
-        "backend-info",
-        help="report the running daemon's backend identity (Mode B identity probe)")
+    # attached tabs is actionable, not empty Chrome"). Internal plumbing for
+    # the skill layer, so it is hidden from --help.
+    p_bi = sub.add_parser("backend-info")
     _add_name(p_bi)
     p_bi.add_argument("--session", default=os.environ.get("BD_SESSION"),
                       help="browserwright session id (defaults to BD_SESSION)")
@@ -235,12 +204,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="ask connected unpacked extensions to reload from disk",
     )
     p_ext_reload.add_argument("--json", action="store_true")
-
-    # stats (v0.5 observability)
-    p_stats = sub.add_parser("stats", help="dump in-process metrics counters")
-    _add_name(p_stats)
-    p_stats.add_argument("--json", action="store_true",
-                         help="emit as JSON (default: tab-separated)")
 
     # open-background (Phase B — extension backend only)
     p_ob = sub.add_parser(
@@ -399,43 +362,6 @@ def _run(coro):
 # ---- subcommand handlers ---------------------------------------------------
 
 
-def _cmd_url(args, cfg: Config) -> int:
-    # --mode-b-proxy → output the daemon socket endpoint, not an upstream URL.
-    # (Spec §6.1: bare socket path on POSIX, host:port + token on Windows.)
-    if getattr(args, "mode_b_proxy", False):
-        from . import _ipc
-        ep = _ipc.endpoint_describe()
-        if args.json:
-            print(json.dumps(ep, sort_keys=True))
-        else:
-            if ep["transport"] == "unix":
-                print(ep["path"])
-            else:
-                # `host:port token=...` so a one-liner shell consumer can split.
-                token = ep["token"] or ""
-                if ep["port"] is None:
-                    # Daemon not running. Exit 2 so Skill can react.
-                    print("error: no daemon running (no port file)", file=sys.stderr)
-                    return 2
-                print(f"{ep['host']}:{ep['port']} token={token}")
-        return 0
-
-    from .resolver import resolve
-
-    rr = _run(resolve(cfg))
-    if args.json:
-        print(json.dumps({
-            "schema_version": 1,
-            "ws_url": rr.ws_url,
-            "backend": rr.backend,
-            "extras": rr.extras,
-        }, sort_keys=True))
-    else:
-        # Bare URL — spec §5.1 stdout discipline: ONE line, no decoration.
-        print(rr.ws_url)
-    return 0
-
-
 def _cmd_serve(args, cfg: Config) -> int:
     """Run the long-lived Mode B daemon (§5 v0.2).
 
@@ -555,64 +481,6 @@ async def _run_backend_info(args, cfg: Config) -> int:
     return 0
 
 
-def _cmd_stats(args, cfg: Config) -> int:
-    """v0.5: query the running daemon's in-process metrics via the
-    `BrowserwrightDaemon.stats` CDP-namespace method, print to stdout.
-
-    Connects to the daemon's unix socket as a normal client. Exits with
-    code 2 if the daemon isn't running (matching `status`).
-    """
-    import asyncio
-    return asyncio.run(_run_stats(args, cfg))
-
-
-async def _run_stats(args, cfg: Config) -> int:
-    from . import _ipc
-    # We're inside `asyncio.run()` already (via _cmd_stats). Nested
-    # asyncio.run raises RuntimeError, so use the async ping directly —
-    # ping_sync's fallback returns None and we'd misreport "not running"
-    # even when a daemon was listening.
-    pid = await _ipc.ping_async(timeout=1.0)
-    if pid is None:
-        print("daemon not running", file=sys.stderr)
-        return 2
-
-    import websockets
-    sock_path = _ipc.sock_path()
-    if _ipc.IS_WINDOWS:
-        ep = _ipc.endpoint_describe()
-        ws_url = f"ws://127.0.0.1:{ep['port']}/?client=stats-cli&token={ep['token']}"
-        conn = await websockets.connect(ws_url, compression=None)
-    else:
-        conn = await websockets.unix_connect(
-            str(sock_path),
-            uri="ws://localhost/?client=stats-cli",
-            compression=None,
-        )
-    try:
-        await conn.send(json.dumps({"id": 1, "method": "BrowserwrightDaemon.stats"}))
-        # Drain until we see id=1.
-        for _ in range(20):
-            raw = await asyncio.wait_for(conn.recv(), timeout=3.0)
-            msg = json.loads(raw)
-            if msg.get("id") == 1 and "result" in msg:
-                snap = msg["result"]
-                if args.json:
-                    print(json.dumps(snap, sort_keys=True))
-                else:
-                    # Tab-separated key=value, one per line.
-                    for k in sorted(snap.keys()):
-                        print(f"{k}\t{snap[k]}")
-                return 0
-        print("daemon did not respond to BrowserwrightDaemon.stats", file=sys.stderr)
-        return 3
-    finally:
-        try:
-            await conn.close()
-        except Exception:
-            pass
-
-
 def _cmd_status(args, cfg: Config) -> int:
     """Report endpoint + liveness. JSON shape used by Skill for status pings."""
     from . import _ipc, _stale
@@ -687,65 +555,6 @@ def _cmd_status(args, cfg: Config) -> int:
             if facade_ws:
                 print(f"  facade: {facade_ws}")
     return 0 if pid is not None else 2
-
-
-def _cmd_disconnect(args, cfg: Config) -> int:
-    """Open a transient ws to the daemon, fire BrowserwrightDaemon.disconnect, exit.
-
-    Equivalent to the RPC over an established connection — Skill can use either.
-    """
-    if not args.session:
-        print("error: provide --session or set BD_SESSION", file=sys.stderr)
-        return 2
-    return _run(_disconnect_via_ws(cfg, args.reason, args.session))
-
-
-async def _disconnect_via_ws(cfg: Config, reason: str, session: str) -> int:
-    """Lightweight ws client that says BrowserwrightDaemon.disconnect and reads the
-    ack. We bypass cdp-use intentionally — we don't need framing, just one
-    request + one response."""
-    import websockets
-    from . import _ipc
-    from urllib.parse import quote
-
-    session_q = f"&session={quote(str(session), safe='')}"
-
-    if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file()
-        if port is None:
-            print("no daemon running", file=sys.stderr)
-            return 2
-        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-disconnect{session_q}"
-        try:
-            async with websockets.connect(url, compression=None) as ws:
-                await ws.send(json.dumps({
-                    "id": 1, "method": "BrowserwrightDaemon.disconnect",
-                    "params": {"reason": reason, "bsSession": session},
-                }))
-                await asyncio.wait_for(ws.recv(), timeout=2.0)
-        except Exception as e:
-            print(f"disconnect failed: {e}", file=sys.stderr)
-            return 2
-    else:
-        path = _ipc.sock_path()
-        if not path.exists():
-            print("no daemon running", file=sys.stderr)
-            return 2
-        # `ws+unix:` URL scheme + path: websockets accepts unix= kwarg.
-        try:
-            async with websockets.unix_connect(
-                str(path), uri=f"ws://localhost/?client=cli-disconnect{session_q}",
-                compression=None,
-            ) as ws:
-                await ws.send(json.dumps({
-                    "id": 1, "method": "BrowserwrightDaemon.disconnect",
-                    "params": {"reason": reason, "bsSession": session},
-                }))
-                await asyncio.wait_for(ws.recv(), timeout=2.0)
-        except Exception as e:
-            print(f"disconnect failed: {e}", file=sys.stderr)
-            return 2
-    return 0
 
 
 def _cmd_attach_active(args, cfg: Config) -> int:
@@ -852,58 +661,6 @@ def _cmd_doctor(args, cfg: Config) -> int:
     return 0
 
 
-def _cmd_list_backends(args, cfg: Config) -> int:
-    from .doctor import list_backends
-
-    out = _run(list_backends(cfg))
-    if args.json:
-        print(json.dumps(out, sort_keys=True))
-    else:
-        for entry in out["backends"]:
-            print(f"{entry['name']:<12} kind={entry['kind']:<12} "
-                  f"recommended_mode={entry['recommended_mode']} "
-                  f"ux_cost={entry['ux_cost']}")
-    return 0
-
-
-def _cmd_active_tab(args, cfg: Config) -> int:
-    if not args.session:
-        print("error: provide --session or set BD_SESSION", file=sys.stderr)
-        return 2
-    try:
-        info = _run(_rpc_via_ws(
-            cfg,
-            "BrowserwrightDaemon.getActiveTab",
-            {"bsSession": args.session},
-            client_label="cli-active-tab",
-            timeout=8.0,
-            browser_session=args.session,
-        ))
-    except Unavailable as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    except DaemonError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 3
-    if not info or not info.get("targetId"):
-        if args.json:
-            print(json.dumps({
-                "schema_version": 1,
-                "targetId": None,
-                "accuracy": "unknown",
-                "since_seconds": None,
-            }, sort_keys=True))
-        else:
-            print("")  # spec §5.4: empty line + exit 2 when no active tab
-        return 2
-    if args.json:
-        print(json.dumps({"schema_version": 1, **info}, sort_keys=True))
-    else:
-        # tab-separated: targetId\turl\ttitle\taccuracy
-        print(f"{info['targetId']}\t{info['url']}\t{info['title']}\t{info['accuracy']}")
-    return 0
-
-
 def _cmd_launch_chrome(args, cfg: Config) -> int:
     from .launch_chrome import launch_chrome
 
@@ -1003,10 +760,11 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
                       *, client_label: str, timeout: float = 10.0,
                       browser_session: str | None = None) -> dict:
     """Open a transient ws to the running daemon, send one BrowserwrightDaemon.*
-    RPC, read the response, close. Mirrors `_disconnect_via_ws` but returns
-    the parsed result (or raises with the daemon's error message).
+    RPC, read the response, close, and return the parsed result (or raise
+    with the daemon's error message).
 
-    Used by `open-background` and `close-tab` subcommands.
+    Used by `open-background`, `close-tab`, `end-session`, `kill-executor`,
+    `backend-info`, `extension reload`, and `userscript` subcommands.
     """
     import websockets
     from . import _ipc
@@ -1491,10 +1249,7 @@ def _ipc_ping() -> int | None:
 
 
 _DISPATCH = {
-    "url": _cmd_url,
     "doctor": _cmd_doctor,
-    "list-backends": _cmd_list_backends,
-    "active-tab": _cmd_active_tab,
     "launch-chrome": _cmd_launch_chrome,
     "version": _cmd_version,
     "extension": _cmd_extension,
@@ -1503,10 +1258,8 @@ _DISPATCH = {
     "stop": _cmd_stop,
     "restart": _cmd_restart,
     "status": _cmd_status,
-    "disconnect": _cmd_disconnect,
     "logs": _cmd_logs,
     # v0.5
-    "stats": _cmd_stats,
     "backend-info": _cmd_backend_info,
     # v0.5.4 — extension backend
     "attach-active": _cmd_attach_active,

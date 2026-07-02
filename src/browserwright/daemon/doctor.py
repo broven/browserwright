@@ -12,9 +12,8 @@ the flag but the v0.1 scope (§7) does not include real ws handshake.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 
-from .backends import all_backends, get_backend, names
+from .backends import all_backends, names
 from .config import Config
 from .errors import UserError
 
@@ -66,23 +65,6 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
         "schema_version": SCHEMA_VERSION,
         "recommended": _pick_recommended([_asdict(r) for r in results]),
         "backends": [_asdict(r) for r in results],
-    }
-
-
-async def list_backends(cfg: Config) -> dict:
-    """Static, no-probe view — spec §5.3."""
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "backends": [
-            {
-                "name": b.name,
-                "kind": b.kind,
-                "recommended_mode": b.recommended_mode,
-                "ux_cost": b.ux_cost,
-                "needs_user_action": _needs_action(b.name),
-            }
-            for b in all_backends(cfg)
-        ],
     }
 
 

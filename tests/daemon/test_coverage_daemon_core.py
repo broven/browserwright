@@ -52,40 +52,12 @@ def test_cli_main_unavailable_verbose_prints_attempts(monkeypatch, capsys):
     def boom(args, cfg):
         raise Unavailable("nothing resolved", attempts={"env": "unset", "rdp": "closed"})
 
-    monkeypatch.setitem(cli_mod._DISPATCH, "url", boom)
-    assert cli_mod.main(["url", "--verbose"]) == 2
+    monkeypatch.setitem(cli_mod._DISPATCH, "doctor", boom)
+    assert cli_mod.main(["doctor", "--verbose"]) == 2
     captured = capsys.readouterr()
     assert "error: nothing resolved" in captured.err
     assert "env: unset" in captured.err
     assert "rdp: closed" in captured.err
-
-
-def test_cmd_url_mode_b_proxy_unix_text(monkeypatch, capsys):
-    from browserwright.daemon import _ipc
-
-    monkeypatch.setattr(
-        _ipc,
-        "endpoint_describe",
-        lambda: {"transport": "unix", "path": "/tmp/bd.sock", "host": None, "port": None, "token": None},
-    )
-    args = SimpleNamespace(mode_b_proxy=True, json=False)
-    assert cli_mod._cmd_url(args, Config()) == 0
-    assert capsys.readouterr().out == "/tmp/bd.sock\n"
-
-
-def test_cmd_url_mode_b_proxy_tcp_without_port_exits_unavailable(monkeypatch, capsys):
-    from browserwright.daemon import _ipc
-
-    monkeypatch.setattr(
-        _ipc,
-        "endpoint_describe",
-        lambda: {"transport": "tcp", "path": None, "host": "127.0.0.1", "port": None, "token": "tok"},
-    )
-    args = SimpleNamespace(mode_b_proxy=True, json=False)
-    assert cli_mod._cmd_url(args, Config()) == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "no daemon running" in captured.err
 
 
 def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
@@ -144,39 +116,6 @@ def test_cmd_daemon_version_check_json_reports_consistent_versions(monkeypatch, 
     assert payload["version"] == payload["extension_version"]
     assert payload["daemon_version"] == "9.9.9"
     assert payload["running_extensions"][0]["version_drift"] == "patch"
-
-
-@pytest.mark.parametrize("json_mode", [False, True])
-def test_cmd_active_tab_none_outputs_mode_specific_shape(monkeypatch, capsys, json_mode):
-    async def fake_rpc(cfg, method, params, *, client_label, timeout, browser_session=None):
-        assert method == "BrowserwrightDaemon.getActiveTab"
-        assert params == {"bsSession": "bw-s"}
-        assert browser_session == "bw-s"
-        return {}
-
-    monkeypatch.setattr(cli_mod, "_rpc_via_ws", fake_rpc)
-    rc = cli_mod._cmd_active_tab(SimpleNamespace(json=json_mode, session="bw-s"), Config())
-    captured = capsys.readouterr()
-    assert rc == 2
-    if json_mode:
-        assert json.loads(captured.out)["accuracy"] == "unknown"
-    else:
-        assert captured.out == "\n"
-
-
-def test_cmd_active_tab_text_outputs_tab_separated_info(monkeypatch, capsys):
-    async def fake_rpc(cfg, method, params, *, client_label, timeout, browser_session=None):
-        assert method == "BrowserwrightDaemon.getActiveTab"
-        return {
-            "targetId": "T1",
-            "url": "https://example.test/",
-            "title": "Example",
-            "accuracy": "heuristic-recent-activate",
-        }
-
-    monkeypatch.setattr(cli_mod, "_rpc_via_ws", fake_rpc)
-    assert cli_mod._cmd_active_tab(SimpleNamespace(json=False, session="bw-s"), Config()) == 0
-    assert capsys.readouterr().out == "T1\thttps://example.test/\tExample\theuristic-recent-activate\n"
 
 
 def test_cmd_close_tab_requires_identifier(capsys):
@@ -240,96 +179,6 @@ def test_pretty_doctor_prints_detail_warning_and_next(capsys):
     assert "detail: missing env" in out
     assert "warning: no url" in out
     assert "next: set BD_CDP_WS" in out
-
-
-@pytest.mark.asyncio
-async def test_fetch_targets_accepts_unwrapped_target_infos(monkeypatch):
-    import browserwright.daemon.active_tab as at_mod
-
-    class FakeClient:
-        def __init__(self, ws_url):
-            self.ws_url = ws_url
-
-        async def start(self):
-            return None
-
-        async def send_raw(self, method):
-            return {"targetInfos": [{"targetId": "T"}]}
-
-        async def stop(self):
-            return None
-
-    monkeypatch.setattr(at_mod, "CDPClient", FakeClient)
-    assert await at_mod._fetch_targets("ws://127.0.0.1:9222/devtools/browser/x", 1) == [{"targetId": "T"}]
-
-
-@pytest.mark.asyncio
-async def test_fetch_targets_non_list_payload_returns_empty(monkeypatch):
-    import browserwright.daemon.active_tab as at_mod
-
-    class FakeClient:
-        def __init__(self, ws_url):
-            pass
-
-        async def start(self):
-            return None
-
-        async def send_raw(self, method):
-            return {"result": {"targetInfos": "not-a-list"}}
-
-        async def stop(self):
-            return None
-
-    monkeypatch.setattr(at_mod, "CDPClient", FakeClient)
-    assert await at_mod._fetch_targets("ws://127.0.0.1:9222/devtools/browser/x", 1) == []
-
-
-@pytest.mark.asyncio
-async def test_fetch_targets_oserror_becomes_unavailable(monkeypatch):
-    import browserwright.daemon.active_tab as at_mod
-
-    class FakeClient:
-        def __init__(self, ws_url):
-            pass
-
-        async def start(self):
-            raise OSError("socket down")
-
-    monkeypatch.setattr(at_mod, "CDPClient", FakeClient)
-    with pytest.raises(Unavailable) as exc:
-        await at_mod._fetch_targets("ws://127.0.0.1:9222/devtools/browser/x", 1)
-    assert exc.value.attempts["active-tab"].startswith("OSError")
-
-
-@pytest.mark.asyncio
-async def test_silent_stop_swallows_client_stop_errors():
-    import browserwright.daemon.active_tab as at_mod
-
-    class BadStop:
-        async def stop(self):
-            raise RuntimeError("close raced")
-
-    await at_mod._silent_stop(BadStop())
-
-
-def test_localhost_bypass_proxy_adds_and_restores_no_proxy(monkeypatch):
-    import browserwright.daemon.active_tab as at_mod
-
-    monkeypatch.setenv("NO_PROXY", "example.com")
-    with at_mod._localhost_bypass_proxy("ws://localhost:9222/devtools/browser/x"):
-        assert "example.com" in at_mod.os.environ["NO_PROXY"]
-        assert "127.0.0.1" in at_mod.os.environ["NO_PROXY"]
-        assert "::1" in at_mod.os.environ["NO_PROXY"]
-    assert at_mod.os.environ["NO_PROXY"] == "example.com"
-
-
-def test_localhost_bypass_proxy_leaves_remote_hosts_alone(monkeypatch):
-    import browserwright.daemon.active_tab as at_mod
-
-    monkeypatch.delenv("NO_PROXY", raising=False)
-    with at_mod._localhost_bypass_proxy("wss://remote.example/devtools/browser/x"):
-        assert "NO_PROXY" not in at_mod.os.environ
-    assert "NO_PROXY" not in at_mod.os.environ
 
 
 def test_runtime_dir_prefers_xdg(monkeypatch, tmp_path):

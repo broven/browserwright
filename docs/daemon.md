@@ -2,7 +2,7 @@
 
 **一个长驻的全局 daemon**，把 Chrome 的多种"远程调试入口"统一抽象成一个本地 CDP 代理。它监听固定的 unix socket（`${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`），同时服务多个 session：extension session 共享一条 relay upstream（用户日常 Chrome），rdp session 各自拿到 daemon 启动并持有的隔离 Chrome。上层（`browserwright` skill CLI、固化脚本等）只连 daemon socket，不关心底层是 `--remote-debugging-port` 还是浏览器插件 relay。
 
-除了长驻的 `serve` 模式（Mode B，skill 的唯一连接路径），它也保留一次性的 resolver 用法（Mode A，`browserwright-daemon url` 输出 ws URL 给自带 ws 客户端的外部脚本）。
+daemon 只有长驻的 `serve` 模式：所有调用方（skill、固化脚本）都连 daemon socket，daemon 代理 CDP 流量。（旧的一次性 resolver 用法 `browserwright-daemon url`（Mode A）已移除；需要外部脚本直连时用 Playwright facade `ws://127.0.0.1:19990/cdp`。）
 
 ## Why
 
@@ -45,48 +45,33 @@ ws://127.0.0.1:9333/devtools/browser/abc-...
 ## Quickstart
 
 ```bash
-# 自动选择最佳可用 backend
-$ browserwright-daemon url
-ws://127.0.0.1:9222/devtools/browser/abc-123...
+# 启动单全局 daemon（通常注册成 LaunchAgent，见下文）
+$ browserwright-daemon serve
 
-# 强制使用 remote-debug-port
-$ browserwright-daemon url --backend rdp
-
-# 列出所有 backend + 当前可达性
-$ browserwright-daemon list-backends
+# daemon 活着吗？endpoint 在哪？
+$ browserwright-daemon status --json
 
 # 诊断（每个 backend 为什么能/不能用）
 $ browserwright-daemon doctor
-```
-
-典型 shell 用法：
-
-```bash
-export BD_CDP_WS="$(browserwright-daemon url)"
-python my-script.py    # 脚本内直接读 BD_CDP_WS 连 CDP
-```
-
-Python 调用方（暂不导出 SDK，统一走 CLI subprocess）：
-
-```python
-import subprocess
-ws = subprocess.check_output(["browserwright-daemon", "url"], text=True).strip()
 ```
 
 ## CLI 总览
 
 | 命令 | 作用 |
 |---|---|
-| `browserwright-daemon url [--backend NAME] [--timeout SEC]` | 解析并输出 ws URL 到 stdout |
-| `browserwright-daemon list-backends` | 列出已注册 backend 及当前可达性 |
+| `browserwright-daemon serve` | 运行单全局 daemon（shared extension relay + per-session rdp） |
+| `browserwright-daemon status [--json]` | 报告 daemon 存活状态、socket endpoint、facade 端口 |
+| `browserwright-daemon stop` / `restart` | 停止 / 重启 daemon（restart 走 LaunchAgent） |
 | `browserwright-daemon doctor` | 详细诊断每个 backend 状态（端口、文件路径、HTTP 响应等） |
-| `browserwright-daemon version` | 输出版本号 |
+| `browserwright-daemon logs [-f]` | 打印 log 文件路径或 tail 之 |
+| `browserwright-daemon launch-chrome` | 启动隔离 profile 的 Chrome 并输出其 ws URL |
+| `browserwright-daemon version` | 输出版本号（`version check` 校验版本一致性） |
 
 ### Exit codes
 
 | 码 | 含义 |
 |---|---|
-| 0 | 成功，stdout 有 ws URL |
+| 0 | 成功 |
 | 1 | 用户错误（参数非法、未知 backend 名等） |
 | 2 | 所有 backend 都不可用（Chrome 没开远程调试 / extension relay 没运行 / 等等） |
 | 3 | 内部错误（崩溃、未预期异常） |
@@ -144,7 +129,7 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 - `open(url, background=True)` — 统一开页动词，开新 tab 进本 session 的 group（`background=True` 在 extension 下 `active:false` 不抢焦点，rdp 下无人争焦点故为 no-op）。黄条出现在那个 tab 上但你看不见。`open_background`/`new_tab` 仍作为 deprecated 别名保留
 - `close_tab(target_id=...)` — Agent 操作完后显式关闭
 
-对应 CLI：`browserwright-daemon attach-active` / `open --url X` / `close-tab --target-id ext-tab-N`。
+对应 CLI：`browserwright-daemon attach-active` / `open-background --url X` / `close-tab --target-id ext-tab-N`。
 
 用户还可以走 popup 手动 attach（点扩展图标），跟 Agent 路径并存。
 
@@ -162,31 +147,9 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 
 `Browser.crash` / `Browser.close` 等浏览器级别命令在 extension backend 下返回 `-32601 "method not implemented in extension backend"`——`chrome.debugger` API 没有对应的 hook。Page-level / Target-level 命令全部支持。
 
-## Mode B vs Mode A
-
-- **Mode B（`browserwright-daemon serve`）**：daemon 自己连上游、代理 CDP 流量。**Skill（Layer 2）一律走 Mode B**——通过 daemon socket 操作，永不自己开 upstream ws。
-- **Mode A（`browserwright-daemon url`）**：daemon 把 ws URL 透传给调用方，调用方自己开 ws。**仅供自带 ws 客户端的外部脚本使用，不是 Skill 的连接路径**。
-
 ## Observability
 
-`browserwright-daemon stats` 子命令查活 daemon 的进程内计数器：
-
-```bash
-# 默认 tab-separated key\tvalue
-$ browserwright-daemon stats
-client_connected_total       3
-proxy_pre_open_buffered_total 0
-upstream_open_succeeded_total 1
-upstream_frame_received_total 247
-uptime_seconds                127.451
-...
-
-# JSON
-$ browserwright-daemon stats --json | jq '.proxy_pre_open_overflow_total'
-0
-```
-
-计数器分四组（`client_*` / `upstream_*` / `proxy_*` / `auth_*`）+ `uptime_seconds`。新增 / 重命名 counter 是 stats schema 的次版本 bump。
+daemon 进程内维护一组计数器（`client_*` / `upstream_*` / `proxy_*` / `auth_*` + `uptime_seconds`），已连接的 ws 客户端可通过 `BrowserwrightDaemon.stats` RPC 拉取快照。（旧的 `browserwright-daemon stats` CLI 子命令已移除。）
 
 ### JSON 日志
 

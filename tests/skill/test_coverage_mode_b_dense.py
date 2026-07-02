@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import socket
-import subprocess
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -143,9 +142,7 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     outputs = deque(
         [
             _Proc(stdout=json.dumps({"backend": "rdp"})),
-            _Proc(stdout=json.dumps({"targetId": "t1", "url": "https://e.test"})),
             _Proc(stdout=json.dumps({"sessionId": "sid", "targetId": "t1"})),
-            _Proc(returncode=0),
             _Proc(stdout=json.dumps({"version": "1.2.3"})),
             _Proc(stdout="browserwright-daemon 9.8.7\n"),
         ]
@@ -161,23 +158,14 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     client._session_id = "s-1"
 
     assert client.get_backend_info() == {"backend": "rdp"}
-    assert client.active_tab() == {
-        "targetId": "t1",
-        "url": "https://e.test",
-        "title": "",
-        "accuracy": "unknown",
-        "since_seconds": None,
-    }
     assert client.attach_active() == {"sessionId": "sid", "targetId": "t1"}
-    assert client.disconnect_upstream("done") is True
     assert client.running_daemon_version() == "1.2.3"
     assert client.installed_daemon_version() == "9.8.7"
     assert commands[0][0] == [
         "browserwright-daemon", "backend-info", "--json", "--session", "s-1",
     ]
-    assert commands[3][0] == [
-        "browserwright-daemon", "disconnect", "--reason", "done",
-        "--session", "s-1",
+    assert commands[1][0] == [
+        "browserwright-daemon", "attach-active", "--json", "--session", "s-1",
     ]
     assert all(call[1]["capture_output"] and call[1]["text"] for call in commands)
 
@@ -189,25 +177,19 @@ def test_cli_info_methods_tolerate_bad_outputs_and_timeouts(monkeypatch):
     outputs = deque(
         [
             _Proc(returncode=1, stdout="{}"),
-            _Proc(stdout="{not json"),
-            _Proc(stdout=""),
             _Proc(stdout=json.dumps({"version": ""})),
             _Proc(returncode=1, stdout="browserwright-daemon 1.0.0"),
         ]
     )
 
     def fake_run(cmd, **kwargs):
-        if cmd[1] == "disconnect":
-            raise subprocess.TimeoutExpired(cmd, timeout=kwargs.get("timeout", 0))
         return outputs.popleft()
 
     monkeypatch.setattr(mb.subprocess, "run", fake_run)
     client = ModeBClient()
 
     assert client.get_backend_info() is None
-    assert client.active_tab() is None
     assert client.attach_active() is None
-    assert client.disconnect_upstream() is False
     assert client.running_daemon_version() is None
     assert client.installed_daemon_version() is None
 

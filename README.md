@@ -221,9 +221,8 @@ Full catalogue and guidance in `skill/SKILL.md`.
 
 ```bash
 browserwright-daemon doctor                  # which backends are live, why each is/isn't usable
-browserwright-daemon list-backends
+browserwright-daemon status --json           # daemon liveness + endpoint + facade port
 browserwright doctor                         # skill-side health
-browserwright-daemon stats                   # observability counters when `serve` is running
 ```
 
 ## Agent integrations

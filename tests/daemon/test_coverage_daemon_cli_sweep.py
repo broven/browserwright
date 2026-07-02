@@ -92,7 +92,6 @@ def test_main_parses_config_and_dispatches_core_commands(monkeypatch, capsys):
 def test_offline_static_handlers_cover_output_modes(monkeypatch, capsys, tmp_path):
     import browserwright.daemon.doctor as doctor_mod
     from browserwright.daemon import _ipc
-    from browserwright.daemon.backends.base import ResolveResult
 
     async def fake_doctor(cfg, backend=None, probe_ws=False):
         return {
@@ -111,25 +110,7 @@ def test_offline_static_handlers_cover_output_modes(monkeypatch, capsys, tmp_pat
             ],
         }
 
-    async def fake_list_backends(cfg):
-        return {
-            "schema_version": 2,
-            "backends": [
-                {
-                    "name": "env",
-                    "kind": "direct",
-                    "recommended_mode": "url",
-                    "ux_cost": "low",
-                }
-            ],
-        }
-
-    async def fake_resolve(cfg):
-        return ResolveResult("ws://resolved", "env", {"source": "test"})
-
     monkeypatch.setattr(doctor_mod, "doctor", fake_doctor)
-    monkeypatch.setattr(doctor_mod, "list_backends", fake_list_backends)
-    monkeypatch.setattr("browserwright.daemon.resolver.resolve", fake_resolve)
     monkeypatch.setattr(_ipc, "endpoint_describe", lambda: {
         "transport": "tcp",
         "path": None,
@@ -143,9 +124,6 @@ def test_offline_static_handlers_cover_output_modes(monkeypatch, capsys, tmp_pat
     monkeypatch.setattr(cli, "_ipc_ping", lambda: 4321)
 
     assert cli._cmd_doctor(_ns(json=False, backend="env", probe_ws=True), Config()) == 0
-    assert cli._cmd_list_backends(_ns(json=False), Config()) == 0
-    assert cli._cmd_url(_ns(mode_b_proxy=False, json=True), Config()) == 0
-    assert cli._cmd_url(_ns(mode_b_proxy=True, json=False), Config()) == 0
     assert cli._cmd_status(_ns(json=False), Config()) == 0
     assert cli._cmd_logs(_ns(follow=False), Config()) == 0
     assert cli._cmd_logs(_ns(follow=True), Config()) == 2
@@ -154,9 +132,7 @@ def test_offline_static_handlers_cover_output_modes(monkeypatch, capsys, tmp_pat
 
     captured = capsys.readouterr()
     assert "recommended: env" in captured.out
-    assert "env          kind=direct" in captured.out
-    assert '"ws_url": "ws://resolved"' in captured.out
-    assert "127.0.0.1:4444 token=tok" in captured.out
+    assert "127.0.0.1:4444  token=tok" in captured.out
     assert "daemon alive (pid 4321)" in captured.out
     assert str(tmp_path / "missing.log") in captured.out
     assert '"running": true' in captured.out
@@ -206,7 +182,7 @@ def test_status_list_and_stop_error_branches(monkeypatch, capsys, tmp_path):
     assert "no daemon installed or running" in captured.out
 
 
-def test_backend_info_stats_attach_and_rpc_success_paths(monkeypatch, capsys, tmp_path):
+def test_backend_info_attach_and_rpc_success_paths(monkeypatch, capsys, tmp_path):
     from browserwright.daemon import _ipc
     import websockets
 
@@ -235,18 +211,8 @@ def test_backend_info_stats_attach_and_rpc_success_paths(monkeypatch, capsys, tm
     assert backend_calls[-1][1]["browser_session"] == "bw-s"
     monkeypatch.setattr(cli, "_rpc_via_ws", real_rpc_via_ws)
 
-    stats_ws = _AsyncWs([
-        {"method": "noise"},
-        {"id": 1, "result": {"clients": 2, "sessions": 3}},
-    ])
-
-    async def fake_unix_connect(*args, **kwargs):
-        return stats_ws
-
     monkeypatch.setattr(_ipc, "IS_WINDOWS", False)
     monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "daemon.sock")
-    monkeypatch.setattr(websockets, "unix_connect", fake_unix_connect)
-    assert cli._cmd_stats(_ns(json=False), Config()) == 0
 
     attach_json = _AsyncWs([
         {"id": 0, "method": "BrowserwrightDaemon.upstreamReady"},
@@ -278,17 +244,15 @@ def test_backend_info_stats_attach_and_rpc_success_paths(monkeypatch, capsys, tm
 
     out = capsys.readouterr().out
     assert '"backend": "extension"' in out
-    assert "clients\t2" in out
     assert '"targetId": "T"' in out
 
 
-def test_rpc_disconnect_attach_error_paths(monkeypatch, capsys, tmp_path):
+def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
     from browserwright.daemon import _ipc
     import websockets
 
     monkeypatch.setattr(_ipc, "IS_WINDOWS", False)
     monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "absent.sock")
-    assert asyncio.run(cli._disconnect_via_ws(Config(), "because", "bw-s")) == 2
     assert asyncio.run(cli._attach_active_via_ws(Config(), _ns(json=False))) == 2
     with pytest.raises(Unavailable):
         asyncio.run(cli._rpc_via_ws(
@@ -321,7 +285,7 @@ def test_rpc_disconnect_attach_error_paths(monkeypatch, capsys, tmp_path):
     assert asyncio.run(cli._attach_active_roundtrip(err_ws, _ns(json=False))) == 1
 
     captured = capsys.readouterr()
-    assert captured.err.count("no daemon running") >= 2
+    assert captured.err.count("no daemon running") >= 1
     assert "attach-active error: attach boom" in captured.err
 
 

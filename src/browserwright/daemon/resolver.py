@@ -1,11 +1,15 @@
-"""Mode A URL resolver.
+"""Upstream CDP URL resolver.
 
-Spec §5.1: walk the backend chain, return the first that yields a ResolveResult,
+Walk the backend chain, return the first that yields a ResolveResult,
 otherwise aggregate per-backend failure reasons and raise Unavailable. When
---backend is explicit, only that one backend runs (no fallback) — that's H10.
+a backend is pinned (cfg.backend), only that one backend runs (no fallback).
+
+Used by the daemon itself (`server/listener.py` shared-upstream open,
+`server/facade.py` upstream resolution). It is not a user-facing CLI verb —
+the old one-shot `browserwright-daemon url` (Mode A) was removed.
 
 Importantly: resolve() never opens a ws. It only does HTTP discovery and
-filesystem reads. The Skill opens the ws downstream. (§2.3 banner sync.)
+filesystem reads. The caller opens the ws downstream.
 """
 from __future__ import annotations
 
@@ -30,9 +34,9 @@ async def resolve(cfg: Config):
         except Unavailable:
             raise  # explicit backend: surface attempts as-is
     # Auto chain. One backend is explicitly NOT in the auto-fallback:
-    #   `extension` — LOCAL_RELAY kind, requires daemon-serve to be the
-    #       ws server; `resolve()` is meaningless for Mode A.
-    # It still works when `--backend extension` is explicit (the branch
+    #   `extension` — LOCAL_RELAY kind: the daemon itself is the ws server,
+    #       so there is no external CDP endpoint for `resolve()` to discover.
+    # It still surfaces when the backend is pinned explicitly (the branch
     # above), it's just absent from auto-fallback.
     attempts: dict[str, str] = {}
     _CHAIN_OPT_OUT = {"extension"}
