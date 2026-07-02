@@ -2,7 +2,7 @@
 
 Pure code motion from ``proxy.py`` (Batch 4a): the ``SessionVerbsMixin`` below
 carries the ``BrowserwrightDaemon.*`` RPC dispatcher, the extension
-session-verb handlers (openBackgroundTab / recoverSession / ensureSession /
+session-verb handlers (openBackgroundTab / recoverSession /
 endSession / closeTab / ensureExecutor / killExecutor), and their rdp raw-CDP
 counterparts. ``Router`` in ``proxy.py`` mixes this in — every method still
 runs on the Router instance and uses the same attributes/callbacks wired by
@@ -15,8 +15,6 @@ import logging
 import os
 import secrets
 
-from .. import __version__
-from ..observability import metrics
 from .state import ClientState, UpstreamPhase
 
 logger = logging.getLogger(__name__)
@@ -211,32 +209,6 @@ class SessionVerbsMixin:
             await self._send_to_client(
                 client.client_id, _result_response(req_id, result or {}))
             return
-        if method == "BrowserwrightDaemon.getActiveTab":
-            session_id = await self._require_browser_session(
-                client, req_id, method, params)
-            if session_id is None:
-                return
-            tab = self.state.best_active_tab()
-            if (tab is not None and self.state.backend_name == "extension"
-                    and self._scoped_targets is not None):
-                try:
-                    scoped = await self._scoped_targets(session_id)
-                except Exception as e:  # noqa: BLE001
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32603, f"getActiveTab scoping failed: {e!r}"))
-                    return
-                scoped_ids = {
-                    info.get("targetId") for info in scoped
-                    if isinstance(info, dict)
-                }
-                if tab.get("targetId") not in scoped_ids:
-                    tab = None
-            payload = tab if tab is not None else {
-                "targetId": None, "url": None, "title": None,
-                "accuracy": "unknown", "since_seconds": None,
-            }
-            await self._send_to_client(client.client_id, _result_response(req_id, payload))
-            return
         if method == "BrowserwrightDaemon.getBackendInfo":
             from ..backends import kind_for
             # Report the live backend's real kind (extension is LOCAL_RELAY),
@@ -248,15 +220,6 @@ class SessionVerbsMixin:
                 "kind": kind,
                 "ux_warnings": [],
                 "schema_version": 1,
-            }))
-            return
-        if method == "BrowserwrightDaemon.uiState":
-            await self._send_to_client(client.client_id, _result_response(req_id, {
-                "ws_count": 1 if self.state.upstream_phase == UpstreamPhase.CONNECTED else 0,
-                "last_popup_resolved_at": self.state.last_popup_resolved_at,
-                "banner_visible_estimated":
-                    self.state.upstream_phase == UpstreamPhase.CONNECTED,
-                "client_count": len(self.state.clients),  # v0.3 addition
             }))
             return
         if method == "BrowserwrightDaemon.waitForSessionAnnounce":
@@ -288,34 +251,6 @@ class SessionVerbsMixin:
             announced = await self._wait_session_announce(session_id, timeout)
             await self._send_to_client(client.client_id, _result_response(
                 req_id, {"announced": bool(announced)}))
-            return
-        if method == "BrowserwrightDaemon.subscribeFocus":
-            if await self._require_browser_session(client, req_id, method, params) is None:
-                return
-            client.subscribed_focus = True
-            await self._send_to_client(client.client_id,
-                                       _result_response(req_id, {"ok": True}))
-            return
-        if method == "BrowserwrightDaemon.unsubscribeFocus":
-            if await self._require_browser_session(client, req_id, method, params) is None:
-                return
-            client.subscribed_focus = False
-            await self._send_to_client(client.client_id,
-                                       _result_response(req_id, {"ok": True}))
-            return
-        if method == "BrowserwrightDaemon.disconnect":
-            if await self._require_browser_session(client, req_id, method, params) is None:
-                return
-            await self._send_to_client(client.client_id,
-                                       _result_response(req_id, {"ok": True}))
-            if self._trigger_disconnect is not None:
-                await self._trigger_disconnect("skill_disconnect")
-            return
-        if method == "BrowserwrightDaemon.version":
-            await self._send_to_client(client.client_id, _result_response(req_id, {
-                "browserwright_daemon_version": __version__,
-                "schema_version": 1,
-            }))
             return
         if method == "BrowserwrightDaemon.extension.reload":
             if self._reload_extensions is None:
@@ -418,12 +353,11 @@ class SessionVerbsMixin:
             if existing is None:
                 local_sid = _new_local_session_id(client.client_id)
                 self.state.bind_session(
-                    client.client_id, local_sid, upstream_sid,
-                    target_id, readonly=False,
+                    client.client_id, local_sid, upstream_sid, target_id,
                 )
                 self.state.claim_attacher(
                     target_id, client.client_id, local_sid, upstream_sid)
-                # Stash target metadata so list_tabs / getActiveTab see it.
+                # Stash target metadata in the visibility table.
                 self.state.note_target_info({
                     "targetId": target_id,
                     "type": "page",
@@ -448,21 +382,11 @@ class SessionVerbsMixin:
                     "title": info.get("title", ""),
                 }))
             return
-        if method == "BrowserwrightDaemon.stats":
-            # v0.5: expose in-process metrics counters. Schema is the
-            # observability.Metrics dataclass keys + uptime_seconds.
-            await self._send_to_client(
-                client.client_id,
-                _result_response(req_id, metrics().snapshot()))
-            return
         if method == "BrowserwrightDaemon.openBackgroundTab":
             await self._handle_open_background_tab(client, msg, req_id)
             return
         if method == "BrowserwrightDaemon.closeTab":
             await self._handle_close_tab(client, msg, req_id)
-            return
-        if method == "BrowserwrightDaemon.ensureSession":
-            await self._handle_ensure_session(client, msg, req_id)
             return
         if method == "BrowserwrightDaemon.endSession":
             await self._handle_end_session(client, msg, req_id)
@@ -579,13 +503,12 @@ class SessionVerbsMixin:
         local_sid = _new_local_session_id(client.client_id)
         self.state.bind_session(
             client.client_id, local_sid, upstream_sid, target_id,
-            readonly=False,
         )
         self.state.claim_attacher(
             target_id, client.client_id, local_sid, upstream_sid,
         )
-        # Note the target in the visibility table so getActiveTab /
-        # uiState see the new tab. groupId is just metadata for the caller.
+        # Note the target in the visibility table. groupId is just metadata
+        # for the caller.
         self.state.note_target_info({
             "targetId": target_id,
             "type": "page",
@@ -671,7 +594,6 @@ class SessionVerbsMixin:
         local_sid = _new_local_session_id(client.client_id)
         self.state.bind_session(
             client.client_id, local_sid, upstream_sid, target_id,
-            readonly=False,
         )
         self.state.claim_attacher(
             target_id, client.client_id, local_sid, upstream_sid,
@@ -691,53 +613,6 @@ class SessionVerbsMixin:
             "groupId": result.get("groupId", -1),
             "recovered": result.get("recovered", []),
         }))
-
-    async def _handle_ensure_session(
-        self, client: ClientState, msg: dict, req_id: int | None,
-    ) -> None:
-        """Phase 2: backend-neutral session verb. Idempotent.
-
-        The backend is read from the ledger (NOT a param) by the dispatcher in
-        listener / Daemon, so by the time a client reaches this Router it must
-        already be routed to the right context:
-          - extension/env → the shared context (this Router). The client
-            is attached; ensureSession is a no-op success.
-          - rdp → a per-session context. `Daemon.context_for(session_id)`
-            already created the context (its state/router/holder) when this
-            client connected with `?session=`.
-
-        Returns `{ "ok": true }`. Never `-32601`.
-        """
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        session = params.get("session_id") or params.get("session")
-        session = session if isinstance(session, str) and session else None
-        if not client.session_id:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32602,
-                "BrowserwrightDaemon.ensureSession requires the websocket "
-                "to connect with ?session=<id>; sessionless clients cannot "
-                "materialize or switch session contexts"))
-            return
-        if session is not None and session != client.session_id:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32602,
-                f"BrowserwrightDaemon.ensureSession session mismatch: "
-                f"connection is bound to {client.session_id!r}, request asked "
-                f"for {session!r}"))
-            return
-        daemon = self.daemon
-        if daemon is not None:
-            try:
-                # Idempotent get-or-create of the session's context. For
-                # extension/env this returns the shared context (no-op);
-                # for rdp it ensures the per-session context exists.
-                daemon.context_for(client.session_id)  # type: ignore[attr-defined]
-            except Exception as e:
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603, f"ensureSession failed: {e!r}"))
-                return
-        await self._send_to_client(
-            client.client_id, _result_response(req_id, {"ok": True}))
 
     async def _handle_end_session(
         self, client: ClientState, msg: dict, req_id: int | None,
@@ -777,7 +652,7 @@ class SessionVerbsMixin:
 
         # rdp branch: if this session has a live per-session context, tear it
         # down — close the upstream + SIGTERM the daemon-owned Chrome + drop the
-        # context. A later ensureSession recreates a fresh context + relaunches.
+        # context. A later session connect recreates a fresh context + relaunches.
         if daemon is not None and getattr(daemon, "contexts", None) is not None:
             if session in daemon.contexts:  # type: ignore[attr-defined]
                 try:
@@ -1108,7 +983,7 @@ class SessionVerbsMixin:
         # Register the binding (mirror the extension path).
         local_sid = _new_local_session_id(client.client_id)
         self.state.bind_session(
-            client.client_id, local_sid, upstream_sid, target_id, readonly=False)
+            client.client_id, local_sid, upstream_sid, target_id)
         self.state.claim_attacher(
             target_id, client.client_id, local_sid, upstream_sid)
         meta = self.state.targets.get(target_id) or {}
@@ -1194,7 +1069,7 @@ class SessionVerbsMixin:
         else:
             local_sid = _new_local_session_id(client.client_id)
             self.state.bind_session(
-                client.client_id, local_sid, upstream_sid, target_id, readonly=False)
+                client.client_id, local_sid, upstream_sid, target_id)
             self.state.claim_attacher(
                 target_id, client.client_id, local_sid, upstream_sid)
         self.state.note_target_info({

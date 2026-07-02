@@ -16,12 +16,9 @@ Three translation tables make v0.3 work:
      - event path:   upstream → client picks owner(s) from upstream_to_locals
 
 3. **attachers** (single-owner rule) — first attach to a targetId wins.
-   Second attach without `allowSecondaryReadOnly` gets `-32602`. Second
-   attach with the flag becomes a read-only reader sharing the existing
-   upstream session.
+   A second attach from a different client gets `-32602`.
 
-`BrowserwrightDaemon.*` self-answer + heuristic active-tab table behave the same
-as v0.2.
+`BrowserwrightDaemon.*` verbs self-answer without touching upstream.
 """
 from __future__ import annotations
 
@@ -31,10 +28,8 @@ import logging
 import time
 from typing import Awaitable, Callable
 
-from ..observability import metrics
 from .state import (
-    AttachOwnership, ClientState, DaemonState, PendingRequest, SessionBinding,
-    UpstreamPhase, PRE_OPEN_BUFFER_LIMIT,
+    ClientState, DaemonState, UpstreamPhase, PRE_OPEN_BUFFER_LIMIT,
 )
 # The BrowserwrightDaemon.* verb handlers live in verbs.py (Batch 4a split);
 # the shared response helpers are re-exported here so existing importers
@@ -58,13 +53,6 @@ def _json_safe(text: str) -> dict | None:
     return v if isinstance(v, dict) else None
 
 
-def _event(method: str, params: dict, session_id: str | None = None) -> str:
-    msg: dict = {"method": method, "params": params}
-    if session_id is not None:
-        msg["sessionId"] = session_id
-    return json.dumps(msg)
-
-
 # ---- the router -----------------------------------------------------------
 
 
@@ -80,8 +68,8 @@ class Router(SessionVerbsMixin):
     def __init__(self, state: DaemonState):
         self.state = state
         # Phase 2: back-reference to the global Daemon, set by Daemon.__init__
-        # / _ensure_rdp_context. Lets the session-verb handlers (ensureSession /
-        # endSession) create or drop an rdp UpstreamContext. None in unit tests
+        # / _ensure_rdp_context. Lets the session-verb handlers (endSession
+        # etc.) create or drop an rdp UpstreamContext. None in unit tests
         # that build a bare Router — those handlers degrade gracefully.
         self.daemon: object | None = None
         self._upstream_send: Callable[[str], Awaitable[None]] | None = None
@@ -150,16 +138,12 @@ class Router(SessionVerbsMixin):
 
         ``DaemonState.release_client`` only mutates bookkeeping. The router owns
         the wire side effects, so a client websocket disappearing still sends
-        real ``Target.detachFromTarget`` frames for sessions where that client
-        was the primary owner. Read-only secondary sessions are local views and
-        need no upstream detach.
+        real ``Target.detachFromTarget`` frames for its sessions.
         """
         client = self.state.clients.get(client_id)
         if client is None:
             return None
         for binding in list(client.sessions.values()):
-            if binding.readonly:
-                continue
             await self._detach_upstream_best_effort(binding.upstream_session_id)
         return self.state.release_client(client_id)
 
@@ -267,14 +251,6 @@ class Router(SessionVerbsMixin):
             await self._handle_detach(client, msg, req_id, params)
             return
 
-        # --- Target.activateTarget side-effect (update last-activated table) ---
-        if method == "Target.activateTarget":
-            tid = params.get("targetId")
-            if isinstance(tid, str):
-                self.state.note_activate(tid)
-                await self._maybe_push_focus(reason="activated", target_id=tid)
-            # falls through to forward
-
         # --- sessionId translation for session-scoped commands ---
         upstream_sid: str | None = None
         if local_sid is not None:
@@ -283,14 +259,6 @@ class Router(SessionVerbsMixin):
                 # Client invented a sessionId we don't know — refuse.
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32602, f"unknown sessionId {local_sid}"))
-                return
-            if binding.readonly:
-                # Shared-read sessions can only receive events; commands are
-                # daemon-side -32602.
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32602,
-                    "session is read-only (allowSecondaryReadOnly); "
-                    "another client is the primary attacher"))
                 return
             upstream_sid = binding.upstream_session_id
 
@@ -331,7 +299,6 @@ class Router(SessionVerbsMixin):
             req_id = None
             if isinstance(msg, dict) and isinstance(msg.get("id"), int):
                 req_id = msg["id"]
-            metrics().proxy_pre_open_overflow_total += 1
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603,
                 f"upstream pre-open buffer overflow "
@@ -339,7 +306,6 @@ class Router(SessionVerbsMixin):
             return False
 
         client.pre_open_buffer.append(text)
-        metrics().proxy_pre_open_buffered_total += 1
         return False
 
     def _spawn_ensure_open(self) -> None:
@@ -376,7 +342,6 @@ class Router(SessionVerbsMixin):
         for client in list(self.state.clients.values()):
             while client.pre_open_buffer:
                 text = client.pre_open_buffer.popleft()
-                metrics().proxy_pre_open_drained_total += 1
                 try:
                     await self.route_from_client(client, text)
                 except Exception as e:
@@ -413,11 +378,6 @@ class Router(SessionVerbsMixin):
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602, "Target.attachToTarget requires params.targetId"))
             return
-        flags = params.get("flags") if isinstance(params.get("flags"), dict) else {}
-        # Read both the v0.3 spec-listed flag AND CDP's standard `flatten`
-        # — we don't change `flatten` semantics, just remember the shared-read
-        # preference.
-        allow_shared_read = bool(flags.get("allowSecondaryReadOnly", False))
 
         existing = self.state.attachers.get(target_id)
         if existing is None:
@@ -426,7 +386,6 @@ class Router(SessionVerbsMixin):
                 client, msg, req_id=req_id, method="Target.attachToTarget",
                 upstream_sid=None,
                 attach_target_id=target_id,
-                attach_allow_shared_read=allow_shared_read,
             )
             return
 
@@ -440,25 +399,10 @@ class Router(SessionVerbsMixin):
                 req_id, {"sessionId": existing.primary_local_session}))
             return
 
-        if not allow_shared_read:
-            # Spec §3.4 H7: -32602 "target already owned by another client".
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32602,
-                f"target {target_id} already attached by another client; "
-                f"set params.flags.allowSecondaryReadOnly=true for read-only access"))
-            return
-
-        # Shared-read path: allocate a local sessionId for this client that
-        # maps to the existing upstream session, flagged readonly. No upstream
-        # roundtrip — we synthesize the response.
-        local_sid = _new_local_session_id(client.client_id)
-        self.state.bind_session(
-            client.client_id, local_sid, existing.upstream_session_id,
-            target_id, readonly=True,
-        )
-        self.state.add_reader(target_id, client.client_id, local_sid)
-        await self._send_to_client(client.client_id, _result_response(
-            req_id, {"sessionId": local_sid}))
+        # Spec §3.4 H7: -32602 "target already owned by another client".
+        await self._send_to_client(client.client_id, _error_response(
+            req_id, -32602,
+            f"target {target_id} already attached by another client"))
 
     async def _handle_detach(
         self, client: ClientState, msg: dict, req_id: int | None,
@@ -473,14 +417,6 @@ class Router(SessionVerbsMixin):
         if binding is None:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602, f"unknown sessionId {local_sid}"))
-            return
-
-        if binding.readonly:
-            # Reader detaches locally only — upstream session stays alive
-            # because the primary owner still owns it.
-            self.state.unbind_session_by_local(client.client_id, local_sid)
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {}))
             return
 
         # Primary owner: forward upstream so the session truly closes.
@@ -513,7 +449,6 @@ class Router(SessionVerbsMixin):
         method: str,
         upstream_sid: str | None,
         attach_target_id: str | None = None,
-        attach_allow_shared_read: bool = False,
     ) -> None:
         """Rewrite id (always) and sessionId (when present) on a copy of the
         message, remember the pending request, and send upstream."""
@@ -524,7 +459,6 @@ class Router(SessionVerbsMixin):
             req_id if req_id is not None else 0,
             method=method,
             attach_target_id=attach_target_id,
-            attach_allow_shared_read=attach_allow_shared_read,
         )
         # Build a fresh dict — never mutate the client's message in place.
         out: dict = {"id": upstream_id, "method": method}
@@ -598,7 +532,7 @@ class Router(SessionVerbsMixin):
                 local_sid = _new_local_session_id(pending.client_id)
                 self.state.bind_session(
                     pending.client_id, local_sid, upstream_sid_in_result,
-                    target_id, readonly=False,
+                    target_id,
                 )
                 self.state.claim_attacher(
                     target_id, pending.client_id, local_sid,
@@ -608,19 +542,11 @@ class Router(SessionVerbsMixin):
             else:
                 # Edge: another client became primary between our attach and
                 # response arriving. Treat as same-client re-attach if we are
-                # primary, else flip to reader if allowed, else surface error.
+                # primary, else surface the race-loss as an error.
                 if existing.primary_client_id == pending.client_id:
                     out["result"] = {**result,
                                      "sessionId": existing.primary_local_session}  # type: ignore[index]
-                elif pending.attach_allow_shared_read:
-                    local_sid = _new_local_session_id(pending.client_id)
-                    self.state.bind_session(
-                        pending.client_id, local_sid,
-                        existing.upstream_session_id, target_id, readonly=True)
-                    self.state.add_reader(target_id, pending.client_id, local_sid)
-                    out["result"] = {**result, "sessionId": local_sid}  # type: ignore[index]
                 else:
-                    # Race-loss: convert to error.
                     out = {
                         "id": pending.client_request_id,
                         "error": {"code": -32602, "message":
@@ -634,8 +560,7 @@ class Router(SessionVerbsMixin):
         params = msg.get("params") or {}
         upstream_sid = msg.get("sessionId") if isinstance(msg.get("sessionId"), str) else None
 
-        # Pre-route observations: update the target table and the focus push
-        # decision uses the latest state.
+        # Pre-route observations: keep the target visibility table current.
         if method == "Target.targetCreated":
             info = params.get("targetInfo")
             if isinstance(info, dict):
@@ -644,16 +569,12 @@ class Router(SessionVerbsMixin):
             info = params.get("targetInfo")
             if isinstance(info, dict):
                 self.state.note_target_info(info)
-                tid = info.get("targetId")
-                if isinstance(tid, str) and info.get("type") == "page":
-                    await self._maybe_push_focus(reason="navigated", target_id=tid)
         elif method == "Target.targetDestroyed":
             tid = params.get("targetId")
             if isinstance(tid, str):
                 self.state.note_target_destroyed(tid)
-                await self._maybe_push_focus(reason="closed", target_id=tid)
         elif method == "Target.attachedToTarget":
-            # Update target table for getActiveTab observability.
+            # Update the target visibility table.
             info = params.get("targetInfo")
             sid = params.get("sessionId")
             if isinstance(info, dict):
@@ -707,9 +628,9 @@ class Router(SessionVerbsMixin):
 
         # --- routing decision ---
         if upstream_sid is not None:
-            # Session-scoped event: route to all bindings of this upstream session
-            # (primary + any shared-read readers). Each gets the event with their
-            # local sessionId substituted.
+            # Session-scoped event: route to all bindings of this upstream
+            # session. Each gets the event with their local sessionId
+            # substituted.
             bindings = list(self.state.upstream_to_locals.get(upstream_sid, []))
             if not bindings:
                 # Orphan event (session not bound to any client). Drop.
@@ -727,12 +648,6 @@ class Router(SessionVerbsMixin):
         # Browser-level event (no sessionId) → broadcast.
         await self._broadcast(text)
 
-    def _pick_active_client(self) -> ClientState | None:
-        if not self.state.clients:
-            return None
-        # Most-recent last_command_at wins.
-        return max(self.state.clients.values(), key=lambda c: c.last_command_at)
-
     # ---- send primitives ------------------------------------------------
 
     async def _send_to_client(self, client_id: int, text: str) -> None:
@@ -747,33 +662,3 @@ class Router(SessionVerbsMixin):
     async def _broadcast(self, text: str) -> None:
         for cid in list(self._client_sends.keys()):
             await self._send_to_client(cid, text)
-
-    # ---- focus push -----------------------------------------------------
-
-    async def _maybe_push_focus(self, *, reason: str, target_id: str) -> None:
-        meta = self.state.targets.get(target_id) or {}
-        params = {
-            "targetId": target_id,
-            "url": meta.get("url", ""),
-            "title": meta.get("title", ""),
-            "accuracy": "heuristic-recent-activate",
-            "reason": reason,
-        }
-        for client in self.state.clients.values():
-            if not client.subscribed_focus or not client.session_id:
-                continue
-            if (self.state.backend_name == "extension"
-                    and self._scoped_targets is not None):
-                try:
-                    scoped = await self._scoped_targets(client.session_id)
-                except Exception:
-                    continue
-                scoped_ids = {
-                    info.get("targetId") for info in scoped
-                    if isinstance(info, dict)
-                }
-                if target_id not in scoped_ids:
-                    continue
-            await self._send_to_client(
-                client.client_id,
-                _event("BrowserwrightDaemon.activeTabChanged", params))

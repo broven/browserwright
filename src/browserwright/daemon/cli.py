@@ -87,7 +87,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="run the long-lived global daemon")
     _add_common(p_serve)
     _add_port(p_serve)
-    _add_name(p_serve)
     # v0.5.3 Task #24: extension relay port override. Useful when default
     # 19989 is occupied (e.g., a stale daemon process). playwriter sits on
     # 19988, so the default no longer collides with it.
@@ -112,25 +111,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # stop (v0.2)
     p_stop = sub.add_parser("stop", help="stop the running daemon")
-    _add_name(p_stop)
     p_stop.add_argument("--timeout", type=float, default=5.0,
                         help="seconds to wait for graceful shutdown before SIGKILL")
 
     p_restart = sub.add_parser(
         "restart",
         help="restart the installed LaunchAgent daemon after an upgrade")
-    _add_name(p_restart)
     p_restart.add_argument("--timeout", type=float, default=5.0,
                            help="seconds to wait for graceful unload/load")
 
     # status (v0.2)
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
-    _add_name(p_status)
     p_status.add_argument("--json", action="store_true")
 
     # logs (v0.2)
     p_logs = sub.add_parser("logs", help="print the daemon log file path or tail it")
-    _add_name(p_logs)
     p_logs.add_argument("--follow", "-f", action="store_true", help="tail -f the log")
 
     # doctor
@@ -147,7 +142,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # attached tabs is actionable, not empty Chrome"). Internal plumbing for
     # the skill layer, so it is hidden from --help.
     p_bi = sub.add_parser("backend-info")
-    _add_name(p_bi)
     p_bi.add_argument("--session", default=os.environ.get("BD_SESSION"),
                       help="browserwright session id (defaults to BD_SESSION)")
     p_bi.add_argument("--json", action="store_true")
@@ -156,7 +150,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_aa = sub.add_parser(
         "attach-active",
         help="(extension backend) attach the focused-window active tab without a popup click")
-    _add_name(p_aa)
     p_aa.add_argument("--session", default=os.environ.get("BD_SESSION"),
                       help="browserwright session id (defaults to BD_SESSION)")
     p_aa.add_argument("--json", action="store_true")
@@ -197,7 +190,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # extension
     p_ext = sub.add_parser("extension", help="manage connected Chrome extensions")
-    _add_name(p_ext)
     ext_sub = p_ext.add_subparsers(dest="extension_cmd", metavar="<action>")
     p_ext_reload = ext_sub.add_parser(
         "reload",
@@ -211,7 +203,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help=("open a Chrome tab in the background (group=Agent by default), "
               "attach chrome.debugger, print {sessionId,targetId,tabId,url,title,groupId}"),
     )
-    _add_name(p_ob)
     p_ob.add_argument("--url", required=True, help="URL to open in the background tab")
     p_ob.add_argument("--group", default="Agent",
                       help="Chrome tab-group title to place the new tab in (default: Agent)")
@@ -224,7 +215,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "close-tab",
         help="close a tab by sessionId (persistent ws) or targetId (CLI)",
     )
-    _add_name(p_ct)
     p_ct.add_argument("--session", default=os.environ.get("BD_SESSION"),
                       help="browserwright session id (defaults to BD_SESSION)")
     p_ct.add_argument("--session-id", default=None,
@@ -240,7 +230,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "end-session",
         help="tear down a browserwright session's tabs: close owned, keep borrowed",
     )
-    _add_name(p_es)
     p_es.add_argument("--session", required=True,
                       help="the browserwright session id whose tabs to clean up")
     p_es.add_argument("--group-id", default=None, type=int,
@@ -258,13 +247,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "kill-executor",
         help="reap a session's persistent executor subprocess (no browser teardown)",
     )
-    _add_name(p_ke)
     p_ke.add_argument("--session", required=True,
                       help="the browserwright session id whose executor to reap")
 
     # userscript — resident extension userscripts
     p_us = sub.add_parser("userscript", help="manage resident extension userscripts")
-    _add_name(p_us)
     p_us.add_argument("--session", default=os.environ.get("BD_SESSION"),
                       help="browserwright session id (defaults to BD_SESSION)")
     us_sub = p_us.add_subparsers(dest="userscript_cmd", metavar="<action>")
@@ -292,7 +279,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "install",
         help=("register the single global daemon as a macOS LaunchAgent "
               "(auto-start + KeepAlive)"))
-    _add_name(p_inst)
     p_inst.add_argument("--backend", choices=names(), default=None,
                         help=argparse.SUPPRESS)
     p_inst.add_argument("--extension-port", type=int, default=None, metavar="N",
@@ -300,10 +286,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_inst.add_argument("--force", action="store_true",
                         help="replace an existing LaunchAgent with the same name")
 
-    p_uninst = sub.add_parser(
+    sub.add_parser(
         "uninstall",
         help="remove the LaunchAgent (stops auto-start)")
-    _add_name(p_uninst)
 
     p_ls = sub.add_parser(
         "list",
@@ -328,14 +313,6 @@ def _add_common(sp: argparse.ArgumentParser) -> None:
 def _add_port(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--port", type=int, default=None,
                     help="rdp backend port (default 9222 / config-backends.rdp.port)")
-
-
-def _add_name(sp: argparse.ArgumentParser) -> None:
-    """No-op. The `--name` / BD_NAME daemon-instance concept was removed: there
-    is exactly one global daemon on a fixed socket (docs/refactor-single-daemon.md).
-    Kept as a no-op so the (many) call sites need not all be deleted at once;
-    they carry no flag now."""
-    return None
 
 
 # ---- shared config building ------------------------------------------------
@@ -548,10 +525,7 @@ def _cmd_status(args, cfg: Config) -> int:
                 print("daemon not running")
         else:
             print(f"daemon alive (pid {pid})")
-            if ep["transport"] == "unix":
-                print(f"  socket: {ep['path']}")
-            else:
-                print(f"  tcp:    127.0.0.1:{ep['port']}  token={ep['token']}")
+            print(f"  socket: {ep['path']}")
             if facade_ws:
                 print(f"  facade: {facade_ws}")
     return 0 if pid is not None else 2
@@ -576,18 +550,6 @@ async def _attach_active_via_ws(cfg: Config, args) -> int:
     session = getattr(args, "session", None)
     session_q = f"&session={quote(str(session), safe='')}" if session else ""
 
-    if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file()
-        if port is None:
-            print("no daemon running", file=sys.stderr)
-            return 2
-        url = f"ws://127.0.0.1:{port}/?token={token}&client=cli-attach-active{session_q}"
-        try:
-            async with websockets.connect(url, compression=None) as ws:
-                return await _attach_active_roundtrip(ws, args)
-        except Exception as e:
-            print(f"attach-active failed: {e}", file=sys.stderr)
-            return 1
     path = _ipc.sock_path()
     if not path.exists():
         print("no daemon running", file=sys.stderr)
@@ -785,29 +747,18 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
                 return msg
         raise DaemonError(f"{method} no id=1 response after 20 frames")
 
-    if _ipc.IS_WINDOWS:
-        port, token = _ipc.read_port_file()
-        if port is None:
-            raise Unavailable("no daemon running")
-        url = f"ws://127.0.0.1:{port}/?token={token}&client={client_label}{session_q}"
-        async with websockets.connect(url, compression=None) as ws:
-            await ws.send(json.dumps({
-                "id": 1, "method": method, "params": params,
-            }))
-            msg = await _drain_until_response(ws)
-    else:
-        path = _ipc.sock_path()
-        if not path.exists():
-            raise Unavailable("no daemon running")
-        async with websockets.unix_connect(
-            str(path),
-            uri=f"ws://localhost/?client={client_label}{session_q}",
-            compression=None,
-        ) as ws:
-            await ws.send(json.dumps({
-                "id": 1, "method": method, "params": params,
-            }))
-            msg = await _drain_until_response(ws)
+    path = _ipc.sock_path()
+    if not path.exists():
+        raise Unavailable("no daemon running")
+    async with websockets.unix_connect(
+        str(path),
+        uri=f"ws://localhost/?client={client_label}{session_q}",
+        compression=None,
+    ) as ws:
+        await ws.send(json.dumps({
+            "id": 1, "method": method, "params": params,
+        }))
+        msg = await _drain_until_response(ws)
     if "error" in msg:
         err = msg["error"] or {}
         raise DaemonError(
@@ -830,11 +781,7 @@ async def _userscript_call_ws(cfg: Config, method: str, params: dict,
 def _cmd_userscript(args, cfg: Config | None = None) -> int:
     if cfg is None:
         cfg = load()
-    if isinstance(args, list):
-        parser = _build_parser()
-        ns = parser.parse_args(["userscript", *args])
-    else:
-        ns = args
+    ns = args
     action = getattr(ns, "userscript_cmd", None)
     if not action:
         print("usage: browserwright-daemon userscript {push,list,remove,toggle,logs} ...",

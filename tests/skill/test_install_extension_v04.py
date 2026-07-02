@@ -3,8 +3,7 @@
 Skill mirrors the daemon's v0.4 ship without a Skill version bump:
 ``install.py`` probes ``browserwright-daemon doctor --json`` for an
 ``extension`` backend entry with ``available=true``. When present,
-wizard option 3 surfaces as live and the persisted preference becomes
-``daemon.preferred_backend = "extension"``.
+wizard option 3 surfaces as live and prints the extension setup steps.
 
 All tests are pure mocks — no real daemon, no real Chrome, no popup risk
 (per chrome-popup-test-policy memory).
@@ -150,14 +149,12 @@ def _drive_wizard(monkeypatch, inputs, *, ext_live=True, ext_dir=None):
     return install.run()
 
 
-def test_wizard_choice_4_available_writes_preference(monkeypatch, tmp_bs_home,
-                                                     capsys):
-    # inputs: choice=3, persist=y.
-    rc = _drive_wizard(monkeypatch, ["3", "y"], ext_live=True,
+def test_wizard_choice_3_available_prints_setup_steps(monkeypatch, tmp_bs_home,
+                                                      capsys):
+    rc = _drive_wizard(monkeypatch, ["3"], ext_live=True,
                        ext_dir="/opt/browserwright-daemon/chrome-extension")
     out = capsys.readouterr().out
     assert rc == 0
-    assert "wrote daemon.preferred_backend = 'extension'" in out
     # Wizard surfaced the absolute extension path.
     assert "/opt/browserwright-daemon/chrome-extension" in out
     # And mentioned the single global daemon requirement.
@@ -165,31 +162,25 @@ def test_wizard_choice_4_available_writes_preference(monkeypatch, tmp_bs_home,
     assert "browserwright-daemon install" in out
     assert "routes session" in out
 
+    # The wizard no longer persists anything to global memory.
     from browserwright.memory.global_mem import global_memory
     blob = global_memory().read()
-    daemon_fm = blob.get("frontmatter", {}).get("daemon", {})
-    assert daemon_fm.get("preferred_backend") == "extension"
+    assert "daemon" not in blob.get("frontmatter", {})
 
 
-def test_wizard_choice_4_unavailable_blocks(monkeypatch, tmp_bs_home, capsys):
+def test_wizard_choice_3_unavailable_blocks(monkeypatch, tmp_bs_home, capsys):
     rc = _drive_wizard(monkeypatch, ["3"], ext_live=False, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 1
     assert "Extension backend is not yet available" in out
 
-    # No preference should have been persisted.
-    from browserwright.memory.global_mem import global_memory
-    blob = global_memory().read()
-    daemon_fm = blob.get("frontmatter", {}).get("daemon", {})
-    assert "preferred_backend" not in daemon_fm
 
-
-def test_wizard_choice_4_available_no_path_falls_back_to_hint(monkeypatch,
+def test_wizard_choice_3_available_no_path_falls_back_to_hint(monkeypatch,
                                                               tmp_bs_home,
                                                               capsys):
     # Wizard should still complete; just print the generic hint instead of
     # an absolute path.
-    rc = _drive_wizard(monkeypatch, ["3", "y"], ext_live=True, ext_dir=None)
+    rc = _drive_wizard(monkeypatch, ["3"], ext_live=True, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 0
     assert "browserwright-daemon extension-path --json" in out
@@ -198,9 +189,9 @@ def test_wizard_choice_4_available_no_path_falls_back_to_hint(monkeypatch,
 def test_wizard_extension_option_renders_as_coming_when_unavailable(monkeypatch,
                                                                     tmp_bs_home,
                                                                     capsys):
-    # Pick option 1 instead so we don't hit the option-4 unavailable branch;
+    # Pick option 1 instead so we don't hit the option-3 unavailable branch;
     # just assert the menu label was rewritten.
-    rc = _drive_wizard(monkeypatch, ["1", "n"], ext_live=False, ext_dir=None)
+    rc = _drive_wizard(monkeypatch, ["1"], ext_live=False, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 0
     assert "daemon reports extension backend not yet available" in out
@@ -209,7 +200,7 @@ def test_wizard_extension_option_renders_as_coming_when_unavailable(monkeypatch,
 def test_wizard_extension_option_renders_live_when_available(monkeypatch,
                                                              tmp_bs_home,
                                                              capsys):
-    rc = _drive_wizard(monkeypatch, ["1", "n"], ext_live=True, ext_dir=None)
+    rc = _drive_wizard(monkeypatch, ["1"], ext_live=True, ext_dir=None)
     out = capsys.readouterr().out
     assert rc == 0
     assert "daemon reports extension backend not yet available" not in out

@@ -149,8 +149,6 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 
 ## Observability
 
-daemon 进程内维护一组计数器（`client_*` / `upstream_*` / `proxy_*` / `auth_*` + `uptime_seconds`），已连接的 ws 客户端可通过 `BrowserwrightDaemon.stats` RPC 拉取快照。（旧的 `browserwright-daemon stats` CLI 子命令已移除。）
-
 ### JSON 日志
 
 设 `BD_LOG_JSON=1` 启动 daemon-serve，每条 log 变成一行 JSON：

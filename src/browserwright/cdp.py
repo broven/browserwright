@@ -6,29 +6,22 @@ Design:
     no session for ``Target.*`` etc.
   - Auto-attach to a tab on demand via ``attach(targetId)``; the resulting
     session id is cached so subsequent calls reuse it.
-  - Events for the attached session are stashed in a per-session ring buffer
-    and exposed via ``drain_events()``.
 
-We intentionally do not depend on cdp-use here. The whole client is < 200
-lines of plain websockets — easier to reason about, easier to unit test,
-and we never need typed wrappers (spec §3 "raw CDP strings over typed
-wrappers").
+The whole client is < 200 lines of plain websockets — easier to reason
+about, easier to unit test, and we never need typed wrappers (spec §3
+"raw CDP strings over typed wrappers").
 """
 from __future__ import annotations
 
 import json
 import threading
 import time
-from collections import deque
-from typing import Any, Optional
+from typing import Optional
 
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
 
 from .errors import CDPError
-
-
-_EVENT_RING_LIMIT = 1024
 
 
 class _UnixSocketAdapter:
@@ -113,7 +106,7 @@ class CDPSession:
 
     All sends are synchronous: send → block on response with matching id →
     return result. Events arrive on the same socket; the reader thread
-    routes them by sessionId into per-session deques.
+    discards them (nothing downstream consumes raw CDP events).
     """
 
     def __init__(self, ws_url: str, connect_timeout: float = 8.0):
@@ -145,7 +138,6 @@ class CDPSession:
         self._next_id = 1
         self._inflight: dict[int, dict] = {}
         self._inflight_cv = threading.Condition(self._lock)
-        self._events: dict[Optional[str], deque] = {None: deque(maxlen=_EVENT_RING_LIMIT)}
         self._closed = False
         self._closed_reason: Optional[str] = None
         self._reader = threading.Thread(target=self._read_loop, name="cdp-reader", daemon=True)
@@ -201,57 +193,13 @@ class CDPSession:
         res = self.send("Target.attachToTarget", targetId=target_id, flatten=True)
         sid = res["sessionId"]
         self._sessions[target_id] = sid
-        self._events.setdefault(sid, deque(maxlen=_EVENT_RING_LIMIT))
-        # Enable the usual domains so wait_for_load / drain_events have data.
+        # Enable the usual domains so wait_for_load has data.
         for domain in ("Page", "Runtime", "DOM", "Network"):
             try:
                 self.send(f"{domain}.enable", session=sid)
             except CDPError:
                 pass  # Some domains are noop in some Chrome builds.
         return sid
-
-    def attach_readonly(self, target_id: str) -> str:
-        """Daemon v0.3 H7 shared-read attach.
-
-        Requests a session via ``flags.allowSecondaryReadOnly=True`` — daemon
-        returns a sessionId that receives this target's events but rejects
-        any command other than ``Target.detachFromTarget`` (`-32602`). Useful
-        for tail-following another agent's session for monitoring / drift
-        detection.
-
-        Note: this opens a *second* session on the same target if some other
-        client / process already owns it. If we own it ourselves, prefer
-        ``attach()``.
-        """
-        res = self.send(
-            "Target.attachToTarget",
-            targetId=target_id,
-            flatten=True,
-            flags={"allowSecondaryReadOnly": True},
-        )
-        sid = res["sessionId"]
-        self._events.setdefault(sid, deque(maxlen=_EVENT_RING_LIMIT))
-        # We deliberately *don't* register sid in ``self._sessions`` — that
-        # map tracks owning attachments, and a readonly attachment isn't one.
-        return sid
-
-    def detach(self, target_id: str) -> None:
-        sid = self._sessions.pop(target_id, None)
-        if sid:
-            try:
-                self.send("Target.detachFromTarget", sessionId=sid)
-            except CDPError:
-                pass
-            self._events.pop(sid, None)
-
-    def drain_events(self, session: Optional[str] = None) -> list[dict]:
-        buf = self._events.get(session)
-        if not buf:
-            return []
-        with self._lock:
-            out = list(buf)
-            buf.clear()
-        return out
 
     def close(self) -> None:
         if self._closed:
@@ -279,13 +227,7 @@ class CDPSession:
                         if mid in self._inflight:
                             self._inflight[mid] = msg
                             self._inflight_cv.notify_all()
-                    continue
-                # Event.
-                sid = msg.get("sessionId")
-                buf = self._events.get(sid)
-                if buf is None:
-                    buf = self._events.setdefault(sid, deque(maxlen=_EVENT_RING_LIMIT))
-                buf.append({"method": msg.get("method"), "params": msg.get("params", {}), "sessionId": sid})
+                # Events (no id) are dropped — nothing consumes them.
         except ConnectionClosed as e:
             self._closed_reason = str(e)
         except Exception as e:  # noqa: BLE001

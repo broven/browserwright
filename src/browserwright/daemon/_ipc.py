@@ -12,29 +12,19 @@ field-tested. Two changes from the source:
 There is exactly ONE daemon, so the endpoint is a fixed path (no per-instance
 name — the `BD_NAME` concept was removed; see docs/refactor-single-daemon.md):
 
-POSIX:
     sock_path     = {XDG_RUNTIME_DIR | /tmp}/browserwright-daemon.sock
     log_path      = {TMPDIR | /tmp}/browserwright-daemon.log
     pid_path      = {XDG_RUNTIME_DIR | /tmp}/browserwright-daemon.pid
-
-Windows:
-    port_path     = %TEMP%/browserwright-daemon.port  (atomic-written JSON)
-    log_path      = %TEMP%/browserwright-daemon.log
-    pid_path      = %TEMP%/browserwright-daemon.pid
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import secrets
 import socket
-import sys
-import tempfile
 from pathlib import Path
 
 
-IS_WINDOWS = sys.platform == "win32"
 _PREFIX = "browserwright-daemon"
 
 
@@ -42,16 +32,14 @@ _PREFIX = "browserwright-daemon"
 
 
 def _runtime_dir() -> Path:
-    """Where sock + pid + (Windows) port file live.
+    """Where sock + pid files live.
 
     AF_UNIX sun_path has a hard 104-byte budget on macOS. `tempfile.gettempdir()`
     on macOS returns `/var/folders/...` which would blow that budget — so we use
-    `/tmp` on POSIX explicitly. On Windows we use `%TEMP%`, no path-length issue.
+    `/tmp` explicitly.
     """
     if (xdg := os.environ.get("XDG_RUNTIME_DIR")):
         return Path(xdg)
-    if IS_WINDOWS:
-        return Path(tempfile.gettempdir())
     return Path("/tmp")
 
 
@@ -59,18 +47,11 @@ def _tmp_dir() -> Path:
     """Where the log lives (long paths OK)."""
     if (t := os.environ.get("TMPDIR")):
         return Path(t)
-    if IS_WINDOWS:
-        return Path(tempfile.gettempdir())
     return Path("/tmp")
 
 
 def sock_path() -> Path:
     return _runtime_dir() / f"{_PREFIX}.sock"
-
-
-def port_path() -> Path:
-    """Windows token file. Holds JSON {port, token}."""
-    return _runtime_dir() / f"{_PREFIX}.port"
 
 
 def log_path() -> Path:
@@ -93,7 +74,7 @@ def facade_path() -> Path:
 
 
 def write_facade_file(ws_url: str, port: int) -> None:
-    """Atomic write of the facade discovery file (mirrors write_port_file)."""
+    """Atomic write (.tmp then os.replace) of the facade discovery file."""
     fp = facade_path()
     fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_name(fp.name + ".tmp")
@@ -121,10 +102,6 @@ def read_facade_file() -> tuple[str | None, int | None]:
 # macOS (see `_runtime_dir`), and `_runtime_dir()` is already `/tmp` for that
 # reason — so we key the per-session socket on a SHORT id digest, not the raw
 # session id (which can be long, e.g. `e2e-phasec-<uuid4hex>`).
-#
-# TODO(Windows): there is no AF_UNIX on Windows; the executor socket will need
-# the same TCP+token fallback the mode_b path uses (`make_tcp_socket` +
-# port-file). Not built here — POSIX unix-socket happy path only for PR1.
 
 
 def _exec_shortid(session_id: str) -> str:
@@ -202,43 +179,14 @@ def make_executor_socket(session_id: str) -> socket.socket:
 def endpoint_describe() -> dict:
     """Public-facing description of the IPC endpoint for `status` / `url --mode-b-proxy`.
     Spec §6.1 --json shape."""
-    if IS_WINDOWS:
-        port, token = read_port_file()
-        if port is None:
-            return {"schema_version": 1, "transport": "tcp",
-                    "host": "127.0.0.1", "port": None, "token": None}
-        return {"schema_version": 1, "transport": "tcp",
-                "host": "127.0.0.1", "port": port, "token": token}
     return {"schema_version": 1, "transport": "unix",
             "path": str(sock_path())}
 
 
-# ---- Windows port-file: atomic write + read --------------------------------
-
-
-def write_port_file(port: int, token: str) -> None:
-    """Atomic write {.tmp → os.replace} so a concurrent reader never sees a
-    half-written file. Mirrors browser-harness `_ipc.py:179-181`."""
-    pf = port_path()
-    pf.parent.mkdir(parents=True, exist_ok=True)
-    tmp = pf.with_name(pf.name + ".tmp")
-    tmp.write_text(json.dumps({"port": port, "token": token}))
-    os.replace(tmp, pf)
-
-
-def read_port_file() -> tuple[int | None, str | None]:
-    try:
-        d = json.loads(port_path().read_text())
-        return int(d["port"]), str(d["token"])
-    except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
-        return None, None
-
-
 def cleanup_endpoint() -> None:
-    """Best-effort: nuke socket / port file. Called on graceful shutdown and
-    by `stop` before bind. Silent on missing files."""
-    paths = [sock_path() if not IS_WINDOWS else port_path(),
-             pid_path(), facade_path()]
+    """Best-effort: nuke socket / pid / facade files. Called on graceful
+    shutdown and by `stop` before bind. Silent on missing files."""
+    paths = [sock_path(), pid_path(), facade_path()]
     for p in paths:
         try:
             p.unlink()
@@ -307,18 +255,11 @@ async def ping_status_async(timeout: float = 1.0) -> tuple[int | None, str | Non
     """
     none = (None, None)
     try:
-        if IS_WINDOWS:
-            port, _ = read_port_file()
-            if port is None:
-                return none
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", port), timeout=timeout)
-        else:
-            p = sock_path()
-            if not p.exists():
-                return none
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(str(p)), timeout=timeout)
+        p = sock_path()
+        if not p.exists():
+            return none
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(p)), timeout=timeout)
     except (OSError, asyncio.TimeoutError):
         return none
     try:
@@ -387,7 +328,7 @@ def ping_sync(timeout: float = 1.0) -> int | None:
     return pid
 
 
-# ---- POSIX socket bind helper ---------------------------------------------
+# ---- socket bind helper -----------------------------------------------------
 
 
 def make_unix_socket() -> socket.socket:
@@ -409,21 +350,6 @@ def make_unix_socket() -> socket.socket:
         os.umask(old_umask)
     s.listen(8)
     return s
-
-
-def make_tcp_socket() -> tuple[socket.socket, int, str]:
-    """Windows path: bind 127.0.0.1:0, return (socket, port, token).
-
-    Caller writes the port-file. We hold the socket and pass it to
-    websockets.serve(sock=...).
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.listen(8)
-    token = secrets.token_hex(32)
-    return s, port, token
 
 
 # ---- pid file helpers ------------------------------------------------------

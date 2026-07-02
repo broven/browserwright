@@ -117,20 +117,8 @@ async def test_raw_frames_lifecycle_failure_and_broadcast_edges():
 
 
 @pytest.mark.asyncio
-async def test_self_answer_focus_stats_version_and_backend_state():
+async def test_self_answer_backend_info_and_target_table():
     state, router, cap, (alice, bob) = setup_router("alice", "bob")
-    await router.route_from_client(alice, json.dumps({
-        "id": 1, "method": "BrowserwrightDaemon.subscribeFocus",
-    }))
-    await router.route_from_client(bob, json.dumps({
-        "id": 2, "method": "BrowserwrightDaemon.subscribeFocus",
-    }))
-    await router.route_from_client(bob, json.dumps({
-        "id": 3, "method": "BrowserwrightDaemon.unsubscribeFocus",
-    }))
-    assert alice.subscribed_focus is True
-    assert bob.subscribed_focus is False
-
     await router.forward_from_upstream(json.dumps({
         "method": "Target.targetInfoChanged",
         "params": {"targetInfo": {
@@ -138,28 +126,13 @@ async def test_self_answer_focus_stats_version_and_backend_state():
             "url": "https://focus/", "title": "Focus",
         }},
     }))
-    focus_events = [
-        m for m in cap.per_client[alice.client_id]
-        if m.get("method") == "BrowserwrightDaemon.activeTabChanged"
-    ]
-    assert focus_events[-1]["params"]["reason"] == "navigated"
-    assert not any(
-        m.get("method") == "BrowserwrightDaemon.activeTabChanged"
-        for m in cap.per_client[bob.client_id]
-    )
+    assert state.targets["T"]["url"] == "https://focus/"
 
-    await router.route_from_client(alice, json.dumps({
-        "id": 4, "method": "BrowserwrightDaemon.version",
-    }))
-    await router.route_from_client(alice, json.dumps({
-        "id": 5, "method": "BrowserwrightDaemon.stats",
-    }))
     await router.route_from_client(alice, json.dumps({
         "id": 6, "method": "BrowserwrightDaemon.getBackendInfo",
     }))
-    assert cap.per_client[alice.client_id][-3]["result"]["schema_version"] == 1
-    assert "uptime_seconds" in cap.per_client[alice.client_id][-2]["result"]
     assert cap.per_client[alice.client_id][-1]["result"]["kind"] == "UPSTREAM_WS"
+    assert cap.per_client[alice.client_id][-1]["result"]["schema_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -235,7 +208,7 @@ async def test_attach_response_race_variants_and_validation():
     }))
     alice_upstream_id = cap.upstream[-1]["id"]
     bob_local = state.bind_session(
-        bob.client_id, "bob-local", "BOB-UP", "RACE", readonly=False)
+        bob.client_id, "bob-local", "BOB-UP", "RACE")
     state.claim_attacher("RACE", bob.client_id, bob_local.local_session_id, "BOB-UP")
     await router.forward_from_upstream(json.dumps({
         "id": alice_upstream_id, "result": {"sessionId": "ALICE-UP"},
@@ -245,21 +218,17 @@ async def test_attach_response_race_variants_and_validation():
     await router.route_from_client(carol, json.dumps({
         "id": 12,
         "method": "Target.attachToTarget",
-        "params": {
-            "targetId": "SHARE",
-            "flags": {"allowSecondaryReadOnly": True},
-        },
+        "params": {"targetId": "SHARE"},
     }))
     carol_upstream_id = cap.upstream[-1]["id"]
-    state.bind_session(bob.client_id, "owner-local", "OWNER-UP", "SHARE",
-                       readonly=False)
+    state.bind_session(bob.client_id, "owner-local", "OWNER-UP", "SHARE")
     state.claim_attacher("SHARE", bob.client_id, "owner-local", "OWNER-UP")
     await router.forward_from_upstream(json.dumps({
         "id": carol_upstream_id, "result": {"sessionId": "CAROL-UP"},
     }))
-    carol_local = cap.per_client[carol.client_id][-1]["result"]["sessionId"]
-    assert carol.sessions[carol_local].readonly is True
-    assert carol.sessions[carol_local].upstream_session_id == "OWNER-UP"
+    # Race-loss: carol's attach converts to an error because bob became
+    # primary between her attach and the response.
+    assert cap.per_client[carol.client_id][-1]["error"]["code"] == -32602
 
     cap.upstream.clear()
     await router.route_from_client(bob, json.dumps({
@@ -272,7 +241,7 @@ async def test_attach_response_race_variants_and_validation():
 
 
 @pytest.mark.asyncio
-async def test_detach_paths_and_session_scoped_event_unbinds_readers():
+async def test_detach_paths_and_session_scoped_event_unbinds():
     state, router, cap, (alice, bob) = setup_router("alice", "bob")
     alice_local = await attach_primary(router, cap, alice, "T", "UP-T")
 
@@ -286,20 +255,13 @@ async def test_detach_paths_and_session_scoped_event_unbinds_readers():
     }))
     assert last_error(cap, alice)["code"] == -32602
 
+    # A second attach from another client is refused (single-attacher rule).
     await router.route_from_client(bob, json.dumps({
         "id": 4,
         "method": "Target.attachToTarget",
-        "params": {"targetId": "T", "flags": {"allowSecondaryReadOnly": True}},
+        "params": {"targetId": "T"},
     }))
-    bob_local = cap.per_client[bob.client_id][-1]["result"]["sessionId"]
-    cap.upstream.clear()
-    await router.route_from_client(bob, json.dumps({
-        "id": 5, "method": "Target.detachFromTarget",
-        "params": {"sessionId": bob_local},
-    }))
-    assert cap.upstream == []
-    assert cap.per_client[bob.client_id][-1]["result"] == {}
-    assert bob_local not in bob.sessions
+    assert last_error(cap, bob)["code"] == -32602
 
     await router.route_from_client(alice, json.dumps({
         "id": 6, "method": "Target.detachFromTarget",
@@ -313,17 +275,14 @@ async def test_detach_paths_and_session_scoped_event_unbinds_readers():
     }))
     assert cap.per_client[alice.client_id][-1]["id"] == 6
 
-    state.bind_session(alice.client_id, "a2", "UP-2", "T2", readonly=False)
+    state.bind_session(alice.client_id, "a2", "UP-2", "T2")
     state.claim_attacher("T2", alice.client_id, "a2", "UP-2")
-    state.bind_session(bob.client_id, "b2", "UP-2", "T2", readonly=True)
-    state.add_reader("T2", bob.client_id, "b2")
     await router.forward_from_upstream(json.dumps({
         "method": "Target.detachedFromTarget",
         "params": {"sessionId": "UP-2", "reason": "gone"},
     }))
-    assert "a2" not in alice.sessions and "b2" not in bob.sessions
+    assert "a2" not in alice.sessions
     assert cap.per_client[alice.client_id][-1]["params"]["sessionId"] == "a2"
-    assert cap.per_client[bob.client_id][-1]["params"]["sessionId"] == "b2"
 
 
 @pytest.mark.asyncio
@@ -498,21 +457,9 @@ async def test_open_recover_close_and_end_error_translation_branches():
 
 
 @pytest.mark.asyncio
-async def test_ensure_and_end_session_daemon_edge_cases():
+async def test_end_session_daemon_edge_cases():
     state, router, cap, (client,) = setup_router()
     client.session_id = "sess"
-
-    class BadContextDaemon:
-        def context_for(self, session_id: str) -> None:
-            raise RuntimeError(session_id)
-
-    router.daemon = BadContextDaemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureSession",
-        "params": {"session_id": "sess"},
-    }))
-    assert last_error(cap, client)["code"] == -32603
 
     class TeardownDaemon:
         def __init__(self, fail: bool = False) -> None:
@@ -663,7 +610,7 @@ async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
 @pytest.mark.asyncio
 async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targets():
     state, router, cap, (client,) = setup_router(backend="rdp")
-    state.bind_session(client.client_id, "local", "UP", "T", readonly=False)
+    state.bind_session(client.client_id, "local", "UP", "T")
     state.claim_attacher("T", client.client_id, "local", "UP")
     state.note_target_info({
         "targetId": "T", "type": "page", "url": "https://front/", "title": "Front",
@@ -712,8 +659,8 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
     }))
     assert last_error(cap, client)["code"] == -32603
 
-    state.bind_session(client.client_id, "l1", "UP1", "T1", readonly=False)
-    state.bind_session(client.client_id, "l2", "UP1", "T1", readonly=False)
+    state.bind_session(client.client_id, "l1", "UP1", "T1")
+    state.bind_session(client.client_id, "l2", "UP1", "T1")
     calls: list[tuple[str, Any, Any]] = []
 
     async def us_cmd(method: str, params=None, session_id=None):

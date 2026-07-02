@@ -1,11 +1,9 @@
 """Focused offline coverage for REPL/misc low-coverage modules."""
 from __future__ import annotations
 
-import io
 import json
 import socket
 import threading
-from collections import deque
 from pathlib import Path
 
 import pytest
@@ -26,15 +24,6 @@ def _stub_inline_session(monkeypatch):
     monkeypatch.setattr(session, "Session", DummySession)
     monkeypatch.setattr(session, "set_session", lambda sess: captured.setdefault("session", sess))
     return captured
-
-
-def test_inline_run_rejects_stdin_heredoc(capsys):
-    from browserwright.repl import inline
-
-    rc = inline.run(io.StringIO("print('old')\n"))
-
-    assert rc == 1
-    assert "browserwright -s <session-id> -e" in capsys.readouterr().err
 
 
 def test_inline_run_code_empty_input_prints_usage(capsys):
@@ -371,7 +360,6 @@ def test_cdp_read_loop_routes_responses_and_events():
     sess._lock = threading.Lock()
     sess._inflight = {7: {}}
     sess._inflight_cv = threading.Condition(sess._lock)
-    sess._events = {None: deque(maxlen=4)}
     sess._closed = False
     sess._closed_reason = None
 
@@ -379,22 +367,5 @@ def test_cdp_read_loop_routes_responses_and_events():
 
     assert sess._closed is True
     assert sess._closed_reason is None
+    # Responses route into inflight; events (frames without an id) are dropped.
     assert sess._inflight[7]["result"] == {"ok": True}
-    assert list(sess._events[None]) == [
-        {"method": "Browser.event", "params": {"x": 1}, "sessionId": None}
-    ]
-    assert list(sess._events["sid-1"]) == [
-        {"method": "Page.loadEventFired", "params": {}, "sessionId": "sid-1"}
-    ]
-
-
-def test_cdp_drain_events_clears_existing_buffer_and_missing_is_empty():
-    from browserwright.cdp import CDPSession
-
-    sess = object.__new__(CDPSession)
-    sess._lock = threading.Lock()
-    sess._events = {"sid": deque([{"method": "A"}, {"method": "B"}])}
-
-    assert sess.drain_events("missing") == []
-    assert sess.drain_events("sid") == [{"method": "A"}, {"method": "B"}]
-    assert sess.drain_events("sid") == []

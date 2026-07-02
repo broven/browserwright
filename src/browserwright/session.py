@@ -105,46 +105,6 @@ class Session:
             self._cdp.close()
         self._cdp = None
 
-    @property
-    def backend_name(self) -> str:
-        """Lazy-resolved daemon backend name (``"rdp"``, ``"extension"``, …).
-
-        Diagnostics only — the downstream API is unified, so primitives no
-        longer branch on the backend (backend divergence is absorbed daemon-side;
-        see docs/refactor-single-daemon.md). Surfaced for doctor / debugging.
-        Falls back to ``""`` when the daemon doesn't surface backend info.
-        """
-        cached = getattr(self, "_backend_name_cache", None)
-        if cached is not None:
-            return cached
-        if isinstance(self.session_record, dict):
-            name = self.session_record.get("backend") or ""
-            if name:
-                self._backend_name_cache = name  # type: ignore[attr-defined]
-                return name
-        info = None
-        getter = getattr(self.daemon, "get_backend_info", None)
-        if callable(getter):
-            # Narrow the catch to the failure modes the underlying clients
-            # actually surface: ModeBClient.get_backend_info wraps subprocess
-            # plumbing (FileNotFoundError, TimeoutExpired) and JSON parsing.
-            # OSError covers low-level I/O. AttributeError absorbs a missing
-            # inner shim rather than letting an internal bug crash backend-name
-            # resolution. Truly unexpected exceptions propagate.
-            import json as _json
-            import subprocess as _subprocess
-            try:
-                info = getter()
-            except (AttributeError, OSError,
-                    _subprocess.CalledProcessError, _subprocess.TimeoutExpired,
-                    _json.JSONDecodeError):
-                info = None
-        name = ""
-        if isinstance(info, dict):
-            name = info.get("backend") or info.get("name") or ""
-        self._backend_name_cache = name  # type: ignore[attr-defined]
-        return name
-
 
 # ---- singleton + context-var override ---------------------------------
 

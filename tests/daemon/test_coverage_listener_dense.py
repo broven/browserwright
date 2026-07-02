@@ -62,13 +62,13 @@ class _FakeRouter:
         self.forwarded.append(text)
 
 
-def test_listener_query_and_process_request_cover_ping_and_windows_token(monkeypatch):
+def test_listener_query_and_process_request_cover_ping(monkeypatch):
     assert listener_mod._parse_query("/ws?client=a&client=b&empty=&encoded=x%20y") == {
         "client": "a",
         "encoded": "x y",
     }
 
-    handler = SimpleNamespace(token="secret")
+    handler = SimpleNamespace()
     conn = _FakeHttpConn()
     process_request = listener_mod._make_process_request(handler)
 
@@ -78,11 +78,7 @@ def test_listener_query_and_process_request_cover_ping_and_windows_token(monkeyp
     assert resp.headers["Content-Type"] == "application/json"
     assert _ipc.parse_pong(resp.body.encode())[0] == 4321
 
-    monkeypatch.setattr(listener_mod._ipc, "IS_WINDOWS", True)
-    assert process_request(conn, SimpleNamespace(path="/ws?token=secret")) is None
-    denied = process_request(conn, SimpleNamespace(path="/ws?token=wrong"))
-    assert denied.status.value == 401
-    assert "wrong ?token" in denied.body
+    assert process_request(conn, SimpleNamespace(path="/ws?client=x")) is None
 
 
 @pytest.mark.asyncio
@@ -156,8 +152,8 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
 async def test_trigger_close_sends_detach_and_closed_events_then_clears_callbacks(monkeypatch):
     state = DaemonState(backend_name="rdp")
     client = state.allocate_client("c1")
-    state.bind_session(client.client_id, "local-1", "up-1", "target-1", readonly=False)
-    await state.set_connected("ws://chrome", was_popup=False)
+    state.bind_session(client.client_id, "local-1", "up-1", "target-1")
+    await state.set_connected("ws://chrome")
     router = _FakeRouter()
     holder = listener_mod._UpstreamHolder(state, router, Config(backend="rdp"), session_id="s1")
     closed: list[tuple[int, str]] = []
@@ -193,7 +189,7 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
 @pytest.mark.asyncio
 async def test_idle_watchdog_closes_idle_rdp_context_and_drops_it(monkeypatch):
     state = DaemonState(backend_name="rdp")
-    await state.set_connected("ws://rdp", was_popup=False)
+    await state.set_connected("ws://rdp")
     state.last_activity_at -= 99
     calls: list[str] = []
 
@@ -471,8 +467,8 @@ async def test_relay_request_cleanup_and_public_helpers_without_socket(monkeypat
     assert 8 in ext.tabs
     assert ext.pending == {}
 
-    auto_results.append({"tabId": 5, "url": "https://active/"})
-    assert await relay.query_active_tab(timeout=1) == {"tabId": 5, "url": "https://active/"}
+    auto_results.append({"groupId": 44, "tabs": []})
+    assert await relay.query_group_tabs(group_id=44, timeout=1) == {"groupId": 44, "tabs": []}
 
     auto_results.append({"result": {"value": 1}})
     assert await relay.send_cdp(5, "Runtime.evaluate", {"expression": "1"}, timeout=1) == {

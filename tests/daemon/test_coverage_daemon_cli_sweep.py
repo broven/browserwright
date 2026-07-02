@@ -112,11 +112,8 @@ def test_offline_static_handlers_cover_output_modes(monkeypatch, capsys, tmp_pat
 
     monkeypatch.setattr(doctor_mod, "doctor", fake_doctor)
     monkeypatch.setattr(_ipc, "endpoint_describe", lambda: {
-        "transport": "tcp",
-        "path": None,
-        "host": "127.0.0.1",
-        "port": 4444,
-        "token": "tok",
+        "transport": "unix",
+        "path": "/tmp/bw.sock",
     })
     monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: (4321, "v.test"))
     monkeypatch.setattr(_ipc, "log_path", lambda: tmp_path / "missing.log")
@@ -132,7 +129,7 @@ def test_offline_static_handlers_cover_output_modes(monkeypatch, capsys, tmp_pat
 
     captured = capsys.readouterr()
     assert "recommended: env" in captured.out
-    assert "127.0.0.1:4444  token=tok" in captured.out
+    assert "socket: /tmp/bw.sock" in captured.out
     assert "daemon alive (pid 4321)" in captured.out
     assert str(tmp_path / "missing.log") in captured.out
     assert '"running": true' in captured.out
@@ -166,9 +163,6 @@ def test_status_list_and_stop_error_branches(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(_ipc, "endpoint_describe", lambda: {
         "transport": "unix",
         "path": str(tmp_path / "dead.sock"),
-        "host": None,
-        "port": None,
-        "token": None,
     })
     assert cli._cmd_status(_ns(json=False), Config()) == 2
     monkeypatch.setattr(cli, "_launchagent_plist_path", lambda: tmp_path / "absent.plist")
@@ -211,7 +205,6 @@ def test_backend_info_attach_and_rpc_success_paths(monkeypatch, capsys, tmp_path
     assert backend_calls[-1][1]["browser_session"] == "bw-s"
     monkeypatch.setattr(cli, "_rpc_via_ws", real_rpc_via_ws)
 
-    monkeypatch.setattr(_ipc, "IS_WINDOWS", False)
     monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "daemon.sock")
 
     attach_json = _AsyncWs([
@@ -251,7 +244,6 @@ def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
     from browserwright.daemon import _ipc
     import websockets
 
-    monkeypatch.setattr(_ipc, "IS_WINDOWS", False)
     monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "absent.sock")
     assert asyncio.run(cli._attach_active_via_ws(Config(), _ns(json=False))) == 2
     with pytest.raises(Unavailable):
@@ -305,11 +297,14 @@ def test_userscript_actions_success_and_error_sweep(monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "_userscript_call_ws", fake_call)
 
+    def _us_ns(*argv: str):
+        return cli._build_parser().parse_args(["userscript", *argv])
+
     assert cli._cmd_userscript(_ns(userscript_cmd=None), Config()) == 1
-    assert cli._cmd_userscript(["--session", "bw-s", "list", "--site", "https://example.test/"], Config()) == 0
-    assert cli._cmd_userscript(["--session", "bw-s", "remove", "missing"], Config()) == 1
-    assert cli._cmd_userscript(["--session", "bw-s", "toggle", "id1", "--enabled", "off"], Config()) == 2
-    assert cli._cmd_userscript(["--session", "bw-s", "logs", "--id", "id1", "--limit", "2"], Config()) == 3
+    assert cli._cmd_userscript(_us_ns("--session", "bw-s", "list", "--site", "https://example.test/"), Config()) == 0
+    assert cli._cmd_userscript(_us_ns("--session", "bw-s", "remove", "missing"), Config()) == 1
+    assert cli._cmd_userscript(_us_ns("--session", "bw-s", "toggle", "id1", "--enabled", "off"), Config()) == 2
+    assert cli._cmd_userscript(_us_ns("--session", "bw-s", "logs", "--id", "id1", "--limit", "2"), Config()) == 3
 
     assert calls == [
         (
@@ -356,7 +351,10 @@ def test_userscript_install_stdin_failed_sync_warns(monkeypatch, capsys):
         "// ==/UserScript==\n"
         "window.x = 1;\n"
     )))
-    assert cli._cmd_userscript(["--session", "bw-s", "install", "-"], Config()) == 2
+    assert cli._cmd_userscript(
+        cli._build_parser().parse_args(
+            ["userscript", "--session", "bw-s", "install", "-"]),
+        Config()) == 2
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["id"] == "remote-id"

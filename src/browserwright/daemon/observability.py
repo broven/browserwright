@@ -1,34 +1,12 @@
-"""Observability (v0.5): metrics counters + structured JSON logging.
+"""Observability: structured JSON logging.
 
-Spec §7 v0.5 line 2 — "observability / metrics / structured logging".
+**JSON log formatter** — opt-in via `BD_LOG_JSON=1`. Emits one JSON
+object per log record, schema:
 
-Three pieces:
+    {"ts": "...", "level": "...", "logger": "...", "msg": "...",
+     "extra": {...optional structured kwargs...}}
 
-1. **Counters** (`Metrics`) — bucketed integer counters incremented inline
-   at hot-path call sites (client connect, upstream open, pre-open buffer
-   overflow, etc.). Pure dataclass; reads / writes don't lock because
-   asyncio gives us single-threaded mutation guarantees within the daemon
-   process.
-
-2. **JSON log formatter** — opt-in via `BD_LOG_JSON=1`. Emits one JSON
-   object per log record, schema:
-
-       {"ts": "...", "level": "...", "logger": "...", "msg": "...",
-        "extra": {...optional structured kwargs...}}
-
-   The default human formatter stays unchanged.
-
-3. **`stats` snapshot** — `snapshot()` returns a dict-of-dicts the
-   `browserwright-daemon stats` CLI subcommand serializes to JSON. Used for
-   external monitoring (`watch -n 5 'browserwright-daemon stats --json'`) and
-   in tests to assert hot paths actually incremented their counters.
-
-Design constraints:
-- No external metrics deps (prometheus_client, opentelemetry). The daemon
-  is supposed to be lightweight (§8.5 "no logging framework").
-- Counters are coarse on purpose — every counter has a clear hot-path
-  call site. We don't try to time-bucket / histogram / export over the
-  wire. That's all v0.6+ territory.
+The default human formatter stays unchanged.
 """
 from __future__ import annotations
 
@@ -37,81 +15,6 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field, asdict
-
-
-# ---- counters --------------------------------------------------------------
-
-
-@dataclass
-class Metrics:
-    """All daemon counters live here. One instance per daemon process,
-    accessed via `metrics()` singleton.
-
-    Naming convention: `<area>_<event>` (snake_case). Areas are stable —
-    `client`, `upstream`, `proxy` (three groups; v0.5.3 F-14 dropped
-    the stale `relay_*` mention from this docstring — relay activity is
-    counted under `proxy_*` / `upstream_*` instead). Adding a counter is a
-    minor version bump for the `stats --json` schema; renaming one is
-    major.
-    """
-    started_at: float = field(default_factory=time.time)
-
-    # ---- client (downstream skill connections) ----
-    client_connected_total: int = 0
-    client_disconnected_total: int = 0
-    client_frame_received_total: int = 0
-
-    # ---- upstream (Chrome / relay) ----
-    upstream_open_attempts_total: int = 0
-    upstream_open_succeeded_total: int = 0
-    upstream_open_failed_total: int = 0
-    upstream_closed_total: int = 0
-    upstream_frame_received_total: int = 0
-    upstream_frame_sent_total: int = 0
-
-    # ---- proxy (router level) ----
-    proxy_attach_succeeded_total: int = 0
-    proxy_attach_rejected_total: int = 0
-    proxy_pre_open_buffered_total: int = 0
-    proxy_pre_open_overflow_total: int = 0
-    proxy_pre_open_drained_total: int = 0
-
-    def snapshot(self) -> dict:
-        """Return a flat dict suitable for JSON serialization.
-
-        Includes `uptime_seconds` derived from `started_at`.
-        """
-        d = asdict(self)
-        d["uptime_seconds"] = round(time.time() - self.started_at, 3)
-        return d
-
-    def reset(self) -> None:
-        """Re-init every counter back to 0 + started_at to now. Mostly a
-        test seam — production daemons rotate by restart, not by reset."""
-        for k in list(self.__dataclass_fields__.keys()):
-            if k == "started_at":
-                self.started_at = time.time()
-            else:
-                setattr(self, k, 0)
-
-
-_singleton: Metrics | None = None
-
-
-def metrics() -> Metrics:
-    """Lazy singleton accessor. The first call creates the instance; every
-    subsequent call returns the same one."""
-    global _singleton
-    if _singleton is None:
-        _singleton = Metrics()
-    return _singleton
-
-
-def reset_metrics_for_test() -> None:
-    """Test seam — wipes the singleton so each test starts at zero."""
-    global _singleton
-    _singleton = None
 
 
 # ---- JSON log formatter ---------------------------------------------------

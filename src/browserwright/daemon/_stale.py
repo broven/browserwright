@@ -21,7 +21,6 @@ import os
 import signal
 import socket
 import subprocess
-import sys
 import time
 
 
@@ -67,8 +66,6 @@ def port_holder_pids(port: int) -> list[int]:
 
     Returns ``[]`` when lsof is missing / errors / finds nothing — callers must
     treat an empty list as "unknown", never as "nobody"."""
-    if sys.platform == "win32":
-        return []
     try:
         out = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
@@ -94,7 +91,7 @@ def pid_is_browserwright_daemon(pid: int) -> bool:
     happens to hold the port. Matches both the installed console-script
     (``browserwright-daemon serve``) and the dev module invocation
     (``python -m browserwright.daemon.cli serve``)."""
-    if pid <= 0 or sys.platform == "win32":
+    if pid <= 0:
         return False
     try:
         out = subprocess.run(
@@ -110,8 +107,8 @@ def pid_is_browserwright_daemon(pid: int) -> bool:
 
 
 def pid_alive(pid: int) -> bool:
-    """True if ``pid`` exists (signal 0 probe). POSIX only."""
-    if pid <= 0 or sys.platform == "win32":
+    """True if ``pid`` exists (signal 0 probe)."""
+    if pid <= 0:
         return False
     try:
         os.kill(pid, 0)

@@ -104,7 +104,7 @@ class Daemon:
         # log-friendliness so two contexts never print the same client #.
         self._next_client_id: "itertools.count[int]" = itertools.count(1)
         # Back-reference set on each context's router so RPC handlers
-        # (ensureSession / endSession) can reach the daemon to create/drop
+        # (endSession etc.) can reach the daemon to create/drop
         # an rdp context.
         shared_context.router.daemon = self  # type: ignore[attr-defined]
 

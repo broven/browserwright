@@ -29,7 +29,6 @@ All helpers take the ``Session`` explicitly — no ContextVar reads here.
 from __future__ import annotations
 
 import time
-from collections import deque
 from typing import Any, Optional
 
 from . import session_registry as reg
@@ -93,7 +92,6 @@ def register_recovered(sess, payload: dict) -> Optional[str]:
         return None
     cdp = sess.cdp
     cdp._sessions[target_id] = session_id
-    cdp._events.setdefault(session_id, deque(maxlen=1024))
     sess.current_target_id = target_id
     return target_id
 
@@ -300,7 +298,6 @@ def close_session_tab(
         cdp._sessions.pop(tid, None)
         if sess.current_target_id == tid:
             sess.current_target_id = None
-    cdp._events.pop(session_id, None)
     return {"ok": bool(payload.get("ok", True)),
             "tabId": payload.get("tabId")}
 

@@ -1,7 +1,7 @@
 """WebSocket listener + lifecycle orchestrator.
 
 This module wires together:
-  - `_ipc` (socket file / token / ping)
+  - `_ipc` (socket file / ping)
   - `state` (DaemonState)
   - `upstream` (UpstreamConnection)
   - `proxy` (Router)
@@ -28,14 +28,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import websockets
-from websockets.asyncio.server import ServerConnection, serve, unix_serve
+from websockets.asyncio.server import ServerConnection, unix_serve
 
 from .. import _ipc
 from .. import __version__
 from ..config import Config
 from ..errors import Unavailable
 from ..resolver import resolve
-from ..observability import metrics, install_json_logging_if_requested
+from ..observability import install_json_logging_if_requested
 from .state import CloseReason, DaemonState, UpstreamPhase
 from .proxy import Router
 from .daemon import Daemon, UnknownSessionError, UpstreamContext
@@ -207,12 +207,11 @@ async def run_serve(cfg: Config) -> int:
     def _on_signal():
         stop.set()
     loop = asyncio.get_running_loop()
-    if sys.platform != "win32":
-        for s in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(s, _on_signal)
-            except NotImplementedError:
-                pass  # e.g. inside pytest event loop
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except NotImplementedError:
+            pass  # e.g. inside pytest event loop
 
     # PID file (best-effort).
     _ipc.write_pid(os.getpid())
@@ -222,16 +221,14 @@ async def run_serve(cfg: Config) -> int:
 
     # issue #15 (2.4): watch our own control socket. If another `serve` (or a
     # manual `rm`) removes/replaces it, self-exit so we release the relay/facade
-    # ports instead of lingering as a port-holding zombie. POSIX only — Windows
-    # uses a port file, not a unix socket inode.
+    # ports instead of lingering as a port-holding zombie.
     sock_watch_task: asyncio.Task | None = None
-    if not _ipc.IS_WINDOWS:
-        try:
-            _st = os.stat(_ipc.sock_path())
-            sock_watch_task = asyncio.create_task(
-                _control_socket_watchdog((_st.st_dev, _st.st_ino), stop))
-        except OSError:
-            pass
+    try:
+        _st = os.stat(_ipc.sock_path())
+        sock_watch_task = asyncio.create_task(
+            _control_socket_watchdog((_st.st_dev, _st.st_ino), stop))
+    except OSError:
+        pass
 
     # v0.4: for the extension shared context, start the relay ws server eagerly
     # so `browserwright-daemon doctor` can probe `__status__` even before any
@@ -428,26 +425,9 @@ def _wire_logging() -> None:
 
 
 async def _open_server(handler: "_ClientHandler"):
-    """Bind the listener with correct umask / file perms for POSIX, or the
-    token file for Windows. The HTTP /__ping__ path is intercepted here so
-    stale-detect works without a ws upgrade."""
+    """Bind the listener with correct umask / file perms. The HTTP /__ping__
+    path is intercepted here so stale-detect works without a ws upgrade."""
     process_request = _make_process_request(handler)
-
-    if _ipc.IS_WINDOWS:
-        sock, port, token = _ipc.make_tcp_socket()
-        _ipc.write_port_file(port, token)
-        handler.token = token
-        server = await serve(
-            handler.serve_one,
-            sock=sock,
-            process_request=process_request,
-            max_size=100 * 1024 * 1024,
-            compression=None,
-            ping_interval=20,
-            ping_timeout=20,
-        )
-        logger.info("listening on 127.0.0.1:%d (token=%s...)", port, token[:8])
-        return server
 
     sock = _ipc.make_unix_socket()
     # Verify the 0600 perms — spec §6.2 promises it; failing loudly here is
@@ -471,10 +451,9 @@ async def _open_server(handler: "_ClientHandler"):
 def _make_process_request(handler: "_ClientHandler"):
     """Intercept the HTTP handshake.
 
-    Two responsibilities:
-    1. `/__ping__` GET → return a 200 with {"pong":true,"pid":N} so the
-       stale-detect probe works *before* a ws upgrade.
-    2. On Windows, verify the `?token=` query matches the server token.
+    One responsibility: `/__ping__` GET → return a 200 with
+    {"pong":true,"pid":N} so the stale-detect probe works *before* a ws
+    upgrade.
 
     v0.3: the single-client gate from v0.2 is **gone**. Multiple clients
     connect concurrently; the router's sessionId/id translation keeps them
@@ -487,15 +466,6 @@ def _make_process_request(handler: "_ClientHandler"):
             resp = conn.respond(http.HTTPStatus.OK, body.decode("utf-8"))
             resp.headers["Content-Type"] = "application/json"
             return resp
-        if _ipc.IS_WINDOWS:
-            query = _parse_query(path)
-            got = query.get("token")
-            if got != handler.token:
-                resp = conn.respond(
-                    http.HTTPStatus.UNAUTHORIZED,
-                    "missing or wrong ?token=\n",
-                )
-                return resp
         return None  # allow upgrade
     return process_request
 
@@ -523,7 +493,6 @@ class _ClientHandler:
     def __init__(self, daemon: "Daemon", cfg: Config):
         self.daemon = daemon
         self.cfg = cfg
-        self.token: str | None = None
 
     async def serve_one(self, conn: ServerConnection) -> None:
         """v0.3: handler instance per client connection — many run concurrently.
@@ -584,7 +553,6 @@ class _ClientHandler:
         if holder.is_open:
             router.update_upstream_send(holder.send_text)
 
-        metrics().client_connected_total += 1
         logger.info("client %d connected (label=%s, session=%s, backend=%s, total=%d)",
                     client.client_id, label, session_id or "-", ctx.backend,
                     len(state.clients))
@@ -593,14 +561,12 @@ class _ClientHandler:
                 if not isinstance(raw, (str, bytes)):
                     continue
                 text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
-                metrics().client_frame_received_total += 1
                 await router.route_from_client(client, text)
         except websockets.exceptions.ConnectionClosed:
             logger.info("client %d disconnected", client.client_id)
         except Exception as e:
             logger.warning("client %d crashed: %r", client.client_id, e)
         finally:
-            metrics().client_disconnected_total += 1
             await router.release_client(client.client_id)
             router.unregister_client(client.client_id)
             # Upstream stays warm so other clients (or the next reconnect)
@@ -699,7 +665,6 @@ class _UpstreamHolder:
                 return
             cfg = self._cfg
             await self.state.begin_connecting(cfg.backend or "auto")
-            metrics().upstream_open_attempts_total += 1
             # F-3: emit BrowserwrightDaemon.upstreamConnecting to all clients.
             await self._broadcast_event(
                 "BrowserwrightDaemon.upstreamConnecting",
@@ -721,10 +686,8 @@ class _UpstreamHolder:
                         await self._launch_rdp_chrome(cfg)
                     await self._open_chrome_upstream(cfg)
             except Exception:
-                metrics().upstream_open_failed_total += 1
                 raise
             else:
-                metrics().upstream_open_succeeded_total += 1
                 # F-3: emit BrowserwrightDaemon.upstreamReady. `state.upstream_ws_url`
                 # is set by both open paths via `state.set_connected(...)`.
                 await self._broadcast_event(
@@ -780,7 +743,7 @@ class _UpstreamHolder:
                 "Target.setDiscoverTargets", {"discover": True})
         except Exception as e:
             logger.warning("setDiscoverTargets failed: %r", e)
-        await self.state.set_connected(rr.ws_url, was_popup=False)
+        await self.state.set_connected(rr.ws_url)
 
     async def _launch_rdp_chrome(self, cfg: Config) -> None:
         """Phase 3 (C2 ephemeral): the daemon launches + owns this rdp session's
@@ -921,8 +884,7 @@ class _UpstreamHolder:
         # Scope Target.getTargets to the requesting session's tab group so
         # extension sessions sharing one Chrome are mutually invisible.
         self.router._scoped_targets = ext.scoped_target_infos
-        await self.state.set_connected(ext.ws_url or "ext://relay",
-                                       was_popup=False)
+        await self.state.set_connected(ext.ws_url or "ext://relay")
 
     async def trigger_close(self, reason: CloseReason) -> None:
         """Run the spec §6.5 close etiquette + tear down upstream.
@@ -1015,8 +977,8 @@ class _UpstreamHolder:
         Phase 3 (docs/refactor-single-daemon.md §Notes): for an rdp context the
         Chrome IS the upstream — once it's gone the context is dead, so we drop
         it from the daemon's registry (not just mark disconnected). A later
-        ensureSession then recreates a fresh context + relaunches Chrome."""
-        metrics().upstream_closed_total += 1
+        a later session connect then recreates a fresh context + relaunches
+        Chrome."""
         if self.state.upstream_phase in (UpstreamPhase.DISCONNECTED, UpstreamPhase.CLOSING):
             return
         await self.trigger_close("chrome_exit")

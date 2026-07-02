@@ -256,8 +256,6 @@ def sync_chrome_extension(version: str) -> dict[str, Any] | None:
 
 
 def _venv_python(venv: Path) -> Path:
-    if sys.platform == "win32":
-        return venv / "Scripts" / "python.exe"
     return venv / "bin" / "python"
 
 

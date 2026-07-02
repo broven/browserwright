@@ -7,7 +7,6 @@
 //     {"type":"attach","id":N,"tabId":42}
 //     {"type":"detach","id":N,"tabId":42}
 //     {"type":"command","id":N,"tabId":42,"method":"Page.navigate","params":{...}}
-//     {"type":"queryActiveTab","id":N}
 //     {"type":"attachActive","id":N,"groupId":7,"groupName":"sess-1"}
 //     {"type":"createTab","id":N,"url":"...","groupId":7,"groupName":"sess-1"}
 //     {"type":"closeTab","id":N,"tabId":42}
@@ -28,7 +27,6 @@
 //     {"type":"attached","tabId":42,"targetInfo":{"url":"...","title":"..."}}
 //     {"type":"detached","tabId":42}
 //     {"type":"event","tabId":42,"method":"Page.frameNavigated","params":{...}}
-//     {"type":"activeTab","id":N,"tabId":42,"url":"...","title":"..."}
 //
 // Design notes:
 //
@@ -55,7 +53,6 @@ let ws = null;
 let reconnectIdx = 0;
 let installId = null;
 const attachedTabs = new Set();
-let userscriptMemoryLog = [];
 
 const PING_INTERVAL_MS = 20000;
 const SERVER_PONG_STALE_MS = 25000;
@@ -64,7 +61,6 @@ let lastPongTs = 0;
 let lastInboundFrameTs = 0;
 let seenServerPing = false;
 let daemonVersion = null;
-let versionDrift = "unknown";
 
 // ---- install id (stable across reloads) -----------------------------------
 
@@ -272,10 +268,15 @@ async function usPutRecord(rec) {
   return scripts[rec.id];
 }
 
+// Resolve a caller-supplied key (script id OR identity) to the script id.
+function usResolveId(scripts, key) {
+  return scripts[key] ? key
+    : Object.values(scripts).find((script) => script.identity === key)?.id;
+}
+
 async function usDelete(key) {
   const { scripts } = await usGetAll();
-  const id = scripts[key] ? key
-    : Object.values(scripts).find((script) => script.identity === key)?.id;
+  const id = usResolveId(scripts, key);
   if (id) {
     delete scripts[id];
     await chrome.storage.local.set({ [US_KEY]: scripts });
@@ -285,10 +286,6 @@ async function usDelete(key) {
 
 async function usAppendLog(entry) {
   const row = { ts: Date.now(), ...entry };
-  userscriptMemoryLog.push(row);
-  if (userscriptMemoryLog.length > US_LOG_CAP) {
-    userscriptMemoryLog.splice(0, userscriptMemoryLog.length - US_LOG_CAP);
-  }
   const v = await chrome.storage.local.get([US_LOG]);
   const log = v[US_LOG] || [];
   log.push(row);
@@ -349,7 +346,7 @@ async function usSyncAll() {
       await usAppendLog({ event: "register_failed", id: rec.id, identity: rec.identity, error: errMessage(e) });
     }
   }
-  return { ok: failed.length === 0, registered, failed, logCount: userscriptMemoryLog.length };
+  return { ok: failed.length === 0, registered, failed };
 }
 
 function usPatternMatchesUrl(pattern, url) {
@@ -437,8 +434,7 @@ async function doUserscriptRemove(id, key) {
 async function doUserscriptToggle(id, key, enabled) {
   try {
     const { scripts } = await usGetAll();
-    const scriptId = scripts[key] ? key
-      : Object.values(scripts).find((script) => script.identity === key)?.id;
+    const scriptId = usResolveId(scripts, key);
     if (!scriptId) throw new Error("userscript not found: " + key);
     scripts[scriptId].enabled = !!enabled;
     scripts[scriptId].updatedAt = Date.now();
@@ -454,8 +450,7 @@ async function doUserscriptLogs(id, msg) {
   try {
     const limit = Number.isFinite(msg?.limit) ? msg.limit : 50;
     const v = await chrome.storage.local.get([US_LOG]);
-    const persisted = v[US_LOG] || [];
-    let log = persisted.concat(userscriptMemoryLog);
+    let log = v[US_LOG] || [];
     // The RPC envelope's own `id` is the request id, so the script-id filter
     // arrives under `scriptId` (see daemon CLI logs construction).
     if (msg?.scriptId) log = log.filter((entry) => entry.id === msg.scriptId);
@@ -472,7 +467,6 @@ async function handleDaemonMessage(msg) {
   switch (type) {
     case "helloAck":
       daemonVersion = msg.daemonVersion || null;
-      versionDrift = msg.versionDrift || "unknown";
       return;
     case "reloadExtension":
       console.info(
@@ -488,8 +482,6 @@ async function handleDaemonMessage(msg) {
       return await doDetach(id, msg.tabId);
     case "command":
       return await doCommand(id, msg.tabId, msg.method, msg.params || {});
-    case "queryActiveTab":
-      return await doQueryActiveTab(id);
     case "attachActive":
       return await doAttachActive(id, msg.groupId, msg.groupName);
     case "createTab":
@@ -815,29 +807,6 @@ async function armAutoAttach(tabId) {
     await sleep(50);
   } catch (e) {
     console.warn("[bd-relay] Target.setAutoAttach(" + tabId + ") failed:", e);
-  }
-}
-
-async function doQueryActiveTab(id) {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    safeSend({
-      type: "response",
-      id,
-      result: tab
-        ? {
-            tabId: tab.id,
-            url: tab.url || "",
-            title: stripMarker(tab.title),
-          }
-        : null,
-    });
-  } catch (e) {
-    safeSend({
-      type: "response",
-      id,
-      error: { code: -32000, message: errMessage(e) },
-    });
   }
 }
 
@@ -1281,17 +1250,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     console.warn("[bd-relay] drag-out detach failed:", e));
 });
 
-// A whole group being removed (last tab dragged out / group dissolved) — drop
-// any attached tabs that belonged to it. Chrome auto-deletes a group when its
-// last tab leaves, so this also covers "session group emptied".
-if (chrome.tabGroups && chrome.tabGroups.onRemoved) {
-  chrome.tabGroups.onRemoved.addListener((group) => {
-    // The tabs are already out of the group by the time this fires; the
-    // per-tab onUpdated above handles the detach. This listener exists so a
-    // future daemon-side "group gone" notification has a hook — kept minimal.
-    console.debug("[bd-relay] tab group removed:", group?.id);
-  });
-}
+// Note: no chrome.tabGroups.onRemoved listener is needed — when a group
+// dissolves, its tabs fire per-tab onUpdated (groupId change) above, which
+// handles the detach.
 
 // onRemoved fires when a tab is closed outright. If we were driving it, tell
 // the daemon so its ghost-target table stays in sync even when chrome.debugger
@@ -1367,11 +1328,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       } catch (e) {
         sendResponse({ ok: false, error: errMessage(e) });
       }
-      return;
-    }
-    if (msg?.type === "userscript.injected") {
-      await usAppendLog({ id: msg.id, url: msg.url, event: "injected" });
-      sendResponse({ ok: true });
       return;
     }
     if (msg?.type === "userscript.popupList") {

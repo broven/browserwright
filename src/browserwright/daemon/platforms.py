@@ -4,7 +4,7 @@ This table is sourced verbatim from browser-harness `daemon.py:36-65` — the sp
 (§8.3) is explicit: "this table is fought for, do not reinvent it." Any addition
 should match a real installed browser and ship with a smoke test.
 
-Covers macOS, Linux, Linux Flatpak, Windows × Chrome (Stable/Canary) / Chromium
+Covers macOS, Linux, Linux Flatpak × Chrome (Stable/Canary) / Chromium
 / Edge (Stable/Beta/Dev/Canary) / Brave / Arc / Dia / Comet.
 """
 from __future__ import annotations
@@ -87,15 +87,6 @@ def profile_paths() -> list[Path]:
         home / ".var/app/com.google.Chrome/config/google-chrome",
         home / ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
         home / ".var/app/com.microsoft.Edge/config/microsoft-edge",
-        # Windows
-        home / "AppData/Local/Google/Chrome/User Data",
-        home / "AppData/Local/Google/Chrome SxS/User Data",
-        home / "AppData/Local/Chromium/User Data",
-        home / "AppData/Local/Microsoft/Edge/User Data",
-        home / "AppData/Local/Microsoft/Edge Beta/User Data",
-        home / "AppData/Local/Microsoft/Edge Dev/User Data",
-        home / "AppData/Local/Microsoft/Edge SxS/User Data",
-        home / "AppData/Local/BraveSoftware/Brave-Browser/User Data",
     ]
 
 
@@ -110,17 +101,6 @@ def chrome_binary_candidates() -> list[Path]:
             Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
             Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
             Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-        ]
-    if system == "Windows":
-        pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-        pfx86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
-        local = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))
-        return [
-            Path(pf) / "Google/Chrome/Application/chrome.exe",
-            Path(pfx86) / "Google/Chrome/Application/chrome.exe",
-            Path(local) / "Google/Chrome/Application/chrome.exe",
-            Path(pf) / "Microsoft/Edge/Application/msedge.exe",
-            Path(pfx86) / "Microsoft/Edge/Application/msedge.exe",
         ]
     # Linux + everything else
     return [
@@ -176,7 +156,7 @@ def discover_chrome_binary(explicit: str | None = None) -> Path | None:
       `chrome_binary_candidates()` BEFORE `shutil.which` PATH lookup.
       Reason: Homebrew leaves stale wrapper scripts on PATH that exit 126
       (= Bug #2 symptom without the actual poll race).
-    - Linux + Windows, PATH is the canonical install signal; check it first
+    - Linux, PATH is the canonical install signal; check it first
       but still validate via `--version` so partial / broken installs fail
       fast with a clean error.
     """
@@ -193,7 +173,7 @@ def discover_chrome_binary(explicit: str | None = None) -> Path | None:
             if (which := shutil.which(name)):
                 candidates.append(Path(which))
     else:
-        # Linux + Windows: PATH first, then platform defaults.
+        # Linux: PATH first, then platform defaults.
         for name in ("google-chrome", "google-chrome-stable", "chromium",
                      "chromium-browser", "microsoft-edge", "brave-browser"):
             if (which := shutil.which(name)):
@@ -215,15 +195,12 @@ def discover_chrome_binary(explicit: str | None = None) -> Path | None:
 def runtime_dir() -> Path:
     """Where pid / sock files live. Spec §5.5 step 7 + §6.7.
 
-    Mirrors browser-harness _ipc.py logic — XDG_RUNTIME_DIR on POSIX, %TEMP% on
-    Windows, /tmp fallback (gettempdir() returns long /var/folders on macOS which
-    is unsafe for AF_UNIX sun_path's 104-byte budget).
+    Mirrors browser-harness _ipc.py logic — XDG_RUNTIME_DIR, /tmp fallback
+    (gettempdir() returns long /var/folders on macOS which is unsafe for
+    AF_UNIX sun_path's 104-byte budget).
     """
     if (xdg := os.environ.get("XDG_RUNTIME_DIR")):
         return Path(xdg)
-    if platform.system() == "Windows":
-        import tempfile
-        return Path(tempfile.gettempdir())
     return Path("/tmp")
 
 

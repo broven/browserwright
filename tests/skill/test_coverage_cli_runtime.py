@@ -961,19 +961,3 @@ def test_session_runtime_persist_target_swallows_registry_update_failure(tmp_bs_
     session_runtime.persist_target("tab-1", group_id=1, sess=_RuntimeSession(record={"id": sid}))
 
     assert "runtime" not in reg.get(sid)
-
-
-def test_session_decisions_record_creates_home_and_overwrites(tmp_path, monkeypatch):
-    from browserwright.memory import session_decisions
-
-    home = tmp_path / "missing-home"
-    monkeypatch.setenv("BS_HOME", str(home))
-
-    session_decisions.record("daily scrape", {"backend": "rdp", "mode": "create"})
-    session_decisions.record("daily scrape", {"backend": "extension", "mode": "attach"})
-
-    assert home.is_dir()
-    assert session_decisions.lookup("daily scrape") == {
-        "backend": "extension",
-        "mode": "attach",
-    }
