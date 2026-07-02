@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from browserwright.daemon.server import proxy as proxy_mod
+from browserwright.daemon.server import verbs as verbs_mod
 from browserwright.daemon.server.proxy import Router
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
@@ -107,7 +107,7 @@ async def _ensure_executor(router: Router, client) -> dict:
 
 @pytest.mark.asyncio
 async def test_extension_no_extension_connected_fast_actionable_error(monkeypatch):
-    monkeypatch.setattr(proxy_mod, "_EXT_READY_BUDGET_S", 0.05)
+    monkeypatch.setattr(verbs_mod, "_EXT_READY_BUDGET_S", 0.05)
     relay = _FakeRelay(ready=False)
     state, router, cap, client, registry = _build("extension", relay=relay)
 
@@ -133,7 +133,7 @@ async def test_extension_no_extension_connected_fast_actionable_error(monkeypatc
 
 @pytest.mark.asyncio
 async def test_extension_ready_proceeds_to_spawn(monkeypatch):
-    monkeypatch.setattr(proxy_mod, "_EXT_READY_BUDGET_S", 0.05)
+    monkeypatch.setattr(verbs_mod, "_EXT_READY_BUDGET_S", 0.05)
     relay = _FakeRelay(ready=True)
     state, router, cap, client, registry = _build("extension", relay=relay)
 
@@ -153,7 +153,7 @@ async def test_extension_ready_proceeds_to_spawn(monkeypatch):
 async def test_rdp_skips_extension_fastfail(monkeypatch):
     """The fast-fail is extension-only: an rdp session never consults the relay
     (it has none) and proceeds through the normal upstream-open + spawn path."""
-    monkeypatch.setattr(proxy_mod, "_EXT_READY_BUDGET_S", 0.05)
+    monkeypatch.setattr(verbs_mod, "_EXT_READY_BUDGET_S", 0.05)
     state, router, cap, client, registry = _build("rdp", relay=None)
 
     await _ensure_executor(router, client)
