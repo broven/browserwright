@@ -18,11 +18,16 @@ PREFIX = "\U0001f440 "
 
 
 def _template_const(source: str, name: str) -> str:
-    match = re.search(rf"const {name} = `\n(?P<body>.*?)\n`;", source, re.DOTALL)
-    assert match is not None, f"{name} template not found"
-    body = match.group("body")
+    # The marker scripts are assembled from shared source fragments
+    # (MARKER_STRIP_PREFIX_SRC / MARKER_RAW_TITLE_SRC in background.js), so
+    # evaluate the whole const region in Node instead of regex-slicing a
+    # single template literal.
+    start = source.index("const MARKER_STRIP_PREFIX_SRC")
+    end = source.index("const markedTabs")
+    snippet = source[start:end]
     proc = subprocess.run(
-        ["node", "-e", f"process.stdout.write(JSON.stringify(`\\n{body}\\n`.slice(1, -1)))"],
+        ["node"],
+        input=f"{snippet}\nprocess.stdout.write(JSON.stringify({name}));",
         text=True,
         capture_output=True,
         check=True,

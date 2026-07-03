@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -203,22 +202,25 @@ def test_backend_info_attach_and_rpc_success_paths(monkeypatch, capsys, tmp_path
     assert cli._cmd_backend_info(_ns(json=False, session="bw-s"), Config()) == 0
     assert backend_calls[-1][0][2] == {"bsSession": "bw-s"}
     assert backend_calls[-1][1]["browser_session"] == "bw-s"
+
+    attach_calls = []
+
+    async def fake_attach_rpc(*args, **kwargs):
+        attach_calls.append((args, kwargs))
+        return {
+            "targetId": "T",
+            "url": "https://example.test/",
+            "title": "Example",
+        }
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_attach_rpc)
+    assert cli._cmd_attach_active(_ns(json=True, session="bw-s"), Config()) == 0
+    assert attach_calls[-1][0][1] == "BrowserwrightDaemon.attachActiveTab"
+    assert attach_calls[-1][0][2] == {"bsSession": "bw-s"}
+    assert attach_calls[-1][1]["browser_session"] == "bw-s"
     monkeypatch.setattr(cli, "_rpc_via_ws", real_rpc_via_ws)
 
     monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "daemon.sock")
-
-    attach_json = _AsyncWs([
-        {"id": 0, "method": "BrowserwrightDaemon.upstreamReady"},
-        {
-            "id": 1,
-            "result": {
-                "targetId": "T",
-                "url": "https://example.test/",
-                "title": "Example",
-            },
-        },
-    ])
-    assert asyncio.run(cli._attach_active_roundtrip(attach_json, _ns(json=True))) == 0
 
     rpc_ws = _AsyncWs([
         {"method": "noise"},
@@ -245,7 +247,7 @@ def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
     import websockets
 
     monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "absent.sock")
-    assert asyncio.run(cli._attach_active_via_ws(Config(), _ns(json=False))) == 2
+    assert cli._cmd_attach_active(_ns(json=False, session="bw-s"), Config()) == 2
     with pytest.raises(Unavailable):
         asyncio.run(cli._rpc_via_ws(
             Config(), "BrowserwrightDaemon.missing", {},
@@ -274,11 +276,13 @@ def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
         ))
 
     err_ws = _AsyncWs([{"id": 1, "error": {"message": "attach boom"}}])
-    assert asyncio.run(cli._attach_active_roundtrip(err_ws, _ns(json=False))) == 1
+    monkeypatch.setattr(websockets, "unix_connect", lambda *a, **kw: err_ws)
+    assert cli._cmd_attach_active(_ns(json=False, session="bw-s"), Config()) == 1
 
     captured = capsys.readouterr()
     assert captured.err.count("no daemon running") >= 1
-    assert "attach-active error: attach boom" in captured.err
+    assert "attach-active failed:" in captured.err
+    assert "attach boom" in captured.err
 
 
 def test_userscript_actions_success_and_error_sweep(monkeypatch, capsys):

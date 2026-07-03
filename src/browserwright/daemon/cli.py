@@ -539,61 +539,27 @@ def _cmd_attach_active(args, cfg: Config) -> int:
     if not args.session:
         print("error: provide --session or set BD_SESSION", file=sys.stderr)
         return 2
-    return _run(_attach_active_via_ws(cfg, args))
-
-
-async def _attach_active_via_ws(cfg: Config, args) -> int:
-    import websockets
-    from . import _ipc
-    from urllib.parse import quote
-
-    session = getattr(args, "session", None)
-    session_q = f"&session={quote(str(session), safe='')}" if session else ""
-
-    path = _ipc.sock_path()
-    if not path.exists():
-        print("no daemon running", file=sys.stderr)
-        return 2
     try:
-        async with websockets.unix_connect(
-                str(path), uri=f"ws://localhost/?client=cli-attach-active{session_q}",
-                compression=None) as ws:
-            return await _attach_active_roundtrip(ws, args)
+        result = _run(_rpc_via_ws(
+            cfg, "BrowserwrightDaemon.attachActiveTab",
+            {"bsSession": args.session},
+            client_label="cli-attach-active", timeout=15.0,
+            browser_session=args.session,
+        ))
+    except Unavailable as e:
+        print(f"{e}", file=sys.stderr)
+        return 2
     except Exception as e:
+        # Historic contract: any attach failure (daemon error response or
+        # transport hiccup) exits 1, not main()'s generic 3.
         print(f"attach-active failed: {e}", file=sys.stderr)
         return 1
-
-
-async def _attach_active_roundtrip(ws, args) -> int:
-    params = {}
-    if getattr(args, "session", None):
-        params["bsSession"] = args.session
-    await ws.send(json.dumps({
-        "id": 1, "method": "BrowserwrightDaemon.attachActiveTab",
-        "params": params,
-    }))
-    # Drain until we see id=1 — lifecycle events (upstreamConnecting,
-    # upstreamReady) can arrive ahead of the response.
-    for _ in range(20):
-        raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
-        msg = json.loads(raw)
-        if msg.get("id") != 1:
-            continue
-        if "error" in msg:
-            err = msg["error"] or {}
-            print(f"attach-active error: {err.get('message', str(err))}",
-                  file=sys.stderr)
-            return 1
-        result = msg.get("result") or {}
-        if args.json:
-            print(json.dumps(result, sort_keys=True))
-        else:
-            print(f"{result.get('targetId')}\t{result.get('url', '')}\t"
-                  f"{result.get('title', '')}")
-        return 0
-    print("daemon did not respond to BrowserwrightDaemon.attachActiveTab",
-          file=sys.stderr)
-    return 1
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(f"{result.get('targetId')}\t{result.get('url', '')}\t"
+              f"{result.get('title', '')}")
+    return 0
 
 
 def _cmd_logs(args, cfg: Config) -> int:
@@ -694,26 +660,16 @@ def _extension_relay_status(cfg: Config) -> dict | None:
 def _cmd_extension(args, cfg: Config) -> int:
     action = getattr(args, "extension_cmd", None)
     if action == "reload":
-        try:
-            result = _run(_rpc_via_ws(
-                cfg,
-                "BrowserwrightDaemon.extension.reload",
-                {"reason": "manual"},
-                client_label="cli-extension-reload",
-                timeout=8.0,
-            ))
-        except Unavailable as e:
-            print(f"error: {e}", file=sys.stderr)
-            return 2
-        except DaemonError as e:
-            print(f"error: {e}", file=sys.stderr)
-            return 3
-        if args.json:
-            print(json.dumps(result, sort_keys=True))
-        else:
-            sent = int(result.get("sent", 0) or 0)
-            print(f"reload requested for {sent} extension(s)")
-        return 0
+        def _emit(result: dict) -> None:
+            if args.json:
+                print(json.dumps(result, sort_keys=True))
+            else:
+                sent = int(result.get("sent", 0) or 0)
+                print(f"reload requested for {sent} extension(s)")
+
+        return _rpc_cmd(
+            cfg, "BrowserwrightDaemon.extension.reload", {"reason": "manual"},
+            client_label="cli-extension-reload", timeout=8.0, emit=_emit)
     print("usage: browserwright-daemon extension reload", file=sys.stderr)
     return 1
 
@@ -725,8 +681,9 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
     RPC, read the response, close, and return the parsed result (or raise
     with the daemon's error message).
 
-    Used by `open-background`, `close-tab`, `end-session`, `kill-executor`,
-    `backend-info`, `extension reload`, and `userscript` subcommands.
+    Used by `attach-active`, `open-background`, `close-tab`, `end-session`,
+    `kill-executor`, `backend-info`, `extension reload`, and `userscript`
+    subcommands.
     """
     import websockets
     from . import _ipc
@@ -739,7 +696,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
     async def _drain_until_response(ws) -> dict:
         # Lifecycle events (upstreamConnecting/Ready) can arrive ahead of the
         # actual id=1 response, especially when lazy-open is triggered by the
-        # RPC. Drain frames until we see ours. Mirrors `_attach_active_roundtrip`.
+        # RPC. Drain frames until we see ours.
         for _ in range(20):
             raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
             msg = json.loads(raw)
@@ -768,6 +725,34 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
     if not isinstance(result, dict):
         raise DaemonError(f"{method} returned non-dict result: {result!r}")
     return result
+
+
+def _rpc_cmd(cfg: Config, method: str, params: dict, *,
+             client_label: str, timeout: float = 10.0,
+             browser_session: str | None = None,
+             emit=None) -> int:
+    """Shared runner for one-shot RPC subcommands: call `_rpc_via_ws`, map
+    Unavailable→2 / DaemonError→3 — the same mapping main()'s top-level
+    handler applies, duplicated here because tests (and any embedder) invoke
+    the `_cmd_*` handlers directly without going through main(). On success
+    prints the sorted-JSON result (spec §5.1 single-line discipline) unless
+    `emit` overrides the formatting."""
+    try:
+        result = _run(_rpc_via_ws(
+            cfg, method, params, client_label=client_label, timeout=timeout,
+            browser_session=browser_session,
+        ))
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    if emit is not None:
+        emit(result)
+    else:
+        print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 async def _userscript_call_ws(cfg: Config, method: str, params: dict,
@@ -874,25 +859,13 @@ def _cmd_open_background(args, cfg: Config) -> int:
     if not args.session:
         print("error: provide --session or set BD_SESSION", file=sys.stderr)
         return 2
-    try:
-        result = _run(_rpc_via_ws(
-            cfg,
-            "BrowserwrightDaemon.openBackgroundTab",
-            {"url": args.url, "groupName": args.group, "bsSession": args.session},
-            client_label="cli-open-background",
-            timeout=15.0,
-            browser_session=args.session,
-        ))
-    except Unavailable as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    except DaemonError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 3
-    # Always emit JSON — single-line spec §5.1 discipline; the response is
+    # Always emits JSON — single-line spec §5.1 discipline; the response is
     # structured so a tab-separated form would lose fields.
-    print(json.dumps(result, sort_keys=True))
-    return 0
+    return _rpc_cmd(
+        cfg, "BrowserwrightDaemon.openBackgroundTab",
+        {"url": args.url, "groupName": args.group, "bsSession": args.session},
+        client_label="cli-open-background", timeout=15.0,
+        browser_session=args.session)
 
 
 def _cmd_close_tab(args, cfg: Config) -> int:
@@ -907,23 +880,10 @@ def _cmd_close_tab(args, cfg: Config) -> int:
         params["sessionId"] = args.session_id
     if args.target_id:
         params["targetId"] = args.target_id
-    try:
-        result = _run(_rpc_via_ws(
-            cfg,
-            "BrowserwrightDaemon.closeTab",
-            params,
-            client_label="cli-close-tab",
-            timeout=10.0,
-            browser_session=args.session,
-        ))
-    except Unavailable as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    except DaemonError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 3
-    print(json.dumps(result, sort_keys=True))
-    return 0
+    return _rpc_cmd(
+        cfg, "BrowserwrightDaemon.closeTab", params,
+        client_label="cli-close-tab", timeout=10.0,
+        browser_session=args.session)
 
 
 def _cmd_end_session(args, cfg: Config) -> int:
@@ -932,23 +892,10 @@ def _cmd_end_session(args, cfg: Config) -> int:
     es_params: dict = {"session": args.session}
     if getattr(args, "group_id", None) is not None:
         es_params["groupId"] = args.group_id
-    try:
-        result = _run(_rpc_via_ws(
-            cfg,
-            "BrowserwrightDaemon.endSession",
-            es_params,
-            client_label="cli-end-session",
-            timeout=10.0,
-            browser_session=args.session,
-        ))
-    except Unavailable as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    except DaemonError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 3
-    print(json.dumps(result, sort_keys=True))
-    return 0
+    return _rpc_cmd(
+        cfg, "BrowserwrightDaemon.endSession", es_params,
+        client_label="cli-end-session", timeout=10.0,
+        browser_session=args.session)
 
 
 def _cmd_kill_executor(args, cfg: Config) -> int:
@@ -957,23 +904,10 @@ def _cmd_kill_executor(args, cfg: Config) -> int:
     Best-effort by design — a dead daemon / missing executor must not fail
     `session end`, so every failure mode maps to a clean exit code the caller
     tolerates. Prints the `{ok, killed}` JSON result on success."""
-    try:
-        result = _run(_rpc_via_ws(
-            cfg,
-            "BrowserwrightDaemon.killExecutor",
-            {"session": args.session},
-            client_label="cli-kill-executor",
-            timeout=10.0,
-            browser_session=args.session,
-        ))
-    except Unavailable as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    except DaemonError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 3
-    print(json.dumps(result, sort_keys=True))
-    return 0
+    return _rpc_cmd(
+        cfg, "BrowserwrightDaemon.killExecutor", {"session": args.session},
+        client_label="cli-kill-executor", timeout=10.0,
+        browser_session=args.session)
 
 
 # ---- LaunchAgent service (macOS) ----------------------------------------

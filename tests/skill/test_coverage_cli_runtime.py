@@ -141,26 +141,6 @@ def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys)
     assert payload["running_extensions"][0]["version_drift"] == "patch"
 
 
-def test_cmd_release_status_json(monkeypatch, capsys):
-    from browserwright import cli, release_install
-
-    monkeypatch.setattr(
-        release_install,
-        "status",
-        lambda: {
-            "schema_version": 1,
-            "installed_version": "0.6.0",
-            "daemon": {"alive": True, "version": "0.5.9", "restart_required": True},
-            "skill": [],
-            "releases": [],
-        },
-    )
-
-    assert cli._cmd_release(["status", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["daemon"]["restart_required"] is True
-
-
 @pytest.mark.parametrize(
     "args, err",
     [

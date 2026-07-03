@@ -41,8 +41,6 @@ Usage:
   browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
 
-  browserwright release {install-local|status|list|activate} ...
-
   browserwright install
   browserwright doctor [--json]
   browserwright index rebuild
@@ -707,88 +705,6 @@ def _extension_relay_status() -> dict | None:
         return None
 
 
-def _cmd_release(args: list[str]) -> int:
-    if not args:
-        print(
-            "usage: browserwright release {install-local|status|list|activate} ...",
-            file=sys.stderr,
-        )
-        return 1
-    from . import release_install
-
-    sub = args[0]
-    rest = args[1:]
-    kw = _parse_kv_args(rest)
-    try:
-        if sub == "install-local":
-            info = release_install.install_local(
-                force=bool(kw.get("force")),
-                activate_release=not bool(kw.get("no-activate")),
-            )
-            if kw.get("restart-daemon") and info["actions"].get("restart_daemon"):
-                subprocess.run(["browserwright-daemon", "restart"], check=False)
-            if kw.get("json"):
-                sys.stdout.write(json.dumps(info, indent=2, sort_keys=True) + "\n")
-            else:
-                print(f"installed browserwright {info['version']} -> {info['path']}")
-                if info.get("activated"):
-                    print("activated global entry points")
-                if info["actions"].get("restart_daemon"):
-                    print("next: restart daemon (`browserwright-daemon restart`)")
-                if info["actions"].get("reload_chrome_extension"):
-                    print(
-                        "next: reload Chrome unpacked extension from "
-                        f"{info.get('chrome_extension_sync', {}).get('path') or info['path'] + '/chrome-extension'}"
-                    )
-            return 0
-
-        if sub == "status":
-            info = release_install.status()
-            if kw.get("json"):
-                sys.stdout.write(json.dumps(info, indent=2, sort_keys=True) + "\n")
-                return 0
-            version = info.get("installed_version") or "(none)"
-            print(f"installed release: {version}")
-            daemon = info.get("daemon") or {}
-            daemon_version = daemon.get("version") or "(not running)"
-            suffix = "  restart required" if daemon.get("restart_required") else ""
-            print(f"running daemon:    {daemon_version}{suffix}")
-            ok = all(row.get("ok") for row in info.get("skill", []))
-            print(f"skill install:     {'copied ok' if ok else 'needs reinstall'}")
-            return 0
-
-        if sub == "list":
-            rows = release_install.list_releases()
-            if kw.get("json"):
-                sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
-                return 0
-            if not rows:
-                print("(no releases installed)")
-                return 0
-            for row in rows:
-                mark = "*" if row.get("active") else " "
-                print(f"{mark} {row.get('version')}  {row.get('path')}")
-            return 0
-
-        if sub == "activate":
-            if not rest or rest[0].startswith("--"):
-                print("usage: browserwright release activate <version>", file=sys.stderr)
-                return 1
-            info = release_install.activate(rest[0])
-            if kw.get("json"):
-                sys.stdout.write(json.dumps(info, indent=2, sort_keys=True) + "\n")
-            else:
-                print(f"activated browserwright {info['version']} -> {info['path']}")
-                print("next: restart daemon and reload Chrome extension if that release differs")
-            return 0
-    except release_install.ReleaseError as e:
-        print(f"release error: {e}", file=sys.stderr)
-        return 1
-
-    print(f"unknown release subcommand: {sub}", file=sys.stderr)
-    return 1
-
-
 def main(argv: Optional[list[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -839,8 +755,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_index(rest))
     if cmd == "memory":
         sys.exit(_cmd_memory(rest))
-    if cmd == "release":
-        sys.exit(_cmd_release(rest))
     if cmd == "session":
         sys.exit(_cmd_session(rest, session_id=global_session))
     if cmd == "whoami":
