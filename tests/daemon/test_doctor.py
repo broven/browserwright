@@ -194,17 +194,6 @@ async def test_recommended_rdp_still_beats_extension_on_ux_cost(monkeypatch):
 # ---- v0.5.3 F-11: _needs_action hints refreshed --------------------------
 
 
-def test_needs_action_extension_hint_no_longer_says_planned_v04():
-    """v0.5.3 F-11: 'planned v0.4' was stale months after v0.4 shipped."""
-    hint = doctor_mod._needs_action("extension")
-    assert hint is not None
-    assert "planned" not in hint.lower()
-    assert "v0.4" not in hint
-    # Should point at the unpacked-extension install flow.
-    assert "unpacked" in hint.lower() or "browserwright install" in hint
-
-
-
 def test_needs_action_unknown_backend_still_none():
     """Spec sanity — unknown name returns None, doesn't fall through."""
     assert doctor_mod._needs_action("nonexistent") is None

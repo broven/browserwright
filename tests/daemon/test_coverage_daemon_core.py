@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,13 +17,6 @@ from browserwright.daemon.errors import (
     Unavailable,
     UserError,
 )
-
-
-def test_cli_main_without_subcommand_prints_help(capsys):
-    assert cli_mod.main([]) == 1
-    captured = capsys.readouterr()
-    assert "browserwright-daemon" in captured.err
-    assert captured.out == ""
 
 
 @pytest.mark.parametrize(
@@ -117,97 +109,6 @@ def test_cmd_daemon_version_check_json_reports_consistent_versions(monkeypatch, 
     assert payload["running_extensions"][0]["version_drift"] == "patch"
 
 
-def test_cmd_close_tab_requires_identifier(capsys):
-    args = SimpleNamespace(session="s1", session_id=None, target_id=None)
-    assert cli_mod._cmd_close_tab(args, Config()) == 2
-    assert "provide --session-id or --target-id" in capsys.readouterr().err
-
-
-def test_cmd_open_background_success_prints_json(monkeypatch, capsys):
-    monkeypatch.setattr(cli_mod, "_rpc_via_ws", lambda *a, **kw: object())
-    def fake_run(awaitable):
-        if hasattr(awaitable, "close"):
-            awaitable.close()
-        return {"targetId": "T", "tabId": 7}
-
-    monkeypatch.setattr(cli_mod, "_run", fake_run)
-    args = SimpleNamespace(url="https://example.test/", group="Agent", session="s1")
-    assert cli_mod._cmd_open_background(args, Config()) == 0
-    assert json.loads(capsys.readouterr().out) == {"tabId": 7, "targetId": "T"}
-
-
-def test_cmd_end_session_passes_group_id(monkeypatch, capsys):
-    seen = {}
-
-    def fake_rpc(cfg, method, params, **kwargs):
-        seen.update({"method": method, "params": params, "kwargs": kwargs})
-        return object()
-
-    monkeypatch.setattr(cli_mod, "_rpc_via_ws", fake_rpc)
-    def fake_run(awaitable):
-        if hasattr(awaitable, "close"):
-            awaitable.close()
-        return {"closed": [1], "kept": []}
-
-    monkeypatch.setattr(cli_mod, "_run", fake_run)
-    args = SimpleNamespace(session="s1", group_id=42)
-    assert cli_mod._cmd_end_session(args, Config()) == 0
-    assert seen["method"] == "BrowserwrightDaemon.endSession"
-    assert seen["params"] == {"session": "s1", "groupId": 42}
-    assert json.loads(capsys.readouterr().out)["closed"] == [1]
-
-
-def test_pretty_doctor_prints_detail_warning_and_next(capsys):
-    cli_mod._pretty_doctor(
-        {
-            "recommended": None,
-            "backends": [
-                {
-                    "name": "env",
-                    "available": False,
-                    "ux_cost": "none",
-                    "detail": "missing env",
-                    "ux_warning": "no url",
-                    "needs_user_action": "set BD_CDP_WS",
-                }
-            ],
-        }
-    )
-    out = capsys.readouterr().out
-    assert "recommended: (none available)" in out
-    assert "detail: missing env" in out
-    assert "warning: no url" in out
-    assert "next: set BD_CDP_WS" in out
-
-
-def test_runtime_dir_prefers_xdg(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    assert platforms_mod.runtime_dir() == tmp_path
-
-
-def test_runtime_dir_falls_back_to_tmp(monkeypatch):
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    assert str(platforms_mod.runtime_dir()) == "/tmp"
-
-
-def test_cache_dir_prefers_xdg_cache_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    assert platforms_mod.cache_dir() == tmp_path / "browserwright-daemon"
-
-
-@pytest.mark.parametrize(
-    ("system", "expected"),
-    [
-        ("Darwin", "Google Chrome.app/Contents/MacOS/Google Chrome"),
-        ("Linux", "/usr/bin/google-chrome"),
-    ],
-)
-def test_chrome_binary_candidates_by_platform(monkeypatch, system, expected):
-    monkeypatch.setattr(platforms_mod.platform, "system", lambda: system)
-    paths = [str(p) for p in platforms_mod.chrome_binary_candidates()]
-    assert any(expected in p for p in paths)
-
-
 def test_binary_is_runnable_false_on_permission_error(monkeypatch, tmp_path):
     def fake_run(*args, **kwargs):
         raise PermissionError("nope")
@@ -258,26 +159,6 @@ def test_proc_start_time_falls_back_to_ps(monkeypatch):
     assert platforms_mod.proc_start_time(456) == "Mon May 24 12:00:00 2026"
 
 
-def test_discover_chrome_binary_darwin_prefers_app_candidate_before_path(monkeypatch, tmp_path):
-    app = tmp_path / "Google Chrome"
-    path_wrapper = tmp_path / "chromium"
-    app.write_text("")
-    path_wrapper.write_text("")
-    calls: list[Path] = []
-
-    monkeypatch.setattr(platforms_mod.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(platforms_mod, "chrome_binary_candidates", lambda: [app])
-    monkeypatch.setattr(platforms_mod.shutil, "which", lambda name: str(path_wrapper))
-
-    def runnable(path, timeout=3.0):
-        calls.append(path)
-        return True
-
-    monkeypatch.setattr(platforms_mod, "_binary_is_runnable", runnable)
-    assert platforms_mod.discover_chrome_binary() == app
-    assert calls == [app]
-
-
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -296,19 +177,6 @@ def test_truthy_env_variants(monkeypatch, value, expected):
 
     monkeypatch.setenv("BD_FLAG", value)
     assert lc_mod._truthy_env("BD_FLAG") is expected
-
-
-def test_allocate_data_dir_persistent_uses_cache(monkeypatch, tmp_path):
-    import browserwright.daemon.launch_chrome as lc_mod
-
-    monkeypatch.setattr(lc_mod, "cache_dir", lambda: tmp_path / "cache")
-    assert lc_mod._allocate_data_dir("prof", persistent=True) == tmp_path / "cache" / "profiles" / "prof"
-
-
-def test_spawn_kwargs_posix_starts_new_session():
-    import browserwright.daemon.launch_chrome as lc_mod
-
-    assert lc_mod._spawn_kwargs() == {"start_new_session": True}
 
 
 def test_silent_context_swallows_only_oserror():

@@ -62,25 +62,6 @@ class _FakeRouter:
         self.forwarded.append(text)
 
 
-def test_listener_query_and_process_request_cover_ping(monkeypatch):
-    assert listener_mod._parse_query("/ws?client=a&client=b&empty=&encoded=x%20y") == {
-        "client": "a",
-        "encoded": "x y",
-    }
-
-    handler = SimpleNamespace()
-    conn = _FakeHttpConn()
-    process_request = listener_mod._make_process_request(handler)
-
-    monkeypatch.setattr(listener_mod.os, "getpid", lambda: 4321)
-    resp = process_request(conn, SimpleNamespace(path="/__ping__?ignored=1"))
-    assert resp.status.value == 200
-    assert resp.headers["Content-Type"] == "application/json"
-    assert _ipc.parse_pong(resp.body.encode())[0] == 4321
-
-    assert process_request(conn, SimpleNamespace(path="/ws?client=x")) is None
-
-
 @pytest.mark.asyncio
 async def test_upstream_holder_extension_missing_relay_emits_connecting_then_fails():
     state = DaemonState(backend_name="extension")

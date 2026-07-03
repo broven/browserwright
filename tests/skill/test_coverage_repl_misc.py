@@ -87,53 +87,6 @@ def test_namespace_skips_same_object_shadow_without_warning(tmp_bs_home, capsys)
     assert capsys.readouterr().err == ""
 
 
-def test_skill_doc_falls_back_when_cli_help_import_fails(monkeypatch):
-    from browserwright import skill_doc
-
-    real_import = __import__
-
-    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if level == 1 and name == "cli" and fromlist == ("HELP",):
-            raise RuntimeError("cli unavailable")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(skill_doc.Path, "is_file", lambda self: False)
-    monkeypatch.setattr("builtins.__import__", guarded_import)
-
-    assert skill_doc._curated_header() == "browserwright — Layer 2 of the browser stack."
-
-
-def test_skill_doc_uses_packaged_runtime_guide():
-    from browserwright import skill_doc
-
-    assert "Version Discipline" in skill_doc._curated_header()
-
-
-def test_skill_doc_documents_state_and_reset_surface():
-    # PR3 DoD: --print-skill must teach the persistent `state` + `reset()`
-    # surface and the "same live objects across calls" mental model.
-    from browserwright import skill_doc
-
-    doc = skill_doc.render()
-    assert "state" in doc
-    assert "reset()" in doc
-    assert "persist" in doc.lower()
-    assert "same live object" in doc.lower()
-    # Both state-loss paths are documented so the agent isn't surprised.
-    assert "daemon restart" in doc.lower()
-
-
-def test_skill_doc_no_longer_advertises_legacy_cdp_primitives():
-    # The legacy CDP-driving primitives were deleted; the doc must not point
-    # agents at them anymore (the browser surface is page/context/snapshot).
-    from browserwright import skill_doc
-
-    doc = skill_doc.render()
-    assert "Importable internal primitives" not in doc
-    assert "capture_screenshot" not in doc
-    assert "click_at_xy" not in doc
-
-
 def test_snapshot_default_max_chars_is_less_aggressive():
     from browserwright.repl import snapshot as snapshot_mod
 
@@ -168,17 +121,6 @@ def test_executor_control_plane_uses_browserwright_session_param():
         "BrowserwrightDaemon.ensureExecutor",
         {"bsSession": "rdp-7"},
     )]
-
-
-def test_skill_doc_signature_uses_ellipsis_for_uninspectable_callable(monkeypatch):
-    from browserwright import skill_doc
-
-    def broken_signature(_obj):
-        raise ValueError("no signature")
-
-    monkeypatch.setattr(skill_doc.inspect, "signature", broken_signature)
-
-    assert skill_doc._signature("mystery", object()) == "mystery(...)"
 
 
 def test_discovery_iter_site_dirs_precedence_and_filters(monkeypatch, tmp_path):

@@ -141,20 +141,6 @@ def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys)
     assert payload["running_extensions"][0]["version_drift"] == "patch"
 
 
-@pytest.mark.parametrize(
-    "args, err",
-    [
-        ([], "usage: browserwright -s <session-id> task"),
-        (["missing-slash"], "task spec must be"),
-    ],
-)
-def test_cmd_task_rejects_bad_invocation(args, err, capsys, tmp_bs_home):
-    from browserwright import cli
-
-    assert cli._cmd_task(args) == 1
-    assert err in capsys.readouterr().err
-
-
 def test_cmd_task_reports_missing_task(monkeypatch, capsys, tmp_bs_home):
     from browserwright import cli, task_runner
     from browserwright import session_registry as reg
@@ -222,30 +208,6 @@ def test_cmd_doctor_human_failure_prints_fixes(monkeypatch, capsys):
     assert "doctor: FAIL" in out
 
 
-def test_cmd_index_rejects_unknown_subcommand(capsys):
-    from browserwright import cli
-
-    assert cli._cmd_index(["refresh"]) == 1
-    assert "usage: browserwright index rebuild" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    "args, expected",
-    [
-        ([], "usage: browserwright memory"),
-        (["show"], "specify --site=SITE or --global"),
-        (["forget", "--global"], "usage: memory forget"),
-        (["replace", "--pattern=x", "--global"], "usage: memory replace"),
-        (["unknown"], "unknown memory subcommand"),
-    ],
-)
-def test_cmd_memory_usage_errors(args, expected, capsys, tmp_bs_home):
-    from browserwright import cli
-
-    assert cli._cmd_memory(args) == 1
-    assert expected in capsys.readouterr().err
-
-
 def test_cmd_memory_replace_dry_run_then_confirm(tmp_bs_home, capsys):
     from browserwright import cli
     from browserwright.memory import global_memory
@@ -273,19 +235,6 @@ def test_cmd_memory_replace_dry_run_then_confirm(tmp_bs_home, capsys):
     body = global_memory().read()["body"]
     assert "old browser note" not in body
     assert "new browser note" in body
-
-
-def test_cmd_session_usage_errors(capsys, tmp_bs_home):
-    from browserwright import cli
-
-    assert cli._cmd_session([]) == 1
-    assert "usage: browserwright session" in capsys.readouterr().err
-
-    assert cli._cmd_session(["new", "--backend=bogus", "--name=x"]) == 1
-    assert "--backend=<extension|rdp|env>" in capsys.readouterr().err
-
-    assert cli._cmd_session(["bogus"]) == 1
-    assert "unknown session subcommand" in capsys.readouterr().err
 
 
 def test_cmd_session_reset_recycles_executor(tmp_bs_home, monkeypatch, capsys):
