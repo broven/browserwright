@@ -194,15 +194,15 @@ async def test_stale_extension_connection_is_closed_and_request_retries(monkeypa
             ext2 = _MockExtension()
             await ext2.connect(relay.port, install_id="same-ext")
             cmd = await ext2.next_command()
-            assert cmd["type"] == "queryActiveTab"
-            await ext2.respond(cmd["id"], result={"tabId": 9, "url": "https://fresh/"})
+            assert cmd["type"] == "queryGroup"
+            await ext2.respond(cmd["id"], result={"groupId": 9, "tabs": []})
             return ext2
 
         reconnect_task = asyncio.create_task(reconnect())
-        result = await relay.query_active_tab(timeout=1.0)
+        result = await relay.query_group_tabs(group_id=9, timeout=1.0)
         ext2 = await reconnect_task
         try:
-            assert result == {"tabId": 9, "url": "https://fresh/"}
+            assert result == {"groupId": 9, "tabs": []}
             assert ext1.ws is not None and ext1.ws.close_code is not None
             active = relay._pick_active_extension()
             assert active is not None
@@ -222,11 +222,11 @@ async def test_live_extension_request_timeout_does_not_retry(monkeypatch):
 
         try:
             with pytest.raises(asyncio.TimeoutError):
-                await relay.query_active_tab(timeout=0.01)
+                await relay.query_group_tabs(group_id=1, timeout=0.01)
             await asyncio.sleep(0.05)
             assert len([
                 msg for msg in ext.received
-                if msg.get("type") == "queryActiveTab"
+                if msg.get("type") == "queryGroup"
             ]) == 1
             active = relay._pick_active_extension()
             assert active is not None
@@ -745,52 +745,6 @@ async def test_end_session_resolves_group_by_passed_id_when_unbound():
         result = await upstream.end_session("never-tracked", group_id=3)
         await r
         assert result["closed"] == [60]
-
-
-@pytest.mark.asyncio
-async def test_session_info_live_fields():
-    """session_info reports the session's bound group id + a sample url. The
-    authoritative tab membership comes from list_tabs (live group query); this
-    synchronous view is best-effort for whoami diagnostics."""
-    async with _ext_upstream() as (relay, upstream, captured, ext):
-        await _open_in_group(upstream, ext, "https://owned/", 40, 400, "A")
-        info = upstream.session_info("A")
-        assert info["group_id"] == 400
-        assert info["sample_url"] == "https://owned/"
-        assert "owned_tabs" not in info
-        assert "borrowed_tabs" not in info
-
-
-@pytest.mark.asyncio
-async def test_list_tabs_resolves_from_live_group_membership():
-    """list_tabs is the single source of truth: it returns whatever the live
-    group currently contains (groupId-keyed), including tabs the user dragged
-    in — not an in-memory owned/borrowed set."""
-    async with _ext_upstream() as (relay, upstream, captured, ext):
-        await _open_in_group(upstream, ext, "https://a/", 70, 700, "A")
-
-        async def responder():
-            q = await ext.next_command()
-            assert q["type"] == "queryGroup"
-            assert q["groupId"] == 700
-            await ext.respond(q["id"], result={
-                "groupId": 700,
-                "tabs": [
-                    {"tabId": 70, "url": "https://a/", "title": "A",
-                     "active": True, "lastAccessed": 5},
-                    # A tab the user dragged into the group — visible despite
-                    # never being opened by the agent.
-                    {"tabId": 71, "url": "https://dragged-in/", "title": "D",
-                     "active": False, "lastAccessed": 4},
-                ],
-            })
-
-        r = asyncio.create_task(responder())
-        out = await upstream.list_tabs(session_id="A")
-        await r
-        assert out["groupId"] == 700
-        ids = {t["tabId"] for t in out["tabs"]}
-        assert ids == {70, 71}
 
 
 @pytest.mark.asyncio

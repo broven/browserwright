@@ -141,26 +141,6 @@ def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys)
     assert payload["running_extensions"][0]["version_drift"] == "patch"
 
 
-def test_cmd_release_status_json(monkeypatch, capsys):
-    from browserwright import cli, release_install
-
-    monkeypatch.setattr(
-        release_install,
-        "status",
-        lambda: {
-            "schema_version": 1,
-            "installed_version": "0.6.0",
-            "daemon": {"alive": True, "version": "0.5.9", "restart_required": True},
-            "skill": [],
-            "releases": [],
-        },
-    )
-
-    assert cli._cmd_release(["status", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["daemon"]["restart_required"] is True
-
-
 @pytest.mark.parametrize(
     "args, err",
     [
@@ -961,19 +941,3 @@ def test_session_runtime_persist_target_swallows_registry_update_failure(tmp_bs_
     session_runtime.persist_target("tab-1", group_id=1, sess=_RuntimeSession(record={"id": sid}))
 
     assert "runtime" not in reg.get(sid)
-
-
-def test_session_decisions_record_creates_home_and_overwrites(tmp_path, monkeypatch):
-    from browserwright.memory import session_decisions
-
-    home = tmp_path / "missing-home"
-    monkeypatch.setenv("BS_HOME", str(home))
-
-    session_decisions.record("daily scrape", {"backend": "rdp", "mode": "create"})
-    session_decisions.record("daily scrape", {"backend": "extension", "mode": "attach"})
-
-    assert home.is_dir()
-    assert session_decisions.lookup("daily scrape") == {
-        "backend": "extension",
-        "mode": "attach",
-    }

@@ -9,7 +9,6 @@ Protocol on the wire (extension ↔ daemon, all JSON text frames):
 
   daemon → extension:
     {"type":"command","id":N,"tabId":42,"method":"Page.navigate","params":{...}}
-    {"type":"queryActiveTab","id":N}
     {"type":"detach","id":N,"tabId":42}
 
   extension → daemon:
@@ -19,7 +18,6 @@ Protocol on the wire (extension ↔ daemon, all JSON text frames):
     {"type":"attached","tabId":42,"targetInfo":{"url":"...","title":"..."}}
     {"type":"detached","tabId":42}
     {"type":"event","tabId":42,"method":"Page.frameNavigated","params":{...}}
-    {"type":"activeTab","id":N,"tabId":42,"url":"...","title":"..."}
 
 Design points:
 
@@ -277,22 +275,6 @@ class RelayServer:
             out.extend(ext.tabs.values())
         return out
 
-    async def query_active_tab(self, *, timeout: float = 5.0) -> dict | None:
-        """Spec §8.4: `BrowserwrightDaemon.getActiveTab` accuracy=`exact` path.
-
-        Asks the first ready extension `chrome.tabs.query({active:true})`. If
-        no extension is connected, returns None — caller falls back to the
-        heuristic-recent-activate table.
-        """
-        ext = self._pick_active_extension()
-        if ext is None:
-            return None
-        ext = await self._ensure_extension_fresh(ext)
-        if ext is None:
-            return None
-        return await self._request(ext, {"type": "queryActiveTab"},
-                                   timeout=timeout)
-
     async def query_group_tabs(self, group_name: str | None = None, *,
                                group_id: int | None = None,
                                timeout: float = 15.0) -> dict | None:
@@ -303,8 +285,7 @@ class RelayServer:
         ``{"groupId":int,"tabs":
         [{tabId,url,title,active,lastAccessed}, ...]}`` — ``groupId == -1`` /
         empty tabs when no group matches (the session's browser has no tabs).
-        Returns None when no extension is connected (mirrors
-        query_active_tab's caller-falls-back contract)."""
+        Returns None when no extension is connected (caller falls back)."""
         ext = self._pick_active_extension()
         if ext is None:
             return None

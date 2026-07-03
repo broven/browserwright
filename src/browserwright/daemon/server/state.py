@@ -5,23 +5,19 @@ v0.3 expansion of the v0.2 single-client model:
 - `client` (singular) → `clients: dict[id, ClientState]`
 - per-client `sessions: dict[local_session_id, SessionBinding]`
 - `upstream_to_local: dict[upstream_session_id, list[SessionBinding]]`
-  (list because one upstream session can serve N local sessions via shared-read)
 - `attachers: dict[target_id, AttachOwnership]` — the single-attacher rule
 - `pending_requests: dict[upstream_id, PendingRequest]` — id translation for
   CDP response routing (CDP responses correlate by id, not by sessionId, so
   ids must be unique across clients on the upstream wire)
-
-The transitions still go through the same observer pattern as v0.2.
 """
 from __future__ import annotations
 
-import asyncio
 import itertools
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 
 # Per-client buffer size for frames received while upstream is still
@@ -52,32 +48,21 @@ CloseReason = Literal[
 @dataclass
 class SessionBinding:
     """One local sessionId, owned by a specific client, mapped to one upstream
-    sessionId. Multiple SessionBindings can point at the same upstream session
-    when shared-read is active.
+    sessionId.
     """
     client_id: int
     local_session_id: str       # what THIS client sees
     upstream_session_id: str    # what Chrome sees
     target_id: str              # known from the attach response onward
-    readonly: bool = False      # True ⇒ shared-read; commands rejected -32602
 
 
 @dataclass
 class AttachOwnership:
-    """Per-targetId ownership record. The primary client has full read+write;
-    additional readers (shared-read) get read-only sessions backed by the
-    same upstream session.
-    """
+    """Per-targetId ownership record. The primary client has full read+write."""
     target_id: str
     primary_client_id: int
     primary_local_session: str
     upstream_session_id: str
-    readers: list[tuple[int, str]] = field(default_factory=list)
-    """(client_id, local_session_id) tuples for read-only attachers."""
-
-    def all_local_sessions(self) -> list[tuple[int, str]]:
-        """Primary first, then readers — useful for event fan-out within a session."""
-        return [(self.primary_client_id, self.primary_local_session), *self.readers]
 
 
 @dataclass
@@ -92,11 +77,6 @@ class PendingRequest:
     # For Target.attachToTarget we need to remember which targetId the client
     # asked for so we can fill the attachers table when the response arrives.
     attach_target_id: str | None = None
-    # Whether the client passed `flags.allowSecondaryReadOnly=true` in the
-    # attach. Daemon doesn't actually forward this flag — the routing decision
-    # is made locally — but we remember it for the rare case where the primary
-    # owner is the SAME client (then we keep regular write semantics).
-    attach_allow_shared_read: bool = False
     # Sessionless-vs-sessioned: if the original request carried a sessionId,
     # the response must carry the *local* sessionId back. CDP responses on
     # session-scoped requests echo the session-id in some daemon-mediated
@@ -121,7 +101,6 @@ class ClientState:
     session_name: str | None = None
     sessions: dict[str, SessionBinding] = field(default_factory=dict)
     """local_session_id → SessionBinding owned by this client."""
-    subscribed_focus: bool = False
     connected_at: float = field(default_factory=time.time)
     last_command_at: float = field(default_factory=time.time)
     # Spec §10 open question: when a client sends a frame while upstream is
@@ -131,9 +110,6 @@ class ClientState:
     # frame is silently dropped and the client times out at the 30s CDP
     # boundary (Task #76).
     pre_open_buffer: deque[str] = field(default_factory=deque)
-
-    def owns_session(self, local_session_id: str) -> bool:
-        return local_session_id in self.sessions
 
 
 # ---- DaemonState -----------------------------------------------------------
@@ -166,14 +142,10 @@ class DaemonState:
     _next_upstream_id: itertools.count = field(
         default_factory=lambda: itertools.count(1))
 
-    # Heuristic active-tab table (unchanged from v0.2).
-    last_activated_at: dict[str, float] = field(default_factory=dict)
+    # Target visibility table (targetId → {type, url, title}).
     targets: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     last_activity_at: float = field(default_factory=time.time)
-    last_popup_resolved_at: float | None = None
-
-    _subscribers: list[Callable[[str, dict], Awaitable[None]]] = field(default_factory=list)
 
     # ---- client lifecycle -------------------------------------------------
 
@@ -225,17 +197,9 @@ class DaemonState:
             return
         if (own.primary_client_id == binding.client_id
                 and own.primary_local_session == binding.local_session_id):
-            # Primary owner is leaving. If there's a reader, promote them;
-            # otherwise drop the attachment. NOTE: actually transferring write
-            # ownership without consent is unusual — for v0.3 we just drop and
-            # let the upstream session die. spec doesn't mandate promotion.
+            # Primary owner is leaving — drop the attachment and let the
+            # upstream session die.
             self.attachers.pop(binding.target_id, None)
-        else:
-            # Reader leaving.
-            own.readers = [
-                (cid, lsid) for (cid, lsid) in own.readers
-                if not (cid == binding.client_id and lsid == binding.local_session_id)
-            ]
 
     # ---- session table ----------------------------------------------------
 
@@ -245,8 +209,6 @@ class DaemonState:
         local_session_id: str,
         upstream_session_id: str,
         target_id: str,
-        *,
-        readonly: bool,
     ) -> SessionBinding:
         client = self.clients[client_id]
         binding = SessionBinding(
@@ -254,7 +216,6 @@ class DaemonState:
             local_session_id=local_session_id,
             upstream_session_id=upstream_session_id,
             target_id=target_id,
-            readonly=readonly,
         )
         client.sessions[local_session_id] = binding
         self.upstream_to_locals.setdefault(upstream_session_id, []).append(binding)
@@ -291,18 +252,6 @@ class DaemonState:
             upstream_session_id=upstream_session_id,
         )
 
-    def add_reader(
-        self,
-        target_id: str,
-        client_id: int,
-        local_session_id: str,
-    ) -> AttachOwnership | None:
-        own = self.attachers.get(target_id)
-        if own is None:
-            return None
-        own.readers.append((client_id, local_session_id))
-        return own
-
     # ---- pending request map ---------------------------------------------
 
     def allocate_upstream_id(self) -> int:
@@ -316,47 +265,30 @@ class DaemonState:
         method: str,
         *,
         attach_target_id: str | None = None,
-        attach_allow_shared_read: bool = False,
     ) -> None:
         self.pending_requests[upstream_id] = PendingRequest(
             client_id=client_id,
             client_request_id=client_request_id,
             method=method,
             attach_target_id=attach_target_id,
-            attach_allow_shared_read=attach_allow_shared_read,
         )
 
     def take_pending(self, upstream_id: int) -> PendingRequest | None:
         return self.pending_requests.pop(upstream_id, None)
 
-    # ---- subscriptions / transitions (unchanged) -------------------------
-
-    def subscribe(self, fn: Callable[[str, dict], Awaitable[None]]) -> None:
-        self._subscribers.append(fn)
-
-    async def _emit(self, event: str, payload: dict) -> None:
-        for fn in list(self._subscribers):
-            try:
-                await fn(event, payload)
-            except Exception:
-                pass
+    # ---- phase transitions ------------------------------------------------
 
     async def begin_connecting(self, backend_name: str) -> None:
         self.upstream_phase = UpstreamPhase.CONNECTING
         self.backend_name = backend_name
-        await self._emit("upstream.connecting", {"backend": backend_name})
 
-    async def set_connected(self, ws_url: str, *, was_popup: bool) -> None:
+    async def set_connected(self, ws_url: str) -> None:
         self.upstream_phase = UpstreamPhase.CONNECTED
         self.upstream_ws_url = ws_url
-        if was_popup:
-            self.last_popup_resolved_at = time.time()
-        await self._emit("upstream.ready", {"ws_url": ws_url})
 
     async def begin_closing(self, reason: CloseReason) -> None:
         self.upstream_phase = UpstreamPhase.CLOSING
         self.last_close_reason = reason
-        await self._emit("upstream.closing", {"reason": reason})
 
     async def set_disconnected(self) -> None:
         self.upstream_phase = UpstreamPhase.DISCONNECTED
@@ -368,13 +300,8 @@ class DaemonState:
         self.upstream_to_locals.clear()
         for c in self.clients.values():
             c.sessions.clear()
-        await self._emit("upstream.disconnected", {"reason": self.last_close_reason})
 
-    # ---- heuristic active-tab table (unchanged) --------------------------
-
-    def note_activate(self, target_id: str) -> None:
-        self.last_activated_at[target_id] = time.time()
-        self.last_activity_at = time.time()
+    # ---- target visibility table ------------------------------------------
 
     def note_target_info(self, info: dict) -> None:
         tid = info.get("targetId")
@@ -388,45 +315,5 @@ class DaemonState:
 
     def note_target_destroyed(self, target_id: str) -> None:
         self.targets.pop(target_id, None)
-        self.last_activated_at.pop(target_id, None)
         # Also drop any attacher record (the upstream session is gone with it).
         self.attachers.pop(target_id, None)
-
-    def best_active_tab(self) -> dict | None:
-        internals = (
-            "chrome://", "chrome-untrusted://", "devtools://", "edge://",
-            "chrome-extension://", "about:", "view-source:",
-        )
-        eligible: list[tuple[float, str, dict]] = []
-        for tid, meta in self.targets.items():
-            if meta.get("type") != "page":
-                continue
-            url = meta.get("url") or ""
-            if url.startswith(internals):
-                continue
-            score = self.last_activated_at.get(tid, 0.0)
-            eligible.append((score, tid, meta))
-        if not eligible:
-            return None
-        eligible.sort(key=lambda r: r[0], reverse=True)
-        score, tid, meta = eligible[0]
-        since = (time.time() - score) if score > 0 else None
-        return {
-            "targetId": tid,
-            "url": meta.get("url", ""),
-            "title": meta.get("title", ""),
-            "accuracy": "heuristic-recent-activate",
-            "since_seconds": since,
-        }
-
-    # ---- v0.2 compat: legacy `client` accessor ---------------------------
-
-    @property
-    def client(self) -> ClientState | None:
-        """v0.2 callers used `state.client` (singular). v0.3 supports many,
-        but keeping this convenient when there happens to be exactly one
-        client connected makes the close-etiquette path simpler in single-
-        client deployments. None when 0 or >1 clients."""
-        if len(self.clients) == 1:
-            return next(iter(self.clients.values()))
-        return None

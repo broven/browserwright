@@ -1,8 +1,7 @@
 """Interactive install wizard.
 
 Goal: walk a fresh user through the Chrome-source options the daemon
-supports and persist their pick into ``global.md`` so future Skill processes
-auto-connect via the right backend.
+supports and print the exact next-step commands for the chosen backend.
 
 Choices (order matters — the default is option 1):
 
@@ -29,8 +28,6 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
-
-from .memory.global_mem import global_memory
 
 
 # (key, backend, label, description). The order here is the order shown.
@@ -59,13 +56,6 @@ def _prompt(msg: str, *, default: Optional[str] = None) -> str:
         return default or ""
     return ans or (default or "")
 
-
-def _yesno(msg: str, *, default_yes: bool = True) -> bool:
-    suffix = "Y/n" if default_yes else "y/N"
-    ans = _prompt(f"{msg} ({suffix})").lower()
-    if not ans:
-        return default_yes
-    return ans.startswith("y")
 
 
 def chrome_extension_path() -> Optional[str]:
@@ -175,7 +165,7 @@ def run() -> int:
     if match is None:
         print(f"unknown choice: {choice!r}", file=sys.stderr)
         return 1
-    _key, backend, label, _desc = match
+    _key, _backend, label, _desc = match
 
     if choice == "3" and not ext_live:
         print()
@@ -184,7 +174,6 @@ def run() -> int:
         print("the extension backend, or pick option 1 / 2 / 4 for now.")
         return 1
 
-    extra_note = label
     if choice == "2":
         port = _prompt("Fingerprint browser CDP port (e.g. 9223)", default="9222")
         try:
@@ -192,19 +181,16 @@ def run() -> int:
         except ValueError:
             print(f"port must be an integer, got {port!r}", file=sys.stderr)
             return 1
-        extra_note = f"{label}, port={port}"
 
     if choice == "4":
         # env has no config.toml section — the daemon reads BD_CDP_WS /
-        # BD_CDP_URL from its environment at serve time, so the wizard can only
-        # record the preference and echo the ready-to-run command. We store the
-        # endpoint (if given) in the note for the user's own reference.
+        # BD_CDP_URL from its environment at serve time, so the wizard just
+        # echoes the ready-to-run command.
         cdp = _prompt(
             "External CDP ws or http URL "
             "(BD_CDP_WS / BD_CDP_URL; blank to set it later)",
             default="",
         ).strip()
-        extra_note = f"{label}, cdp={cdp}" if cdp else label
         var = "BD_CDP_URL" if cdp.startswith("http") else "BD_CDP_WS"
         example = cdp or "ws://127.0.0.1:8080/api/profiles/<id>/cdp"
         print()
@@ -219,18 +205,6 @@ def run() -> int:
 
     print()
     print(f"Selected: {label}")
-    if not _yesno("Persist this preference to ~/.browserwright/global.md?"):
-        print("ok, leaving global memory untouched. You can run the wizard again later.")
-        return 0
-
-    # Direct write — install wizard *is* the user confirmation step, so we
-    # call set_preference with confirm=False intentionally.
-    mem = global_memory()
-    result = mem.set_preference("daemon.preferred_backend", backend, confirm=False)
-    mem.set_preference("daemon.notes", extra_note, confirm=False)
-    print(f"wrote daemon.preferred_backend = {backend!r} to {mem.path}")
-    if result.get("previous") and result["previous"] != backend:
-        print(f"(previous was {result['previous']!r}; kept in notes)")
     print()
     print("Next steps:")
     if choice == "1":

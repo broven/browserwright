@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import datetime as _dt
-import fcntl
 import os
 import threading
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any, Optional
 
 from ..errors import NeedsUserConfirm
 from . import _md
+from ._lock import FileLock as _FileLock
 
 
 _DEFAULT_BODY = """# Global skill memory
@@ -29,38 +29,6 @@ def home_dir() -> Path:
 
 def global_path() -> Path:
     return home_dir() / "global.md"
-
-
-class _FileLock:
-    """Cross-process advisory lock on the global memory file."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._fd: Optional[int] = None
-        self._thread_lock = threading.Lock()
-
-    def __enter__(self):
-        self._thread_lock.acquire()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
-        except OSError:
-            # Non-POSIX (Windows) — skip; rely on the thread lock.
-            pass
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            if self._fd is not None:
-                try:
-                    fcntl.flock(self._fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                os.close(self._fd)
-        finally:
-            self._fd = None
-            self._thread_lock.release()
 
 
 class GlobalMemory:
@@ -162,17 +130,6 @@ def _set_dotted(obj: dict, dotted: str, value: Any) -> Any:
     return prev
 
 
-def _get_dotted(obj: dict, dotted: str, default=None):
-    cur: Any = obj
-    for p in dotted.split("."):
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(p)
-        if cur is None:
-            return default
-    return cur
-
-
 # ---- module-level convenience ---------------------------------------
 
 
@@ -187,15 +144,3 @@ def global_memory() -> GlobalMemory:
             if _singleton is None:
                 _singleton = GlobalMemory()
     return _singleton
-
-
-def read_daemon_preferred_backend() -> Optional[str]:
-    """Backend resolution helper used at Skill startup (spec §C.3)."""
-    mem = global_memory().read()
-    return _get_dotted(mem["frontmatter"], "daemon.preferred_backend")
-
-
-def write_daemon_preferred_backend(backend: str, *, confirm: bool = True) -> dict:
-    return global_memory().set_preference(
-        "daemon.preferred_backend", backend, confirm=confirm
-    )

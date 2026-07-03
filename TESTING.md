@@ -104,7 +104,6 @@ tests/skill/test_coverage_primitives_sweep.py  session-runtime tab helpers, http
 tests/skill/test_coverage_repl_misc.py         inline run, discovery, schemas, errors, CDP loop
 tests/skill/test_cdp_slow_rpc_regression.py    slow-RPC timeout regression
 tests/skill/test_install_extension_v04.py      install wizard + extension availability
-tests/skill/test_release_install.py            release install/activate/status
 ```
 
 ## Real Chrome E2E (opt-in)

@@ -51,11 +51,6 @@ class ExecutorHandle:
     proc: subprocess.Popen
     sock_path: str
     spawned_at: float = field(default_factory=time.monotonic)
-    # Reserved by PR1; the AUTHORITATIVE idle clock is the discovery-file mtime
-    # (see `idle_seconds`), because the data plane (Fork 2) bypasses the daemon
-    # so the daemon never observes the executes directly. Kept for symmetry /
-    # potential daemon-side stamping but NOT consulted by the watchdog.
-    last_execute_at: float = field(default_factory=time.monotonic)
     # Wall-clock spawn time, used to floor the discovery-file-mtime idle clock
     # (mtime is wall-clock; spawned_at above is a monotonic clock for races).
     spawned_wall: float = field(default_factory=time.time)
@@ -249,10 +244,6 @@ class ExecutorRegistry:
 
 def _pid_alive(pid: int) -> bool:
     """POSIX liveness probe: ``kill(pid, 0)`` raises if the process is gone."""
-    if sys.platform == "win32":
-        # No cheap signal-0 probe; conservatively treat as alive so we don't
-        # purge a discovery file out from under a live executor on Windows.
-        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -281,15 +272,6 @@ def _spawn_kwargs() -> dict:
     """Detach the spawn from this process group — mirrors
     ``launch_chrome._spawn_kwargs`` so the executor survives independently and
     its pid is ours to reap (PR2)."""
-    import platform
-
-    if platform.system() == "Windows":
-        return {
-            "creationflags": (
-                subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                | subprocess.CREATE_NO_WINDOW       # type: ignore[attr-defined]
-            )
-        }
     return {"start_new_session": True}
 
 
@@ -304,19 +286,11 @@ def _terminate(handle: ExecutorHandle) -> None:
     the daemon's asyncio event loop (this is called from `_handle_end_session`,
     `_idle_watchdog`, and `_graceful_shutdown`, all on the loop — unlike
     `_kill_rdp_chrome` which only fire-and-forgets a SIGTERM, we additionally
-    guarantee escalation without stalling the loop for the grace window).
-
-    On Windows there is no process group / SIGTERM; we fall back to the
-    Popen.terminate/kill API."""
+    guarantee escalation without stalling the loop for the grace window)."""
     proc = handle.proc
     if proc.poll() is not None:
         return  # already gone
     pid = proc.pid
-    if sys.platform == "win32":
-        with _quiet():
-            proc.terminate()
-        _escalate_async(proc, lambda: proc.kill())
-        return
     # POSIX: signal the process group (negative pid) so detached grandchildren
     # die too. Fall back to the bare pid if the group signal isn't permitted.
     with _quiet():

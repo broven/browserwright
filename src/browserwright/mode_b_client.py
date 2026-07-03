@@ -3,7 +3,7 @@
 Mode B is the v0.2 happy path:
 
   - Skill connects to a running ``browserwright-daemon serve`` instance via its
-    unix-socket (POSIX) or TCP+token (Windows) endpoint.
+    unix-socket endpoint.
   - Standard CDP commands are tunnelled through. ``BrowserwrightDaemon.*`` RPCs
     (``getActiveTab``, ``disconnect``, ``subscribeFocus``, ``uiState``) are
     answered by the daemon itself, not forwarded upstream.
@@ -41,10 +41,6 @@ def _default_socket_path() -> Path:
     return Path(base) / "browserwright-daemon.sock"
 
 
-def _windows_port_file() -> Path:
-    return Path(os.environ.get("TEMP", "/tmp")) / "browserwright-daemon.port"
-
-
 class ModeBClient:
     """Mode B daemon endpoint. Use ``connect()`` to confirm reachability;
     ``ws_url()`` returns the CDP-compatible URL Skill's ``CDPSession`` can
@@ -53,8 +49,7 @@ class ModeBClient:
 
     def __init__(self) -> None:
         self._endpoint: Optional[str] = None
-        self._transport: Optional[str] = None  # "unix" or "tcp"
-        self._token: Optional[str] = None
+        self._transport: Optional[str] = None  # always "unix"
         self._cached_ws: Optional[str] = None
         # client label sent on the ws query string for daemon observability;
         # session-bound clients override this with ``skill-s<id>``.
@@ -67,10 +62,9 @@ class ModeBClient:
     # ---- endpoint discovery ---------------------------------------------
 
     def discover(self) -> dict:
-        """Return ``{"transport": ..., "path": ..., "host": ..., "port": ...,
-        "token": ...}``. Probes the daemon's ``status --json`` first; falls
-        back to direct path inspection on POSIX so we still work when
-        daemon CLI is on a slow path."""
+        """Return ``{"transport": "unix", "path": ...}``. Probes the daemon's
+        ``status --json`` first; falls back to direct path inspection so we
+        still work when the daemon CLI is on a slow path."""
         try:
             proc = subprocess.run(
                 ["browserwright-daemon", "status", "--json"],
@@ -83,26 +77,10 @@ class ModeBClient:
         except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
             pass
 
-        # POSIX fallback: just look at the well-known socket path.
-        if os.name != "nt":
-            sock_path = _default_socket_path()
-            if sock_path.exists():
-                return {"transport": "unix", "path": str(sock_path)}
-
-        # Windows fallback: look at the port file.
-        port_file = _windows_port_file()
-        if port_file.exists():
-            try:
-                data = json.loads(port_file.read_text(encoding="utf-8"))
-                if "port" in data and "token" in data:
-                    return {
-                        "transport": "tcp",
-                        "host": data.get("host", "127.0.0.1"),
-                        "port": int(data["port"]),
-                        "token": data["token"],
-                    }
-            except (OSError, ValueError):
-                pass
+        # Fallback: just look at the well-known socket path.
+        sock_path = _default_socket_path()
+        if sock_path.exists():
+            return {"transport": "unix", "path": str(sock_path)}
         raise DaemonUnavailable("no Mode B endpoint — the daemon is not running")
 
     @staticmethod
@@ -114,8 +92,7 @@ class ModeBClient:
             out.update(info["endpoint"])
         out.pop("alive", None)
         # Drop everything outside our known schema so callers don't pin on it.
-        return {k: out[k] for k in ("transport", "path", "host", "port", "token", "name")
-                if k in out}
+        return {k: out[k] for k in ("transport", "path", "name") if k in out}
 
     # ---- connect probe + ws_url ----------------------------------------
 
@@ -149,21 +126,10 @@ class ModeBClient:
         it's responsive. We avoid a CDP request because the upstream may
         not be open yet — we just want to know the daemon's accept loop is
         live."""
-        if ep["transport"] == "unix":
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1.5)
-            try:
-                s.connect(ep["path"])
-            except OSError:
-                s.close()
-                return False
-            s.close()
-            return True
-        # TCP / windows
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(1.5)
         try:
-            s.connect((ep.get("host", "127.0.0.1"), int(ep["port"])))
+            s.connect(ep["path"])
         except OSError:
             s.close()
             return False
@@ -171,7 +137,7 @@ class ModeBClient:
         return True
 
     def ws_url(self, *, client_label: Optional[str] = None) -> str:
-        """Return a ``ws+unix://`` or ``ws://`` URL the ``CDPSession`` can open.
+        """Return a ``ws+unix://`` URL the ``CDPSession`` can open.
 
         Caches the result; call ``invalidate()`` to force a re-resolve (e.g.
         after a 1011 close).
@@ -185,20 +151,13 @@ class ModeBClient:
         # routes on this (not on the client label). Without it an rdp session
         # resolves to None → the shared (extension) context.
         session_q = f"&session={self._session_id}" if self._session_id else ""
-        if ep["transport"] == "unix":
-            # websockets.sync.client.connect doesn't support ws+unix:// natively;
-            # we hand it a pre-built socket via the `sock=` kwarg instead.
-            # Return a sentinel URL the CDPSession layer recognises.
-            url = f"ws+unix://{ep['path']}?client={client_label}{session_q}"
-        else:
-            tok = ep.get("token", "")
-            host = ep.get("host", "127.0.0.1")
-            port = ep["port"]
-            url = f"ws://{host}:{port}?token={tok}&client={client_label}{session_q}"
+        # websockets.sync.client.connect doesn't support ws+unix:// natively;
+        # we hand it a pre-built socket via the `sock=` kwarg instead.
+        # Return a sentinel URL the CDPSession layer recognises.
+        url = f"ws+unix://{ep['path']}?client={client_label}{session_q}"
         self._cached_ws = url
-        self._endpoint = ep.get("path") or f"{ep.get('host')}:{ep.get('port')}"
+        self._endpoint = ep.get("path")
         self._transport = ep["transport"]
-        self._token = ep.get("token")
         return url
 
     def invalidate(self) -> None:
@@ -213,8 +172,7 @@ class ModeBClient:
     def get_backend_info(self) -> Optional[dict]:
         """Return the running daemon's reported backend, or ``None`` if the
         daemon doesn't support the ``BrowserwrightDaemon.getBackendInfo`` RPC.
-        Surfaced via ``Session.backend_name`` so primitives can branch on
-        backend quirks (e.g. extension's explicit-attach model).
+        Used by ``ensure_version_coherent`` to pin the backend on a respawn.
 
         We use the CLI shim ``browserwright-daemon backend-info --name <X>
         --json`` (zero-side-effect, mirrors doctor's contract) because that's
@@ -236,147 +194,6 @@ class ModeBClient:
             return json.loads(proc.stdout)
         except json.JSONDecodeError:
             return None
-
-    # ---- minimal one-shot RPC (subprocess CLI) -------------------------
-    # These let a caller ask the *same* daemon for BrowserwrightDaemon.* answers
-    # via its CLI subcommands without opening a ws. The interesting ones
-    # (subscribeFocus, uiState) require a live ws and are handled inside
-    # CDPSession instead.
-
-    def attach_active(self) -> Optional[dict]:
-        """v0.5.4: ask the daemon's extension backend to attach the
-        currently-focused-window active tab — bypasses the popup click.
-
-        Returns ``{sessionId, targetId, tabId, url, title}`` on success,
-        ``None`` if the daemon errored or isn't reachable. The verb is unified:
-        on extension it adopts the focused tab into the session's group; on rdp
-        the daemon returns the session's current front tab. It never returns
-        -32601 to the agent.
-        """
-        if not self._session_id:
-            return None
-        try:
-            proc = subprocess.run(
-                ["browserwright-daemon", "attach-active", "--json",
-                 "--session", self._session_id],
-                capture_output=True, text=True, timeout=20,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return None
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return None
-
-    # ---- Phase B: open_background / close_tab CLI shims ---------------
-
-    def open_background(self, url: str, *, group: str = "Agent") -> Optional[dict]:
-        """Phase B Feature 1 — invoke ``browserwright-daemon open-background``.
-
-        Returns the parsed JSON result (``{sessionId,targetId,tabId,url,
-        title,groupId}``) or ``None`` if the CLI was unavailable. On
-        failure the captured subprocess detail is stashed on
-        ``self.last_cli_error`` so the caller can surface a meaningful
-        message instead of guessing. The daemon-side handler requires
-        backend=extension; on any other backend the call surfaces an
-        error (returncode != 0) which is recorded here verbatim.
-        """
-        self.last_cli_error = None
-        cmd = ["browserwright-daemon", "open-background",
-               "--url", url,
-               "--group", group]
-        if self._session_id:
-            cmd += ["--session", self._session_id]
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            self.last_cli_error = f"subprocess failed: {e!r}"
-            return None
-        if proc.returncode != 0 or not proc.stdout.strip():
-            self.last_cli_error = (
-                f"`{' '.join(cmd)}` exit={proc.returncode}; "
-                f"stderr={proc.stderr.strip() or '<empty>'}; "
-                f"stdout={proc.stdout.strip() or '<empty>'}"
-            )
-            return None
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            self.last_cli_error = (
-                f"`{' '.join(cmd)}` returned non-JSON stdout: {proc.stdout!r}"
-            )
-            return None
-
-    def close_tab(
-        self, session_id: str | None = None, *, target_id: str | None = None,
-    ) -> Optional[dict]:
-        """Phase B Feature 2 — invoke ``browserwright-daemon close-tab``.
-
-        Pass ``target_id`` (the ``ext-tab-N`` string returned by
-        ``open_background``) when calling from a fresh subprocess context —
-        the CLI's transient ws can't see other clients' session bindings.
-        ``session_id`` works only from a persistent ws (e.g. inside the
-        Skill REPL where the same client connection issued the open).
-
-        Returns ``{"ok":True,"tabId":N}`` on success or ``None`` when the
-        CLI is unreachable / the daemon errored.
-        """
-        if not session_id and not target_id:
-            return None
-        self.last_cli_error = None
-        cmd = ["browserwright-daemon", "close-tab"]
-        if self._session_id:
-            cmd += ["--session", self._session_id]
-        if target_id:
-            cmd += ["--target-id", target_id]
-        if session_id:
-            cmd += ["--session-id", session_id]
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            self.last_cli_error = f"subprocess failed: {e!r}"
-            return None
-        if proc.returncode != 0 or not proc.stdout.strip():
-            self.last_cli_error = (
-                f"`{' '.join(cmd)}` exit={proc.returncode}; "
-                f"stderr={proc.stderr.strip() or '<empty>'}; "
-                f"stdout={proc.stdout.strip() or '<empty>'}"
-            )
-            return None
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            self.last_cli_error = (
-                f"`{' '.join(cmd)}` returned non-JSON stdout: {proc.stdout!r}"
-            )
-            return None
-
-    def doctor(self) -> dict:
-        """Forward ``browserwright-daemon doctor --json`` over a subprocess."""
-        try:
-            proc = subprocess.run(
-                ["browserwright-daemon", "doctor", "--json"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            return {"schema_version": 1, "backends": [], "error": str(e),
-                    "skill_synthetic": True}
-        if proc.returncode != 0:
-            return {"schema_version": 1, "backends": [],
-                    "error": (proc.stderr or proc.stdout).strip(),
-                    "skill_synthetic": True}
-        try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return {"schema_version": 1, "backends": [],
-                    "error": "doctor output was not JSON",
-                    "skill_synthetic": True}
 
     # ---- S6 (A2-a): daemon ↔ code version coherence --------------------
     #

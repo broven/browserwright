@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import platform
 import shutil
 import subprocess
 import tempfile
@@ -337,13 +336,6 @@ def _spawn_kwargs() -> dict:
     """Detach the spawn from this terminal — mirrors browser-harness
     `_ipc.py:68-76` `spawn_kwargs()`.
     """
-    if platform.system() == "Windows":
-        return {
-            "creationflags": (
-                subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-                | subprocess.CREATE_NO_WINDOW       # type: ignore[attr-defined]
-            )
-        }
     return {"start_new_session": True}
 
 

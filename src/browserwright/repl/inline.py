@@ -26,7 +26,6 @@ import json
 import sys
 import traceback
 from contextlib import redirect_stdout
-from typing import IO
 
 from ..errors import BrowserwrightError, serialize
 from . import _namespace
@@ -57,15 +56,6 @@ def _touches_executor_surface(code_obj) -> bool:
             if hasattr(const, "co_names"):  # nested code object
                 seen.append(const)
     return False
-
-
-def run(stdin: IO[str]) -> int:
-    """Deprecated stdin entrypoint kept only to reject old heredoc usage."""
-    code = stdin.read()
-    del code
-    print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
-          file=sys.stderr)
-    return 1
 
 
 def run_code(code: str, *, session_id: str) -> int:

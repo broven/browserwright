@@ -2,15 +2,13 @@
 from __future__ import annotations
 
 import datetime as _dt
-import fcntl
-import os
 import re
-import threading
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 from . import _md
+from ._lock import FileLock as _FileLock
 from .global_mem import home_dir
 
 
@@ -177,35 +175,6 @@ def memory_path(host: str) -> Path:
 
 
 # ---- file ops --------------------------------------------------------
-
-
-class _FileLock:
-    def __init__(self, path: Path):
-        self.path = path
-        self._fd: Optional[int] = None
-        self._t = threading.Lock()
-
-    def __enter__(self):
-        self._t.acquire()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
-        except OSError:
-            pass
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            if self._fd is not None:
-                try:
-                    fcntl.flock(self._fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                os.close(self._fd)
-        finally:
-            self._fd = None
-            self._t.release()
 
 
 _BOOT_BODY = """# {stem} site memory

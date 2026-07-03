@@ -74,8 +74,8 @@ class _Router:
         self.drained += 1
 
 
-def test_process_request_ping_windows_token_and_origin(monkeypatch):
-    handler = SimpleNamespace(token="sekrit")
+def test_process_request_ping_and_query_parse(monkeypatch):
+    handler = SimpleNamespace()
     process_request = listener_mod._make_process_request(handler)
     conn = _HttpConn()
 
@@ -85,19 +85,14 @@ def test_process_request_ping_windows_token_and_origin(monkeypatch):
     assert ping.headers["Content-Type"] == "application/json"
     assert _ipc.parse_pong(ping.body.encode()) == (2468, listener_mod.__version__)
 
-    monkeypatch.setattr(listener_mod._ipc, "IS_WINDOWS", True)
     allowed = process_request(
         conn,
         SimpleNamespace(
-            path="/ws?token=sekrit&client=ok",
+            path="/ws?client=ok",
             headers={"Origin": "https://web.example"},
         ),
     )
-    denied = process_request(conn, SimpleNamespace(path="/ws?token=nope", headers={}))
-
     assert allowed is None
-    assert denied.status.value == 401
-    assert "wrong ?token" in denied.body
     assert listener_mod._parse_query("/ws?client=a&client=b&empty=&q=x%20y") == {
         "client": "a",
         "q": "x y",
@@ -105,41 +100,26 @@ def test_process_request_ping_windows_token_and_origin(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_open_server_windows_and_unix_bind_branches(monkeypatch, tmp_path):
+async def test_open_server_unix_bind(monkeypatch, tmp_path):
     calls: list[tuple[str, dict]] = []
-    handler = SimpleNamespace(serve_one=object(), token=None)
-
-    async def fake_serve(*args, **kwargs):
-        calls.append(("tcp", kwargs))
-        return SimpleNamespace(kind="tcp")
+    handler = SimpleNamespace(serve_one=object())
 
     async def fake_unix_serve(*args, **kwargs):
         calls.append(("unix", kwargs))
         return SimpleNamespace(kind="unix")
 
-    monkeypatch.setattr(listener_mod, "serve", fake_serve)
     monkeypatch.setattr(listener_mod, "unix_serve", fake_unix_serve)
-    monkeypatch.setattr(listener_mod._ipc, "make_tcp_socket", lambda: ("sock", 4567, "tok"))
-    monkeypatch.setattr(listener_mod._ipc, "write_port_file", lambda port, token: calls.append(("port", {"port": port, "token": token})))
     monkeypatch.setattr(listener_mod._ipc, "make_unix_socket", lambda: "unix-sock")
     monkeypatch.setattr(listener_mod._ipc, "sock_path", lambda: tmp_path / "daemon.sock")
     monkeypatch.setattr(listener_mod.os, "stat", lambda path: SimpleNamespace(st_mode=0o100600))
 
-    monkeypatch.setattr(listener_mod._ipc, "IS_WINDOWS", True)
-    tcp = await listener_mod._open_server(handler)
-    monkeypatch.setattr(listener_mod._ipc, "IS_WINDOWS", False)
     unix = await listener_mod._open_server(handler)
 
-    assert tcp.kind == "tcp"
     assert unix.kind == "unix"
-    assert handler.token == "tok"
-    assert calls[0] == ("port", {"port": 4567, "token": "tok"})
-    assert calls[1][0] == "tcp"
-    assert calls[1][1]["sock"] == "sock"
-    assert calls[1][1]["max_size"] == 100 * 1024 * 1024
-    assert calls[2][0] == "unix"
-    assert calls[2][1]["sock"] == "unix-sock"
-    assert calls[2][1]["process_request"] is not None
+    assert calls[0][0] == "unix"
+    assert calls[0][1]["sock"] == "unix-sock"
+    assert calls[0][1]["max_size"] == 100 * 1024 * 1024
+    assert calls[0][1]["process_request"] is not None
 
 
 @pytest.mark.asyncio
@@ -328,7 +308,7 @@ async def test_rdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
     assert killed == [(111, listener_mod.signal.SIGTERM)]
 
     state = DaemonState("rdp")
-    await state.set_connected("ws://rdp", was_popup=False)
+    await state.set_connected("ws://rdp")
     router = _Router()
     dropped: list[str] = []
     router.daemon = SimpleNamespace(drop_rdp_context=lambda sid: dropped.append(sid))

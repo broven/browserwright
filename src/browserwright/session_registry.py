@@ -1,13 +1,14 @@
 """File-locked session ledger: short id → session record (P1 isolation key)."""
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Optional
+
+from .memory._lock import FileLock
 
 
 def _home() -> Path:
@@ -27,16 +28,11 @@ def _ledger_path() -> Path:
 @contextmanager
 def _locked() -> Iterator[dict]:
     """Exclusive flock around a read-modify-write of the ledger."""
-    lock = _dir() / ".lock"
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            p = _ledger_path()
-            data = json.loads(p.read_text()) if p.exists() else {"next_id": 1, "sessions": {}}
-            yield data
-            p.write_text(json.dumps(data))
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    with FileLock(_dir() / ".lock"):
+        p = _ledger_path()
+        data = json.loads(p.read_text()) if p.exists() else {"next_id": 1, "sessions": {}}
+        yield data
+        p.write_text(json.dumps(data))
 
 
 def allocate(*, backend: str, owner: str,

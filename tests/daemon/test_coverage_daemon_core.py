@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -186,13 +185,9 @@ def test_runtime_dir_prefers_xdg(monkeypatch, tmp_path):
     assert platforms_mod.runtime_dir() == tmp_path
 
 
-def test_runtime_dir_windows_uses_tempdir(monkeypatch, tmp_path):
-    import tempfile
-
+def test_runtime_dir_falls_back_to_tmp(monkeypatch):
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.setattr(platforms_mod.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
-    assert platforms_mod.runtime_dir() == tmp_path
+    assert str(platforms_mod.runtime_dir()) == "/tmp"
 
 
 def test_cache_dir_prefers_xdg_cache_home(monkeypatch, tmp_path):
@@ -204,7 +199,6 @@ def test_cache_dir_prefers_xdg_cache_home(monkeypatch, tmp_path):
     ("system", "expected"),
     [
         ("Darwin", "Google Chrome.app/Contents/MacOS/Google Chrome"),
-        ("Windows", "Google/Chrome/Application/chrome.exe"),
         ("Linux", "/usr/bin/google-chrome"),
     ],
 )
@@ -311,20 +305,10 @@ def test_allocate_data_dir_persistent_uses_cache(monkeypatch, tmp_path):
     assert lc_mod._allocate_data_dir("prof", persistent=True) == tmp_path / "cache" / "profiles" / "prof"
 
 
-def test_spawn_kwargs_posix_starts_new_session(monkeypatch):
+def test_spawn_kwargs_posix_starts_new_session():
     import browserwright.daemon.launch_chrome as lc_mod
 
-    monkeypatch.setattr(lc_mod.platform, "system", lambda: "Linux")
     assert lc_mod._spawn_kwargs() == {"start_new_session": True}
-
-
-def test_spawn_kwargs_windows_sets_creation_flags(monkeypatch):
-    import browserwright.daemon.launch_chrome as lc_mod
-
-    monkeypatch.setattr(lc_mod.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(lc_mod.subprocess, "CREATE_NEW_PROCESS_GROUP", 1, raising=False)
-    monkeypatch.setattr(lc_mod.subprocess, "CREATE_NO_WINDOW", 2, raising=False)
-    assert lc_mod._spawn_kwargs() == {"creationflags": 3}
 
 
 def test_silent_context_swallows_only_oserror():
@@ -450,7 +434,7 @@ def test_state_bind_unbind_session_updates_lookup_tables():
 
     state = DaemonState("rdp")
     client = state.allocate_client("c")
-    binding = state.bind_session(client.client_id, "local", "upstream", "target", readonly=False)
+    binding = state.bind_session(client.client_id, "local", "upstream", "target")
     state.claim_attacher("target", client.client_id, "local", "upstream")
     assert state.upstream_to_locals["upstream"] == [binding]
     assert client.sessions["local"] is binding
@@ -460,28 +444,13 @@ def test_state_bind_unbind_session_updates_lookup_tables():
     assert "target" not in state.attachers
 
 
-def test_state_reader_cleanup_leaves_primary_attacher():
-    from browserwright.daemon.server.state import DaemonState
-
-    state = DaemonState("rdp")
-    owner = state.allocate_client("owner")
-    reader = state.allocate_client("reader")
-    state.bind_session(owner.client_id, "own", "up", "target", readonly=False)
-    state.claim_attacher("target", owner.client_id, "own", "up")
-    state.bind_session(reader.client_id, "read", "up", "target", readonly=True)
-    state.add_reader("target", reader.client_id, "read")
-    state.release_client(reader.client_id)
-    assert state.attachers["target"].primary_client_id == owner.client_id
-    assert state.attachers["target"].readers == []
-
-
 @pytest.mark.asyncio
 async def test_state_set_disconnected_clears_upstream_tied_tables():
     from browserwright.daemon.server.state import DaemonState
 
     state = DaemonState("rdp")
     client = state.allocate_client("c")
-    state.bind_session(client.client_id, "local", "up", "target", readonly=False)
+    state.bind_session(client.client_id, "local", "up", "target")
     state.claim_attacher("target", client.client_id, "local", "up")
     state.remember_request(1, client.client_id, 99, "Browser.getVersion")
     await state.set_disconnected()
@@ -497,17 +466,6 @@ def test_state_note_target_info_ignores_non_string_target_id():
     state = DaemonState("rdp")
     state.note_target_info({"targetId": 123, "type": "page", "url": "https://x/"})
     assert state.targets == {}
-
-
-def test_state_note_activate_updates_activity_timestamp():
-    from browserwright.daemon.server.state import DaemonState
-
-    state = DaemonState("rdp")
-    before = state.last_activity_at
-    time.sleep(0.001)
-    state.note_activate("T")
-    assert state.last_activated_at["T"] >= before
-    assert state.last_activity_at >= state.last_activated_at["T"]
 
 
 def test_daemon_context_for_rdp_lazily_creates_isolated_config(monkeypatch):
@@ -590,8 +548,6 @@ def test_proxy_json_helpers_and_cdp_result_unwrap():
     assert proxy._json_safe("[1, 2]") is None
     assert json.loads(proxy._error_response(1, -1, "bad"))["error"]["message"] == "bad"
     assert json.loads(proxy._result_response(2, {"ok": True}))["result"]["ok"] is True
-    event = json.loads(proxy._event("Target.attachedToTarget", {"x": 1}, session_id="s"))
-    assert event["sessionId"] == "s"
     assert proxy._cmd_result({"id": 1, "result": {"value": 7}}) == {"value": 7}
     assert proxy._cmd_result({"id": 1, "result": None}) == {}
     with pytest.raises(RuntimeError):
@@ -601,7 +557,7 @@ def test_proxy_json_helpers_and_cdp_result_unwrap():
 
 
 @pytest.mark.asyncio
-async def test_router_release_client_detaches_only_primary_sessions():
+async def test_router_release_client_detaches_sessions():
     from browserwright.daemon.server.proxy import Router
     from browserwright.daemon.server.state import DaemonState
 
@@ -610,8 +566,7 @@ async def test_router_release_client_detaches_only_primary_sessions():
     sent = []
     router.update_upstream_send(lambda text: sent.append(json.loads(text)) or asyncio.sleep(0))
     client = state.allocate_client("c")
-    state.bind_session(client.client_id, "primary", "up-primary", "target-1", readonly=False)
-    state.bind_session(client.client_id, "reader", "up-reader", "target-2", readonly=True)
+    state.bind_session(client.client_id, "primary", "up-primary", "target-1")
     released = await router.release_client(client.client_id)
     assert released is client
     assert [msg["params"]["sessionId"] for msg in sent] == ["up-primary"]

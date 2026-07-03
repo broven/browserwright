@@ -160,7 +160,6 @@ class ExtensionUpstream:
         # owned/borrowed bookkeeping. ``group_name`` (= session name) is only a
         # human-visible title used when creating a new group.
         self._groups: dict[str, int] = {}        # bs session → tab-group id
-        self._tab_url: dict[int, str] = {}        # tab_id → last-known url
 
     def reset_session_announce(self, session_id: str | None) -> None:
         self._relay.reset_session_announce(session_id)
@@ -265,23 +264,6 @@ class ExtensionUpstream:
         for sid in [s for s, t in self._sessions.items() if t == tab_id]:
             self._sessions.pop(sid, None)
 
-    def session_info(self, session_id: str) -> dict:
-        """Live view of a session's browser: its bound group id, the number of
-        tabs we currently track for it (best-effort, in-memory), and a sample
-        url. Used to fill `whoami`'s live fields. Membership-as-truth means the
-        authoritative count comes from the live group query (``list_tabs``);
-        this synchronous view reports the in-memory tabs bound to the group's
-        recorded sessions."""
-        gid = self._groups.get(session_id, -1)
-        sample = next((u for u in (self._tab_url.get(t) for t in self._sessions.values())
-                       if u), "")
-        return {
-            "session_id": session_id,
-            "group_id": gid,
-            "tab_count": sum(1 for _ in self._sessions),
-            "sample_url": sample,
-        }
-
     async def end_session(self, session_id: str,
                           group_id: int | None = None) -> dict:
         """Tear down a session's browser (DECIDED): close the WHOLE tab group —
@@ -302,35 +284,7 @@ class ExtensionUpstream:
                 pass
             # Evict any fabricated CDP sessions bound to a closed tab.
             self.evict_tab_sessions(tab_id)
-            self._tab_url.pop(tab_id, None)
         return {"closed": closed, "kept": []}
-
-    async def list_tabs(self, session_id: str | None = None,
-                        group_id: int | None = None) -> dict:
-        """The session's tabs, resolved from LIVE group membership (the source
-        of truth) by numeric groupId — never an in-memory set or the title.
-        Returns ``{groupId, tabs:[{tabId, url, title, attached}, ...]}``."""
-        gid = self._groups.get(session_id) if session_id else None
-        if gid is None:
-            gid = group_id
-        info = await self._relay.query_group_tabs(group_id=gid)
-        if not info:
-            return {"groupId": -1, "tabs": []}
-        live_gid = int(info.get("groupId", -1))
-        if session_id and live_gid >= 0:
-            self._groups[session_id] = live_gid
-        attached_tabs = {t for t in self._sessions.values()}
-        tabs = [
-            {
-                "tabId": t.get("tabId"),
-                "url": t.get("url", ""),
-                "title": t.get("title", ""),
-                "attached": t.get("tabId") in attached_tabs,
-            }
-            for t in (info.get("tabs") or [])
-            if isinstance(t.get("tabId"), int)
-        ]
-        return {"groupId": live_gid, "tabs": tabs}
 
     async def scoped_target_infos(self, session_id: str | None) -> list[dict]:
         """CDP ``targetInfos`` for the session's browser = its tab group ONLY.
@@ -529,8 +483,6 @@ class ExtensionUpstream:
         sid = self.register_session(ghost.tab_id)
         if session_id is not None:
             self._bind_group(session_id, group_id)
-            if ghost.url:
-                self._tab_url[ghost.tab_id] = ghost.url
         return {
             "sessionId": sid,
             "targetId": ghost.target_id,
@@ -576,8 +528,6 @@ class ExtensionUpstream:
         sid = self.register_session(gt.tab_id)
         if session_id is not None:
             self._bind_group(session_id, group_id)
-            if gt.url:
-                self._tab_url[gt.tab_id] = gt.url
         return {
             "sessionId": sid,
             "targetId": gt.target_id,
@@ -626,8 +576,6 @@ class ExtensionUpstream:
             url = str(tab.get("url", ""))
             if session_id:
                 self._bind_group(session_id, group_id)
-                if url:
-                    self._tab_url[tab_id] = url
             recovered.append(tab_id)
             meta[tab_id] = {
                 "sid": sid,

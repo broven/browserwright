@@ -7,7 +7,6 @@
 //     {"type":"attach","id":N,"tabId":42}
 //     {"type":"detach","id":N,"tabId":42}
 //     {"type":"command","id":N,"tabId":42,"method":"Page.navigate","params":{...}}
-//     {"type":"queryActiveTab","id":N}
 //     {"type":"attachActive","id":N,"groupId":7,"groupName":"sess-1"}
 //     {"type":"createTab","id":N,"url":"...","groupId":7,"groupName":"sess-1"}
 //     {"type":"closeTab","id":N,"tabId":42}
@@ -28,7 +27,6 @@
 //     {"type":"attached","tabId":42,"targetInfo":{"url":"...","title":"..."}}
 //     {"type":"detached","tabId":42}
 //     {"type":"event","tabId":42,"method":"Page.frameNavigated","params":{...}}
-//     {"type":"activeTab","id":N,"tabId":42,"url":"...","title":"..."}
 //
 // Design notes:
 //
@@ -55,7 +53,6 @@ let ws = null;
 let reconnectIdx = 0;
 let installId = null;
 const attachedTabs = new Set();
-let userscriptMemoryLog = [];
 
 const PING_INTERVAL_MS = 20000;
 const SERVER_PONG_STALE_MS = 25000;
@@ -64,7 +61,6 @@ let lastPongTs = 0;
 let lastInboundFrameTs = 0;
 let seenServerPing = false;
 let daemonVersion = null;
-let versionDrift = "unknown";
 
 // ---- install id (stable across reloads) -----------------------------------
 
@@ -272,10 +268,15 @@ async function usPutRecord(rec) {
   return scripts[rec.id];
 }
 
+// Resolve a caller-supplied key (script id OR identity) to the script id.
+function usResolveId(scripts, key) {
+  return scripts[key] ? key
+    : Object.values(scripts).find((script) => script.identity === key)?.id;
+}
+
 async function usDelete(key) {
   const { scripts } = await usGetAll();
-  const id = scripts[key] ? key
-    : Object.values(scripts).find((script) => script.identity === key)?.id;
+  const id = usResolveId(scripts, key);
   if (id) {
     delete scripts[id];
     await chrome.storage.local.set({ [US_KEY]: scripts });
@@ -285,10 +286,6 @@ async function usDelete(key) {
 
 async function usAppendLog(entry) {
   const row = { ts: Date.now(), ...entry };
-  userscriptMemoryLog.push(row);
-  if (userscriptMemoryLog.length > US_LOG_CAP) {
-    userscriptMemoryLog.splice(0, userscriptMemoryLog.length - US_LOG_CAP);
-  }
   const v = await chrome.storage.local.get([US_LOG]);
   const log = v[US_LOG] || [];
   log.push(row);
@@ -349,7 +346,7 @@ async function usSyncAll() {
       await usAppendLog({ event: "register_failed", id: rec.id, identity: rec.identity, error: errMessage(e) });
     }
   }
-  return { ok: failed.length === 0, registered, failed, logCount: userscriptMemoryLog.length };
+  return { ok: failed.length === 0, registered, failed };
 }
 
 function usPatternMatchesUrl(pattern, url) {
@@ -437,8 +434,7 @@ async function doUserscriptRemove(id, key) {
 async function doUserscriptToggle(id, key, enabled) {
   try {
     const { scripts } = await usGetAll();
-    const scriptId = scripts[key] ? key
-      : Object.values(scripts).find((script) => script.identity === key)?.id;
+    const scriptId = usResolveId(scripts, key);
     if (!scriptId) throw new Error("userscript not found: " + key);
     scripts[scriptId].enabled = !!enabled;
     scripts[scriptId].updatedAt = Date.now();
@@ -454,8 +450,7 @@ async function doUserscriptLogs(id, msg) {
   try {
     const limit = Number.isFinite(msg?.limit) ? msg.limit : 50;
     const v = await chrome.storage.local.get([US_LOG]);
-    const persisted = v[US_LOG] || [];
-    let log = persisted.concat(userscriptMemoryLog);
+    let log = v[US_LOG] || [];
     // The RPC envelope's own `id` is the request id, so the script-id filter
     // arrives under `scriptId` (see daemon CLI logs construction).
     if (msg?.scriptId) log = log.filter((entry) => entry.id === msg.scriptId);
@@ -472,7 +467,6 @@ async function handleDaemonMessage(msg) {
   switch (type) {
     case "helloAck":
       daemonVersion = msg.daemonVersion || null;
-      versionDrift = msg.versionDrift || "unknown";
       return;
     case "reloadExtension":
       console.info(
@@ -488,8 +482,6 @@ async function handleDaemonMessage(msg) {
       return await doDetach(id, msg.tabId);
     case "command":
       return await doCommand(id, msg.tabId, msg.method, msg.params || {});
-    case "queryActiveTab":
-      return await doQueryActiveTab(id);
     case "attachActive":
       return await doAttachActive(id, msg.groupId, msg.groupName);
     case "createTab":
@@ -526,11 +518,52 @@ async function handleDaemonMessage(msg) {
   }
 }
 
-async function doAttach(id, tabId) {
-  try {
+// Shared attach sequence: chrome.debugger.attach → attachedTabs.add →
+// armAutoAttach → [announceAttached]. Options:
+//   announce (default true) — emit the `attached` ghost-target event. doAttach
+//     deliberately passes false: the daemon builds the ghost from the RPC
+//     response instead.
+//   skipIfAttached (default false) — skip the attach core when we already
+//     drive this tab (doAttachActive re-adopt path); announce still fires.
+async function attachTab(tabId, { announce = true, skipIfAttached = false } = {}) {
+  if (!(skipIfAttached && attachedTabs.has(tabId))) {
     await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
     attachedTabs.add(tabId);
     await armAutoAttach(tabId);
+  }
+  if (announce) await announceAttached(tabId);
+}
+
+// Post-attach niceties, deliberately NOT awaited by callers. Called at each
+// site's original position (after/before the RPC response varies per site).
+function postAttachCosmetics(tabId) {
+  markTabAttached(tabId);  // fire-and-forget; cosmetic
+  keepTabRendered(tabId);  // fire-and-forget; keep off-screen tab rendering
+}
+
+// Shared detach cleanup: strip title marker → chrome.debugger.detach →
+// attachedTabs.delete → [announce `detached`]. Options:
+//   announceReason — when set, emit {type:"detached", reason} to the daemon.
+//   ignoreDetachError (default false) — swallow chrome.debugger.detach errors
+//     (already detached / tab gone) instead of throwing.
+async function detachTab(tabId, { announceReason = null, ignoreDetachError = false } = {}) {
+  await unmarkTabBeforeDetach(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch (e) {
+    if (!ignoreDetachError) throw e;
+  }
+  attachedTabs.delete(tabId);
+  if (announceReason) {
+    safeSend({ type: "detached", tabId, reason: announceReason });
+  }
+}
+
+async function doAttach(id, tabId) {
+  try {
+    // No announceAttached here — the daemon builds the ghost target from
+    // this RPC response itself.
+    await attachTab(tabId, { announce: false });
     const tab = await chrome.tabs.get(tabId);
     safeSend({
       type: "response",
@@ -542,8 +575,7 @@ async function doAttach(id, tabId) {
         },
       },
     });
-    markTabAttached(tabId);  // fire-and-forget; cosmetic
-    keepTabRendered(tabId);  // fire-and-forget; keep off-screen tab rendering
+    postAttachCosmetics(tabId);
   } catch (e) {
     safeSend({
       type: "response",
@@ -596,12 +628,7 @@ async function doAttachActive(id, groupId, groupName) {
     // it with the session name for human-readable Chrome UI.
     const finalGroupId = await _ensureTabInGroup(
       tab.id, groupName, ourGroupId, tab.windowId);
-    if (!attachedTabs.has(tab.id)) {
-      await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
-      attachedTabs.add(tab.id);
-      await armAutoAttach(tab.id);
-    }
-    await announceAttached(tab.id);
+    await attachTab(tab.id, { skipIfAttached: true });
     safeSend({
       type: "response",
       id,
@@ -612,8 +639,7 @@ async function doAttachActive(id, groupId, groupName) {
         groupId: finalGroupId,
       },
     });
-    markTabAttached(tab.id);  // fire-and-forget; cosmetic
-    keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
+    postAttachCosmetics(tab.id);
   } catch (e) {
     safeSend({
       type: "response",
@@ -660,10 +686,7 @@ async function doCreateTab(
       groupId = await _ensureTabInGroup(
         tab.id, groupName, resolved, tab.windowId);
     }
-    await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
-    attachedTabs.add(tab.id);
-    await armAutoAttach(tab.id);
-    await announceAttached(tab.id);
+    await attachTab(tab.id);
     let title = tab.title || "";
     let actualUrl = tab.url || url;
     try {
@@ -679,8 +702,7 @@ async function doCreateTab(
       result: { tabId: tab.id, url: actualUrl, title: stripMarker(title), groupId },
     });
     if (!skipPostAttachCommands) {
-      markTabAttached(tab.id);  // fire-and-forget; cosmetic
-      keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
+      postAttachCosmetics(tab.id);
     }
   } catch (e) {
     safeSend({
@@ -756,9 +778,9 @@ async function doCloseTab(id, tabId) {
 
 async function doDetach(id, tabId) {
   try {
-    await unmarkTabBeforeDetach(tabId);
-    await chrome.debugger.detach({ tabId });
-    attachedTabs.delete(tabId);
+    // No `detached` announcement — the daemon initiated this detach and
+    // updates its own state from the RPC response.
+    await detachTab(tabId);
     safeSend({ type: "response", id, result: {} });
   } catch (e) {
     // "Debugger is not attached to the tab with id X" — surface as a
@@ -815,29 +837,6 @@ async function armAutoAttach(tabId) {
     await sleep(50);
   } catch (e) {
     console.warn("[bd-relay] Target.setAutoAttach(" + tabId + ") failed:", e);
-  }
-}
-
-async function doQueryActiveTab(id) {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    safeSend({
-      type: "response",
-      id,
-      result: tab
-        ? {
-            tabId: tab.id,
-            url: tab.url || "",
-            title: stripMarker(tab.title),
-          }
-        : null,
-    });
-  } catch (e) {
-    safeSend({
-      type: "response",
-      id,
-      error: { code: -32000, message: errMessage(e) },
-    });
   }
 }
 
@@ -904,8 +903,16 @@ function errMessage(e) {
 
 const TITLE_PREFIX = "\u{1F440} ";  // 👀 + space
 
-const MARKER_INSTALL_SCRIPT = `
-(function() {
+// ---- shared injected-source fragments --------------------------------------
+//
+// Both MARKER_INSTALL_SCRIPT and MARKER_REMOVE_SCRIPT are assembled from
+// these canonical fragments so the prefix-stripping / title-reading logic
+// can't drift between the two. The SW-side stripMarker() below mirrors
+// MARKER_STRIP_PREFIX_SRC but can't be generated from it (MV3 extension CSP
+// forbids eval/new Function) — keep them in sync by hand.
+
+// Defines PREFIX + stripPrefix(value) in the injected scope.
+const MARKER_STRIP_PREFIX_SRC = `
   const PREFIX = '\u{1F440} ';
 
   function stripPrefix(value) {
@@ -921,7 +928,27 @@ const MARKER_INSTALL_SCRIPT = `
     }
     return title;
   }
+`;
 
+// Defines rawTitle(doc) in the injected scope. Reads the real document title
+// via a `titleDescriptor` that must already be in scope (each script derives
+// its own), falling back to the <title> element. writeRawTitle is NOT shared:
+// the install and remove scripts intentionally differ in which descriptor
+// they trust for writing.
+const MARKER_RAW_TITLE_SRC = `
+  function rawTitle(doc) {
+    doc = doc || document;
+    if (titleDescriptor && titleDescriptor.get) {
+      return titleDescriptor.get.call(doc) || '';
+    }
+    const el = doc.querySelector && doc.querySelector('title');
+    return el ? (el.textContent || '') : '';
+  }
+`;
+
+const MARKER_INSTALL_SCRIPT = `
+(function() {
+` + MARKER_STRIP_PREFIX_SRC + `
   const previousMarker = window.__bdTitleMarker || null;
   try {
     previousMarker && previousMarker.obs && previousMarker.obs.disconnect();
@@ -947,16 +974,7 @@ const MARKER_INSTALL_SCRIPT = `
   const titleDescriptor = titleOwner
     ? Object.getOwnPropertyDescriptor(titleOwner, 'title')
     : null;
-
-  function rawTitle(doc) {
-    doc = doc || document;
-    if (titleDescriptor && titleDescriptor.get) {
-      return titleDescriptor.get.call(doc) || '';
-    }
-    const el = doc.querySelector && doc.querySelector('title');
-    return el ? (el.textContent || '') : '';
-  }
-
+` + MARKER_RAW_TITLE_SRC + `
   function writeRawTitle(doc, title) {
     doc = doc || document;
     if (titleDescriptor && titleDescriptor.set) {
@@ -1041,20 +1059,7 @@ const MARKER_INSTALL_SCRIPT = `
 
 const MARKER_REMOVE_SCRIPT = `
 (function() {
-  const PREFIX = '\u{1F440} ';
-  function stripPrefix(value) {
-    let title = String(value ?? '');
-    while (title.startsWith(PREFIX)) {
-      title = title.slice(PREFIX.length);
-    }
-    while (title.length > 0 && title.codePointAt(0) === 0x1F440) {
-      title = title.slice(2);
-      if (title.length > 0 && /\\s/.test(title[0])) {
-        title = title.slice(1);
-      }
-    }
-    return title;
-  }
+` + MARKER_STRIP_PREFIX_SRC + `
   const marker = window.__bdTitleMarker || null;
   const nativeTitleDescriptor =
     marker && marker.nativeTitleDescriptor;
@@ -1064,14 +1069,7 @@ const MARKER_REMOVE_SCRIPT = `
     (typeof HTMLDocument !== 'undefined'
       ? Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title')
       : null);
-  function rawTitle(doc) {
-    doc = doc || document;
-    if (titleDescriptor && titleDescriptor.get) {
-      return titleDescriptor.get.call(doc) || '';
-    }
-    const el = doc.querySelector && doc.querySelector('title');
-    return el ? (el.textContent || '') : '';
-  }
+` + MARKER_RAW_TITLE_SRC + `
   function writeRawTitle(doc, title) {
     doc = doc || document;
     if (nativeTitleDescriptor && nativeTitleDescriptor.set) {
@@ -1106,6 +1104,9 @@ const MARKER_REMOVE_SCRIPT = `
 // (needed to remove the per-document hook on detach).
 const markedTabs = new Map();
 
+// SW-side twin of the injected stripPrefix — see MARKER_STRIP_PREFIX_SRC
+// above. Can't be generated from that fragment (MV3 CSP bans eval); if you
+// change one, change both.
 function stripMarker(title) {
   let clean = String(title ?? "");
   while (clean.startsWith(TITLE_PREFIX)) {
@@ -1256,14 +1257,11 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 async function _detachAttachedTab(tabId, reason) {
   if (!attachedTabs.has(tabId)) return;
+  // Delete up-front so a concurrent re-trigger can't double-detach.
   attachedTabs.delete(tabId);
-  await unmarkTabBeforeDetach(tabId);
-  try {
-    await chrome.debugger.detach({ tabId });
-  } catch (_e) {
-    // Already detached / tab gone — onDetach (if any) handles the rest.
-  }
-  safeSend({ type: "detached", tabId, reason });
+  // ignoreDetachError: already detached / tab gone — onDetach (if any)
+  // handles the rest.
+  await detachTab(tabId, { announceReason: reason, ignoreDetachError: true });
 }
 
 // onUpdated fires with changeInfo.groupId when a tab is dragged into/out of a
@@ -1281,17 +1279,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     console.warn("[bd-relay] drag-out detach failed:", e));
 });
 
-// A whole group being removed (last tab dragged out / group dissolved) — drop
-// any attached tabs that belonged to it. Chrome auto-deletes a group when its
-// last tab leaves, so this also covers "session group emptied".
-if (chrome.tabGroups && chrome.tabGroups.onRemoved) {
-  chrome.tabGroups.onRemoved.addListener((group) => {
-    // The tabs are already out of the group by the time this fires; the
-    // per-tab onUpdated above handles the detach. This listener exists so a
-    // future daemon-side "group gone" notification has a hook — kept minimal.
-    console.debug("[bd-relay] tab group removed:", group?.id);
-  });
-}
+// Note: no chrome.tabGroups.onRemoved listener is needed — when a group
+// dissolves, its tabs fire per-tab onUpdated (groupId change) above, which
+// handles the detach.
 
 // onRemoved fires when a tab is closed outright. If we were driving it, tell
 // the daemon so its ghost-target table stays in sync even when chrome.debugger
@@ -1340,12 +1330,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       try {
-        await chrome.debugger.attach({ tabId: tab.id }, PROTOCOL_VERSION);
-        attachedTabs.add(tab.id);
-        await armAutoAttach(tab.id);
-        await announceAttached(tab.id);
-        markTabAttached(tab.id);  // fire-and-forget; cosmetic
-        keepTabRendered(tab.id);  // fire-and-forget; keep off-screen tab rendering
+        await attachTab(tab.id);
+        postAttachCosmetics(tab.id);
         sendResponse({ ok: true, tabId: tab.id });
       } catch (e) {
         sendResponse({ ok: false, error: errMessage(e) });
@@ -1359,19 +1345,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       try {
-        await unmarkTabBeforeDetach(tab.id);
-        await chrome.debugger.detach({ tabId: tab.id });
-        attachedTabs.delete(tab.id);
-        safeSend({ type: "detached", tabId: tab.id, reason: "popup_request" });
+        await detachTab(tab.id, { announceReason: "popup_request" });
         sendResponse({ ok: true });
       } catch (e) {
         sendResponse({ ok: false, error: errMessage(e) });
       }
-      return;
-    }
-    if (msg?.type === "userscript.injected") {
-      await usAppendLog({ id: msg.id, url: msg.url, event: "injected" });
-      sendResponse({ ok: true });
       return;
     }
     if (msg?.type === "userscript.popupList") {

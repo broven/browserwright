@@ -5,7 +5,6 @@ import json
 import sys
 import threading
 import types
-from collections import deque
 
 import pytest
 
@@ -23,19 +22,15 @@ class _StubDaemon:
 class _FakeCDP:
     _closed = False
 
-    def __init__(self, responses: dict | None = None, events=None):
+    def __init__(self, responses: dict | None = None):
         self.responses = responses or {}
         self.calls: list[tuple[str, dict]] = []
         self.attached: list[str] = []
         self._sessions: dict[str, str] = {}
-        self._events: dict[str | None, deque] = {}
-        self._drain_batches = list(events or [])
 
     def attach(self, target_id: str) -> str:
         self.attached.append(target_id)
-        sid = self._sessions.setdefault(target_id, f"sid-{target_id}")
-        self._events.setdefault(sid, deque(maxlen=16))
-        return sid
+        return self._sessions.setdefault(target_id, f"sid-{target_id}")
 
     def send(self, method: str, *, session: str | None = None, **params):
         self.calls.append((method, {"session": session, **params}))
@@ -47,16 +42,6 @@ class _FakeCDP:
         if callable(response):
             return response(method=method, session=session, **params)
         return response
-
-    def drain_events(self, *, session: str | None = None):
-        if self._drain_batches:
-            return self._drain_batches.pop(0)
-        buf = self._events.get(session)
-        if not buf:
-            return []
-        out = list(buf)
-        buf.clear()
-        return out
 
 
 @pytest.fixture
@@ -207,10 +192,8 @@ def test_close_session_tab_error_paths_and_state_cleanup(fake_session):
         rt.close_session_tab(sess, target_id="target-1")
 
     fake.responses["BrowserwrightDaemon.closeTab"] = {"ok": False, "tabId": 55}
-    fake._events["sid-target-1"] = deque([{"method": "Network.requestWillBeSent"}])
     assert rt.close_session_tab(sess) == {"ok": False, "tabId": 55}
     assert "target-1" not in fake._sessions
-    assert "sid-target-1" not in fake._events
     assert sess.current_target_id is None
 
 
@@ -342,7 +325,7 @@ def test_site_memory_host_resolution_confirm_and_reads(tmp_bs_home, fake_session
     assert "offline dense note" in out["current_site"]["data"]["body"]
 
 
-def test_cdp_send_attach_detach_readonly_close_and_read_loop():
+def test_cdp_send_attach_close_and_read_loop():
     from browserwright.cdp import CDPSession
 
     cdp = CDPSession.__new__(CDPSession)
@@ -350,7 +333,6 @@ def test_cdp_send_attach_detach_readonly_close_and_read_loop():
     cdp._inflight_cv = threading.Condition(cdp._lock)
     cdp._next_id = 1
     cdp._inflight = {}
-    cdp._events = {None: deque(maxlen=4)}
     cdp._sessions = {}
     cdp._closed = False
     cdp._closed_reason = None
@@ -363,9 +345,7 @@ def test_cdp_send_attach_detach_readonly_close_and_read_loop():
             frame = json.loads(payload)
             sent.append(frame)
             if frame["method"] == "Target.attachToTarget":
-                result = {"sessionId": "sid-ro" if frame["params"].get("flags") else "sid-own"}
-            elif frame["method"] == "Target.detachFromTarget":
-                result = {"detached": True}
+                result = {"sessionId": "sid-own"}
             else:
                 result = {"ok": True}
             with cdp._inflight_cv:
@@ -379,17 +359,9 @@ def test_cdp_send_attach_detach_readonly_close_and_read_loop():
 
     assert CDPSession.send(cdp, "Runtime.evaluate", session="sid", expression="1") == {"ok": True}
     assert sent[-1]["sessionId"] == "sid"
-    assert CDPSession.attach_readonly(cdp, "target-ro") == "sid-ro"
-    assert cdp._sessions == {}
-    assert sent[-1]["params"]["flags"] == {"allowSecondaryReadOnly": True}
     assert CDPSession.attach(cdp, "target-1") == "sid-own"
     assert CDPSession.attach(cdp, "target-1") == "sid-own"
-    assert [frame["method"] for frame in sent].count("Target.attachToTarget") == 2
-
-    cdp._events["sid-own"].append({"method": "Page.loadEventFired"})
-    cdp.detach("target-1")
-    assert "target-1" not in cdp._sessions
-    assert "sid-own" not in cdp._events
+    assert [frame["method"] for frame in sent].count("Target.attachToTarget") == 1
 
     cdp.close()
     cdp.close()
@@ -406,15 +378,10 @@ def test_cdp_send_attach_detach_readonly_close_and_read_loop():
     reader._lock = threading.Lock()
     reader._inflight_cv = threading.Condition(reader._lock)
     reader._inflight = {99: {}}
-    reader._events = {None: deque(maxlen=4)}
     reader._closed = False
     reader._closed_reason = None
 
+    # Responses are routed to inflight; events (no id) are dropped.
     reader._read_loop()
     assert reader._inflight[99]["result"] == {"ok": True}
-    assert list(reader._events[None]) == [
-        {"method": "Browser.event", "params": {"root": True}, "sessionId": None}
-    ]
-    assert list(reader._events["sid-new"]) == [
-        {"method": "Runtime.consoleAPICalled", "params": {}, "sessionId": "sid-new"}
-    ]
+    assert reader._closed is True
