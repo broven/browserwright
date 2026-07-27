@@ -15,6 +15,7 @@ the serial queue forever).
 from __future__ import annotations
 
 import json
+import re
 import socket
 import struct
 from dataclasses import dataclass, field
@@ -32,20 +33,103 @@ DEFAULT_TIMEOUT_MS = 90000
 # `snapshot._truncate_lines`; here we cap the console blob so a runaway print
 # loop can't ship megabytes back to the agent.
 MAX_TEXT_CHARS = 10000
+TERMINAL_DEADLINE_EXCEEDED = "deadline_exceeded"
+TERMINAL_RESET_REQUESTED = "reset_requested"
+TERMINAL_REASONS = frozenset(
+    {
+        TERMINAL_DEADLINE_EXCEEDED,
+        TERMINAL_RESET_REQUESTED,
+    }
+)
 
 _LEN = struct.Struct(">I")
 _MAX_FRAME = 256 * 1024 * 1024  # generous: screenshots land here in PR3
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def is_valid_env_name(name: str) -> bool:
+    """Return whether ``name`` is a portable process-environment key."""
+    return bool(_ENV_NAME_RE.fullmatch(name))
+
+
+def _validate_json_value(value: Any, *, path: str = "task.args") -> Any:
+    """Validate and copy a JSON-compatible task argument value."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, list):
+        return [
+            _validate_json_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        copied: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            copied[key] = _validate_json_value(item, path=f"{path}.{key}")
+        return copied
+    raise ValueError(f"{path} must contain only JSON-compatible values")
+
+
+@dataclass
+class TaskEnvelope:
+    """A validated site-skill invocation carried by the executor protocol."""
+
+    site: str
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+    isolated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "site": self.site,
+            "name": self.name,
+            "args": _validate_json_value(self.args),
+            "isolated": self.isolated,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TaskEnvelope":
+        if not isinstance(d, dict):
+            raise ValueError("ExecuteRequest.task must be an object")
+        site = d.get("site")
+        name = d.get("name")
+        args = d.get("args", {})
+        isolated = d.get("isolated", False)
+        if not isinstance(site, str) or not site.strip():
+            raise ValueError("ExecuteRequest.task.site must be a non-empty string")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("ExecuteRequest.task.name must be a non-empty string")
+        if not isinstance(args, dict):
+            raise ValueError("ExecuteRequest.task.args must be an object")
+        if not isinstance(isolated, bool):
+            raise ValueError("ExecuteRequest.task.isolated must be a boolean")
+        return cls(
+            site=site,
+            name=name,
+            args=_validate_json_value(args),
+            isolated=isolated,
+        )
 
 
 @dataclass
 class ExecuteRequest:
-    """A code blob the thin client ships to the executor."""
+    """One code blob or validated task invocation shipped to the executor."""
 
     code: str
     timeout_ms: int = DEFAULT_TIMEOUT_MS
+    env: dict[str, str] = field(default_factory=dict)
+    executor_id: str | None = None
+    task: TaskEnvelope | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"code": self.code, "timeout_ms": self.timeout_ms}
+        return {
+            "code": self.code,
+            "timeout_ms": self.timeout_ms,
+            "env": dict(self.env),
+            "executor_id": self.executor_id,
+            "task": self.task.to_dict() if self.task is not None else None,
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ExecuteRequest":
@@ -55,7 +139,34 @@ class ExecuteRequest:
         timeout = d.get("timeout_ms", DEFAULT_TIMEOUT_MS)
         if not isinstance(timeout, int) or timeout <= 0:
             timeout = DEFAULT_TIMEOUT_MS
-        return cls(code=code, timeout_ms=timeout)
+        env = d.get("env", {})
+        if not isinstance(env, dict):
+            raise ValueError("ExecuteRequest.env must be an object")
+        request_env: dict[str, str] = {}
+        for name, value in env.items():
+            if not isinstance(name, str) or not is_valid_env_name(name):
+                raise ValueError("ExecuteRequest.env contains an invalid variable name")
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"ExecuteRequest.env value for {name!r} must be a string"
+                )
+            request_env[name] = value
+        executor_id = d.get("executor_id")
+        if executor_id is not None and (
+            not isinstance(executor_id, str) or not executor_id
+        ):
+            raise ValueError("ExecuteRequest.executor_id must be a non-empty string")
+        raw_task = d.get("task")
+        task = TaskEnvelope.from_dict(raw_task) if raw_task is not None else None
+        if task is not None and code:
+            raise ValueError("ExecuteRequest must contain code or task, not both")
+        return cls(
+            code=code,
+            timeout_ms=timeout,
+            env=request_env,
+            executor_id=executor_id,
+            task=task,
+        )
 
 
 @dataclass
@@ -89,6 +200,14 @@ class ExecuteResponse:
     warnings: list[str] = field(default_factory=list)
     screenshots: list[dict[str, Any]] = field(default_factory=list)
     truncated: bool = False
+    # A terminal disposition belongs to the *executor request*, not to an
+    # exception raised by user code.  This is deliberately separate from
+    # ``error.type`` so an ordinary Playwright ``TimeoutError`` cannot be
+    # mistaken for an outer executor deadline.
+    terminal_reason: str | None = None
+    # JSON encoding of a task's result.  ``None`` means this was not a
+    # successful task response; the JSON string ``"null"`` is a valid result.
+    task_result_json: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,10 +218,25 @@ class ExecuteResponse:
             "warnings": self.warnings,
             "screenshots": self.screenshots,
             "truncated": self.truncated,
+            "terminal_reason": self.terminal_reason,
+            "task_result_json": self.task_result_json,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ExecuteResponse":
+        terminal_reason = d.get("terminal_reason")
+        if terminal_reason is not None and terminal_reason not in TERMINAL_REASONS:
+            raise ValueError("ExecuteResponse.terminal_reason is invalid")
+        task_result_json = d.get("task_result_json")
+        if task_result_json is not None:
+            if not isinstance(task_result_json, str):
+                raise ValueError("ExecuteResponse.task_result_json must be a string")
+            try:
+                json.loads(task_result_json)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    "ExecuteResponse.task_result_json must contain valid JSON"
+                ) from e
         return cls(
             console=str(d.get("console") or ""),
             return_value=d.get("return_value"),
@@ -111,6 +245,8 @@ class ExecuteResponse:
             warnings=list(d.get("warnings") or []),
             screenshots=list(d.get("screenshots") or []),
             truncated=bool(d.get("truncated") or False),
+            terminal_reason=terminal_reason,
+            task_result_json=task_result_json,
         )
 
 

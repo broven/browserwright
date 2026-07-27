@@ -230,6 +230,168 @@ def test_handle_close_is_noop_without_connect():
     h.close()
 
 
+def test_bind_current_page_waits_for_delayed_target_without_creating_page(
+    monkeypatch,
+):
+    import browserwright.repl.playwright_handle as ph
+    from browserwright import session_runtime
+
+    class FakePage:
+        url = "https://target.test/"
+
+        def goto(self, *_args, **_kwargs):
+            pass
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = []
+            self.new_page_calls = 0
+
+        def new_page(self):
+            self.new_page_calls += 1
+            raise AssertionError("binding must not create a replacement page")
+
+    context = FakeContext()
+    target_page = FakePage()
+    monkeypatch.setattr(
+        session_runtime,
+        "resolve_current_target",
+        lambda _sess: {
+            "targetId": "target-1",
+            "url": "https://target.test/",
+        },
+    )
+
+    def announce(_sess, *, timeout):
+        assert timeout > 0
+        context.pages.append(target_page)
+        return True
+
+    monkeypatch.setattr(ph, "_wait_for_session_announce", announce)
+
+    bound = ph.bind_current_page(context, object())
+
+    assert bound is target_page
+    assert context.pages == [target_page]
+    assert context.new_page_calls == 0
+
+
+def test_bind_current_page_timeout_never_creates_replacement_page(monkeypatch):
+    import pytest
+
+    import browserwright.repl.playwright_handle as ph
+    from browserwright import session_runtime
+    from browserwright.errors import PageBindTimeout
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = []
+            self.new_page_calls = 0
+
+        def new_page(self):
+            self.new_page_calls += 1
+            raise AssertionError("binding must not create a replacement page")
+
+    context = FakeContext()
+    monkeypatch.setattr(
+        session_runtime,
+        "resolve_current_target",
+        lambda _sess: {
+            "targetId": "target-1",
+            "url": "https://target.test/",
+        },
+    )
+    monkeypatch.setattr(ph, "_wait_for_session_announce", lambda *_a, **_k: False)
+    monkeypatch.setattr(ph, "_PAGE_BIND_TIMEOUT_S", 0.001)
+
+    with pytest.raises(PageBindTimeout) as raised:
+        ph.bind_current_page(context, object())
+
+    assert raised.value.target_id == "target-1"
+    assert raised.value.timeout == 0.001
+    assert raised.value.retryable is True
+    assert "browserwright session reset <id>" in raised.value.fix
+    assert context.pages == []
+    assert context.new_page_calls == 0
+
+
+def test_page_for_target_rejects_unrelated_singleton_without_guessing():
+    import browserwright.repl.playwright_handle as ph
+
+    class Page:
+        url = "about:blank"
+
+    class Context:
+        pages = [Page()]
+
+    assert ph.page_for_target(
+        Context(),
+        object(),
+        "target-not-this-page",
+        "https://wanted.test/",
+    ) is None
+
+
+def test_page_for_target_rejects_ambiguous_duplicate_urls_without_guessing():
+    import browserwright.repl.playwright_handle as ph
+
+    class Page:
+        url = "about:blank"
+
+    class Context:
+        pages = [Page(), Page()]
+
+    assert ph.page_for_target(
+        Context(),
+        object(),
+        "target-one-of-two",
+        "about:blank",
+    ) is None
+
+
+def test_page_for_target_uses_exact_agent_marker_for_duplicate_urls(monkeypatch):
+    import browserwright.repl.playwright_handle as ph
+
+    class Page:
+        url = "https://same.test/"
+
+        def __init__(self, marker: bool):
+            self.marker = marker
+
+    wrong = Page(False)
+    exact = Page(True)
+    cleared = []
+    cdp = object()
+    monkeypatch.setattr(
+        ph,
+        "_install_target_marker",
+        lambda _sess, _target: (
+            True,
+            ("marker-key", "marker-value", cdp, "agent-session"),
+        ),
+    )
+    monkeypatch.setattr(
+        ph,
+        "_page_has_target_marker",
+        lambda page, _key, _value: page.marker,
+    )
+    monkeypatch.setattr(
+        ph,
+        "_clear_target_marker",
+        lambda *args: cleared.append(args),
+    )
+
+    page = ph.page_for_target(
+        type("Context", (), {"pages": [wrong, exact]})(),
+        object(),
+        "target-exact",
+        "https://same.test/",
+    )
+
+    assert page is exact
+    assert cleared == [(cdp, "agent-session", "marker-key")]
+
+
 def test_smart_goto_ignores_explicit_wait_until_and_returns_response():
     from browserwright.repl._smart_goto import patch_page_goto
 

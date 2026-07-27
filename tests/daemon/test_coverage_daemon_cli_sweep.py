@@ -329,7 +329,11 @@ def test_end_and_kill_executor_pass_browser_session_for_ws_scoping(monkeypatch):
 
     def fake_rpc(cfg, method, params, **kwargs):
         calls.append((method, kwargs))
-        return {"ok": True}
+        return (
+            {"ok": True, "reaped": True}
+            if method == "BrowserwrightDaemon.killExecutor"
+            else {"ok": True}
+        )
 
     monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
     monkeypatch.setattr(cli, "_run", lambda value: value)
@@ -344,6 +348,23 @@ def test_end_and_kill_executor_pass_browser_session_for_ws_scoping(monkeypatch):
     kill_method, kill_kwargs = calls[1]
     assert kill_method == "BrowserwrightDaemon.killExecutor"
     assert kill_kwargs["browser_session"] == "bw-s"
+
+
+def test_kill_executor_requires_confirmed_reap(monkeypatch, capsys):
+    async def not_reaped(*args, **kwargs):
+        return {
+            "ok": True,
+            "killed": False,
+            "reaped": False,
+            "matched": True,
+        }
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", not_reaped)
+
+    assert cli._cmd_kill_executor(_ns(session="bw-s"), Config()) == 3
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    assert "did not confirm executor death" in streams.err
 
 
 def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, tmp_path):

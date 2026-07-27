@@ -748,7 +748,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
 def _rpc_cmd(cfg: Config, method: str, params: dict, *,
              client_label: str, timeout: float = 10.0,
              browser_session: str | None = None,
-             emit=None) -> int:
+             emit=None, validate_result=None) -> int:
     """Shared runner for one-shot RPC subcommands: call `_rpc_via_ws`, map
     Unavailable→2 / DaemonError→3 — the same mapping main()'s top-level
     handler applies, duplicated here because tests (and any embedder) invoke
@@ -760,6 +760,8 @@ def _rpc_cmd(cfg: Config, method: str, params: dict, *,
             cfg, method, params, client_label=client_label, timeout=timeout,
             browser_session=browser_session,
         ))
+        if validate_result is not None:
+            validate_result(result)
     except Unavailable as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -919,13 +921,24 @@ def _cmd_end_session(args, cfg: Config) -> int:
 def _cmd_kill_executor(args, cfg: Config) -> int:
     """Phase B: reap a session's resident executor (no browser teardown).
 
-    Best-effort by design — a dead daemon / missing executor must not fail
-    `session end`, so every failure mode maps to a clean exit code the caller
-    tolerates. Prints the `{ok, killed}` JSON result on success."""
+    The RPC is idempotent when no executor exists, but a wait-mode response is
+    successful only when the daemon explicitly confirms ``reaped: true``.
+    ``session end`` may still treat a nonzero result as best-effort; ``session
+    reset`` relies on it to avoid claiming a live executor was recycled."""
+
+    def require_reaped(result: dict) -> None:
+        if result.get("reaped") is not True:
+            raise DaemonError(
+                "BrowserwrightDaemon.killExecutor did not confirm executor "
+                f"death: {result!r}"
+            )
+
     return _rpc_cmd(
-        cfg, "BrowserwrightDaemon.killExecutor", {"session": args.session},
+        cfg, "BrowserwrightDaemon.killExecutor",
+        {"session": args.session, "wait": True},
         client_label="cli-kill-executor", timeout=10.0,
-        browser_session=args.session)
+        browser_session=args.session,
+        validate_result=require_reaped)
 
 
 # ---- LaunchAgent service (macOS) ----------------------------------------

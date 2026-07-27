@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 
 from .. import _ipc
@@ -50,6 +51,7 @@ class ExecutorHandle:
     session_id: str
     proc: subprocess.Popen
     sock_path: str
+    executor_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     spawned_at: float = field(default_factory=time.monotonic)
     # Wall-clock spawn time, used to floor the discovery-file-mtime idle clock
     # (mtime is wall-clock; spawned_at above is a monotonic clock for races).
@@ -131,8 +133,16 @@ class ExecutorRegistry:
         # Clear any stale discovery file from a prior (dead) executor so the
         # readiness wait below can't latch onto it.
         _ipc.cleanup_executor(session_id)
-        cmd = [sys.executable, "-m", "browserwright._executor",
-               "--session", session_id]
+        executor_id = uuid.uuid4().hex
+        cmd = [
+            sys.executable,
+            "-m",
+            "browserwright._executor",
+            "--session",
+            session_id,
+            "--executor-id",
+            executor_id,
+        ]
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -140,14 +150,18 @@ class ExecutorRegistry:
             stdin=subprocess.DEVNULL,
             **_spawn_kwargs(),
         )
-        sock_path = await self._await_ready(session_id, proc)
-        logger.info("spawned executor for session %s (pid=%s)",
-                    session_id, proc.pid)
+        sock_path = await self._await_ready(session_id, proc, executor_id=executor_id)
+        logger.info("spawned executor for session %s (pid=%s)", session_id, proc.pid)
         return ExecutorHandle(
-            session_id=session_id, proc=proc, sock_path=sock_path)
+            session_id=session_id,
+            proc=proc,
+            sock_path=sock_path,
+            executor_id=executor_id,
+        )
 
-    async def _await_ready(self, session_id: str,
-                           proc: subprocess.Popen) -> str:
+    async def _await_ready(
+        self, session_id: str, proc: subprocess.Popen, executor_id: str | None = None
+    ) -> str:
         """Poll the executor's ``_ipc`` discovery file until it appears (or the
         child dies / we time out).
 
@@ -163,10 +177,13 @@ class ExecutorRegistry:
             if proc.poll() is not None:
                 raise RuntimeError(
                     f"executor for session {session_id!r} exited during "
-                    f"cold-start (code={proc.returncode})")
-            sock_path, _pid = _ipc.read_executor_file(session_id)
-            if sock_path:
-                return sock_path
+                    f"cold-start (code={proc.returncode})"
+                )
+            record = _ipc.read_executor_record(session_id)
+            if record is not None and (
+                executor_id is None or record.get("executor_id") == executor_id
+            ):
+                return str(record["sock"])
             await asyncio.sleep(0.05)
         # Timed out — kill the stuck child so it doesn't leak.
         try:
@@ -201,6 +218,88 @@ class ExecutorRegistry:
         logger.info("killed executor for session %s (pid=%s)",
                     session_id, handle.proc.pid)
         return True
+
+    async def kill_and_wait(
+        self,
+        session_id: str,
+        *,
+        executor_id: str | None = None,
+    ) -> dict[str, object]:
+        """Terminate one exact executor instance and confirm it is gone.
+
+        The per-session spawn lock stays held through reap confirmation.  A
+        concurrent ``ensure`` therefore cannot create a replacement at the
+        same socket path until the old process is dead and its discovery files
+        are removed.
+
+        ``executor_id`` prevents a delayed timeout cleanup from killing a newer
+        executor.  When the registry already contains a different instance,
+        the requested instance is considered superseded/reaped and the newer
+        one is left untouched.
+        """
+        async with self._lock_for(session_id):
+            handle = self._handles.get(session_id)
+            if handle is None:
+                record = _ipc.read_executor_record(session_id)
+                if record is not None:
+                    recorded_id = record.get("executor_id")
+                    if executor_id is not None and recorded_id != executor_id:
+                        return {
+                            "killed": False,
+                            "reaped": True,
+                            "matched": False,
+                            "executor_id": executor_id,
+                            "current_executor_id": recorded_id,
+                        }
+                    if _pid_alive(int(record["pid"])):
+                        # The daemon cannot honestly confirm death for a live
+                        # process it no longer owns with a Popen handle.
+                        return {
+                            "killed": False,
+                            "reaped": False,
+                            "matched": True,
+                            "executor_id": executor_id,
+                        }
+                _ipc.cleanup_executor(session_id)
+                return {
+                    "killed": False,
+                    "reaped": True,
+                    "matched": True,
+                    "executor_id": executor_id,
+                }
+            if executor_id is not None and handle.executor_id != executor_id:
+                return {
+                    "killed": False,
+                    "reaped": True,
+                    "matched": False,
+                    "executor_id": executor_id,
+                    "current_executor_id": handle.executor_id,
+                }
+
+            self._handles.pop(session_id, None)
+            await asyncio.to_thread(_terminate_and_wait, handle)
+            reaped = handle.proc.poll() is not None
+            if reaped:
+                _ipc.cleanup_executor(session_id)
+            else:
+                # Never permit a replacement at the same unix-socket path
+                # while the old process is still alive.  Preserve ownership so
+                # a later reap can retry instead of spawning alongside it.
+                self._handles[session_id] = handle
+            logger.info(
+                "synchronously reaped executor for session %s "
+                "(pid=%s, executor_id=%s, reaped=%s)",
+                session_id,
+                handle.proc.pid,
+                handle.executor_id,
+                reaped,
+            )
+            return {
+                "killed": True,
+                "reaped": reaped,
+                "matched": True,
+                "executor_id": handle.executor_id,
+            }
 
     def kill_all(self) -> None:
         """Shutdown path: SIGTERM every registered executor. Mirrors
@@ -290,15 +389,27 @@ def _terminate(handle: ExecutorHandle) -> None:
     proc = handle.proc
     if proc.poll() is not None:
         return  # already gone
+    _signal_terminate(proc)
+    _escalate_async(proc, lambda: _killpg_or_kill(proc, signal.SIGKILL))
+
+
+def _terminate_and_wait(handle: ExecutorHandle) -> None:
+    """Blocking reap used only through ``asyncio.to_thread``."""
+    proc = handle.proc
+    if proc.poll() is not None:
+        return
+    _signal_terminate(proc)
+    _wait_or_kill(proc, lambda: _killpg_or_kill(proc, signal.SIGKILL))
+
+
+def _signal_terminate(proc: subprocess.Popen) -> None:
+    """SIGTERM a detached executor process group, with pid fallback."""
     pid = proc.pid
-    # POSIX: signal the process group (negative pid) so detached grandchildren
-    # die too. Fall back to the bare pid if the group signal isn't permitted.
     with _quiet():
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             proc.terminate()
-    _escalate_async(proc, lambda: _killpg_or_kill(proc, signal.SIGKILL))
 
 
 def _escalate_async(proc: subprocess.Popen, escalate) -> None:

@@ -38,6 +38,31 @@ class PageLoadFailed(BrowserwrightError):
         super().__init__(f"page load failed: {url} ({reason})", fix=fix)
 
 
+class PageBindTimeout(BrowserwrightError):
+    """Playwright did not expose the session's already-resolved target in time."""
+
+    exit_code = 3
+    retryable = True
+    default_fix = (
+        "retry the same browserwright command; if it persists, run "
+        "`browserwright session reset <id>` and retry"
+    )
+
+    def __init__(
+        self,
+        target_id: str = "",
+        timeout: float = 0.0,
+        fix: str = "",
+    ):
+        self.target_id, self.timeout = target_id, timeout
+        target = repr(target_id) if target_id else "<missing>"
+        super().__init__(
+            "timed out binding Playwright to session target "
+            f"{target} after {timeout:g}s; no replacement page was created",
+            fix=fix,
+        )
+
+
 class ElementNotFound(BrowserwrightError):
     exit_code = 3
     default_fix = (
@@ -143,9 +168,9 @@ class NeedsUserConfirm(BrowserwrightError):
 def serialize(exc: BaseException) -> dict:
     """Compact JSON-friendly representation for stderr / repl socket."""
     out = {"type": type(exc).__name__, "msg": str(exc)}
-    for k in ("url", "selector", "timeout", "reason", "signals", "kind",
+    for k in ("url", "selector", "target_id", "timeout", "reason", "signals", "kind",
               "status", "detail", "site", "task", "failed_check",
-              "method", "cdp_message", "what", "proposal", "fix"):
+              "method", "cdp_message", "what", "proposal", "fix", "retryable"):
         v = getattr(exc, k, None)
         if v is not None and not isinstance(v, (type(None),)):
             try:
@@ -169,7 +194,10 @@ def playwright_error_fix(exc: BaseException) -> str:
     lower = msg.lower()
     exc_type = type(exc).__name__
     if "frame detached" in lower or "target closed" in lower or "page closed" in lower:
-        return "call reset() to rebuild the browser connection, then re-snapshot and retry"
+        return (
+            "run reset() as a standalone/final statement; then re-snapshot "
+            "and retry in the next command"
+        )
     if "timeout" not in lower and exc_type != "TimeoutError":
         return ""
     if "locator" in lower or "click" in lower or "fill" in lower:

@@ -27,18 +27,22 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import os
 import queue
 import socket
 import sys
 import threading
 import traceback
-from contextlib import redirect_stdout
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stdout
 from typing import Any
 
 from ..errors import BrowserwrightError, serialize
 from .protocol import (
     MAX_TEXT_CHARS,
+    TERMINAL_DEADLINE_EXCEEDED,
+    TERMINAL_RESET_REQUESTED,
     ExecuteRequest,
     ExecuteResponse,
     recv_message,
@@ -52,12 +56,28 @@ from .protocol import (
 _COLD_START_CONNECT_ATTEMPTS = 13
 _COLD_START_CONNECT_BACKOFF_S = 0.75
 
-# Extra wait the worker-side `submit` grants the FIRST execute (before
-# `_connected`), to absorb the lazy cold-start (connect+bind) latency on top of
-# the per-call `timeout_ms`. Kept slightly above the connect-retry window
-# (~13×0.75s ≈ 10s) so a legitimate cold-start is never reported as a per-call
-# timeout. Mirrors the client-side recv slack (`client._COLD_START_RECV_SLACK_S`).
-_COLD_START_WAIT_SLACK_S = 45.0
+
+@contextmanager
+def _request_environment(env: dict[str, str]) -> Iterator[None]:
+    """Temporarily overlay request-selected values on ``os.environ``.
+
+    The resident executor must not retain request credentials. Snapshot only
+    the selected keys, then restore each key exactly even if user code mutates
+    or deletes it, raises, or exits via ``SystemExit``.
+    """
+    original: dict[str, tuple[bool, str | None]] = {
+        name: (name in os.environ, os.environ.get(name)) for name in env
+    }
+    try:
+        os.environ.update(env)
+        yield
+    finally:
+        for name, (was_present, value) in original.items():
+            if not was_present:
+                os.environ.pop(name, None)
+            else:
+                # Present environment entries are always strings.
+                os.environ[name] = value or ""
 
 
 class _LivePageHolder:
@@ -71,6 +91,15 @@ class _LivePageHolder:
         self.page: Any = None
 
 
+class _ResetRequested(BaseException):
+    """Private control-flow signal for terminal ``reset()``.
+
+    It inherits directly from ``BaseException`` so user code's common
+    ``except Exception`` cannot accidentally swallow the reset request and
+    continue issuing browser actions on a transport scheduled for recycle.
+    """
+
+
 class _Worker:
     """Owns the live Playwright objects + persistent ``state``; runs code FIFO.
 
@@ -78,11 +107,10 @@ class _Worker:
     thread enqueues ``(request, reply_box)`` pairs; the worker connects on
     cold-start, then drains the queue."""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, executor_id: str | None = None) -> None:
         self._session_id = session_id
-        self._q: "queue.Queue[tuple[ExecuteRequest, queue.Queue[ExecuteResponse]] | None]" = (
-            queue.Queue()
-        )
+        self._executor_id = executor_id
+        self._q: "queue.Queue[tuple[ExecuteRequest, queue.Queue[ExecuteResponse]] | None]" = queue.Queue()
         # Whether cold-start (connect_over_cdp + bind) has completed. Cold-start
         # is LAZY: it runs on the worker thread on the FIRST execute request, not
         # at process start (so the control-plane `ensureExecutor` RPC returns the
@@ -95,10 +123,7 @@ class _Worker:
         self._browser: Any = None
         self._context: Any = None
         self._page: Any = None
-        # The currently-armed facade-death handler (Fork 4). Tracked so reset()
-        # can DETACH it before tearing down the old browser — otherwise the
-        # intentional disconnect during reset would trip the self-exit and kill
-        # the process. Re-armed on the rebuilt browser after reset.
+        # The currently-armed facade-death handler (Fork 4).
         self._facade_death_handler: Any = None
         # Persistent per-session state, injected by reference each call (Fork 5).
         self._state: dict[str, Any] = {}
@@ -123,42 +148,31 @@ class _Worker:
         timeout (Fork 3 + PR3).
 
         The worker thread is thread-affine to the sync-Playwright driver, so a
-        running call CANNOT be force-killed from here without corrupting the
-        driver. Instead we bound the WAIT: if the worker hasn't replied within
-        ``timeout_ms`` we return a timeout error to the client immediately. The
-        worker keeps finishing the (possibly wedged) call on its own thread;
-        subsequent calls QUEUE behind it (FIFO). A merely-slow call thus just
-        DELAYS later calls (they run once it finishes); `state` + the live page
-        survive (the process is untouched). A PERMANENTLY-stuck call, however,
-        blocks the queue forever — even a `reset()` queues behind it — so the
-        only hard-wedge escape is `endSession` (the daemon SIGTERMs the executor
-        out-of-band; sync Playwright can't be force-killed from here). This is
-        the documented semantics: timeout is a CLIENT-side bound, the worker
-        drains at its own pace.
-
-        Cold-start slack: the FIRST execute (before `_connected`) carries the
-        lazy facade connect+bind on the worker, which can add up to ~35s. We add
-        that slack to the wait so a legitimate cold-start isn't reported as a
-        per-call timeout. Once connected the slack is gone (the wait is exactly
-        `timeout_ms`). This mirrors the client-side recv slack."""
+        running call cannot be interrupted safely in-process.  The main thread
+        instead bounds the wait across queueing, cold-start, and user code.  On
+        expiry it returns a terminal response; the serve loop flushes it and
+        exits the whole executor process, which lets the OS tear down the
+        Playwright transport without touching browser tabs."""
         box: "queue.Queue[ExecuteResponse]" = queue.Queue(maxsize=1)
         self._q.put((req, box))
-        slack = 0.0 if self._connected else _COLD_START_WAIT_SLACK_S
         try:
-            return box.get(timeout=max(req.timeout_ms, 1) / 1000.0 + slack)
+            return box.get(timeout=max(req.timeout_ms, 1) / 1000.0)
         except queue.Empty:
             return ExecuteResponse(
                 error={
                     "type": "TimeoutError",
-                    "msg": (f"executor call exceeded {req.timeout_ms}ms; the "
-                            "worker is still finishing it — later calls queue "
-                            "behind it"),
-                    "fix": ("the call is slow or wedged; run "
-                            f"`browserwright session reset {self._session_id}` "
-                            "to recycle the executor without closing browser "
-                            "tabs, then retry the call"),
+                    "msg": (
+                        f"executor request deadline exceeded "
+                        f"({req.timeout_ms}ms); the executor was recycled"
+                    ),
+                    "fix": (
+                        "retry the command; browser tabs were preserved, but "
+                        "executor state and Python finally blocks were not"
+                    ),
                 },
-                exit_code=3)
+                exit_code=3,
+                terminal_reason=TERMINAL_DEADLINE_EXCEEDED,
+            )
 
     def shutdown(self) -> None:
         self._q.put(None)
@@ -175,7 +189,16 @@ class _Worker:
             if item is None:
                 break
             req, box = item
-            box.put(self._execute(req))
+            try:
+                response = self._execute(req)
+            finally:
+                # Values are restored out of os.environ by
+                # `_request_environment`; also drop the request mapping before
+                # this resident thread blocks on its next queue read.  Python
+                # cannot promise physical erasure of immutable strings, but it
+                # need not retain our explicit references.
+                req.env.clear()
+            box.put(response)
         self._teardown()
 
     def _ensure_cold_started(self) -> None:
@@ -183,10 +206,9 @@ class _Worker:
         first execute (worker thread), NOT at process start.
 
         Idempotent: a no-op once connected (subsequent executes reuse the live
-        objects). ``reset()`` rebuilds independently of this flag. Raises on a
-        failed connect; the caller (:meth:`_execute`) turns that into an
-        actionable error response so the agent sees it. A failed cold-start
-        leaves ``_connected`` False, so the NEXT execute retries the connect —
+        objects). Raises on a failed connect; the caller (:meth:`_execute`)
+        turns that into an actionable error response so the agent sees it. A
+        failed cold-start leaves ``_connected`` False, so the NEXT execute retries the connect —
         matching the facade-death cold-restart discipline.
 
         Reuses the shared connect+bind free functions (single source of truth
@@ -205,7 +227,7 @@ class _Worker:
         # On a retry after a failed connect we REUSE the live driver (just re-run
         # `_connect_and_bind` below), NEVER re-enter the manager: its event loop
         # is thread-bound and cannot be restarted once `__exit__`-ed
-        # ("Event loop is closed"). Same discipline as `reset()`.
+        # ("Event loop is closed").
         if self._pw_cm is None:
             self._start_driver()
         # Raises on a still-dead facade; `_connected` stays False so the next
@@ -222,8 +244,6 @@ class _Worker:
         CANNOT be restarted in the same thread once stopped — re-entering
         ``sync_playwright()`` on the worker after a prior ``__exit__`` yields
         "Event loop is closed." So the driver is entered exactly once here at
-        cold-start; :meth:`reset` REUSES this same live ``self._pw`` driver
-        (it only re-runs :meth:`_connect_and_bind`, never re-enters the manager).
         The manager is ``__exit__``-ed only at :meth:`_teardown` (process exit).
         MUST run on the worker thread (Playwright sync is thread-affine)."""
         from playwright.sync_api import sync_playwright
@@ -236,12 +256,9 @@ class _Worker:
         bind the session's current tab, rebind ``snapshot``, and arm
         facade-death.
 
-        Shared by cold-start AND :meth:`reset`. It does NOT enter/exit the
-        ``sync_playwright()`` manager — that is :meth:`_start_driver` /
-        :meth:`_teardown`'s job. It only (re)builds the browser/context/page
-        connection on the EXISTING driver, so it is safe to call repeatedly
-        (reset) without restarting the dead-once event loop. MUST run on the
-        worker thread (Playwright sync is thread-affine)."""
+        It does not enter/exit the ``sync_playwright()`` manager — that is
+        :meth:`_start_driver` / :meth:`_teardown`'s job.  MUST run on the worker
+        thread (Playwright sync is thread-affine)."""
         from ..repl import playwright_handle as ph
         from ..repl.snapshot import make_snapshot
         from ..session import current_session
@@ -264,45 +281,15 @@ class _Worker:
         self._arm_facade_death()
 
     def _reset(self) -> None:
-        """Fork 6: rebuild the connection from scratch + clear ``state``.
+        """Request terminal executor recycle without touching browser tabs.
 
-        The injected ``reset()`` callable (see :meth:`_build_globals`) calls
-        this. It runs ON the worker thread (the same thread that owns the
-        Playwright driver), so it is safe to touch the live objects.
-
-        ORDER MATTERS:
-          1. DISARM the facade-death handler so dropping the old browser below
-             does NOT trip ``os._exit`` and kill the process.
-          2. DROP the old ``browser``/``context``/``page`` references — do NOT
-             ``close()`` them (closing a page kills the user's real tab; a
-             browser ``close()`` hangs over the facade) and do NOT ``__exit__``
-             the ``sync_playwright()`` manager (its event loop is thread-bound
-             and cannot be restarted once stopped — re-entering would yield
-             "Event loop is closed"). The old browser CDP connection is simply
-             ABANDONED; it is cleaned when the driver finally stops at
-             :meth:`_teardown`.
-          3. Rebuild via :meth:`_connect_and_bind` on the SAME live
-             ``self._pw`` driver — which RE-ARMS facade-death on the NEW browser.
-          4. Clear ``state`` (playwriter parity; the agent asked for a clean
-             slate). Same state-loss contract as a daemon-restart cold start —
-             documented."""
-        self._disarm_facade_death()
-        self._connected = False
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._snapshot = None
-        self._snapshot_holder.page = None
-        # reset() can be called BEFORE the lazy cold-start ever ran (the first
-        # heredoc was literally `reset()`), so the driver may not be entered yet.
-        if self._pw_cm is None:
-            self._start_driver()
-        # Rebuild + re-arm on the SAME driver. Raises on a still-dead facade
-        # (the agent sees the actionable FacadeUnavailable just as a fresh
-        # cold start would).
-        self._connect_and_bind()
-        self._connected = True
-        self._state.clear()
+        Reconnecting in-place used to abandon the old facade CDP transport,
+        leaking one bridge per reset.  Reset is now terminal control flow:
+        statements after ``reset()`` do not run, the response is flushed, and
+        the thin client asks the daemon to reap this exact executor instance.
+        The next command cold-starts and rebinds the session's current tab.
+        """
+        raise _ResetRequested()
 
     def _arm_facade_death(self) -> None:
         """Fork 4: when the facade transport drops (daemon restarted → facade ws
@@ -317,30 +304,14 @@ class _Worker:
         thread; we hard-exit the process from there so the worker thread (which
         may be blocked in a queue.get) doesn't have to notice.
 
-        We KEEP a reference to the bound handler + the browser it was armed on so
-        :meth:`reset` can `off("disconnected", handler)` it BEFORE the
-        intentional teardown — otherwise the reset's own disconnect would trip
-        the self-exit and defeat the rebuild."""
-        handler = lambda *_: self._on_facade_dead()  # noqa: E731
+        The handler reference is retained for testability and lifecycle
+        introspection."""
+        handler = lambda *_: self._on_facade_dead()
         try:
             self._browser.on("disconnected", handler)
             self._facade_death_handler = handler
         except Exception:  # noqa: BLE001 - never let arming break cold-start
             self._facade_death_handler = None
-
-    def _disarm_facade_death(self) -> None:
-        """Detach the armed `disconnected` handler so an INTENTIONAL browser
-        teardown (reset) does NOT trip the self-exit. Best-effort + idempotent;
-        a failure here only risks an over-eager self-exit, which we avoid by
-        clearing the reference unconditionally."""
-        handler = self._facade_death_handler
-        self._facade_death_handler = None
-        if handler is None or self._browser is None:
-            return
-        try:
-            self._browser.off("disconnected", handler)
-        except Exception:  # noqa: BLE001
-            pass
 
     def _on_facade_dead(self) -> None:
         sys.stderr.write(
@@ -357,9 +328,8 @@ class _Worker:
         truncation / error-with-traceback).
 
         Runs on the worker thread (Playwright thread-affinity). The per-call
-        timeout is enforced by :meth:`submit` on the CLIENT side; this method
-        runs the code to completion on its own thread (a sync-Playwright call
-        can't be force-killed mid-flight without corrupting the driver).
+        timeout is enforced by :meth:`submit` on the executor's main thread;
+        this method itself runs the code until completion or process exit.
 
         Cold-start (connect_over_cdp + bind) is performed HERE, lazily, on the
         first execute — so the slow connect is absorbed by this data-plane call,
@@ -389,32 +359,63 @@ class _Worker:
         globals_ = self._build_globals()
         buf = io.StringIO()
         return_value: str | None = None
-        try:
-            with redirect_stdout(buf):
-                return_value = self._exec_with_return(req.code, globals_)
-        except BrowserwrightError as e:
-            return self._finish(buf, error=serialize(e), exit_code=e.exit_code)
-        except SystemExit as e:
-            code = int(e.code) if isinstance(e.code, int) else 0
-            return self._finish(buf, exit_code=code)
-        except BaseException as e:  # noqa: BLE001 - surface to the client
-            # Restore traceback fidelity: the in-process path writes
-            # `traceback.format_exc()` to stderr; a shipped heredoc must show
-            # the SAME traceback. We carry it on the serialized error dict.
-            from ..errors import playwright_error_fix
-            error = {
-                "type": type(e).__name__,
-                "msg": str(e),
-                "traceback": traceback.format_exc(),
-            }
-            fix = playwright_error_fix(e)
-            if fix:
-                error["fix"] = fix
-            return self._finish(
-                buf,
-                error=error,
-                exit_code=3)
-        return self._finish(buf, return_value=return_value, exit_code=0)
+        task_result_json: str | None = None
+        with _request_environment(req.env):
+            try:
+                with redirect_stdout(buf):
+                    if req.task is None:
+                        return_value = self._exec_with_return(req.code, globals_)
+                    else:
+                        result = self._run_task_on_live_surface(
+                            req.task.site,
+                            req.task.name,
+                            isolated=req.task.isolated,
+                            **req.task.args,
+                        )
+                        try:
+                            return_value = repr(result)
+                        except Exception:  # noqa: BLE001
+                            return_value = (
+                                f"<{type(result).__name__} (repr failed)>"
+                            )
+                        task_result_json = json.dumps(result, default=str)
+            except _ResetRequested:
+                return self._finish(
+                    buf,
+                    warnings=[
+                        (
+                            "executor reset requested; statements after "
+                            "reset() were not run"
+                        )
+                    ],
+                    terminal_reason=TERMINAL_RESET_REQUESTED,
+                )
+            except BrowserwrightError as e:
+                return self._finish(buf, error=serialize(e), exit_code=e.exit_code)
+            except SystemExit as e:
+                code = int(e.code) if isinstance(e.code, int) else 0
+                return self._finish(buf, exit_code=code)
+            except BaseException as e:  # noqa: BLE001 - surface to the client
+                # Restore traceback fidelity: the in-process path writes
+                # `traceback.format_exc()` to stderr; a shipped heredoc must
+                # show the SAME traceback. We carry it on the serialized error.
+                from ..errors import playwright_error_fix
+
+                error = {
+                    "type": type(e).__name__,
+                    "msg": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+                fix = playwright_error_fix(e)
+                if fix:
+                    error["fix"] = fix
+                return self._finish(buf, error=error, exit_code=3)
+        return self._finish(
+            buf,
+            return_value=return_value,
+            task_result_json=task_result_json,
+            exit_code=0,
+        )
 
     @staticmethod
     def _exec_with_return(code: str, globals_: dict[str, Any]) -> str | None:
@@ -442,9 +443,17 @@ class _Worker:
         except Exception:  # noqa: BLE001 - a hostile __repr__ must not crash us
             return f"<{type(value).__name__} (repr failed)>"
 
-    def _finish(self, buf: io.StringIO, *, return_value: str | None = None,
-                error: dict[str, Any] | None = None,
-                exit_code: int = 0) -> ExecuteResponse:
+    def _finish(
+        self,
+        buf: io.StringIO,
+        *,
+        return_value: str | None = None,
+        error: dict[str, Any] | None = None,
+        exit_code: int = 0,
+        warnings: list[str] | None = None,
+        terminal_reason: str | None = None,
+        task_result_json: str | None = None,
+    ) -> ExecuteResponse:
         """Assemble the response: cap the console at ``MAX_TEXT_CHARS`` and
         attach the warnings/screenshots collected during the call."""
         console = buf.getvalue()
@@ -457,9 +466,43 @@ class _Worker:
             return_value=return_value,
             error=error,
             exit_code=exit_code,
-            warnings=list(self._call_warnings),
+            warnings=(
+                list(self._call_warnings) if warnings is None else list(warnings)
+            ),
             screenshots=list(self._call_screenshots),
             truncated=truncated,
+            terminal_reason=terminal_reason,
+            task_result_json=task_result_json,
+        )
+
+    def _run_task_on_live_surface(
+        self,
+        site: str,
+        name: str | None = None,
+        *,
+        isolated: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a task while borrowing this executor's sole browser surface."""
+        from ..task_runner import BrowserSurface, _run_task_on_surface
+
+        if name is None and "/" in site:
+            site, name = site.split("/", 1)
+        if name is None:
+            raise ValueError(
+                "run_task: missing task name. Pass '<site>/<name>' or two "
+                "positional args."
+            )
+        return _run_task_on_surface(
+            site,
+            name,
+            browser_surface=BrowserSurface(
+                page=self._page,
+                context=self._context,
+                snapshot=self._snapshot,
+            ),
+            isolated=isolated,
+            **kwargs,
         )
 
     def _build_globals(self) -> dict[str, Any]:
@@ -482,11 +525,12 @@ class _Worker:
         g["state"] = self._state  # same dict object each call → persistent
         if self._snapshot is not None:
             g["snapshot"] = self._snapshot
-        # Fork 6: `reset()` acts on the executor's LIVE objects (a daemon verb
-        # can't reach them), so it is an injected callable, not an RPC. It
-        # rebuilds the connection (re-binds the session's current tab) and
-        # clears `state`. Use it when the connection broke / the page closed /
-        # you want a clean slate.
+        # Task invocations inside inline code borrow the same resident surface;
+        # never let the public task runner allocate a second Playwright handle.
+        g["run_task"] = self._run_task_on_live_surface
+        # ``reset()`` is injected terminal control flow.  The response tells the
+        # client to reap this exact process; the next command reconnects and
+        # binds the session's durable current target.
         g["reset"] = self._reset
         # Output-protocol producers the agent (or helpers) can call to surface a
         # `[WARNING]` line or a screenshot path back through the response.
@@ -563,12 +607,41 @@ def _serve(session_id: str, sock: socket.socket, worker: _Worker) -> None:
                     error={"type": "ValueError", "msg": str(e)},
                     exit_code=3).to_dict())
                 continue
+            # `from_dict` copied the selected environment into `req.env`; clear
+            # the decoded frame's duplicate mapping before submit blocks.
+            raw_env = msg.get("env")
+            if isinstance(raw_env, dict):
+                raw_env.clear()
+            msg.clear()
+            if req.executor_id is not None and req.executor_id != worker._executor_id:
+                send_message(
+                    conn,
+                    ExecuteResponse(
+                        error={
+                            "type": "ExecutorIdentityMismatch",
+                            "msg": (
+                                "executor lease no longer matches the process "
+                                "serving this socket"
+                            ),
+                        },
+                        exit_code=3,
+                    ).to_dict(),
+                )
+                continue
             resp = worker.submit(req)
+            # The worker loop clears req.env before publishing its response.
+            # Drop the now-empty request reference on the serving thread too.
+            del req
             _touch_discovery(session_id, _ipc)
             try:
                 send_message(conn, resp.to_dict())
             except OSError:
                 pass
+            if resp.terminal_reason is not None:
+                # The response has been flushed.  Returning lets main clean the
+                # socket/discovery record and exit even if the daemon/client
+                # disappears before issuing its exact-instance reap RPC.
+                return
 
 
 def _touch_discovery(session_id: str, _ipc: Any) -> None:
@@ -587,15 +660,22 @@ def main(argv: list[str] | None = None) -> int:
     from ..daemon import _ipc
 
     parser = argparse.ArgumentParser(prog="browserwright._executor")
-    parser.add_argument("--session", required=True,
-                        help="the session id this executor serves")
+    parser.add_argument(
+        "--session", required=True, help="the session id this executor serves"
+    )
+    parser.add_argument(
+        "--executor-id",
+        required=True,
+        help="opaque daemon-issued executor instance identity",
+    )
     args = parser.parse_args(argv)
     session_id = args.session
     # Keep the env marker for helper code that still reads it; the --session
     # flag is authoritative for binding.
     os.environ["BD_SESSION"] = session_id
 
-    worker = _Worker(session_id)
+    executor_id = args.executor_id
+    worker = _Worker(session_id, executor_id=executor_id)
     worker.start()
 
     # Bind the socket + publish the discovery file BEFORE any cold-start, so the
@@ -608,7 +688,11 @@ def main(argv: list[str] | None = None) -> int:
     # plane fast.
     sock = _ipc.make_executor_socket(session_id)
     _ipc.write_executor_file(
-        session_id, str(_ipc.executor_sock_path(session_id)), os.getpid())
+        session_id,
+        str(_ipc.executor_sock_path(session_id)),
+        os.getpid(),
+        executor_id=executor_id,
+    )
 
     # Defense-in-depth: clean our own discovery file + socket on SIGTERM (the
     # daemon's `registry.kill` also cleans them daemon-side, but a kill from any

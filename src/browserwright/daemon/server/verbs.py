@@ -700,8 +700,14 @@ class SessionVerbsMixin:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"ensureExecutor failed: {e!r}"))
             return
-        await self._send_to_client(client.client_id, _result_response(
-            req_id, {"exec_sock": sock_path}))
+        result = {"exec_sock": sock_path}
+        get_handle = getattr(registry, "get", None)
+        handle = get_handle(session) if callable(get_handle) else None
+        executor_id = getattr(handle, "executor_id", None)
+        if isinstance(executor_id, str) and executor_id:
+            result["executor_id"] = executor_id
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, result))
 
     async def _handle_kill_executor(
         self, client: ClientState, msg: dict, req_id: int | None,
@@ -722,13 +728,32 @@ class SessionVerbsMixin:
         daemon = self.daemon
         registry = getattr(daemon, "executors", None) if daemon is not None else None
         killed = False
+        reaped = False
+        matched = True
+        executor_id = params.get("executorId")
+        if not isinstance(executor_id, str) or not executor_id:
+            executor_id = None
+        wait = params.get("wait") is True
         if registry is not None:
             try:
-                killed = bool(registry.kill(session))
+                if wait:
+                    result = await registry.kill_and_wait(
+                        session, executor_id=executor_id)
+                    killed = bool(result.get("killed"))
+                    reaped = bool(result.get("reaped"))
+                    matched = bool(result.get("matched", True))
+                else:
+                    killed = bool(registry.kill(session))
+                    # The legacy fire-and-forget path has acknowledged only the
+                    # signal, not process death.
+                    reaped = not killed
             except Exception as e:  # noqa: BLE001 - executor kill is best-effort
                 logger.warning("killExecutor: kill for %s failed: %r", session, e)
-        await self._send_to_client(client.client_id, _result_response(
-            req_id, {"ok": True, "killed": killed}))
+        response = {"ok": True, "killed": killed}
+        if wait:
+            response.update({"reaped": reaped, "matched": matched})
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, response))
 
     async def _handle_close_tab(
         self, client: ClientState, msg: dict, req_id: int | None,

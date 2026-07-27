@@ -109,18 +109,27 @@ def test_executor_control_plane_uses_browserwright_session_param():
     class _CDP:
         def send(self, method, **kwargs):
             calls.append((method, kwargs))
-            return {"exec_sock": "/tmp/bw-exec.sock"}
+            return {
+                "exec_sock": "/tmp/bw-exec.sock",
+                "executor_id": "executor-rdp-7",
+            }
 
-    sess = type("Sess", (), {
-        "session_record": {"id": "rdp-7", "backend": "rdp"},
-        "cdp": _CDP(),
-    })()
+    sess = type(
+        "Sess",
+        (),
+        {
+            "session_record": {"id": "rdp-7", "backend": "rdp"},
+            "cdp": _CDP(),
+        },
+    )()
 
     assert exec_client.ensure_executor(sess) == "/tmp/bw-exec.sock"
-    assert calls == [(
-        "BrowserwrightDaemon.ensureExecutor",
-        {"bsSession": "rdp-7"},
-    )]
+    assert calls == [
+        (
+            "BrowserwrightDaemon.ensureExecutor",
+            {"bsSession": "rdp-7"},
+        )
+    ]
 
 
 def test_discovery_iter_site_dirs_precedence_and_filters(monkeypatch, tmp_path):

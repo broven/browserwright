@@ -127,7 +127,12 @@ def executor_file_path(session_id: str) -> Path:
     return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.json"
 
 
-def write_executor_file(session_id: str, sock: str, pid: int) -> None:
+def write_executor_file(
+    session_id: str,
+    sock: str,
+    pid: int,
+    executor_id: str | None = None,
+) -> None:
     """Atomic write of the executor discovery file (mirrors write_facade_file).
 
     Written by the executor once its socket is bound and the worker is ready,
@@ -135,18 +140,53 @@ def write_executor_file(session_id: str, sock: str, pid: int) -> None:
     fp = executor_file_path(session_id)
     fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_name(fp.name + ".tmp")
-    tmp.write_text(json.dumps({"sock": sock, "pid": pid, "session": session_id}))
+    payload = {"sock": sock, "pid": pid, "session": session_id}
+    if executor_id is not None:
+        payload["executor_id"] = executor_id
+    tmp.write_text(json.dumps(payload))
     os.replace(tmp, fp)
+
+
+def read_executor_record(session_id: str) -> dict | None:
+    """Return a validated executor discovery record, or ``None``.
+
+    ``executor_id`` was added after the original pid/socket format.  Old files
+    remain readable for startup cleanup, while new registry leases require the
+    identity to match before they consider an executor ready.
+    """
+    try:
+        d = json.loads(executor_file_path(session_id).read_text())
+        sock = d["sock"]
+        pid = d["pid"]
+        recorded_session = d["session"]
+        executor_id = d.get("executor_id")
+        if not isinstance(sock, str) or not sock:
+            return None
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        if recorded_session != session_id:
+            return None
+        if executor_id is not None and (
+            not isinstance(executor_id, str) or not executor_id
+        ):
+            return None
+        return {
+            "sock": sock,
+            "pid": pid,
+            "session": recorded_session,
+            "executor_id": executor_id,
+        }
+    except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
+        return None
 
 
 def read_executor_file(session_id: str) -> tuple[str | None, int | None]:
     """Return ``(sock_path, pid)`` of the session's executor, or
     ``(None, None)`` when the discovery file is absent/unreadable."""
-    try:
-        d = json.loads(executor_file_path(session_id).read_text())
-        return str(d["sock"]), int(d["pid"])
-    except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
+    record = read_executor_record(session_id)
+    if record is None:
         return None, None
+    return record["sock"], record["pid"]
 
 
 def cleanup_executor(session_id: str) -> None:

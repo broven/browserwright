@@ -26,9 +26,9 @@ from . import __version__
 HELP = """browserwright — Layer 2 of the browser stack.
 
 Usage:
-  browserwright -s <session-id> -e 'page.goto("https://example.com"); print(page.title())'
-  browserwright -s <session-id> -f script.py
-  browserwright -s <session-id> --code-stdin < script.py
+  browserwright -s <session-id> [--env NAME ...] -e 'page.goto("https://example.com"); print(page.title())'
+  browserwright -s <session-id> [--env NAME ...] -f script.py
+  browserwright -s <session-id> [--env NAME ...] --code-stdin < script.py
 
   browserwright session new --backend=<extension|rdp|env> --name=SESSION_LABEL [--create | --attach=PORT]
   browserwright session reset <id>
@@ -164,7 +164,9 @@ def _bind_cli_session(session_id: Optional[str]):
     return 0
 
 
-def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _parse_execute_args(
+    args: list[str],
+) -> tuple[Optional[str], Optional[str], list[str], Optional[str]]:
     """Parse playwriter-style execution flags.
 
     Supports both short and long forms:
@@ -174,13 +176,14 @@ def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], 
     session_id: Optional[str] = None
     code: Optional[str] = None
     code_file: Optional[str] = None
+    env_names: list[str] = []
     code_stdin = False
     i, n = 0, len(args)
     while i < n:
         a = args[i]
         if a in {"-s", "--session"}:
             if i + 1 >= n:
-                return None, None, f"{a} requires a value"
+                return None, None, [], f"{a} requires a value"
             session_id = args[i + 1]
             i += 2
             continue
@@ -188,11 +191,32 @@ def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], 
             session_id = a.split("=", 1)[1]
             i += 1
             continue
+        if a == "--env":
+            if i + 1 >= n or args[i + 1].startswith("-"):
+                return None, None, [], "--env requires a variable name"
+            name = args[i + 1]
+            error = _validate_execute_env_name(name)
+            if error:
+                return None, None, [], error
+            env_names.append(name)
+            i += 2
+            continue
+        if a.startswith("--env="):
+            name = a.split("=", 1)[1]
+            error = _validate_execute_env_name(name)
+            if error:
+                return None, None, [], error
+            env_names.append(name)
+            i += 1
+            continue
         if a in {"-e", "--execute"}:
             if i + 1 >= n:
-                return None, None, f"{a} requires a value"
+                return None, None, [], f"{a} requires a value"
             if code is not None or code_file is not None or code_stdin:
-                return None, None, "pass only one of -e, -f, or --code-stdin"
+                return (
+                    None, None, [],
+                    "pass only one of -e, -f, or --code-stdin",
+                )
             value = args[i + 1]
             if value == "-":
                 code_stdin = True
@@ -202,7 +226,10 @@ def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], 
             continue
         if a.startswith("--execute="):
             if code is not None or code_file is not None or code_stdin:
-                return None, None, "pass only one of -e, -f, or --code-stdin"
+                return (
+                    None, None, [],
+                    "pass only one of -e, -f, or --code-stdin",
+                )
             value = a.split("=", 1)[1]
             if value == "-":
                 code_stdin = True
@@ -212,49 +239,103 @@ def _parse_execute_args(args: list[str]) -> tuple[Optional[str], Optional[str], 
             continue
         if a in {"-f", "--code-file"}:
             if i + 1 >= n:
-                return None, None, f"{a} requires a value"
+                return None, None, [], f"{a} requires a value"
             if code is not None or code_file is not None or code_stdin:
-                return None, None, "pass only one of -e, -f, or --code-stdin"
+                return (
+                    None, None, [],
+                    "pass only one of -e, -f, or --code-stdin",
+                )
             code_file = args[i + 1]
             i += 2
             continue
         if a.startswith("--code-file="):
             if code is not None or code_file is not None or code_stdin:
-                return None, None, "pass only one of -e, -f, or --code-stdin"
+                return (
+                    None, None, [],
+                    "pass only one of -e, -f, or --code-stdin",
+                )
             code_file = a.split("=", 1)[1]
             i += 1
             continue
         if a == "--code-stdin":
             if code is not None or code_file is not None or code_stdin:
-                return None, None, "pass only one of -e, -f, or --code-stdin"
+                return (
+                    None, None, [],
+                    "pass only one of -e, -f, or --code-stdin",
+                )
             code_stdin = True
             i += 1
             continue
-        return None, None, f"unknown execute argument: {a!r}"
+        return None, None, [], f"unknown execute argument: {a!r}"
     if not session_id:
-        return None, None, "missing session id: pass -s <id>"
+        return None, None, [], "missing session id: pass -s <id>"
     if code_file is not None:
         try:
             code = Path(code_file).read_text()
         except OSError as e:
-            return None, None, f"cannot read code file {code_file!r}: {e}"
+            return (
+                None, None, [],
+                f"cannot read code file {code_file!r}: {e}",
+            )
     elif code_stdin:
         code = sys.stdin.read()
     if code is None:
-        return None, None, "missing code: pass -e '<python>', -f <path>, or --code-stdin"
-    return session_id, code, None
+        return (
+            None, None, [],
+            "missing code: pass -e '<python>', -f <path>, or --code-stdin",
+        )
+    return session_id, code, env_names, None
+
+
+def _validate_execute_env_name(name: str) -> Optional[str]:
+    """Validate one name-only ``--env`` argument without echoing its value."""
+    from ._executor.protocol import is_valid_env_name
+
+    if not name:
+        return "--env requires a variable name"
+    if "=" in name:
+        var_name = name.split("=", 1)[0]
+        if is_valid_env_name(var_name):
+            return (
+                f"--env {var_name!r} must not include a value; "
+                "pass the variable name only"
+            )
+        return "--env must contain a variable name only, not NAME=value"
+    if not is_valid_env_name(name):
+        return "invalid environment variable name for --env"
+    return None
+
+
+def _resolve_execute_env(
+    env_names: list[str],
+) -> tuple[dict[str, str], Optional[str]]:
+    """Select explicit variables from this CLI process for one request."""
+    values: dict[str, str] = {}
+    for name in env_names:
+        if name not in os.environ:
+            return {}, f"environment variable {name!r} is not set"
+        values[name] = os.environ[name]
+    return values, None
 
 
 def _cmd_execute(args: list[str]) -> int:
-    session_id, code, err = _parse_execute_args(args)
+    session_id, code, env_names, err = _parse_execute_args(args)
     if err:
         print(f"usage error: {err}", file=sys.stderr)
-        print("usage: browserwright -s <session-id> "
+        print("usage: browserwright -s <session-id> [--env NAME ...] "
               "(-e 'print(snapshot())' | -f script.py | --code-stdin)",
               file=sys.stderr)
         return 1
+    request_env, err = _resolve_execute_env(env_names)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
     from .repl import inline
-    return inline.run_code(code or "", session_id=session_id or "")
+    return inline.run_code(
+        code or "",
+        session_id=session_id or "",
+        env=request_env,
+    )
 
 
 def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
@@ -293,19 +374,46 @@ def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
             kwargs.update(json.loads(js))
         elif isinstance(js, dict):
             kwargs.update(js)
-    from .task_runner import run_task
+    isolated = bool(kwargs.pop("isolated", False))
+    from ._executor.client import run_task_on_executor
+    from .session import current_session
+
     try:
-        result = run_task(site, name, **kwargs)
-    except FileNotFoundError as e:
-        print(f"task not found: {e}", file=sys.stderr)
-        return 1
+        response = run_task_on_executor(
+            current_session(),
+            site,
+            name,
+            args=kwargs,
+            isolated=isolated,
+        )
     except Exception as e:  # noqa: BLE001
         print(f"task crashed: {e!r}", file=sys.stderr)
         return 3
+    if response.console:
+        sys.stdout.write(response.console)
+    for warning in response.warnings:
+        sys.stderr.write(f"[WARNING] {warning}\n")
+    if response.truncated:
+        sys.stderr.write("[output truncated]\n")
+    if response.error is not None:
+        error_type = str(response.error.get("type") or "Exception")
+        message = str(response.error.get("msg") or "")
+        if error_type == "FileNotFoundError":
+            print(f"task not found: {message}", file=sys.stderr)
+            return 1
+        print(f"task crashed: {error_type}({message!r})", file=sys.stderr)
+        return response.exit_code or 3
+    if response.task_result_json is None:
+        print("task crashed: executor returned no task result", file=sys.stderr)
+        return 3
     if json_output:
+        result = json.loads(response.task_result_json)
         sys.stdout.write(json.dumps(result, default=str))
     else:
-        sys.stdout.write(repr(result))
+        if response.return_value is None:
+            print("task crashed: executor returned no repr result", file=sys.stderr)
+            return 3
+        sys.stdout.write(response.return_value)
     sys.stdout.write("\n")
     return 0
 
@@ -513,15 +621,16 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
         return 0
 
     if sub == "reset":
-        from .errors import NoSession
+        from .errors import BrowserwrightError
         from .session_ctx import resolve_session_or_env
         raw_sid = args[1] if len(args) > 1 and not args[1].startswith("--") else session_id
         try:
             rec = resolve_session_or_env(raw_sid)
-        except NoSession as e:
+            message = session_create.reset_executor(rec)
+        except BrowserwrightError as e:
             print(str(e), file=sys.stderr)
             return e.exit_code
-        print(session_create.reset_executor(rec))
+        print(message)
         return 0
 
     if sub == "list":
@@ -595,20 +704,29 @@ def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int
                 raise RuntimeError(
                     "no drivable session bound; pass -s <id> or set BD_SESSION"
                 )
-            # Drive the verify through the same Playwright path the agent
-            # uses (the legacy CDP primitives are gone): bind the session's
-            # current tab, reload it, screenshot it, print the path.
-            from .repl.playwright_handle import PlaywrightHandle
+            # Verification is another instruction in this session, so route
+            # it through the resident executor instead of creating a second
+            # Playwright connection. This preserves FIFO ordering and the
+            # exact page binding used by -e and task.
+            from ._executor.client import run_on_executor
+            from .session import current_session
 
-            handle = PlaywrightHandle()
-            try:
-                page = handle.page
-                page.reload(wait_until="load")
-                shot = _fresh_screenshot_path()
-                page.screenshot(path=shot)
-                print(shot)
-            finally:
-                handle.close()
+            shot = _fresh_screenshot_path()
+            response = run_on_executor(
+                current_session(),
+                "page.reload(wait_until='load')\n"
+                f"page.screenshot(path={shot!r})",
+            )
+            if response.error is not None or response.exit_code != 0:
+                error = response.error or {
+                    "type": "ExecutorError",
+                    "msg": f"verify exited with code {response.exit_code}",
+                }
+                raise RuntimeError(
+                    f"{error.get('type', 'ExecutorError')}: "
+                    f"{error.get('msg', '')}"
+                )
+            print(shot)
         except Exception as e:
             print(f"pushed OK — --verify skipped (no drivable tab): {e}",
                   file=sys.stderr)
@@ -731,6 +849,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             command_argv[0] in {"-e", "--execute", "-f", "--code-file", "--code-stdin"}
             or command_argv[0].startswith("--execute=")
             or command_argv[0].startswith("--code-file=")
+            or command_argv[0] == "--env"
+            or command_argv[0].startswith("--env=")
         ):
             sys.exit(_cmd_execute(argv))
         argv = command_argv

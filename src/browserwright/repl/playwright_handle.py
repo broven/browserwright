@@ -36,8 +36,12 @@ from __future__ import annotations
 import os
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
-from ..errors import BrowserwrightError
+from ..errors import BrowserwrightError, PageBindTimeout
+
+_PAGE_BIND_TIMEOUT_S = 2.0
+_PAGE_BIND_POLL_INTERVAL_S = 0.05
 
 
 class FacadeUnavailable(BrowserwrightError):
@@ -212,14 +216,15 @@ def bind_current_page(context: Any, sess: Any) -> Any:
         tab. ``context.new_page()`` over the facade would open an un-grouped
         tab the agent path can't track → ledger drift → tab explosion.
 
-    We then attach Playwright to that exact tab by matching the agent's
-    targetId against ``context.pages`` (the facade replays ``attached`` events
-    for every open tab, so a session-group tab IS enumerable). Mapping is done
-    WITHOUT any Playwright CDP session — a per-page (``context.new_cdp_session``)
-    or even a second browser-level (``new_browser_cdp_session``) session is
-    FATAL over the extension facade (the facade reuses one synthetic sessionId
-    → a Playwright-driver assert kills the connection). We correlate by URL via
-    the AGENT path instead.
+    We then attach Playwright to that exact tab by writing a short-lived random
+    marker through the already-attached AGENT target session and accepting only
+    the ``context.pages`` entry that reads it. The facade replays ``attached``
+    events for every open tab, so a session-group tab is enumerable once
+    materialized. Mapping creates NO Playwright CDP session — a per-page
+    (``context.new_cdp_session``) or even a second browser-level
+    (``new_browser_cdp_session``) session is fatal over the extension facade
+    because it reuses one synthetic sessionId and trips a Playwright-driver
+    assertion.
     """
     from ..session_runtime import resolve_current_target
     from ._smart_goto import patch_context_pages, patch_page_goto
@@ -231,21 +236,61 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     target_id = info.get("targetId") if isinstance(info, dict) else None
 
     if target_id:
-        page = page_for_target(context, sess, target_id, info.get("url"))
+        page = _wait_for_target_page(
+            context,
+            sess,
+            target_id,
+            info.get("url"),
+            timeout=_PAGE_BIND_TIMEOUT_S,
+        )
         if page is not None:
             return patch_page_goto(page)
-        if _wait_for_session_announce(sess, timeout=2.0):
-            page = page_for_target(context, sess, target_id, info.get("url"))
-            if page is not None:
-                return patch_page_goto(page)
 
-    # Could not correlate a Playwright Page to the agent tab (e.g. the facade
-    # hasn't replayed it yet). Fall back to a Playwright-created page so the
-    # agent still gets a usable handle; the agent ledger already points at the
-    # current tab for the next cold-start.
-    if context.pages:
-        return patch_page_goto(context.pages[0])
-    return patch_page_goto(context.new_page())
+    # The agent path has already resolved (and, for an empty workspace,
+    # created) the session's one authoritative target. Never manufacture a
+    # second target merely because the facade has not exposed the first one to
+    # Playwright yet: that splits the ledger and Playwright views and is the
+    # source of duplicate user-visible tabs.
+    raise PageBindTimeout(
+        target_id=target_id or "",
+        timeout=_PAGE_BIND_TIMEOUT_S,
+    )
+
+
+def _wait_for_target_page(
+    context: Any,
+    sess: Any,
+    target_id: str,
+    hint_url: str | None,
+    *,
+    timeout: float,
+) -> Any | None:
+    """Wait for Playwright to expose the agent-resolved target.
+
+    The daemon announce is the efficient extension-backend wake-up. Polling
+    ``context.pages`` after it returns covers the short interval between the
+    facade emitting the target event and Playwright materializing its ``Page``.
+    This function only correlates existing pages; it never creates a target.
+    """
+    import time
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    page = page_for_target(context, sess, target_id, hint_url)
+    if page is not None:
+        return page
+
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        _wait_for_session_announce(sess, timeout=remaining)
+
+    while True:
+        page = page_for_target(context, sess, target_id, hint_url)
+        if page is not None:
+            return page
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(_PAGE_BIND_POLL_INTERVAL_S, remaining))
 
 
 def _wait_for_session_announce(sess: Any, *, timeout: float) -> bool:
@@ -274,17 +319,36 @@ def page_for_target(context: Any, sess: Any, target_id: str,
                      hint_url: str | None = None) -> Any | None:
     """Find the live Playwright Page for the session's ``target_id``.
 
-    Mapping uses NO Playwright CDP session (fatal over the extension facade —
-    see ``_agent_page_targets``). Steady state — the session owns exactly one
-    tab — binds that page directly (one tab per session is the whole point of
-    the reuse discipline, and also resolves the ``about:blank`` ambiguity URLs
-    can't). Otherwise correlate the target's URL (agent-path
-    ``Target.getTargets``, or the caller's hint) to the matching page."""
+    Mapping uses NO *Playwright-created* CDP session (fatal over the extension
+    facade — see ``_agent_page_targets``). Instead, the already-attached agent
+    path writes a short-lived random marker into the exact target's main world;
+    only the Playwright Page that can read that marker is accepted. This avoids
+    guessing from page count or URL, both of which are ambiguous for launcher
+    tabs, duplicate URLs, and several ``about:blank`` pages.
+
+    Lightweight unit-test doubles without an agent CDP surface retain a strict
+    unique-URL fallback. A real Session whose marker command fails returns no
+    match and lets the outer wait retry; it never degrades to a guess."""
     pages = list(context.pages)
     if not pages:
         return None
-    if len(pages) == 1:
-        return pages[0]
+
+    marker_attempted, marker = _install_target_marker(sess, target_id)
+    if marker_attempted:
+        if marker is None:
+            return None
+        key, value, cdp, session_id = marker
+        try:
+            matches = [
+                page for page in pages
+                if _page_has_target_marker(page, key, value)
+            ]
+            return matches[0] if len(matches) == 1 else None
+        finally:
+            _clear_target_marker(cdp, session_id, key)
+
+    # Test-double compatibility only: without an agent CDP path, require a
+    # unique URL match. Never use the old singleton/last-match heuristics.
     url = hint_url
     if url is None:
         targets = _agent_page_targets(sess)
@@ -293,17 +357,80 @@ def page_for_target(context: Any, sess: Any, target_id: str,
     if not url:
         return None
     matches = [p for p in pages if p.url == url]
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0]
-    # Ambiguous (e.g. several `about:blank` tabs incl. a non-session one):
-    # prefer the MOST-RECENTLY-announced match. The facade replays targets in
-    # creation order, so the session's just-opened tab is announced last —
-    # `context.pages` preserves that order. This disambiguates the fresh-blank
-    # first bind; once the agent tab carries real content its url is unique and
-    # the tie never arises.
-    return matches[-1]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _install_target_marker(
+    sess: Any,
+    target_id: str,
+) -> tuple[bool, tuple[str, str, Any, str] | None]:
+    """Mark ``target_id`` through the existing agent CDP attachment.
+
+    Returns ``(False, None)`` only for lightweight objects with no ``cdp``
+    attribute (unit-test doubles). For a real Session, ``True`` means exact
+    matching was attempted; a failed attach/evaluate returns ``(True, None)``
+    so callers retry rather than fall back to an inexact URL guess.
+    """
+    try:
+        cdp = sess.cdp
+    except AttributeError:
+        return False, None
+    except Exception:
+        return True, None
+
+    key = f"__browserwright_bind_{uuid4().hex}"
+    value = uuid4().hex
+    try:
+        session_id = cdp.attach(target_id)
+        import json
+
+        expression = (
+            "(() => {"
+            f"Object.defineProperty(globalThis, {json.dumps(key)}, "
+            f"{{value: {json.dumps(value)}, configurable: true}});"
+            "return true;"
+            "})()"
+        )
+        result = cdp.send(
+            "Runtime.evaluate",
+            session=session_id,
+            expression=expression,
+            returnByValue=True,
+        )
+        if result.get("exceptionDetails"):
+            return True, None
+    except Exception:
+        return True, None
+    return True, (key, value, cdp, session_id)
+
+
+def _page_has_target_marker(page: Any, key: str, value: str) -> bool:
+    try:
+        return bool(page.evaluate(
+            "([key, value]) => globalThis[key] === value",
+            [key, value],
+        ))
+    except Exception:
+        return False
+
+
+def _clear_target_marker(
+    cdp: Any,
+    session_id: str,
+    key: str,
+) -> None:
+    """Best-effort cleanup of the temporary page-global marker."""
+    try:
+        import json
+
+        cdp.send(
+            "Runtime.evaluate",
+            session=session_id,
+            expression=f"delete globalThis[{json.dumps(key)}]",
+            returnByValue=True,
+        )
+    except Exception:
+        pass
 
 
 class PlaywrightHandle:

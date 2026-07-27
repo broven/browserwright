@@ -12,13 +12,14 @@ browser) are covered by `tests/daemon/e2e/test_l2_phase_b_executor.py`.
 """
 from __future__ import annotations
 
+import os
 import socket
 
 import pytest
 
 from browserwright._executor import client as executor_client
-from browserwright._executor.client import ExecutorUnavailable
 from browserwright._executor import protocol
+from browserwright._executor.client import ExecutorUnavailable
 from browserwright._executor.process import _LivePageHolder, _Worker
 from browserwright.repl import inline
 
@@ -85,7 +86,7 @@ def test_run_on_executor_touches_session_before_ensure(monkeypatch):
     )
     monkeypatch.setattr(
         executor_client,
-        "ensure_executor",
+        "_ensure_executor_lease",
         lambda sess: order.append("ensure") or (_ for _ in ()).throw(
             ExecutorUnavailable("stop after ensure")
         ),
@@ -97,6 +98,184 @@ def test_run_on_executor_touches_session_before_ensure(monkeypatch):
     assert order == ["touch:sess-touch", "ensure"]
 
 
+def test_run_on_executor_forwards_explicit_request_env(monkeypatch):
+    captured: dict = {}
+
+    class _Sess:
+        session_record = {"id": "sess-env"}
+
+    class _Connection:
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(executor_client.reg, "touch", lambda _sid: None)
+    monkeypatch.setattr(
+        executor_client,
+        "_ensure_executor_lease",
+        lambda _sess: executor_client.ExecutorLease("/tmp/exec.sock", "executor-env"),
+    )
+    monkeypatch.setattr(
+        executor_client,
+        "_connect",
+        lambda _path, *, timeout: _Connection(),
+    )
+    monkeypatch.setattr(
+        executor_client,
+        "send_message",
+        lambda _conn, payload: captured.setdefault("payload", payload),
+    )
+    monkeypatch.setattr(
+        executor_client,
+        "recv_message",
+        lambda _conn: protocol.ExecuteResponse(console="ok\n").to_dict(),
+    )
+
+    response = executor_client.run_on_executor(
+        _Sess(),
+        "page.url",
+        env={"SITE_TOKEN": "request-only"},
+    )
+
+    assert captured["payload"]["env"] == {"SITE_TOKEN": "request-only"}
+    assert captured["payload"]["executor_id"] == "executor-env"
+    assert captured["closed"] is True
+    assert response.console == "ok\n"
+
+
+def _client_test_session(cdp_calls, connection_state=None):
+    class _CDP:
+        def send(self, method, **params):
+            if connection_state is not None:
+                assert connection_state["closed"] is True
+            cdp_calls.append((method, params))
+            return {"ok": True, "killed": True, "reaped": True}
+
+    class _Sess:
+        session_record = {"id": "sess-client"}
+        cdp = _CDP()
+
+    return _Sess()
+
+
+def _stub_client_transport(monkeypatch, response_or_error, connection_state=None):
+    class _Connection:
+        def close(self):
+            if connection_state is not None:
+                connection_state["closed"] = True
+
+    monkeypatch.setattr(executor_client.reg, "touch", lambda _sid: None)
+    monkeypatch.setattr(
+        executor_client,
+        "_ensure_executor_lease",
+        lambda _sess: executor_client.ExecutorLease(
+            "/tmp/exec.sock", "executor-client"
+        ),
+    )
+    monkeypatch.setattr(executor_client, "_connect", lambda *_a, **_kw: _Connection())
+    monkeypatch.setattr(executor_client, "send_message", lambda *_a: None)
+
+    def _recv(_conn):
+        if isinstance(response_or_error, BaseException):
+            raise response_or_error
+        if isinstance(response_or_error, dict):
+            return response_or_error
+        return response_or_error.to_dict()
+
+    monkeypatch.setattr(executor_client, "recv_message", _recv)
+
+
+def test_outer_deadline_waits_for_exact_executor_reap(monkeypatch):
+    calls = []
+    connection_state = {"closed": False}
+    _stub_client_transport(
+        monkeypatch,
+        protocol.ExecuteResponse(
+            error={"type": "TimeoutError", "msg": "outer deadline"},
+            exit_code=3,
+            terminal_reason="deadline_exceeded",
+        ),
+        connection_state,
+    )
+
+    response = executor_client.run_on_executor(
+        _client_test_session(calls, connection_state), "slow()", timeout_ms=10
+    )
+
+    assert response.terminal_reason == "deadline_exceeded"
+    assert calls == [
+        (
+            "BrowserwrightDaemon.killExecutor",
+            {
+                "bsSession": "sess-client",
+                "executorId": "executor-client",
+                "wait": True,
+            },
+        )
+    ]
+
+
+def test_ordinary_action_timeout_does_not_recycle_executor(monkeypatch):
+    calls = []
+    _stub_client_transport(
+        monkeypatch,
+        protocol.ExecuteResponse(
+            error={"type": "TimeoutError", "msg": "locator timed out"},
+            exit_code=3,
+        ),
+    )
+
+    response = executor_client.run_on_executor(
+        _client_test_session(calls), "page.click('x')"
+    )
+
+    assert response.error["type"] == "TimeoutError"
+    assert response.terminal_reason is None
+    assert calls == []
+
+
+def test_ambiguous_recv_after_send_reaps_exact_executor(monkeypatch):
+    calls = []
+    connection_state = {"closed": False}
+    _stub_client_transport(
+        monkeypatch,
+        ConnectionError("closed after request was sent"),
+        connection_state,
+    )
+
+    with pytest.raises(ExecutorUnavailable):
+        executor_client.run_on_executor(
+            _client_test_session(calls, connection_state), "page.click('x')")
+
+    assert calls[0][1]["executorId"] == "executor-client"
+    assert calls[0][1]["wait"] is True
+
+
+def test_malformed_response_after_send_reaps_exact_executor(monkeypatch):
+    calls = []
+    connection_state = {"closed": False}
+    _stub_client_transport(
+        monkeypatch,
+        {"terminal_reason": "not-a-valid-reason"},
+        connection_state,
+    )
+
+    with pytest.raises(ExecutorUnavailable, match="malformed response"):
+        executor_client.run_on_executor(
+            _client_test_session(calls, connection_state), "page.click('x')")
+
+    assert calls[0][1]["executorId"] == "executor-client"
+
+
+def test_keyboard_interrupt_after_send_best_effort_recycles(monkeypatch):
+    calls = []
+    _stub_client_transport(monkeypatch, KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        executor_client.run_on_executor(_client_test_session(calls), "page.click('x')")
+
+    assert calls[0][1]["executorId"] == "executor-client"
+
+
 # ---- wire framing ----------------------------------------------------------
 
 
@@ -104,10 +283,19 @@ def test_request_roundtrip():
     a, b = socket.socketpair()
     try:
         protocol.send_message(
-            a, protocol.ExecuteRequest("print('hi')", 12345).to_dict())
+            a,
+            protocol.ExecuteRequest(
+                "print('hi')",
+                12345,
+                env={"BROWSERWRIGHT_TEST_TOKEN": "request-only"},
+                executor_id="executor-roundtrip",
+            ).to_dict(),
+        )
         got = protocol.ExecuteRequest.from_dict(protocol.recv_message(b))
         assert got.code == "print('hi')"
         assert got.timeout_ms == 12345
+        assert got.env == {"BROWSERWRIGHT_TEST_TOKEN": "request-only"}
+        assert got.executor_id == "executor-roundtrip"
     finally:
         a.close()
         b.close()
@@ -117,20 +305,42 @@ def test_request_defaults_and_validation():
     # Missing/invalid timeout falls back to the default.
     r = protocol.ExecuteRequest.from_dict({"code": "x"})
     assert r.timeout_ms == protocol.DEFAULT_TIMEOUT_MS
+    assert r.env == {}
     r2 = protocol.ExecuteRequest.from_dict({"code": "x", "timeout_ms": -5})
     assert r2.timeout_ms == protocol.DEFAULT_TIMEOUT_MS
     # Non-string code is rejected.
     with pytest.raises(ValueError):
         protocol.ExecuteRequest.from_dict({"code": 123})
+    with pytest.raises(ValueError):
+        protocol.ExecuteRequest.from_dict({"code": "x", "env": []})
+    with pytest.raises(ValueError):
+        protocol.ExecuteRequest.from_dict(
+            {
+                "code": "x",
+                "env": {"TOKEN": 123},
+            }
+        )
+    with pytest.raises(ValueError) as exc:
+        protocol.ExecuteRequest.from_dict(
+            {
+                "code": "x",
+                "env": {"TOKEN=do-not-print": "ignored"},
+            }
+        )
+    assert "do-not-print" not in str(exc.value)
 
 
 def test_response_roundtrip():
     a, b = socket.socketpair()
     try:
         resp = protocol.ExecuteResponse(
-            console="out\n", return_value="42",
-            error={"type": "X", "msg": "boom"}, exit_code=3,
-            warnings=["w1"])
+            console="out\n",
+            return_value="42",
+            error={"type": "X", "msg": "boom"},
+            exit_code=3,
+            warnings=["w1"],
+            terminal_reason="deadline_exceeded",
+        )
         protocol.send_message(a, resp.to_dict())
         got = protocol.ExecuteResponse.from_dict(protocol.recv_message(b))
         assert got.console == "out\n"
@@ -138,6 +348,7 @@ def test_response_roundtrip():
         assert got.error == {"type": "X", "msg": "boom"}
         assert got.exit_code == 3
         assert got.warnings == ["w1"]
+        assert got.terminal_reason == "deadline_exceeded"
     finally:
         a.close()
         b.close()
@@ -151,6 +362,78 @@ def test_recv_message_closed_socket_raises():
             protocol.recv_message(b)
     finally:
         b.close()
+
+
+def test_serve_flushes_terminal_response_then_stops(monkeypatch):
+    from browserwright._executor import process as process_mod
+
+    server, client = socket.socketpair()
+
+    class _Listener:
+        def accept(self):
+            return server, None
+
+    class _WorkerStub:
+        _executor_id = "executor-serve"
+
+        def submit(self, req):
+            assert req.executor_id == self._executor_id
+            return protocol.ExecuteResponse(
+                terminal_reason="deadline_exceeded",
+                exit_code=3,
+            )
+
+    monkeypatch.setattr(process_mod, "_touch_discovery", lambda *_a: None)
+    protocol.send_message(
+        client,
+        protocol.ExecuteRequest(
+            "slow()",
+            executor_id="executor-serve",
+        ).to_dict(),
+    )
+
+    process_mod._serve("sess", _Listener(), _WorkerStub())
+
+    response = protocol.ExecuteResponse.from_dict(protocol.recv_message(client))
+    assert response.terminal_reason == "deadline_exceeded"
+    client.close()
+
+
+def test_serve_clears_decoded_env_frame_before_submit(monkeypatch):
+    from browserwright._executor import process as process_mod
+
+    payload = protocol.ExecuteRequest(
+        "print('ok')",
+        env={"BROWSERWRIGHT_TEST_SECRET_REF": "request-only"},
+        executor_id="executor-serve",
+    ).to_dict()
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Listener:
+        def accept(self):
+            return _Connection(), None
+
+    class _WorkerStub:
+        _executor_id = "executor-serve"
+
+        def submit(self, req):
+            assert payload == {}
+            req.env.clear()
+            return protocol.ExecuteResponse(terminal_reason="reset_requested")
+
+    monkeypatch.setattr(process_mod, "recv_message", lambda _conn: payload)
+    monkeypatch.setattr(process_mod, "send_message", lambda *_args: None)
+    monkeypatch.setattr(process_mod, "_touch_discovery", lambda *_args: None)
+
+    process_mod._serve("sess", _Listener(), _WorkerStub())
+
+    assert payload == {}
 
 
 # ---- executor namespace injection -----------------------------------------
@@ -183,6 +466,105 @@ def _fake_worker_with_objects():
     # the code with a cold-start error.
     w._connected = True
     return w, page
+
+
+def test_request_env_is_visible_only_during_one_executor_call(monkeypatch):
+    """A secret injected into the short-lived CLI process must be explicitly
+    forwarded to the resident executor, then removed before the next call."""
+    key = "BROWSERWRIGHT_TEST_EPHEMERAL"
+    monkeypatch.delenv(key, raising=False)
+    worker, _page = _fake_worker_with_objects()
+
+    first = worker._execute(
+        protocol.ExecuteRequest(
+            f"import os\nprint(os.environ[{key!r}])",
+            1000,
+            env={key: "request-only"},
+        )
+    )
+    second = worker._execute(
+        protocol.ExecuteRequest(
+            f"import os\nprint(os.environ.get({key!r}, 'missing'))",
+            1000,
+        )
+    )
+
+    assert first.exit_code == 0
+    assert first.console == "request-only\n"
+    assert second.console == "missing\n"
+    assert key not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_exit"),
+    [
+        ("import os\nos.environ['BROWSERWRIGHT_TEST_RESTORE'] = 'changed'", 0),
+        ("import os\ndel os.environ['BROWSERWRIGHT_TEST_RESTORE']", 0),
+        ("raise RuntimeError('boom')", 3),
+        ("raise KeyboardInterrupt()", 3),
+        ("raise SystemExit(7)", 7),
+    ],
+)
+def test_request_env_restores_existing_value_on_every_exit(
+    monkeypatch,
+    code,
+    expected_exit,
+):
+    key = "BROWSERWRIGHT_TEST_RESTORE"
+    monkeypatch.setenv(key, "executor-original")
+    worker, _page = _fake_worker_with_objects()
+
+    response = worker._execute(
+        protocol.ExecuteRequest(
+            code,
+            1000,
+            env={key: "request-only"},
+        )
+    )
+
+    assert response.exit_code == expected_exit
+    assert os.environ[key] == "executor-original"
+
+
+def test_request_env_is_installed_after_cold_start(monkeypatch):
+    key = "BROWSERWRIGHT_TEST_AFTER_COLD_START"
+    monkeypatch.delenv(key, raising=False)
+    worker, _page = _fake_worker_with_objects()
+    worker._connected = False
+
+    def fake_cold_start():
+        assert key not in os.environ
+        worker._connected = True
+
+    monkeypatch.setattr(worker, "_ensure_cold_started", fake_cold_start)
+
+    response = worker._execute(
+        protocol.ExecuteRequest(
+            f"import os\nprint(os.environ[{key!r}])",
+            1000,
+            env={key: "request-only"},
+        )
+    )
+
+    assert response.console == "request-only\n"
+    assert key not in os.environ
+
+
+def test_worker_loop_drops_request_env_references():
+    worker, _page = _fake_worker_with_objects()
+    worker.start()
+    request = protocol.ExecuteRequest(
+        "print('ok')",
+        1000,
+        env={"BROWSERWRIGHT_TEST_SECRET_REF": "request-only"},
+    )
+
+    response = worker.submit(request)
+    worker.shutdown()
+    worker._thread.join(timeout=2.0)
+
+    assert response.console == "ok\n"
+    assert request.env == {}
 
 
 def test_namespace_injects_live_objects_and_state():
@@ -362,149 +744,22 @@ def _arm_fake_browser(w):
     return b
 
 
-def test_reset_disarms_old_rearms_new_without_exiting(monkeypatch):
-    import browserwright._executor.process as proc
-
-    w, page = _fake_worker_with_objects()
-    w._state["keep"] = "no"
-    # reset() reuses the live driver; fake it so reset() does not enter the real
-    # sync_playwright() manager (the driver was entered at cold-start).
-    w._pw_cm = object()
-    w._pw = object()
-    old_browser = _arm_fake_browser(w)
-    old_handler = w._facade_death_handler
-
-    rebuilt = {"called": False, "new_browser": None}
-
-    def fake_connect_and_bind(self):
-        # Simulate a successful rebuild: new browser + re-arm.
-        rebuilt["called"] = True
-        nb = _FakeBrowser()
-        self._browser = nb
-        self._arm_facade_death()
-        rebuilt["new_browser"] = nb
-
-    monkeypatch.setattr(proc._Worker, "_connect_and_bind", fake_connect_and_bind)
-
-    # If reset wrongly tripped the self-exit, this would call os._exit; guard it.
-    exited = {"code": None}
-    monkeypatch.setattr(proc.os, "_exit", lambda c: exited.__setitem__("code", c))
-
-    w._reset()
-
-    # Old handler detached from the old browser (intentional disconnect must NOT
-    # self-exit).
-    assert old_handler not in old_browser.handlers.get("disconnected", [])
-    # New browser is armed with a FRESH handler.
-    assert rebuilt["called"] is True
-    nb = rebuilt["new_browser"]
-    assert w._browser is nb
-    assert w._facade_death_handler is not None
-    assert nb.handlers["disconnected"] == [w._facade_death_handler]
-    # state cleared (Fork 6).
-    assert w._state == {}
-    # The process was NOT exited.
-    assert exited["code"] is None
-
-
-def test_reset_reuses_driver_does_not_exit_sync_playwright(monkeypatch):
-    """Failure 2 (CODE bug): reset() must REUSE the live `sync_playwright()`
-    driver — Playwright's sync event loop is thread-bound and cannot be
-    restarted once `__exit__`-ed (re-entering yields "Event loop is closed").
-
-    Assert: reset() does NOT `__exit__` the manager, but DOES re-run
-    `connect_over_cdp` on the SAME driver instance (rebuild on the live `_pw`)."""
-    import browserwright._executor.process as proc
-
-    w, _page = _fake_worker_with_objects()
-
-    class _FakeCM:
-        def __init__(self):
-            self.entered = 0
-            self.exited = 0
-            self.driver = object()
-
-        def __enter__(self):
-            self.entered += 1
-            return self.driver
-
-        def __exit__(self, *a):
-            self.exited += 1
-            return False
-
-    cm = _FakeCM()
-    # Simulate a completed cold-start: driver already entered (we set _pw to the
-    # live driver directly, as _start_driver would have left it), browser armed.
-    w._pw_cm = cm
-    w._pw = cm.driver
-    _arm_fake_browser(w)
-
-    connect_calls = {"pw": [], "n": 0}
-
-    def fake_connect_over_cdp(pw, **_kw):
-        # The executor cold-start now passes attempts=/backoff_s= for the
-        # Failure #4 retry; accept + ignore them in the stub.
-        connect_calls["n"] += 1
-        connect_calls["pw"].append(pw)
-        return _FakeBrowser()
-
-    def fake_context_for_browser(_b):
-        class _Ctx:
-            pages = []
-        return _Ctx()
-
-    def fake_bind_current_page(_ctx, _sess):
-        class _P:
-            url = "about:blank"
-        return _P()
-
-    monkeypatch.setattr(
-        "browserwright.repl.playwright_handle.connect_over_cdp",
-        fake_connect_over_cdp)
-    monkeypatch.setattr(
-        "browserwright.repl.playwright_handle.context_for_browser",
-        fake_context_for_browser)
-    monkeypatch.setattr(
-        "browserwright.repl.playwright_handle.bind_current_page",
-        fake_bind_current_page)
-    monkeypatch.setattr("browserwright.session.current_session", lambda: object())
-    monkeypatch.setattr(proc.os, "_exit", lambda c: None)
-
-    w._reset()
-
-    # The driver manager was NEVER exited (would kill the thread-bound loop)
-    # and NEVER re-entered (the event loop can't be restarted in-thread).
-    assert cm.exited == 0, "reset() must not __exit__ the sync_playwright manager"
-    assert cm.entered == 0, "reset() must not re-enter sync_playwright"
-    # connect_over_cdp ran again, on the SAME live driver instance.
-    assert connect_calls["n"] == 1
-    assert connect_calls["pw"] == [cm.driver]
-    # The driver references are intact (reused), not nulled.
-    assert w._pw is cm.driver and w._pw_cm is cm
-
-
-def test_reset_is_injected_and_clears_state(monkeypatch):
-    import browserwright._executor.process as proc
-
+def test_reset_is_terminal_and_skips_following_statements():
     w, _page = _fake_worker_with_objects()
     w._state["x"] = 1
-    # reset() reuses the live driver; fake it so reset() does not enter the real
-    # sync_playwright() manager.
-    w._pw_cm = object()
-    w._pw = object()
-    _arm_fake_browser(w)
-
-    def fake_connect_and_bind(self):
-        self._browser = _FakeBrowser()
-        self._arm_facade_death()
-
-    monkeypatch.setattr(proc._Worker, "_connect_and_bind", fake_connect_and_bind)
-    monkeypatch.setattr(proc.os, "_exit", lambda c: None)
-
-    # reset() is reachable from the exec namespace and clears state.
-    r = w._execute(protocol.ExecuteRequest("reset()", 1000))
+    r = w._execute(
+        protocol.ExecuteRequest(
+            "print('before')\nreset()\nstate['after'] = True",
+            1000,
+        )
+    )
     assert r.exit_code == 0 and r.error is None
-    assert w._state == {}
+    assert r.console == "before\n"
+    assert r.terminal_reason == "reset_requested"
+    assert "after" not in w._state
+    # The dying worker is not reconnected in place; its state disappears with
+    # the process after the terminal response is flushed.
+    assert w._state == {"x": 1}
 
 
 # ---- SIGTERM self-cleanup (Failure 3 defense-in-depth) ---------------------
@@ -544,7 +799,7 @@ def test_sigterm_handler_unlinks_discovery_and_exits(monkeypatch):
 # ---- PR3: timeout enforcement ---------------------------------------------
 
 
-def test_submit_timeout_does_not_wedge_next_call():
+def test_submit_timeout_has_terminal_deadline_disposition():
     import threading
     import time as _time
 
@@ -558,13 +813,9 @@ def test_submit_timeout_does_not_wedge_next_call():
     release = threading.Event()
 
     def worker_loop():
-        # First item: slow.
         req, box = w._q.get()
         release.wait(2.0)
         box.put(protocol.ExecuteResponse(console="slow-done\n", exit_code=0))
-        # Second item: fast.
-        req2, box2 = w._q.get()
-        box2.put(protocol.ExecuteResponse(console="fast-done\n", exit_code=0))
 
     t = threading.Thread(target=worker_loop, daemon=True)
     t.start()
@@ -575,21 +826,16 @@ def test_submit_timeout_does_not_wedge_next_call():
     assert _time.monotonic() - t0 < 1.0
     assert r1.error is not None and r1.error["type"] == "TimeoutError"
     assert r1.exit_code == 3
+    assert r1.terminal_reason == "deadline_exceeded"
 
-    # The worker is still finishing the slow call; let it complete, then the
-    # NEXT submit must succeed (the queue did not wedge).
+    # The process-level serve loop flushes this terminal response and exits;
+    # release the fake worker only so this unit-test thread can finish.
     release.set()
-    r2 = w.submit(protocol.ExecuteRequest("fast()", timeout_ms=5000))
-    assert r2.exit_code == 0
-    assert "fast-done" in r2.console
     t.join(timeout=3.0)
 
 
-def test_submit_grants_cold_start_slack_on_first_call(monkeypatch):
-    """The FIRST execute (worker not yet `_connected`) gets the cold-start slack
-    added to the `submit` wait, so a connect+code run that exceeds the bare
-    `timeout_ms` is NOT reported as a per-call timeout. Once connected, the slack
-    is gone (the bare `timeout_ms` applies)."""
+def test_submit_deadline_includes_cold_start(monkeypatch):
+    """Cold-start and warm execution use the same outer request deadline."""
     import browserwright._executor.process as proc
 
     captured: list[float] = []
@@ -608,13 +854,12 @@ def test_submit_grants_cold_start_slack_on_first_call(monkeypatch):
     monkeypatch.setattr(proc.queue, "Queue", _FakeBox)
 
     w = _Worker("sess-slack")
-    # Not connected → first-call slack is added.
+    # Not connected still uses the exact caller deadline.
     assert w._connected is False
     w.submit(protocol.ExecuteRequest("page.goto('x')", timeout_ms=1000))
-    first_wait = captured[-1]
-    assert first_wait == pytest.approx(1.0 + proc._COLD_START_WAIT_SLACK_S)
+    assert captured[-1] == pytest.approx(1.0)
 
-    # Connected → no slack, bare per-call timeout.
+    # Connected uses the same deadline.
     w._connected = True
     w.submit(protocol.ExecuteRequest("page.title()", timeout_ms=1000))
     assert captured[-1] == pytest.approx(1.0)
