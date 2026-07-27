@@ -42,6 +42,36 @@ browserwright -s "$sid" -f script.py
 browserwright -s "$sid" --code-stdin < script.py
 ```
 
+### Passing approved credentials to the resident executor
+
+A secret broker injects credentials into the short-lived CLI process, while
+browser code runs in the resident executor. Select each credential explicitly
+with repeatable `--env NAME`; Browserwright forwards only those values for that
+one request:
+
+```bash
+approved-secret exec \
+  --item DefaultUser username=SITE_EMAIL password=SITE_PASSWORD \
+  -- browserwright -s "$sid" \
+       --env SITE_EMAIL \
+       --env SITE_PASSWORD \
+       -e $'
+import os
+page.get_by_label("Email").fill(os.environ["SITE_EMAIL"])
+page.get_by_label("Password").fill(os.environ["SITE_PASSWORD"])
+'
+```
+
+Pass names only. `--env SITE_EMAIL=value` is rejected so credential values do
+not enter shell history or the process argument list. An unset selected variable
+is also rejected before execution, and its value is never printed in the error.
+Inside the executor, selected variables temporarily overlay standard
+`os.environ` after the browser connection is ready. Browserwright restores the
+executor's prior environment exactly when the call succeeds, raises, or exits;
+the next call cannot see the values unless it selects them again. Values travel
+directly over the local executor socket and are not written to persistent
+`state`, discovery files, or Browserwright logs.
+
 ## Driving The Browser: real Playwright
 
 Inside `browserwright -s <id> -e <code>` you write **synchronous Playwright**. Four names are injected for you, served by a **resident per-session executor** the daemon spawns on first browser use:
@@ -59,7 +89,11 @@ print(snapshot())
 '
 ```
 
-The connection is **lazy**: code that never touches `page` / `context` / `snapshot` / `state` / `reset` (e.g. one that only calls `remember()` or `run_task()`) opens no browser connection and spawns no executor — it stays lightweight.
+The connection is **lazy**: code that never touches `page` / `context` /
+`snapshot` / `state` / `reset` / `run_task` (for example, one that only calls
+`remember()`) opens no browser connection and spawns no executor. `run_task()`
+uses the resident executor because a task may drive its injected Playwright
+surface.
 
 ### Navigation: `page.goto()` has smart waiting
 
@@ -78,7 +112,11 @@ returns the Playwright `Response | None` so you can inspect the page with
 These are NOT re-created per call. A long-lived per-session **executor** holds the live `page` / `context` / `browser` and your `state` for the whole session, and each `-s/-e` call that touches the browser surface ships its body to that executor. So:
 
 - `page` and `context` are the **same live objects** across separate calls — they do not reconnect or re-bind each time. Navigate `page` in place; the NEXT call sees the same tab on the same URL, with no re-navigation.
-- The first browser call cold-starts the executor (connect + bind the session's current tab). After that, only a `reset()`, `browserwright session reset <id>`, a daemon restart, or an executor crash rebinds — steady state is "same objects."
+- The first browser call cold-starts the executor (connect + bind the session's
+  current tab). Steady state is "same objects." A terminal `reset()`,
+  `browserwright session reset <id>`, outer request deadline, daemon restart,
+  or executor crash ends that executor; the next browser command cold-starts
+  and rebinds the ledger target.
 
 This is the whole point: you are continuing one live session, not starting over each invocation.
 
@@ -99,25 +137,29 @@ print("last title was:", state.get("seen_title"))   # still there
 
 Use `state` for cross-call working memory (a collected list, a cursor, a flag). It is **per session** and never leaks to another session.
 
-> **Two ways `state` is intentionally cleared** (so you are not surprised):
+> **Executor recycle clears `state`** (so you are not surprised):
 > 1. You call `reset()` (below) — it clears `state` on purpose.
-> 2. The daemon restarts, the executor crashes, or you run `browserwright session reset <id>`: the next call cold-starts a fresh executor that re-binds the session's current tab via the ledger, but `state` starts empty. Persist anything you must keep across a restart with `remember(...)`, not `state`.
+> 2. The daemon restarts, the executor crashes, an outer executor request deadline expires, or you run `browserwright session reset <id>`: the next call cold-starts a fresh executor that re-binds the session's current tab via the ledger, but `state` starts empty. Persist anything you must keep across a restart with `remember(...)`, not `state`.
 
-### `reset()` — rebuild a broken connection / clean slate
+### `reset()` — terminal recycle / clean slate
 
-`reset()` tears down and rebuilds the Playwright connection, re-binds the session's current tab, and **clears `state`**. Use it when:
+`reset()` requests a clean executor recycle and **ends the current code body**. Statements after `reset()` are not executed. The daemon confirms that the old executor is dead without closing browser tabs; the next command cold-starts, re-binds the session's current tab, and starts with empty `state`. Use it when:
 
 - the connection broke or the page closed (you see connection / "Frame detached" / facade errors), or
 - you want a deliberate clean slate (drop `state`, re-bind a fresh `page`).
 
 ```bash
 browserwright -s "$sid" -e $'
-reset()                       # rebuild + clear state
+reset()                       # terminal: nothing after this line runs
+'
+browserwright -s "$sid" -e $'
 page.goto("https://example.com")
 '
 ```
 
-`reset()` does **not** kill the executor or close the user's tabs — it just rebuilds the live objects. If the executor itself is wedged and cannot run `reset()`, use `browserwright session reset <id>` to recycle the executor without closing tabs.
+If the executor itself is wedged and cannot run `reset()`, use `browserwright session reset <id>`. Both reset paths recycle only the executor; the browser, tab group, and tabs stay open.
+
+An outer executor request deadline follows the same fail-stop rule: Browserwright terminates that executor and waits for daemon confirmation before the command returns. The next command starts fresh on the same browser tabs. An ordinary Playwright action timeout that is caught and returned normally does **not** recycle the executor. After fail-stop, Python `finally` blocks are not guaranteed to run and webpage side effects are not rolled back.
 
 ### Tab discipline (read this)
 

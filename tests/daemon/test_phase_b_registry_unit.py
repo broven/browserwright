@@ -34,9 +34,18 @@ class _FakeProc:
         self._alive = False
 
 
-def _handle(session_id: str, sock: str, alive: bool = True) -> ExecutorHandle:
+def _handle(
+    session_id: str,
+    sock: str,
+    alive: bool = True,
+    executor_id: str | None = None,
+) -> ExecutorHandle:
+    kwargs = {}
+    if executor_id is not None:
+        kwargs["executor_id"] = executor_id
     return ExecutorHandle(
-        session_id=session_id, proc=_FakeProc(alive), sock_path=sock)
+        session_id=session_id, proc=_FakeProc(alive), sock_path=sock, **kwargs
+    )
 
 
 # ---- registry single-flight ------------------------------------------------
@@ -109,6 +118,38 @@ async def test_ensure_isolates_per_session(monkeypatch):
     pb = await reg.ensure("sess-y")
     assert pa != pb
     assert {h.session_id for h in reg.all_handles()} == {"sess-x", "sess-y"}
+
+
+@pytest.mark.asyncio
+async def test_kill_and_wait_does_not_kill_newer_executor_instance(monkeypatch):
+    reg = ExecutorRegistry()
+    current = _handle("sess-race", "/tmp/current.sock", executor_id="executor-new")
+    reg._handles["sess-race"] = current
+
+    result = await reg.kill_and_wait("sess-race", executor_id="executor-old")
+
+    assert result["reaped"] is True
+    assert result["matched"] is False
+    assert current.is_alive()
+    assert reg.get("sess-race") is current
+
+
+@pytest.mark.asyncio
+async def test_kill_and_wait_confirms_matching_process_death(monkeypatch):
+    reg = ExecutorRegistry()
+    current = _handle("sess-reap", "/tmp/current.sock", executor_id="executor-current")
+    reg._handles["sess-reap"] = current
+
+    result = await reg.kill_and_wait("sess-reap", executor_id="executor-current")
+
+    assert result == {
+        "killed": True,
+        "reaped": True,
+        "matched": True,
+        "executor_id": "executor-current",
+    }
+    assert current.is_alive() is False
+    assert reg.get("sess-reap") is None
 
 
 # ---- stale discovery-file robustness (Fork 4 / daemon restart) -------------
@@ -221,6 +262,39 @@ async def test_await_ready_does_not_wait_for_cold_start(monkeypatch, tmp_path):
     assert sock == "/tmp/bw-exec-sess-slowcold.sock"
 
 
+@pytest.mark.asyncio
+async def test_await_ready_requires_matching_executor_instance(
+    monkeypatch,
+    tmp_path,
+):
+    from browserwright.daemon import _ipc
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    reg = ExecutorRegistry()
+    proc = _FakeProc(alive=True)
+    _ipc.write_executor_file(
+        "sess-instance",
+        "/tmp/stale.sock",
+        proc.pid,
+        executor_id="executor-old",
+    )
+
+    async def _replace_stale_record():
+        await asyncio.sleep(0.1)
+        _ipc.write_executor_file(
+            "sess-instance",
+            "/tmp/current.sock",
+            proc.pid,
+            executor_id="executor-current",
+        )
+
+    publisher = asyncio.create_task(_replace_stale_record())
+    sock = await reg._await_ready("sess-instance", proc, executor_id="executor-current")
+    await publisher
+
+    assert sock == "/tmp/current.sock"
+
+
 # ---- ensureExecutor verb dispatch ------------------------------------------
 
 
@@ -263,16 +337,27 @@ async def test_ensure_executor_verb_returns_socket():
                 assert session_id == "sess"
                 return "/tmp/bw-exec-sess.sock"
 
+            def get(self, session_id):
+                assert session_id == "sess"
+                return type("Handle", (), {"executor_id": "executor-sess"})()
+
         executors = _Reg()
 
     router.daemon = _Daemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {"session": "sess"},
-    }))
+    await router.route_from_client(
+        client,
+        json.dumps(
+            {
+                "id": 1,
+                "method": "BrowserwrightDaemon.ensureExecutor",
+                "params": {"session": "sess"},
+            }
+        ),
+    )
     assert captured[client.client_id][-1]["result"] == {
-        "exec_sock": "/tmp/bw-exec-sess.sock"}
+        "exec_sock": "/tmp/bw-exec-sess.sock",
+        "executor_id": "executor-sess",
+    }
 
 
 @pytest.mark.asyncio
@@ -498,6 +583,48 @@ async def test_kill_executor_verb_reaps_and_acks():
     assert killed == ["sess"]
     assert captured[client.client_id][-1]["result"] == {
         "ok": True, "killed": True}
+
+
+@pytest.mark.asyncio
+async def test_kill_executor_waits_for_exact_instance_reap():
+    router, client, captured = _router_with_client()
+    calls = []
+
+    class _Daemon:
+        class _Reg:
+            async def kill_and_wait(self, session_id, *, executor_id=None):
+                calls.append((session_id, executor_id))
+                return {
+                    "killed": True,
+                    "reaped": True,
+                    "matched": True,
+                }
+
+        executors = _Reg()
+
+    router.daemon = _Daemon()
+    await router.route_from_client(
+        client,
+        json.dumps(
+            {
+                "id": 1,
+                "method": "BrowserwrightDaemon.killExecutor",
+                "params": {
+                    "session": "sess",
+                    "executorId": "executor-current",
+                    "wait": True,
+                },
+            }
+        ),
+    )
+
+    assert calls == [("sess", "executor-current")]
+    assert captured[client.client_id][-1]["result"] == {
+        "ok": True,
+        "killed": True,
+        "reaped": True,
+        "matched": True,
+    }
 
 
 @pytest.mark.asyncio

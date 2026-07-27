@@ -3,8 +3,8 @@
 Two paths, chosen by a cheap static pre-check on the code (Phase B, Fork 7):
 
   - **In-process** (Phase C path, unchanged): code that touches NONE of
-    ``{page, context, snapshot, state, reset}`` — pure ``memory()`` /
-    site-skill / ``http_get`` — is exec'd here, in this short-lived process. It
+    ``{page, context, snapshot, state, reset, run_task}`` — pure ``memory()`` /
+    discovery / ``http_get`` — is exec'd here, in this short-lived process. It
     never spawns or contacts an executor (stays lightweight).
   - **Shipped to the executor** (Phase B path): code that references any of
     those names is shipped WHOLE to the session's resident, per-session executor
@@ -33,7 +33,11 @@ from . import _namespace
 # Names whose presence routes the heredoc to the persistent executor (Fork 7).
 # `state` / `reset` are executor-only (live across calls / acts on live
 # objects); `page` / `context` / `snapshot` are live cross-process objects.
-_EXECUTOR_NAMES = frozenset({"page", "context", "snapshot", "state", "reset"})
+# `run_task` is routed too, so its browser surface is always borrowed from the
+# same resident executor instead of opening a temporary Playwright controller.
+_EXECUTOR_NAMES = frozenset(
+    {"page", "context", "snapshot", "state", "reset", "run_task"}
+)
 
 
 def _touches_executor_surface(code_obj) -> bool:
@@ -58,7 +62,8 @@ def _touches_executor_surface(code_obj) -> bool:
     return False
 
 
-def run_code(code: str, *, session_id: str) -> int:
+def run_code(code: str, *, session_id: str,
+             env: dict[str, str] | None = None) -> int:
     """Execute inline code for an explicit session id."""
     if not code.strip():
         print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
@@ -88,7 +93,7 @@ def run_code(code: str, *, session_id: str) -> int:
         # (identical behaviour to before); never ship un-compilable code.
         code_obj = None
     if code_obj is not None and _touches_executor_surface(code_obj):
-        return _run_on_executor(sess, code)
+        return _run_on_executor(sess, code, env=env)
 
     # Run in-process. Capture stdout so we can replay it after the exec.
     globals_ = _namespace.build_globals()
@@ -124,7 +129,8 @@ def run_code(code: str, *, session_id: str) -> int:
     return 0
 
 
-def _run_on_executor(sess, code: str) -> int:
+def _run_on_executor(sess, code: str, *,
+                     env: dict[str, str] | None = None) -> int:
     """Ship the whole code body to the session's persistent executor and replay
     its response locally (Phase B path).
 
@@ -138,7 +144,7 @@ def _run_on_executor(sess, code: str) -> int:
 
     try:
         # ExecutorUnavailable is a BrowserwrightError subclass — caught below.
-        resp = run_on_executor(sess, code)
+        resp = run_on_executor(sess, code, env=env)
     except BrowserwrightError as e:
         sys.stderr.write(json.dumps(serialize(e)) + "\n")
         return e.exit_code

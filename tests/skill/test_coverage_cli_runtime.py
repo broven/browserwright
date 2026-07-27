@@ -31,17 +31,27 @@ def test_parse_kv_args_coerces_json_space_values_and_flags():
 def test_parse_execute_args_supports_short_and_long_forms():
     from browserwright import cli
 
-    assert cli._parse_execute_args(["-s", "1", "-e", "print(1)"]) == (
+    assert cli._parse_execute_args([
+        "-s",
+        "1",
+        "--env",
+        "USPS_EMAIL",
+        "--env=USPS_PASSWORD",
+        "-e",
+        "print(1)",
+    ]) == (
         "1",
         "print(1)",
+        ["USPS_EMAIL", "USPS_PASSWORD"],
         None,
     )
     assert cli._parse_execute_args(["--session=2", "--execute=print(2)"]) == (
         "2",
         "print(2)",
+        [],
         None,
     )
-    assert cli._parse_execute_args(["-s", "1"])[2] == (
+    assert cli._parse_execute_args(["-s", "1"])[3] == (
         "missing code: pass -e '<python>', -f <path>, or --code-stdin"
     )
 
@@ -55,6 +65,7 @@ def test_parse_execute_args_reads_code_file(tmp_path):
     assert cli._parse_execute_args(["-s", "1", "-f", str(script)]) == (
         "1",
         "print('from file')\n",
+        [],
         None,
     )
 
@@ -62,7 +73,9 @@ def test_parse_execute_args_reads_code_file(tmp_path):
 def test_parse_execute_args_rejects_multiple_code_sources():
     from browserwright import cli
 
-    assert cli._parse_execute_args(["-s", "1", "-e", "print(1)", "--code-stdin"])[2] == (
+    assert cli._parse_execute_args([
+        "-s", "1", "-e", "print(1)", "--code-stdin",
+    ])[3] == (
         "pass only one of -e, -f, or --code-stdin"
     )
 
@@ -76,11 +89,38 @@ def test_parse_execute_args_reads_code_stdin(monkeypatch):
     assert cli._parse_execute_args(["--session=1", "--code-stdin"]) == (
         "1",
         "print('stdin')\n",
+        [],
         None,
     )
 
 
-def test_cmd_execute_dispatches_to_inline_run_code(monkeypatch):
+@pytest.mark.parametrize(
+    ("args", "expected_error"),
+    [
+        (["-s", "1", "--env", "-e", "print(1)"],
+         "--env requires a variable name"),
+        (["-s", "1", "--env=", "-e", "print(1)"],
+         "--env requires a variable name"),
+        (["-s", "1", "--env", "TOKEN=secret", "-e", "print(1)"],
+         "--env 'TOKEN' must not include a value"),
+        (["-s", "1", "--env", "1TOKEN", "-e", "print(1)"],
+         "invalid environment variable name"),
+        (["-s", "1", "--env", "not-valid-secret", "-e", "print(1)"],
+         "invalid environment variable name"),
+    ],
+)
+def test_parse_execute_args_rejects_invalid_env_without_echoing_value(
+    args, expected_error,
+):
+    from browserwright import cli
+
+    error = cli._parse_execute_args(args)[3]
+
+    assert expected_error in error
+    assert "secret" not in error
+
+
+def test_cmd_execute_dispatches_selected_env(monkeypatch):
     from browserwright import cli
     from browserwright.repl import inline
 
@@ -88,24 +128,78 @@ def test_cmd_execute_dispatches_to_inline_run_code(monkeypatch):
     monkeypatch.setattr(
         inline,
         "run_code",
-        lambda code, *, session_id: calls.append((session_id, code)) or 0,
+        lambda code, *, session_id, env: calls.append(
+            (session_id, code, env)
+        ) or 0,
     )
+    monkeypatch.setenv("SITE_EMAIL", "alice@example.test")
 
-    assert cli._cmd_execute(["-s", "abc", "-e", "print('ok')"]) == 0
-    assert calls == [("abc", "print('ok')")]
+    assert cli._cmd_execute([
+        "-s", "abc", "--env", "SITE_EMAIL", "-e", "print('ok')",
+    ]) == 0
+    assert calls == [(
+        "abc",
+        "print('ok')",
+        {"SITE_EMAIL": "alice@example.test"},
+    )]
+
+
+def test_cmd_execute_missing_env_reports_name_not_other_values(
+    monkeypatch, capsys,
+):
+    from browserwright import cli
+
+    monkeypatch.delenv("SITE_MISSING", raising=False)
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+
+    assert cli._cmd_execute([
+        "-s", "abc", "--env", "SITE_MISSING", "-e", "page.url",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert "SITE_MISSING" in error
+    assert "must-not-leak" not in error
+
+
+def test_global_session_prefix_dispatches_execute_starting_with_env(monkeypatch):
+    from browserwright import cli
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_cmd_execute",
+        lambda args: calls.append(args) or 0,
+    )
+    argv = ["-s", "abc", "--env", "SITE_EMAIL", "-e", "page.url"]
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+
+    assert exc.value.code == 0
+    assert calls == [argv]
 
 
 def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys):
     from browserwright import cli
     from browserwright import session_registry as reg
-    from browserwright import task_runner
+    from browserwright._executor import client as executor_client
+    from browserwright._executor.protocol import ExecuteResponse
 
     sid = reg.allocate(backend="rdp", owner="create", name="job")
-    monkeypatch.setattr(task_runner, "run_task", lambda site, name, **kw: {
-        "site": site,
-        "name": name,
-        "kwargs": kw,
-    })
+    calls = []
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda sess, site, name, **kw: (
+            calls.append((sess, site, name, kw))
+            or ExecuteResponse(
+                task_result_json=json.dumps({
+                    "site": site,
+                    "name": name,
+                    "kwargs": kw["args"],
+                })
+            )
+        ),
+    )
 
     with pytest.raises(SystemExit) as exc:
         cli.main(["-s", sid, "task", "example.com/check", "--count=2", "--output", "json"])
@@ -116,6 +210,7 @@ def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys)
         "name": "check",
         "kwargs": {"count": 2},
     }
+    assert calls[0][3]["isolated"] is False
 
 
 def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys):
@@ -142,13 +237,19 @@ def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys)
 
 
 def test_cmd_task_reports_missing_task(monkeypatch, capsys, tmp_bs_home):
-    from browserwright import cli, task_runner
+    from browserwright import cli
     from browserwright import session_registry as reg
+    from browserwright._executor import client as executor_client
+    from browserwright._executor.protocol import ExecuteResponse
 
-    def missing(site, name, **kwargs):
-        raise FileNotFoundError(f"{site}/{name}")
-
-    monkeypatch.setattr(task_runner, "run_task", missing)
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda *_args, **_kwargs: ExecuteResponse(
+            error={"type": "FileNotFoundError", "msg": "site/name"},
+            exit_code=3,
+        ),
+    )
     sid = reg.allocate(backend="rdp", owner="create")
 
     assert cli._cmd_task(["--session", sid, "site/name"]) == 1
@@ -156,13 +257,19 @@ def test_cmd_task_reports_missing_task(monkeypatch, capsys, tmp_bs_home):
 
 
 def test_cmd_task_reports_crash(monkeypatch, capsys, tmp_bs_home):
-    from browserwright import cli, task_runner
+    from browserwright import cli
     from browserwright import session_registry as reg
+    from browserwright._executor import client as executor_client
+    from browserwright._executor.protocol import ExecuteResponse
 
-    def crashed(site, name, **kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(task_runner, "run_task", crashed)
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda *_args, **_kwargs: ExecuteResponse(
+            error={"type": "RuntimeError", "msg": "boom"},
+            exit_code=3,
+        ),
+    )
     sid = reg.allocate(backend="rdp", owner="create")
 
     assert cli._cmd_task(["--session", sid, "site/name"]) == 3
@@ -170,22 +277,72 @@ def test_cmd_task_reports_crash(monkeypatch, capsys, tmp_bs_home):
 
 
 def test_cmd_task_binds_session_and_outputs_json(monkeypatch, tmp_bs_home, capsys):
-    from browserwright import cli, task_runner
+    from browserwright import cli
     from browserwright import session_registry as reg
+    from browserwright._executor import client as executor_client
+    from browserwright._executor.protocol import ExecuteResponse
 
     sid = reg.allocate(backend="rdp", owner="create")
-    monkeypatch.setattr(task_runner, "run_task", lambda site, name, **kwargs: {
-        "site": site,
-        "name": name,
-        "limit": kwargs["limit"],
-    })
+    captured = {}
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda sess, site, name, **kwargs: (
+            captured.update({
+                "session": sess,
+                "site": site,
+                "name": name,
+                **kwargs,
+            })
+            or ExecuteResponse(
+                console="task log\n",
+                task_result_json=json.dumps({
+                    "site": site,
+                    "name": name,
+                    "limit": kwargs["args"]["limit"],
+                }),
+            )
+        ),
+    )
 
     assert cli._cmd_task(["--session", sid, "site/name", "--limit=3", "--output", "json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
+    output = capsys.readouterr().out
+    assert output.startswith("task log\n")
+    assert json.loads(output.removeprefix("task log\n")) == {
         "site": "site",
         "name": "name",
         "limit": 3,
     }
+    assert captured["session"].session_record["id"] == sid
+    assert captured["isolated"] is False
+
+
+def test_cmd_task_default_output_uses_executor_repr_and_isolated(
+    monkeypatch, tmp_bs_home, capsys,
+):
+    from browserwright import cli
+    from browserwright import session_registry as reg
+    from browserwright._executor import client as executor_client
+    from browserwright._executor.protocol import ExecuteResponse
+
+    captured = {}
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda _sess, _site, _name, **kwargs: (
+            captured.update(kwargs)
+            or ExecuteResponse(
+                return_value="<CustomResult exact-repr>",
+                task_result_json='"string fallback is intentionally different"',
+            )
+        ),
+    )
+    sid = reg.allocate(backend="rdp", owner="create")
+
+    assert cli._cmd_task(["--session", sid, "site/name", "--isolated"]) == 0
+    assert capsys.readouterr().out == "<CustomResult exact-repr>\n"
+    assert captured["isolated"] is True
+    assert captured["args"] == {}
 
 
 def test_cmd_doctor_human_failure_prints_fixes(monkeypatch, capsys):
@@ -377,33 +534,56 @@ def test_cmd_userscript_verify_binds_bd_session(monkeypatch, tmp_bs_home, capsys
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr("browserwright.mode_b_client.ModeBClient.is_alive", lambda self: False)
 
-    # --verify drives the Playwright path: reload the bound page, screenshot
-    # it, print the path, and ALWAYS close the handle.
-    events = []
-
-    class FakePage:
-        def reload(self, *, wait_until=None):
-            events.append(("reload", wait_until))
-
-        def screenshot(self, *, path):
-            events.append(("screenshot", path))
-
-    class FakeHandle:
-        page = FakePage()
-
-        def close(self):
-            events.append(("close", None))
-
+    # --verify is queued on the same resident executor as -e and task.
+    executor_calls = []
     monkeypatch.setattr(
-        "browserwright.repl.playwright_handle.PlaywrightHandle", FakeHandle)
+        "browserwright._executor.client.run_on_executor",
+        lambda sess, code: executor_calls.append((sess, code))
+        or SimpleNamespace(error=None, exit_code=0),
+    )
+    monkeypatch.setattr(
+        "browserwright.repl.playwright_handle.PlaywrightHandle",
+        lambda: pytest.fail("verify must not create a second Playwright handle"),
+    )
     monkeypatch.setattr(cli, "_fresh_screenshot_path", lambda: "/tmp/shot.png")
 
     assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 0
     assert calls == [["browserwright-daemon", "userscript", "push", "script.js"]]
     assert capsys.readouterr().out == "/tmp/shot.png\n"
-    assert events == [
-        ("reload", "load"), ("screenshot", "/tmp/shot.png"), ("close", None),
-    ]
+    assert len(executor_calls) == 1
+    executor_session, code = executor_calls[0]
+    assert executor_session.session_record["id"] == sid
+    assert "page.reload(wait_until='load')" in code
+    assert "page.screenshot(path='/tmp/shot.png')" in code
+
+
+def test_cmd_userscript_verify_failure_preserves_successful_push(
+        monkeypatch, tmp_bs_home, capsys):
+    from browserwright import cli
+    from browserwright import session_registry as reg
+
+    sid = reg.allocate(backend="rdp", owner="create")
+    monkeypatch.setenv("BD_SESSION", sid)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        "browserwright._executor.client.run_on_executor",
+        lambda sess, code: SimpleNamespace(
+            error={"type": "PageBindTimeout", "msg": "target did not appear"},
+            exit_code=3,
+        ),
+    )
+
+    assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 0
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    assert "pushed OK — --verify skipped" in streams.err
+    assert "PageBindTimeout: target did not appear" in streams.err
 
 
 def test_daemon_doctor_synthetic_for_spawn_failure(monkeypatch):
@@ -578,6 +758,42 @@ def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
 
     assert calls == [["ensure"], ["browserwright-daemon", "kill-executor", "--session", sid]]
     assert "left untouched" in message
+    assert reg.get(sid) is not None
+
+
+def test_session_create_reset_executor_refuses_unconfirmed_reap(
+    tmp_bs_home, monkeypatch,
+):
+    from browserwright import session_create, session_registry as reg
+    from browserwright.errors import DaemonUnavailable
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    monkeypatch.setattr(session_create, "_run", lambda _cmd: 1)
+
+    with pytest.raises(DaemonUnavailable, match="could not confirm"):
+        session_create.reset_executor(reg.get(sid))
+
+    assert reg.get(sid) is not None
+
+
+def test_cmd_session_reset_reports_unconfirmed_reap(
+    tmp_bs_home, monkeypatch, capsys,
+):
+    from browserwright import cli, session_create, session_registry as reg
+    from browserwright.errors import DaemonUnavailable
+
+    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    monkeypatch.setattr(
+        session_create,
+        "reset_executor",
+        lambda _rec: (_ for _ in ()).throw(
+            DaemonUnavailable("could not confirm executor reap")
+        ),
+    )
+
+    assert cli._cmd_session(["reset", sid]) == DaemonUnavailable.exit_code
+    assert "could not confirm executor reap" in capsys.readouterr().err
     assert reg.get(sid) is not None
 
 

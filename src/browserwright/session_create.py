@@ -114,8 +114,23 @@ def reset_executor(record: dict) -> str:
     call cold-starts a fresh executor against the same session.
     """
     _ensure_daemon_running()
-    _reap_executor(record)
     sid = record["id"]
+    rc = _run([
+        "browserwright-daemon",
+        "kill-executor",
+        "--session",
+        str(sid),
+    ])
+    if rc != 0:
+        from .errors import DaemonUnavailable
+
+        raise DaemonUnavailable(
+            "session reset could not confirm that the old executor exited",
+            fix=(
+                "run `browserwright doctor`, then retry "
+                f"`browserwright session reset {sid}`"
+            ),
+        )
     return (
         f"session {sid} reset; executor was recycled. "
         "The browser and tabs were left untouched."

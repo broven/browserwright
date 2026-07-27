@@ -26,6 +26,36 @@ The word "workspace" is backend-specific:
 | `rdp` attach | One externally-owned browser instance exposed on the recorded port | That browser instance | Never create or simulate tab groups |
 | `env` | The externally-owned browser the daemon resolved (BD_CDP_WS / BD_CDP_URL) | That browser instance | Never create or simulate tab groups |
 
+## Executor Ownership
+
+Each session has at most one resident executor process, and that executor is
+the session's only Playwright controller. Browser-driving `-e` code, CLI tasks,
+inline `run_task()`, and userscript verification must reuse its live
+`page`/`context` instead of opening a second Playwright facade connection.
+Requests are FIFO; there is no second executor running concurrently inside one
+session. Explicit `context.new_page()` remains the intentional way for that one
+controller to create another tab.
+
+Cold binding has one authoritative target: the target resolved and persisted by
+the agent/session path. Playwright may need time to materialize its matching
+`Page`; wait for that exact mapping and fail with a retryable bind error if it
+does not appear. Never use `context.pages[0]` or `context.new_page()` as an
+implicit fallback, because that splits the ledger target from the executor's
+page and can create duplicate user-visible tabs.
+
+The executor request deadline is fail-stop. When it expires, Browserwright
+flushes a terminal response, terminates that exact executor instance (including
+its Playwright driver), and waits for daemon-confirmed process death before the
+CLI returns. Browser tabs survive, but executor `state` is lost, Python
+`finally` blocks are not guaranteed, and webpage side effects are not rolled
+back. A Playwright action timeout that returns before the outer request
+deadline is an ordinary request error and does not recycle the executor.
+
+`reset()` is also terminal for its current code request; statements after it do
+not run. Both `reset()` and `browserwright session reset <id>` use the same
+tab-preserving executor recycle model. The next browser command cold-starts one
+fresh executor and rebinds the ledger target.
+
 ## Extension Backend
 
 The extension backend connects to the user's real Chrome through the unpacked

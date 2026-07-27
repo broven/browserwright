@@ -11,8 +11,9 @@ Proves the Phase B core through the REAL `browserwright` heredoc CLI:
   3. pure-memory heredocs stay lightweight: a heredoc touching none of
      {page,context,snapshot,state,reset} runs in-process and never spawns an
      executor (no `bw-exec-*` discovery file appears).
-  4. PR3 `reset()`: clears `state` + rebuilds the connection in-place (the
-     executor process survives) — `test_reset_clears_state_across_heredocs_rdp`.
+  4. Terminal `reset()`: the old executor is confirmed dead before the command
+     returns; tabs survive, the next call gets a new executor, and `state` is
+     empty — `test_reset_clears_state_across_heredocs_rdp`.
 
 Run on BOTH backends: rdp (cheapest) + the extension CfT harness. These reuse
 the auto-facade daemon fixtures from `test_l2_heredoc_playwright_page.py`.
@@ -25,6 +26,7 @@ green pattern as `test_l2_heredoc_playwright_page.py` (same fixtures, same
 from __future__ import annotations
 
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -153,15 +155,7 @@ def test_single_executor_single_tab_rdp(rdp_autofacade_daemon):
 
 
 def test_reset_clears_state_across_heredocs_rdp(rdp_autofacade_daemon):
-    """PR3 ACCEPTANCE (rdp): `reset()` clears `state` + rebuilds the connection.
-
-    heredoc#1 stashes state; heredoc#2 calls `reset()` then reads state (gone)
-    and the page still works (connection was rebuilt, not killed). The executor
-    process survives (one discovery file throughout).
-
-    HONEST GAP: needs the CfT/live-daemon harness; NOT run in the implementing
-    agent's sandbox. Written to the same proven harness pattern as the sibling
-    reuse tests."""
+    """Terminal reset reaps the old executor while preserving its browser tab."""
     pytest.importorskip("playwright.sync_api")
     runtime_dir, _facade_ws = rdp_autofacade_daemon
     sid = _seed_session(runtime_dir, "rdp")
@@ -176,20 +170,33 @@ def test_reset_clears_state_across_heredocs_rdp(rdp_autofacade_daemon):
         assert "SET_OK" in r1.stdout
         files_before = _executor_files(runtime_dir)
         assert files_before, "no executor discovery file"
+        old_record = json.loads(Path(files_before[0]).read_text())
+        old_pid = old_record["pid"]
+        old_executor_id = old_record["executor_id"]
 
         r2 = run_skill(
             "reset()\n"
-            "print('X=' + repr(state.get('x')))\n"  # cleared → None
-            "page.goto('data:text/html,<title>after</title>', wait_until='load')\n"
-            "print('TITLE=' + page.title())\n",
+            "print('AFTER_RESET_SHOULD_NOT_RUN')\n",
             backend="rdp", runtime_dir=runtime_dir, extra_env=extra)
         assert r2.returncode == 0, f"heredoc#2 (reset) failed: {r2.stderr}"
-        assert _grep(r2.stdout, "X") == "None", "reset() did not clear state"
-        assert _grep(r2.stdout, "TITLE") == "after", "page unusable after reset()"
-        # Same executor survived the reset (it rebuilds the connection in-place,
-        # it does NOT kill the process).
-        assert _executor_files(runtime_dir) == files_before, (
-            "reset() should not respawn/kill the executor")
+        assert "AFTER_RESET_SHOULD_NOT_RUN" not in r2.stdout
+        assert _executor_files(runtime_dir) == [], (
+            "reset command returned before executor discovery was removed")
+        with pytest.raises(ProcessLookupError):
+            os.kill(old_pid, 0)
+
+        r3 = run_skill(
+            "print('X=' + repr(state.get('x')))\n"
+            "print('TITLE=' + page.title())\n",
+            backend="rdp", runtime_dir=runtime_dir, extra_env=extra)
+        assert r3.returncode == 0, f"heredoc#3 (cold restart) failed: {r3.stderr}"
+        assert _grep(r3.stdout, "X") == "None", "reset() did not clear state"
+        assert _grep(r3.stdout, "TITLE") == "r", "reset() did not preserve the tab"
+        files_after = _executor_files(runtime_dir)
+        assert len(files_after) == 1
+        new_record = json.loads(Path(files_after[0]).read_text())
+        assert new_record["pid"] != old_pid
+        assert new_record["executor_id"] != old_executor_id
     finally:
         _cleanup_session("rdp", sid)
 

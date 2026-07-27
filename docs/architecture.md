@@ -28,6 +28,11 @@ Chrome (daily via extension relay / daemon-owned isolated via rdp / external via
   `browserwright session new` and immutable afterwards; the daemon routes each
   client by reading the session ledger. On extension the session's workspace is
   a Chrome tab group; on rdp/env it is the browser instance.
+- **One session, one resident executor, one Playwright controller.** Browser
+  code and tasks for a session run FIFO in that executor and reuse its live
+  page/context. A request deadline or reset recycles that exact executor and
+  waits for confirmed process death; it never closes the session's browser
+  tabs.
 
 Authoritative references — read before changing session routing, backend
 semantics, tab creation, facade behavior, or teardown:

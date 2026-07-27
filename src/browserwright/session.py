@@ -167,6 +167,26 @@ def isolated_session() -> Session:
     return Session(daemon=parent.daemon)
 
 
+def _borrowed_session() -> Session:
+    """A target-isolated Session borrowing the current agent CDP transport.
+
+    Resident-executor tasks need a separate ``current_target_id`` for an
+    explicitly-created page, but extension Chrome exposes only one physical
+    debugger attachment per tab. Opening and then closing another CDP client
+    would physically detach tabs still owned by the Playwright facade. Borrow
+    the parent's already-live CDP transport and mark it non-owning so
+    :meth:`Session.close` only drops this wrapper's reference.
+    """
+    parent = current_session()
+    borrowed = Session(
+        daemon=parent.daemon,
+        record=parent.session_record,
+    )
+    borrowed._cdp = parent.cdp
+    borrowed._owns_cdp = False
+    return borrowed
+
+
 @contextmanager
 def with_session(sess: Session) -> Iterator[Session]:
     """Run a block with ``sess`` as the active session.
