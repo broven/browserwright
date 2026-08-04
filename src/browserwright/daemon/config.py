@@ -257,13 +257,17 @@ def load(
                 f"BD_SESSION_IDLE_PRUNE must be a number, got "
                 f"{e['BD_SESSION_IDLE_PRUNE']!r}")
     if "BD_CDP_WS" in e:
-        cfg.cdp_ws = e["BD_CDP_WS"]; cfg.cdp_ws_source = "BD_CDP_WS"
+        cfg.cdp_ws = e["BD_CDP_WS"]
+        cfg.cdp_ws_source = "BD_CDP_WS"
     elif "BU_CDP_WS" in e:
-        cfg.cdp_ws = e["BU_CDP_WS"]; cfg.cdp_ws_source = "BU_CDP_WS"
+        cfg.cdp_ws = e["BU_CDP_WS"]
+        cfg.cdp_ws_source = "BU_CDP_WS"
     if "BD_CDP_URL" in e:
-        cfg.cdp_url = e["BD_CDP_URL"]; cfg.cdp_url_source = "BD_CDP_URL"
+        cfg.cdp_url = e["BD_CDP_URL"]
+        cfg.cdp_url_source = "BD_CDP_URL"
     elif "BU_CDP_URL" in e:
-        cfg.cdp_url = e["BU_CDP_URL"]; cfg.cdp_url_source = "BU_CDP_URL"
+        cfg.cdp_url = e["BU_CDP_URL"]
+        cfg.cdp_url_source = "BU_CDP_URL"
     if "BD_CHROME_BINARY" in e:
         cfg.chrome_binary = e["BD_CHROME_BINARY"]
     # `BD_RDP_PORT` env override for the rdp backend's port (v0.4.1).

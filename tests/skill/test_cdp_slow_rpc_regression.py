@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import socket
 import tempfile
 import threading
 import time

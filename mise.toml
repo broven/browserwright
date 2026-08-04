@@ -1,8 +1,21 @@
 # Tool runtimes pinned for this repo. `cd` here auto-activates; `mise install`
-# installs them. Migrated from .python-version (3.11); uv drives all deps.
+# installs them; uv drives all deps.
+#
+# `.python-version` (3.11) is kept alongside this on purpose, not left over: it
+# is what pins uv's interpreter choice for the direct `uv run` entrypoints
+# (tests/daemon/e2e/run.sh, `uv run pytest`). pyproject's
+# `requires-python = ">=3.11"` is only a floor, so without that file uv is free
+# to resolve a newer interpreter than the one pinned here and the local venv
+# silently drifts off 3.11. Change the version in both places together.
 [tools]
 python = "3.11"
 uv = "latest"
+# Pinned, not "latest", and deliberately not run via `uvx`: `uvx ruff` resolves
+# whatever ruff is newest at call time, so a ruff release that widens the default
+# rule set silently turns `mise run lint` red with no code change (0.16.x did
+# exactly that here — 646 findings overnight). The companion rule-set pin lives
+# in pyproject `[tool.ruff.lint]`; bump the two together.
+ruff = "0.16.1"
 
 # ---------------------------------------------------------------------------
 # Standard repo-harness verbs. Heavy/operational tasks (dev-link, upgrade-global,
@@ -49,10 +62,85 @@ description = "Real-Chrome + unpacked-extension E2E (needs Chrome for Testing; o
 dir = "{{config_root}}"
 run = "tests/daemon/e2e/run.sh -v"
 
-[tasks.lint]
-description = "Static checks: ruff lint + format check"
+# teardown — reclaim the external resources the test/dev loop can leak, scoped
+# to THIS worktree. The worktree-orchestration layer (Orca archive, `wt
+# cleanup`, Worktrunk pre-remove) probes for this exact task name and runs it
+# before deleting a worktree, so anything not reclaimed here leaks per worktree.
+#
+# Deliberately narrow — it must never touch:
+#   - the machine-global daemon (runs ~/.local/share/uv/tools/browserwright/...,
+#     never this worktree's .venv), which is LaunchAgent-managed and shared;
+#   - the user's daily Chrome or the global daemon's profiles under
+#     ~/.cache/browserwright-daemon/profiles/;
+#   - a sibling worktree's daemon, or a *live* e2e run in a sibling worktree.
+[tasks.teardown]
+description = "Reclaim this worktree's leaked e2e daemons/Chrome + test artifacts. Idempotent."
 dir = "{{config_root}}"
-run = "uvx ruff check . && uvx ruff format --check ."
+run = '''
+#!/usr/bin/env bash
+# Safe to run on a worktree that never ran a test: every step is a no-op then.
+set -uo pipefail
+ROOT="{{config_root}}"
+self=$$
+
+# 1. Daemons spawned from THIS worktree. The e2e fixtures launch
+#    `<worktree>/.venv/bin/python -m browserwright.daemon.cli serve`, so the
+#    absolute venv path is an exact, collision-free marker: the global daemon
+#    and every sibling worktree resolve to a different interpreter path.
+pids=$(ps -eo pid=,command= 2>/dev/null \
+  | grep -F "$ROOT/.venv" \
+  | grep -E "browserwright[-.]daemon|browserwright\.daemon\.cli" \
+  | awk -v me="$self" '$1 != me {print $1}')
+if [ -n "${pids:-}" ]; then
+  echo "teardown: stopping this worktree's daemon(s): $(echo "$pids" | tr '\n' ' ')"
+  echo "$pids" | xargs kill 2>/dev/null
+  sleep 1
+  echo "$pids" | xargs kill -9 2>/dev/null
+fi
+
+# 2. Orphaned Chrome for Testing from an interrupted e2e run. The e2e harness
+#    always uses a `bd-e2e-chrome-` profile prefix (the daily browser and the
+#    global daemon never do), and we additionally require ppid==1 so a sibling
+#    worktree's *running* e2e — whose Chrome still has a live pytest parent —
+#    is left alone. Orphans are exactly the leak this is meant to reap.
+orphans=$(ps -eo pid=,ppid=,command= 2>/dev/null \
+  | grep -F -- "--user-data-dir=" \
+  | grep -F "bd-e2e-chrome-" \
+  | awk '$2 == 1 {print $1}')
+if [ -n "${orphans:-}" ]; then
+  echo "teardown: killing orphaned e2e Chrome: $(echo "$orphans" | tr '\n' ' ')"
+  echo "$orphans" | xargs kill 2>/dev/null
+  sleep 1
+  echo "$orphans" | xargs kill -9 2>/dev/null
+fi
+
+# 3. Regenerable, gitignored e2e state inside the worktree.
+for d in tests/daemon/e2e/_artifacts tests/daemon/e2e/_bs_home; do
+  if [ -d "$ROOT/$d" ]; then
+    echo "teardown: removing $d"
+    rm -rf "${ROOT:?}/$d"
+  fi
+done
+
+echo "teardown: done (this worktree only)"
+exit 0
+'''
+
+[tasks.lint]
+description = "Static checks: ruff lint (pinned ruff + pinned rule set)"
+dir = "{{config_root}}"
+run = "ruff check ."
+
+# `ruff format` is NOT part of `lint`: this codebase has never been
+# ruff-format-clean (135 of 177 files would be rewritten), so asserting it in the
+# gate just keeps `lint` permanently red and tells you nothing. Adopting the
+# formatter is a fine idea, but it's a single deliberate commit that rewrites
+# most of the repo and blows up `git blame` — run this task when you decide to do
+# it, don't let it leak into an unrelated change.
+[tasks.format]
+description = "Apply ruff format to the whole repo (opt-in; large diff — see comment)"
+dir = "{{config_root}}"
+run = "ruff format ."
 
 [tasks.build]
 description = "Build the wheel/sdist with uv"

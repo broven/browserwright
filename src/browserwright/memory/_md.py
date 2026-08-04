@@ -43,7 +43,6 @@ def append_to_section(body: str, section: str, line: str) -> str:
     heading = f"## {section}"
     lines = body.splitlines()
     out: list[str] = []
-    in_target = False
     appended = False
     next_heading_idx: int | None = None
 

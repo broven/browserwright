@@ -36,7 +36,6 @@ def test_inline_run_code_empty_input_prints_usage(capsys):
 
 
 def test_inline_run_replays_stdout_before_browserwright_error(monkeypatch, capsys):
-    from browserwright.errors import BrowserwrightError
     from browserwright.repl import inline
 
     captured = _stub_inline_session(monkeypatch)

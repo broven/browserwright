@@ -241,7 +241,6 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
 # ---------------------------------------------------------------------------
 
 import asyncio
-import glob as _glob
 import platform
 import shutil
 import signal

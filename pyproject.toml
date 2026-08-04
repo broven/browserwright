@@ -59,6 +59,36 @@ markers = [
     "real_chrome: end-to-end test that launches a real Chrome + extension (skipped unless explicitly selected)",
 ]
 
+# Lint config. `select` is explicit on purpose: ruff's *default* rule set grew
+# substantially by 0.16.x (ASYNC/S/BLE/B/UP/RUF/... are now on by default), which
+# silently took this repo from clean to 646 findings without a line of code
+# changing. Pinning the ruff version (mise `[tools]`) *and* the rule set here is
+# what makes `mise run lint` mean the same thing on every machine and across ruff
+# upgrades. Widening the set is a deliberate, separate decision — do it in one
+# focused pass, not as a side effect of an unrelated ruff release.
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# api.py exists purely to re-export the agent-facing surface; the names it
+# imports are listed in `EXPORTS` as *strings*, which ruff can't see as usage.
+# Without this, `--fix` strips the whole re-export block and every
+# `api.<name>` lookup dies at runtime (verified: it breaks 22 test modules).
+"src/browserwright/api.py" = ["F401"]
+# Site-skill task snippets are executed with a Playwright `page` injected into
+# globals by the executor — `page` is undefined at import time by design.
+"src/browserwright/site_skills_starter/**" = ["F821"]
+# pytest fixtures are shadowed by same-named test parameters (the standard
+# fixture-injection pattern), and the e2e helpers extend sys.path before
+# importing, so imports legitimately follow statements.
+"tests/daemon/e2e/**" = ["E402", "F811"]
+# Agent hook scripts bootstrap sys.path before importing their own modules.
+".claude/hooks/**" = ["E402"]
+".cursor/hooks/**" = ["E402"]
+
 [tool.coverage.run]
 source = ["src/browserwright"]
 omit = [

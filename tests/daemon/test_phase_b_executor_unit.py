@@ -963,7 +963,6 @@ def test_ensure_cold_started_enters_driver_once_and_reuses_on_retry(monkeypatch)
     driver's event loop is thread-bound and cannot be restarted once exited, so
     re-entering after a failed connect would yield 'Event loop is closed' — this
     guards that the failure path does not tear the driver down."""
-    import browserwright._executor.process as proc
 
     w = _Worker("sess-driveronce")
     entered = {"n": 0}

@@ -306,7 +306,9 @@ class _Worker:
 
         The handler reference is retained for testability and lifecycle
         introspection."""
-        handler = lambda *_: self._on_facade_dead()
+        def handler(*_):
+            return self._on_facade_dead()
+
         try:
             self._browser.on("disconnected", handler)
             self._facade_death_handler = handler

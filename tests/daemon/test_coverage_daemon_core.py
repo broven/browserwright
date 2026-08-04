@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -12,10 +11,7 @@ from browserwright.daemon import platforms as platforms_mod
 from browserwright.daemon.backends.base import ResolveResult
 from browserwright.daemon.config import Config, load
 from browserwright.daemon.errors import (
-    ChromeBinaryNotFound,
-    DaemonError,
     Unavailable,
-    UserError,
 )
 
 
@@ -69,7 +65,7 @@ def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
 
 
 def test_cmd_status_json_marks_transient_probe_failure(monkeypatch, tmp_path, capsys):
-    from browserwright.daemon import _ipc
+    from browserwright.daemon import _ipc, _stale
 
     sock = tmp_path / "daemon.sock"
     sock.write_text("", encoding="utf-8")
@@ -82,6 +78,11 @@ def test_cmd_status_json_marks_transient_probe_failure(monkeypatch, tmp_path, ca
         lambda: {"transport": "unix", "path": str(sock), "host": None, "port": None, "token": None},
     )
     monkeypatch.setattr(cli_mod.time, "sleep", lambda _seconds: None)
+    # Hermetic: without this the probe reaches out to the real default ports
+    # (19989/19990) and reports `port_held_by_unresponsive_process` whenever the
+    # developer's own daemon relay happens to be listening. Same stub the
+    # sibling wiring tests use.
+    monkeypatch.setattr(_stale, "port_is_listening", lambda host, port: False)
 
     assert cli_mod._cmd_status(SimpleNamespace(json=True), Config()) == 2
     payload = json.loads(capsys.readouterr().out)

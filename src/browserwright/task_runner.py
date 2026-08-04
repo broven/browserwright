@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 from .discovery import find_task_path
