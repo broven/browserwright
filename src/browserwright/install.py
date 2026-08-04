@@ -219,8 +219,8 @@ def run() -> int:
         ext_dir = chrome_extension_path()
         print("  1. Install the unpacked Chrome extension:")
         if ext_dir:
-            print(f"       - chrome://extensions → toggle 'Developer mode'")
-            print(f"       - click 'Load unpacked' → pick:")
+            print("       - chrome://extensions → toggle 'Developer mode'")
+            print("       - click 'Load unpacked' → pick:")
             print(f"           {ext_dir}")
         else:
             print("       - chrome://extensions → toggle 'Developer mode'")

@@ -21,7 +21,13 @@ import os
 import sys
 import time
 from xml.sax.saxutils import escape as _xml_escape
-from typing import NoReturn
+from typing import NoReturn, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-checking only: the runtime imports pathlib lazily inside the few
+    # LaunchAgent helpers that need it, so this keeps `Path` resolvable in
+    # annotations without adding a module-level runtime import.
+    from pathlib import Path
 
 from . import __version__
 from .backends import names
@@ -388,7 +394,8 @@ def _cmd_stop(args, cfg: Config) -> int:
     """
     from . import _ipc
     from . import platforms
-    import signal, time
+    import signal
+    import time
 
     pid = _ipc.ping_sync(timeout=1.0)
     if pid is None:
@@ -952,12 +959,12 @@ def _cmd_kill_executor(args, cfg: Config) -> int:
 _LAUNCHAGENT_LABEL = "com.browserwright-daemon"
 
 
-def _launchagent_dir() -> "Path":
+def _launchagent_dir() -> Path:
     from pathlib import Path
     return Path.home() / "Library" / "LaunchAgents"
 
 
-def _launchagent_plist_path() -> "Path":
+def _launchagent_plist_path() -> Path:
     return _launchagent_dir() / f"{_LAUNCHAGENT_LABEL}.plist"
 
 

@@ -18,17 +18,14 @@ Implications:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from typing import Any
 
 import httpx
 
 from ..config import Config
 from ..errors import Unavailable
 from .base import Backend, DoctorResult, ResolveResult
-from ..server.relay import DEFAULT_RELAY_PORT
 from browserwright.version import EXTENSION_PROTOCOL_VERSION, package_version
 
 logger = logging.getLogger(__name__)

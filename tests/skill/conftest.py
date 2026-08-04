@@ -1,6 +1,4 @@
 """Shared fixtures: temp BS_HOME, etc."""
-import os
-from pathlib import Path
 
 import pytest
 

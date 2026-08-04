@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import sys
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 from ..errors import NeedsUserConfirm
 from ..memory import global_memory, site_memory
