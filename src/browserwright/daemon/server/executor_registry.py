@@ -614,6 +614,7 @@ def cleanup_orphan_executors() -> None:
                 pass
     for entry in runtime_dir.glob("bw-exec-*.json"):
         pid: int | None = None
+        started: str | None = None
         try:
             import json
             d = json.loads(entry.read_text())
@@ -621,9 +622,11 @@ def cleanup_orphan_executors() -> None:
             if isinstance(raw, int) and 0 < raw < (1 << 31):
                 pid = raw
             sock = d.get("sock")
+            raw_started = d.get("start_time")
+            started = raw_started if isinstance(raw_started, str) else None
         except (OSError, ValueError, TypeError):
             sock = None
-        if pid is not None and not _terminate_orphan_and_wait(pid):
+        if pid is not None and not _terminate_orphan_and_wait(pid, started):
             # Fixed per-session paths cannot be reused while the old process
             # may still run its unconditional SIGTERM cleanup handler.
             logger.warning(
@@ -641,12 +644,37 @@ def cleanup_orphan_executors() -> None:
                 pass
 
 
-def _terminate_orphan_and_wait(pid: int) -> bool:
-    """Bounded TERM→KILL reap for a process without a ``Popen`` handle."""
+def _terminate_orphan_and_wait(pid: int, start_time: str | None = None) -> bool:
+    """Bounded TERM→KILL reap for a process without a ``Popen`` handle.
+
+    ``start_time`` is the fingerprint recorded when the discovery file was
+    written. A crash can leave that file behind while its executor exits, and
+    the OS is free to hand the pid to anything — so liveness alone does not
+    say the pid is still ours, and signalling its whole *group* on that basis
+    can take out an unrelated process tree. Three cases, deliberately graded:
+
+    - recorded and matching  → ours; full group escalation.
+    - recorded and differing → someone else's; do not signal at all, and
+      report the orphan as gone so its stale files are cleaned up.
+    - not recorded (a discovery file written before this field existed)
+      → unverifiable; signal only the exact pid, never the group.
+    """
     if not _pid_alive(pid):
         return True
+    verified = False
+    if start_time is not None:
+        from ..platforms import proc_start_time
+        current = proc_start_time(pid)
+        if current is not None and current != start_time:
+            logger.info(
+                "orphan-cleanup: pid %d was recycled (start-time mismatch); "
+                "not signalling", pid)
+            return True
+        verified = current is not None
     try:
         try:
+            if not verified:
+                raise PermissionError("unverified pid: exact-pid signal only")
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             os.kill(pid, signal.SIGTERM)
@@ -657,6 +685,8 @@ def _terminate_orphan_and_wait(pid: int) -> bool:
         return True
     try:
         try:
+            if not verified:
+                raise PermissionError("unverified pid: exact-pid signal only")
             os.killpg(os.getpgid(pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             os.kill(pid, signal.SIGKILL)

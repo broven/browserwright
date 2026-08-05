@@ -409,7 +409,8 @@ def test_orphan_cleanup_keeps_fixed_paths_until_process_death_confirmed(
     discovery = _ipc.executor_file_path("bs-live-orphan")
     socket_path = _ipc.executor_sock_path("bs-live-orphan")
     socket_path.write_text("old socket placeholder")
-    monkeypatch.setattr(er, "_terminate_orphan_and_wait", lambda _pid: False)
+    monkeypatch.setattr(er, "_terminate_orphan_and_wait",
+                        lambda _pid, _start=None: False)
 
     er.cleanup_orphan_executors()
 

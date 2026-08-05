@@ -233,6 +233,14 @@ def write_executor_file(
     fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_name(fp.name + ".tmp")
     payload = {"sock": sock, "pid": pid, "session": session_id}
+    # Start-time fingerprint so a later sweep can tell "our executor is still
+    # running" from "the OS handed this pid to somebody else". Without it the
+    # orphan cleanup can only check that *a* process holds the pid, and its
+    # SIGKILL escalation would take out an unrelated process group.
+    from .platforms import proc_start_time
+    started = proc_start_time(pid)
+    if started is not None:
+        payload["start_time"] = started
     if executor_id is not None:
         payload["executor_id"] = executor_id
     tmp.write_text(json.dumps(payload))
