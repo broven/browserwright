@@ -78,35 +78,24 @@ def _ensure_daemon_running() -> None:
     _spawn_detached(["browserwright-daemon", "serve"])
 
 
-def _close_browser(record: dict) -> bool:
-    """Tear down a create-owned rdp session's browser via the single daemon.
+def _end_daemon_session(record: dict) -> bool:
+    """End every session through the daemon's atomic terminal lifecycle.
 
-    The daemon owns the per-session Chrome (launched on ``ensureSession``), so
-    ``endSession`` closes the upstream + SIGTERMs that Chrome + drops the
-    context. Returns whether the daemon confirmed a complete teardown; callers
-    retain the ledger on failure so the operation can be retried. Only
-    create-owned sessions reach here — attach sessions never launched a browser
-    we own."""
+    The daemon, not Layer 2, applies workspace ownership: extension closes its
+    group, rdp create closes its Chrome, while rdp attach/env keep the external
+    browser.  All four still revoke live control/facade clients and reap the
+    executor before this function confirms success.
+    """
     sid = record.get("id")
-    if sid:
-        return _run([
-            "browserwright-daemon", "end-session", "--session", str(sid)]) == 0
-    return True
-
-
-def _reap_executor(record: dict) -> None:
-    """Best-effort: reap this session's resident Phase B executor (no browser
-    teardown). Called for EVERY owner on `end()` so an attach session's
-    long-lived executor subprocess doesn't leak — the full `endSession` path is
-    create-only and would also close the browser an attach session must keep.
-
-    Best-effort by contract: a dead daemon / no-executor / stale binary all
-    return non-zero from `_run`, which we ignore — `session end` must never fail
-    because the executor couldn't be reaped (the orphan-sweep on the next daemon
-    start is the backstop)."""
-    sid = record.get("id")
-    if sid:
-        _run(["browserwright-daemon", "kill-executor", "--session", str(sid)])
+    if not sid:
+        return True
+    cmd = ["browserwright-daemon", "end-session", "--session", str(sid)]
+    if record.get("backend") == "extension":
+        runtime = record.get("runtime") or {}
+        gid = runtime.get("group_id")
+        if isinstance(gid, int) and gid >= 0:
+            cmd += ["--group-id", str(gid)]
+    return _run(cmd) == 0
 
 
 def reset_executor(record: dict) -> str:
@@ -146,13 +135,8 @@ def reap(*, idle_seconds: float) -> list[dict]:
     stale = reg.stale(idle_seconds=idle_seconds)
     pruned: list[dict] = []
     for rec in stale:
-        _reap_executor(rec)
-        if (rec.get("backend") == "extension"
-                and not _end_extension_workspace(rec)):
+        if not _end_daemon_session(rec):
             continue
-        if rec.get("owner") == "create":
-            if _close_browser(rec) is False:
-                continue
         removed = reg.remove(str(rec.get("id")))
         if removed is not None:
             pruned.append(removed)
@@ -228,55 +212,25 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     raise ValueError(f"unknown backend {backend!r} (use extension|rdp|env)")
 
 
-def _end_extension_workspace(record: dict) -> bool:
-    """Close the session's agent-owned extension tabs via the single daemon.
-
-    The shared browser itself stays open (extension sessions are attach-owned);
-    only the session group is closed. A non-zero result is significant: the
-    caller retains the ledger so teardown can be retried. The ``end-session``
-    CLI no longer takes ``--name`` — there is one daemon."""
-    cmd = ["browserwright-daemon", "end-session", "--session", record["id"]]
-    # Thread the durable numeric groupId (persisted in ledger.runtime on every
-    # open) so the daemon can close the whole group even when its in-memory
-    # binding was wiped (restart). The title is not used — names aren't unique.
-    runtime = record.get("runtime") or {}
-    gid = runtime.get("group_id")
-    if isinstance(gid, int) and gid >= 0:
-        cmd += ["--group-id", str(gid)]
-    return _run(cmd) == 0
-
-
 def end(record: dict) -> str:
     """Tear down a session honoring ownership. Returns a human-readable line.
 
     create-owned → the daemon closes the browser it launched (endSession).
     attach       → leave the browser running, remind the user.
     extension    → also close the session's agent-owned tabs (browser stays).
-    Removes the ledger entry only after owned workspace teardown is confirmed.
+    Removes the ledger entry only after the daemon confirms executor, clients,
+    and ownership-aware workspace teardown all completed.
     """
     sid = record["id"]
-    if record.get("backend") == "extension":
-        if not _end_extension_workspace(record):
-            from .errors import DaemonUnavailable
+    if not _end_daemon_session(record):
+        from .errors import DaemonUnavailable
 
-            raise DaemonUnavailable(
-                f"session {sid} still has extension tabs that could not be "
-                "closed; its ledger entry was kept for retry")
+        raise DaemonUnavailable(
+            f"session {sid} termination was incomplete; its ledger entry was "
+            "kept for retry")
     if record.get("owner") == "create":
-        # `_close_browser` → daemon `endSession`, which ALSO kills the executor
-        # (symmetric in `_handle_end_session`), so no separate reap needed here.
-        if _close_browser(record) is False:
-            from .errors import DaemonUnavailable
-
-            raise DaemonUnavailable(
-                f"session {sid} browser teardown was incomplete; its ledger "
-                "entry was kept for retry")
         msg = f"session {sid} ended; the browser it launched was closed."
     else:
-        # attach: leave the browser running (semantics unchanged) but still reap
-        # the session's resident executor so it doesn't leak — `endSession` is
-        # create-only and the attach path never otherwise contacts the daemon.
-        _reap_executor(record)
         msg = (f"session {sid} ended. The browser is still running — you "
                f"attached to it, so it was left untouched.")
     reg.remove(sid)

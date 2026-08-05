@@ -549,9 +549,29 @@ class _ClientHandler:
         label = query.get("client", "anonymous")
         session_id = query.get("session") or None
 
+        lease_token: object | None = None
+        handler_task = asyncio.current_task()
+
+        async def revoke_connection() -> None:
+            with contextlib.suppress(Exception):
+                await conn.close(code=1008, reason="browserwright session ended")
+            if (handler_task is not None
+                    and handler_task is not asyncio.current_task()):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await handler_task
+
         try:
-            ctx = (self.daemon.context_for_required(session_id)
-                   if session_id else self.daemon.context_for(None))
+            if session_id:
+                acquire = getattr(self.daemon, "acquire_session_lease", None)
+                if callable(acquire):
+                    lease_token = object()
+                    ctx = acquire(
+                        session_id, lease_token, revoke_connection,
+                        kind="control")
+                else:
+                    ctx = self.daemon.context_for_required(session_id)
+            else:
+                ctx = self.daemon.context_for(None)
         except UnknownSessionError:
             logger.warning("refusing client %s: unknown session %s",
                            label, session_id)
@@ -575,6 +595,7 @@ class _ClientHandler:
         client = state.allocate_client(
             label, client_id=next(self.daemon._next_client_id),
             session_id=session_id, session_name=session_name)
+        client.connection_token = lease_token
 
         async def send_to_client(text: str) -> None:
             try:
@@ -605,6 +626,10 @@ class _ClientHandler:
         finally:
             await router.release_client(client.client_id)
             router.unregister_client(client.client_id)
+            if lease_token is not None:
+                release = getattr(self.daemon, "release_session_lease", None)
+                if callable(release):
+                    release(lease_token)
             # Upstream stays warm so other clients (or the next reconnect)
             # don't pay banner-flash for our churn.
 
@@ -1071,6 +1096,16 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
         sid = str(rec.get("id") or "")
         if not sid:
             continue
+        context_for_required = getattr(daemon, "context_for_required", None)
+        if callable(context_for_required):
+            try:
+                # Use the same ledger/backend/scope boundary as every live
+                # client. An isolated env daemon must never prune another
+                # daemon's slot.
+                context_for_required(sid)
+            except UnknownSessionError:
+                continue
+
         async def teardown_workspace() -> dict:
             if rec.get("backend") == "rdp" and rec.get("owner") == "create":
                 await daemon.teardown_rdp_context(sid)
@@ -1095,12 +1130,18 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
 
         teardown_ok = True
         try:
-            terminate = getattr(daemon.executors, "terminate_session", None)
+            terminate = getattr(daemon, "terminate_session", None)
             if callable(terminate):
                 reap, result = await terminate(sid, teardown_workspace)
             else:
-                reap = await daemon.executors.kill_current_and_wait(sid)
-                result = await teardown_workspace()
+                legacy_terminate = getattr(
+                    daemon.executors, "terminate_session", None)
+                if callable(legacy_terminate):
+                    reap, result = await legacy_terminate(
+                        sid, teardown_workspace)
+                else:
+                    reap = await daemon.executors.kill_current_and_wait(sid)
+                    result = await teardown_workspace()
             if reap.get("reaped") is not True:
                 teardown_ok = False
                 logger.warning(

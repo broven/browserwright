@@ -263,11 +263,37 @@ class PlaywrightFacade:
         through the shared relay with target-event synthesis (PR2); otherwise
         resolve the rdp Chrome's real CDP ws and pump frames byte-for-byte."""
         task = asyncio.current_task()
+        lease_token: object | None = None
         if task is not None:
             self._sessions.add(task)
+
+        async def revoke_connection() -> None:
+            with contextlib.suppress(Exception):
+                await conn.close(code=1008, reason="browserwright session ended")
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
         try:
             try:
-                ctx = self._context_for_connection(conn)
+                session_id = self._session_for_connection(conn)
+                shared = getattr(self._daemon, "shared_context", None)
+                if (not session_id and shared is not None
+                        and getattr(shared, "backend", None) == "env"):
+                    with contextlib.suppress(Exception):
+                        await conn.close(
+                            code=1008,
+                            reason="env facade requires browserwright session")
+                    return
+                acquire = getattr(self._daemon, "acquire_session_lease", None)
+                if session_id and callable(acquire):
+                    lease_token = object()
+                    ctx = acquire(
+                        session_id, lease_token, revoke_connection,
+                        kind="facade")
+                else:
+                    ctx = self._context_for_connection(conn)
             except UnknownSessionError:
                 with contextlib.suppress(Exception):
                     await conn.close(code=1008, reason="unknown browserwright session")
@@ -278,6 +304,9 @@ class PlaywrightFacade:
                 return
             await self._handle_rdp_client(conn, ctx)
         finally:
+            release = getattr(self._daemon, "release_session_lease", None)
+            if lease_token is not None and callable(release):
+                release(lease_token)
             if task is not None:
                 self._sessions.discard(task)
 

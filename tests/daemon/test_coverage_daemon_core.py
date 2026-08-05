@@ -412,6 +412,191 @@ def test_daemon_context_for_unknown_or_non_rdp_uses_shared(monkeypatch):
     assert daemon.context_for_required("extension-session") is shared
 
 
+def test_daemon_context_for_preserves_multi_extension_shared_context(monkeypatch):
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension"},
+    )
+
+    assert daemon.context_for_required("extension-a") is shared
+    assert daemon.context_for_required("extension-b") is shared
+
+
+def test_daemon_context_for_env_requires_matching_daemon_scope(
+    monkeypatch, tmp_path,
+):
+    from browserwright.daemon.server.daemon import (
+        Daemon,
+        UnknownSessionError,
+        UpstreamContext,
+    )
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    scope = str((tmp_path / "browserwright-daemon.sock").resolve())
+    shared = UpstreamContext(
+        backend="env", state=DaemonState("env"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(backend="env"), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    records = {
+        "matching": {
+            "id": "matching", "backend": "env", "daemon_scope": scope,
+        },
+        "foreign": {
+            "id": "foreign", "backend": "env",
+            "daemon_scope": "/tmp/another-daemon.sock",
+        },
+        "legacy": {"id": "legacy", "backend": "env"},
+    }
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        records.get,
+    )
+
+    assert daemon.context_for_required("matching") is shared
+    with pytest.raises(UnknownSessionError):
+        daemon.context_for_required("foreign")
+    with pytest.raises(UnknownSessionError):
+        daemon.context_for_required("legacy")
+
+
+@pytest.mark.parametrize("shared_backend,record_backend", [
+    ("extension", "env"),
+    ("env", "extension"),
+    ("extension", "mystery"),
+])
+def test_daemon_context_for_rejects_backend_context_mismatch(
+    monkeypatch, shared_backend, record_backend,
+):
+    from browserwright.daemon.server.daemon import (
+        Daemon,
+        UnknownSessionError,
+        UpstreamContext,
+    )
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    shared = UpstreamContext(
+        backend=shared_backend, state=DaemonState(shared_backend),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(backend=shared_backend), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": record_backend},
+    )
+
+    with pytest.raises(UnknownSessionError):
+        daemon.context_for_required("wrong-backend")
+
+
+@pytest.mark.asyncio
+async def test_daemon_termination_revokes_only_the_ended_session_and_gates_races(
+    monkeypatch,
+):
+    from browserwright.daemon.server.daemon import (
+        Daemon,
+        UnknownSessionError,
+        UpstreamContext,
+    )
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    class Registry:
+        async def terminate_session(self, session_id, teardown, *, budget=None):
+            assert session_id == "session-a"
+            result = await teardown()
+            return {"reaped": True}, result
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    daemon.executors = Registry()
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension"},
+    )
+    calls = []
+
+    async def revoke(token):
+        calls.append(("revoke", token))
+
+    caller = object()
+    other_control = object()
+    facade = object()
+    other_session = object()
+    daemon.acquire_session_lease(
+        "session-a", caller, lambda: revoke("caller"), kind="control")
+    daemon.acquire_session_lease(
+        "session-a", other_control, lambda: revoke("other-control"),
+        kind="control")
+    daemon.acquire_session_lease(
+        "session-a", facade, lambda: revoke("facade"), kind="facade")
+    daemon.acquire_session_lease(
+        "session-b", other_session, lambda: revoke("session-b"),
+        kind="facade")
+    teardown_started = asyncio.Event()
+    finish_teardown = asyncio.Event()
+
+    async def teardown():
+        calls.append(("teardown", "session-a"))
+        teardown_started.set()
+        await finish_teardown.wait()
+        return {"ok": True, "backend": "extension"}
+
+    ending = asyncio.create_task(daemon.terminate_session(
+        "session-a", teardown, caller_token=caller))
+    await teardown_started.wait()
+
+    with pytest.raises(UnknownSessionError):
+        daemon.acquire_session_lease(
+            "session-a", object(), lambda: revoke("late-facade"),
+            kind="facade")
+    assert ("revoke", "session-b") not in calls
+    assert ("revoke", "caller") not in calls
+    assert calls[:3] == [
+        ("revoke", "other-control"),
+        ("revoke", "facade"),
+        ("teardown", "session-a"),
+    ]
+
+    finish_teardown.set()
+    reap, result = await ending
+    assert reap["reaped"] is True
+    assert result["ok"] is True
+    assert daemon.session_is_terminal("session-a") is True
+
+    # The endSession caller is closed only after its result has been sent.
+    calls.append(("ack", "caller"))
+    await daemon.revoke_session_lease(caller)
+    assert calls[-2:] == [("ack", "caller"), ("revoke", "caller")]
+
+
 @pytest.mark.asyncio
 async def test_daemon_teardown_missing_rdp_context_returns_false():
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext

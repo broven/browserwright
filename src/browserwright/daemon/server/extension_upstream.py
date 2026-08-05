@@ -492,7 +492,14 @@ class ExtensionUpstream:
         the single Target.attachToTarget core both the agent path and the
         Playwright facade drive. Raises `_CommandError` / other exceptions from
         the relay; callers map them to CDP errors."""
-        await self._relay.attach_tab(tab_id, timeout=timeout)
+        # Both callers reach this method immediately after their live-membership
+        # await; capture before our first await so that exact authorization
+        # epoch, rather than a replacement relay's recycled tab id, reaches the
+        # write boundary.
+        validated_generation = self._relay_generation()
+        await self._relay.attach_tab(
+            tab_id, timeout=timeout,
+            expected_generation=validated_generation)
         return self.register_session(tab_id, sid)
 
     def resolve_tab_id(self, session_id: str) -> int | None:
@@ -1148,6 +1155,7 @@ class ExtensionUpstream:
                 "(group missing or empty)")
         group_id = int(resolved_group_id if resolved_group_id is not None else -1)
         tabs = info["tabs"]
+        validated_generation = self._relay_generation()
         recovered: list[int] = []
         # tab_id → (sid, url, title, lastAccessed) for picking a representative.
         meta: dict[int, dict] = {}
@@ -1159,7 +1167,8 @@ class ExtensionUpstream:
             # ghost already exists from a popup attach / re-announce). NOTE:
             # deliberately NOT `attach_target` — recovery keeps the relay's
             # default attach timeout, not the emulation path's 10s.
-            await self._relay.attach_tab(tab_id)
+            await self._relay.attach_tab(
+                tab_id, expected_generation=validated_generation)
             sid = self.register_session(tab_id)
             url = str(tab.get("url", ""))
             recovered.append(tab_id)

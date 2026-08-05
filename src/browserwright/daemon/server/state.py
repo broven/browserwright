@@ -110,6 +110,9 @@ class ClientState:
     # the bare REPL client / single-context unit tests.
     session_id: str | None = None
     session_name: str | None = None
+    # Opaque daemon lease used to revoke this exact control transport when its
+    # Browserwright session ends.  None for sessionless/unit-test clients.
+    connection_token: object | None = None
     sessions: dict[str, SessionBinding] = field(default_factory=dict)
     """local_session_id → SessionBinding owned by this client."""
     # Wall-clock, deliberately: these two are rendered as "connected 4m ago" /
