@@ -7,15 +7,32 @@ belongs to ``CdpUpstream``, not to this dispatcher.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
+import time
 from functools import partial
 from typing import Any, Awaitable, Callable, Protocol
 
 from .state import ClientState, UpstreamPhase
 
 logger = logging.getLogger(__name__)
+
+_END_SESSION_BUDGET_S = 8.0
+
+
+def _teardown_budget_result(backend: str) -> dict:
+    return {
+        "ok": False,
+        "partial": True,
+        "timedOut": True,
+        "closed": [],
+        "failed": [],
+        "unknown": ["workspace"],
+        "kept": [],
+        "backend": backend,
+    }
 
 
 class Handler(Protocol):
@@ -458,6 +475,10 @@ class SessionVerbsMixin:
 
         group_id = params.get("groupId")
         group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
+        # Adapters stop cooperatively at this deadline, after committing every
+        # confirmed mutation. The registry deliberately never hard-cancels the
+        # callback between a browser write and its durable checkpoint.
+        teardown_deadline = time.monotonic() + _END_SESSION_BUDGET_S - 0.5
 
         async def teardown_workspace() -> dict:
             # This readiness + teardown runs under ExecutorRegistry's lifecycle
@@ -465,16 +486,34 @@ class SessionVerbsMixin:
             # workspace between executor reap and terminal teardown.
             if (self.upstream is None and self._ensure_upstream is not None
                     and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                await self._ensure_upstream()
+                remaining = max(0.0, teardown_deadline - time.monotonic())
+                if remaining <= 0:
+                    return _teardown_budget_result(self.state.backend_name)
+                try:
+                    await asyncio.wait_for(
+                        self._ensure_upstream(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    # ensure_open may have entered CONNECTING before it was
+                    # cancelled. No workspace mutation follows this result;
+                    # restore a retryable daemon phase when no adapter was
+                    # published.
+                    if self.upstream is None:
+                        await self.state.set_disconnected()
+                    return _teardown_budget_result(self.state.backend_name)
             upstream = self.upstream
             if upstream is None:
                 raise RuntimeError("upstream not attached")
+            end_before = getattr(upstream, "end_session_before", None)
+            if callable(end_before):
+                return await end_before(
+                    session, group_id, deadline=teardown_deadline)
             return await upstream.end_session(session, group_id)
 
         terminate = getattr(registry, "terminate_session", None)
         if callable(terminate):
             try:
-                reap, result = await terminate(session, teardown_workspace)
+                reap, result = await terminate(
+                    session, teardown_workspace, budget=_END_SESSION_BUDGET_S)
                 if reap.get("reaped") is not True:
                     await self._send_to_client(
                         client.client_id,
@@ -484,6 +523,8 @@ class SessionVerbsMixin:
                             f"{reap!r}"),
                     )
                     return
+                if isinstance(result, dict):
+                    result.setdefault("backend", self.state.backend_name)
             except Exception as e:  # noqa: BLE001 - executor kill is best-effort
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
@@ -654,22 +695,6 @@ class SessionVerbsMixin:
         upstream = await self._ready_upstream(client, req_id, "closeTab failed")
         if upstream is None:
             return
-        if has_tid:
-            authorize = getattr(upstream, "target_belongs_to_session", None)
-            if callable(authorize):
-                try:
-                    allowed = await authorize(browser_session, target_id_param)
-                except Exception as e:  # noqa: BLE001 - unknown must fail closed
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32603,
-                        f"closeTab ownership check failed: {e!r}"))
-                    return
-                if not allowed:
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32602,
-                        f"target {target_id_param} does not belong to session "
-                        f"{browser_session!r}"))
-                    return
         # Resolve to (target_id, upstream_sid, owner_client_id, owner_local_sid).
         # sessionId path = per-client lookup; targetId path = state.attachers
         # global lookup, valid even across different ws clients.
@@ -691,30 +716,45 @@ class SessionVerbsMixin:
                 owner_client_id = attacher.primary_client_id
                 owner_local_sid = attacher.primary_local_session
                 upstream_sid = attacher.upstream_session_id
-        # Fallback path: targetId given but no live attacher (original opener
-        # disconnected — common for CLI subcommands). The tab still exists in
-        # Chrome; close via targetId-only path that bypasses session lookup.
-        if upstream_sid is None and has_tid:
-            target_id = target_id_param
-            try:
-                result = await upstream.close_tab(target_id)
-            except Exception as e:
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603, f"closeTab failed: {e!r}"))
-                return
-            self._forget_tab_binding(target_id)
-            await self._send_to_client(client.client_id, _result_response(req_id, {
-                "ok": True,
-                "tabId": result.get("tabId"),
-            }))
-            return
-        if target_id is None or upstream_sid is None:
+        if target_id is None:
             ident = local_sid if has_sid else target_id_param
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602, f"unknown sessionId/targetId {ident}"))
             return
+
+        if has_sid and has_tid and target_id_param != target_id:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "sessionId and targetId refer to different tabs"))
+            return
+
+        # A local sessionId is only an address, not continuing authority. Both
+        # forms are canonicalized to targetId before checking live group
+        # membership, so a tab dragged to another session fails closed.
+        authorize = getattr(upstream, "target_belongs_to_session", None)
+        if callable(authorize):
+            try:
+                allowed = await authorize(browser_session, target_id)
+            except Exception as e:  # noqa: BLE001 - unknown must fail closed
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"closeTab ownership check failed: {e!r}"))
+                return
+            if not allowed:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32602,
+                    f"target {target_id} does not belong to session "
+                    f"{browser_session!r}"))
+                return
         try:
-            result = await upstream.close_tab(upstream_sid)
+            close_for_session = getattr(upstream, "close_session_tab", None)
+            if callable(close_for_session):
+                result = await close_for_session(browser_session, target_id)
+            else:
+                # No attacher is required for the one-shot CLI fallback; the
+                # live ownership check above is the authorization boundary.
+                close_handle = upstream_sid if upstream_sid is not None else target_id
+                result = await upstream.close_tab(close_handle)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"closeTab failed: {e!r}"))

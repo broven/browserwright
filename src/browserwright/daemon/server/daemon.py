@@ -27,8 +27,10 @@ Phase boundaries (this file is Phase 2):
 from __future__ import annotations
 
 import dataclasses
+import asyncio
 import itertools
 import logging
+import time
 
 from ... import session_registry
 from ..config import Config
@@ -207,7 +209,9 @@ class Daemon:
         dropping."""
         return self.contexts.pop(session_id, None)
 
-    async def teardown_rdp_context(self, session_id: str) -> bool:
+    async def teardown_rdp_context(
+        self, session_id: str, *, deadline: float | None = None,
+    ) -> bool:
         """Phase 3 endSession teardown: close the per-session upstream, kill the
         daemon-owned Chrome (the holder's `trigger_close` SIGTERMs `rdp_pid`),
         and drop the context. Returns True if a context was found + torn down.
@@ -217,13 +221,48 @@ class Daemon:
         ctx = self.contexts.get(session_id)
         if ctx is None:
             return False
+        holder = ctx.holder
+        # Terminate the owned process before the first cancellable close-
+        # etiquette await. A timeout can lose notifications, but cannot leak
+        # the Chrome or leave the context stuck in CLOSING.
+        kill = getattr(holder, "_kill_rdp_chrome", None)
+        if callable(kill):
+            if kill() is False:
+                raise RuntimeError(
+                    f"could not terminate rdp Chrome for session {session_id!r}")
         try:
             # "skill_disconnect" is the closest honest CloseReason — the client
             # explicitly asked to end this session (vs chrome_exit / idle).
-            await ctx.holder.trigger_close("skill_disconnect")  # type: ignore[attr-defined]
+            close = holder.trigger_close("skill_disconnect")  # type: ignore[attr-defined]
+            if deadline is None:
+                await close
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    close.close()
+                    abort = getattr(holder, "abort_rdp_teardown", None)
+                    if callable(abort):
+                        await abort()
+                    return False
+                await asyncio.wait_for(close, timeout=remaining)
+        except asyncio.TimeoutError:
+            abort = getattr(holder, "abort_rdp_teardown", None)
+            if callable(abort):
+                await abort()
+            logger.warning("teardown rdp context %s exceeded its budget", session_id)
+            return False
+        except asyncio.CancelledError:
+            abort = getattr(holder, "abort_rdp_teardown", None)
+            if callable(abort):
+                await asyncio.shield(abort())
+            raise
         except Exception as e:
+            abort = getattr(holder, "abort_rdp_teardown", None)
+            if callable(abort):
+                await abort()
             logger.warning("teardown rdp context %s close failed: %r",
                            session_id, e)
+            raise
         self.contexts.pop(session_id, None)
         logger.info("tore down rdp context for session %s", session_id)
         return True

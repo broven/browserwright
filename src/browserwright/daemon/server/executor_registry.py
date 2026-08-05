@@ -158,6 +158,8 @@ class ExecutorRegistry:
         self,
         session_id: str,
         teardown: Callable[[], Awaitable[dict]],
+        *,
+        budget: float | None = None,
     ) -> tuple[dict[str, object], dict]:
         """Atomically reap the executor and tear down its browser workspace.
 
@@ -181,6 +183,12 @@ class ExecutorRegistry:
                 session_id, executor_id=executor_id)
             if reap.get("reaped") is not True:
                 return reap, {}
+            # Teardown adapters own their cooperative deadline. Hard-cancelling
+            # this callback can land between a browser mutation and its durable
+            # ledger checkpoint, creating the exact split-brain this lifecycle
+            # lock exists to prevent. ``budget`` remains part of the boundary
+            # for compatibility; Router supplies the deadline to its adapter.
+            _ = budget
             result = await teardown()
             if isinstance(result, dict) and result.get("ok") is True:
                 self._terminal_results[session_id] = dict(result)
@@ -355,16 +363,23 @@ class ExecutorRegistry:
                 "current_executor_id": handle.executor_id,
             }
 
-        self._handles.pop(session_id, None)
-        await asyncio.to_thread(_terminate_and_wait, handle)
+        # Keep the fixed-path lease (handle + session lock) until death is
+        # confirmed. asyncio cancellation cannot stop the reaper thread, so it
+        # must not release the lease early either.
+        reap_task = asyncio.create_task(
+            asyncio.to_thread(_terminate_and_wait, handle))
+        cancelled: asyncio.CancelledError | None = None
+        while not reap_task.done():
+            try:
+                await asyncio.shield(reap_task)
+            except asyncio.CancelledError as e:
+                cancelled = e
+        reap_task.result()
         reaped = handle.proc.poll() is not None
         if reaped:
+            if self._handles.get(session_id) is handle:
+                self._handles.pop(session_id, None)
             _ipc.cleanup_executor(session_id)
-        else:
-            # Never permit a replacement at the same unix-socket path while
-            # the old process is still alive. Preserve ownership so a later
-            # reap can retry instead of spawning alongside it.
-            self._handles[session_id] = handle
         logger.info(
             "synchronously reaped executor for session %s "
             "(pid=%s, executor_id=%s, reaped=%s)",
@@ -373,12 +388,15 @@ class ExecutorRegistry:
             handle.executor_id,
             reaped,
         )
-        return {
+        result = {
             "killed": True,
             "reaped": reaped,
             "matched": True,
             "executor_id": handle.executor_id,
         }
+        if cancelled is not None:
+            raise cancelled
+        return result
 
     async def kill_all(self) -> None:
         """Reap the current executor for every session in a key snapshot."""

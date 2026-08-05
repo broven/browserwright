@@ -558,7 +558,7 @@ async def test_upstream_close_failure_preserves_session_binding():
     class _FailingRelay:
         port = 19989
 
-        async def close_tab(self, tab_id):
+        async def close_tab(self, tab_id, **_kwargs):
             raise RuntimeError(f"close failed for {tab_id}")
 
     async def _noop(_value):
@@ -650,7 +650,8 @@ async def test_open_background_restores_live_group_from_ledger_after_restart(
 
         async def create_background_tab(self, url, *, group_name, group_id,
                                         background,
-                                        skip_post_attach_commands):
+                                        skip_post_attach_commands,
+                                        expected_generation=None):
             calls.append(("create", group_id))
             return SimpleNamespace(
                 tab_id=11, target_id="ext-tab-11", url=url, title="new",
@@ -696,7 +697,8 @@ async def test_stale_ledger_group_is_not_reused_for_new_tab(monkeypatch):
 
         async def create_background_tab(self, url, *, group_name, group_id,
                                         background,
-                                        skip_post_attach_commands):
+                                        skip_post_attach_commands,
+                                        expected_generation=None):
             calls.append(("create", group_id))
             return SimpleNamespace(
                 tab_id=12, target_id="ext-tab-12", url=url, title="new",
@@ -771,7 +773,8 @@ async def test_other_group_sensitive_operations_restore_ledger_binding(
                 "tabs": [{"tabId": 10, "url": "https://old/", "title": "old"}],
             }
 
-        async def attach_active_tab(self, *, group_name, group_id, timeout):
+        async def attach_active_tab(self, *, group_name, group_id, timeout,
+                                    expected_generation=None):
             calls.append(("attach", group_id))
             return SimpleNamespace(
                 tab_id=11, target_id="ext-tab-11", url="https://active/",
@@ -1020,7 +1023,8 @@ async def test_concurrent_first_opens_share_one_group_across_adapters(monkeypatc
 
         async def create_background_tab(self, url, *, group_name, group_id,
                                         background,
-                                        skip_post_attach_commands):
+                                        skip_post_attach_commands,
+                                        expected_generation=None):
             calls.append(group_id)
             await asyncio.sleep(0)
             final_group = group_id if group_id is not None else 100 + len(calls)
@@ -1076,7 +1080,7 @@ async def test_end_session_reports_failed_tabs_and_retains_their_binding(
                 "tabs": [{"tabId": 1}, {"tabId": 2}],
             }
 
-        async def close_tab(self, tab_id):
+        async def close_tab(self, tab_id, **_kwargs):
             if tab_id == 2:
                 raise RuntimeError("tab 2 refused to close")
 
@@ -1193,7 +1197,7 @@ async def test_end_session_resolves_group_by_passed_id_when_unbound(monkeypatch)
                 ],
             }
 
-        async def close_tab(self, tab_id):
+        async def close_tab(self, tab_id, **_kwargs):
             calls.append(("close", tab_id))
 
     monkeypatch.setattr(
@@ -1301,7 +1305,7 @@ async def test_end_session_reconciles_lost_close_responses_before_anchor(
                 "tabs": [{"tabId": tab_id} for tab_id in sorted(self.members)],
             }
 
-        async def close_tab(self, tab_id):
+        async def close_tab(self, tab_id, **_kwargs):
             if tab_id == 1:
                 self.members.remove(1)
                 raise RuntimeError("response lost after remove")
@@ -1319,6 +1323,345 @@ async def test_end_session_reconciles_lost_close_responses_before_anchor(
     assert result["closed"] == [1]
     assert result["failed"] == [2]
     assert record["runtime"]["current_target_id"] == "ext-tab-2"
+
+
+@pytest.mark.asyncio
+async def test_end_session_stale_requery_keeps_every_retry_anchor(monkeypatch):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _StaleRequeryRelay:
+        port = 19989
+        connection_generation = 1
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "tabs": [{"tabId": 1}, {"tabId": 2}],
+            }
+
+        async def close_tab(self, tab_id, **_kwargs):
+            raise RuntimeError(f"lost or refused {tab_id}")
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_StaleRequeryRelay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    result = await upstream.end_session("A")
+
+    assert result["failed"] == [1, 2]
+    assert record["runtime"]["current_target_id"] is None
+    assert record["runtime"]["retry_target_ids"] == [
+        "ext-tab-1", "ext-tab-2"]
+
+
+@pytest.mark.asyncio
+async def test_close_session_tab_moves_durable_anchor_to_a_survivor(monkeypatch):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.members = {1, 2}
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "groupTitle": "Agent",
+                "tabs": [{"tabId": tab_id} for tab_id in sorted(self.members)],
+            }
+
+        async def close_tab(self, tab_id, **_kwargs):
+            self.members.remove(tab_id)
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_Relay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    assert await upstream.close_session_tab("A", "ext-tab-1") == {
+        "ok": True, "tabId": 1}
+    assert record["runtime"]["current_target_id"] == "ext-tab-2"
+    assert record["runtime"].get("retry_target_ids") == ["ext-tab-2"]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_end_session_stops_and_persists_unfinished_candidates(
+    monkeypatch,
+):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.closed: list[int] = []
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "groupTitle": "Agent",
+                "tabs": [{"tabId": 1}, {"tabId": 2}, {"tabId": 3}],
+            }
+
+        async def close_tab(self, tab_id, *, timeout=5.0,
+                            expected_generation=None):
+            self.closed.append(tab_id)
+            if tab_id == 2:
+                raise asyncio.TimeoutError
+
+    async def _noop(_value):
+        return None
+
+    relay = _Relay()
+    upstream = ExtensionUpstream(relay, _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    result = await upstream.end_session_before(
+        "A", deadline=asyncio.get_running_loop().time() + 1.0)
+
+    assert relay.closed == [1, 2]
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert result["timedOut"] is True
+    assert result["closed"] == [1]
+    assert result["failed"] == [2, 3]
+    assert record["runtime"]["retry_target_ids"] == [
+        "ext-tab-2", "ext-tab-3"]
+
+
+@pytest.mark.asyncio
+async def test_non_replayable_relay_request_does_not_use_replacement(monkeypatch):
+    from browserwright.daemon.server.relay import _ExtensionConn
+
+    class _BrokenConn:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+            raise ConnectionError("old epoch disappeared")
+
+        async def close(self, **_kwargs):
+            return None
+
+    relay = RelayServer(port=0)
+    conn = _BrokenConn()
+    ext = _ExtensionConn(conn=conn)
+    ext.install_id = "same-install"
+    ext.hello_received.set()
+    relay._extensions[ext.install_id] = ext
+
+    async def forbidden_retry(*_args, **_kwargs):
+        raise AssertionError("write request crossed into a replacement epoch")
+
+    monkeypatch.setattr(relay, "_retry_request_on_replacement", forbidden_retry)
+
+    with pytest.raises(ConnectionError, match="not retried"):
+        await relay.create_background_tab("https://example.test/")
+    assert len(conn.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_preflight_does_not_send_write_on_replacement(monkeypatch):
+    from browserwright.daemon.server.relay import _ExtensionConn
+
+    class _Conn:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, **_kwargs):
+            return None
+
+    relay = RelayServer(port=0)
+    old = _ExtensionConn(conn=_Conn())
+    replacement = _ExtensionConn(conn=_Conn())
+    old.install_id = replacement.install_id = "same-install"
+    old.hello_received.set()
+    replacement.hello_received.set()
+    relay._extensions[old.install_id] = old
+
+    async def replace(_ext, **_kwargs):
+        return replacement
+
+    monkeypatch.setattr(relay, "_ensure_extension_fresh", replace)
+
+    with pytest.raises(ConnectionError, match="not sent on the replacement"):
+        await relay.create_background_tab("https://example.test/")
+    assert replacement.conn.sent == []
+
+
+@pytest.mark.asyncio
+async def test_validated_generation_refuses_write_before_send():
+    from browserwright.daemon.server.relay import _ExtensionConn
+
+    class _Conn:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+    relay = RelayServer(port=0)
+    ext = _ExtensionConn(conn=_Conn())
+    ext.install_id = "install"
+    ext.hello_received.set()
+    relay._extensions[ext.install_id] = ext
+    relay._connection_generation = 2
+
+    with pytest.raises(ConnectionError, match="ownership validation"):
+        await relay.close_tab(7, expected_generation=1)
+    assert ext.conn.sent == []
+
+
+@pytest.mark.asyncio
+async def test_group_query_timeout_is_end_to_end_across_stale_preflight(
+    monkeypatch,
+):
+    from browserwright.daemon.server.relay import _ExtensionConn
+
+    class _Conn:
+        async def send(self, _payload):
+            return None
+
+    relay = RelayServer(port=0)
+    old = _ExtensionConn(conn=_Conn())
+    replacement = _ExtensionConn(conn=_Conn())
+    old.install_id = replacement.install_id = "install"
+    old.hello_received.set()
+    replacement.hello_received.set()
+    relay._extensions[old.install_id] = old
+
+    async def delayed_preflight(_ext, **_kwargs):
+        await asyncio.sleep(0.03)
+        return replacement
+
+    remaining: list[float] = []
+
+    async def capture_request(_ext, _body, *, timeout, **_kwargs):
+        remaining.append(timeout)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(relay, "_ensure_extension_fresh", delayed_preflight)
+    monkeypatch.setattr(relay, "_request", capture_request)
+    with pytest.raises(asyncio.TimeoutError):
+        await relay.query_group_tabs(group_id=7, timeout=0.04)
+    assert 0 < remaining[0] < 0.02
+
+
+@pytest.mark.asyncio
+async def test_end_session_stops_writes_at_generation_boundary(monkeypatch):
+    record = {
+        "id": "A", "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+    monkeypatch.setattr(
+        "browserwright.session_registry.update",
+        lambda _session_id, **fields: record.update(fields) or record)
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.sent: list[int] = []
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {"groupId": group_id, "groupTitle": "Agent",
+                    "tabs": [{"tabId": 1}, {"tabId": 2}]}
+
+        async def close_tab(self, tab_id, *, expected_generation=None,
+                            timeout=5.0):
+            if expected_generation != self.connection_generation:
+                raise ConnectionError("generation boundary")
+            self.sent.append(tab_id)
+            self.connection_generation += 1
+
+    async def _noop(_value):
+        return None
+
+    relay = _Relay()
+    upstream = ExtensionUpstream(relay, _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    result = await upstream.end_session("A")
+
+    assert relay.sent == [1]
+    assert result["ok"] is False
+    assert result["closed"] == [1]
+    assert result["failed"] == [2]
+    assert record["runtime"]["retry_target_ids"] == ["ext-tab-2"]
+
+
+@pytest.mark.asyncio
+async def test_relay_detached_reaches_primary_event_handler():
+    from browserwright.daemon.server.relay import GhostTarget, _ExtensionConn
+
+    class _Conn:
+        async def send(self, _payload):
+            return None
+
+    relay = RelayServer(port=0)
+    received: list[dict] = []
+
+    async def primary(msg):
+        received.append(msg)
+
+    relay.set_event_handler(primary)
+    ext = _ExtensionConn(conn=_Conn())
+    ext.tabs[7] = GhostTarget("ext-tab-7", 7)
+
+    await relay._dispatch_from_extension(
+        ext, "pending", {"type": "detached", "tabId": 7})
+
+    assert received == [{"type": "detached", "tabId": 7}]
+    assert 7 not in ext.tabs
 
 
 @pytest.mark.asyncio

@@ -255,6 +255,8 @@ class ExtensionUpstream:
         self,
         session_id: str | None,
         explicit_group_id: int | None = None,
+        *,
+        timeout: float | None = None,
     ) -> tuple[int | None, dict | None]:
         """Resolve one session's group before any group-sensitive operation.
 
@@ -275,6 +277,9 @@ class ExtensionUpstream:
         recycled group/tab ids after a Chrome restart can collide with another
         same-titled group. See ``binding`` in CONTEXT.md.
         """
+        deadline = (
+            None if timeout is None else time.monotonic() + max(0.0, timeout))
+
         if session_id:
             live = self._groups.get(session_id)
             live_generation = self._group_generations.get(session_id)
@@ -296,7 +301,11 @@ class ExtensionUpstream:
 
         for candidate in candidates:
             validation_generation = self._relay_generation()
-            info = await self._relay.query_group_tabs(group_id=candidate)
+            query_kwargs = {"group_id": candidate}
+            if deadline is not None:
+                query_kwargs["timeout"] = max(
+                    0.001, deadline - time.monotonic())
+            info = await self._relay.query_group_tabs(**query_kwargs)
             if validation_generation != self._relay_generation():
                 raise RuntimeError(
                     f"extension reconnected while validating group id {candidate}")
@@ -413,8 +422,10 @@ class ExtensionUpstream:
                 f"{op} did not return a tab group id; the extension failed to "
                 "place the tab in the session tab group")
 
-    async def _group_member_tabs(self, session_id: str | None,
-                                 group_id: int | None = None) -> tuple[int, list[int]]:
+    async def _group_member_tabs(
+        self, session_id: str | None, group_id: int | None = None, *,
+        timeout: float | None = None,
+    ) -> tuple[int, list[int]]:
         """Resolve the session's live group membership = the source of truth.
         Returns ``(group_id, [tab_id, ...])``. Keyed ONLY on the numeric Chrome
         groupId — adapter memory first, then the ledger's durable id, then the
@@ -422,10 +433,19 @@ class ExtensionUpstream:
         (names aren't unique; decision 6). Empty list when the session has no
         live group (never opened a tab, or its last tab closed and Chrome
         auto-deleted the group)."""
-        gid, info = await self._resolve_session_group(session_id, group_id)
+        deadline = (
+            None if timeout is None else time.monotonic() + max(0.0, timeout))
+        gid, info = await self._resolve_session_group(
+            session_id, group_id,
+            timeout=(None if deadline is None
+                     else max(0.001, deadline - time.monotonic())))
         if info is None:
             query_generation = self._relay_generation()
-            info = await self._relay.query_group_tabs(group_id=gid)
+            query_kwargs = {"group_id": gid}
+            if deadline is not None:
+                query_kwargs["timeout"] = max(
+                    0.001, deadline - time.monotonic())
+            info = await self._relay.query_group_tabs(**query_kwargs)
             if query_generation != self._relay_generation():
                 raise RuntimeError(
                     "extension reconnected while resolving group membership")
@@ -501,30 +521,94 @@ class ExtensionUpstream:
         async with self._lock_for(session_id):
             return await self._end_session_locked(session_id, group_id)
 
+    async def end_session_before(
+        self, session_id: str, group_id: int | None = None, *, deadline: float,
+    ) -> dict:
+        """Run teardown cooperatively within the daemon RPC's deadline."""
+        async with self._lock_for(session_id):
+            return await self._end_session_locked(
+                session_id, group_id, deadline=deadline)
+
     async def _end_session_locked(self, session_id: str,
-                                  group_id: int | None = None) -> dict:
-        group_id, members = await self._group_member_tabs(session_id, group_id)
+                                  group_id: int | None = None, *,
+                                  deadline: float | None = None) -> dict:
+        def budget_left() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
+        initial_timeout = budget_left()
+        if initial_timeout is not None and initial_timeout <= 0:
+            return self._budget_exhausted_result(session_id)
+        try:
+            group_id, members = await self._group_member_tabs(
+                session_id, group_id, timeout=initial_timeout)
+        except asyncio.TimeoutError:
+            return self._budget_exhausted_result(session_id)
+
+        teardown_generation = self._relay_generation()
         closed: list[int] = []
         uncertain: list[int] = []
+        attempted: set[int] = set()
+        timed_out = False
         for tab_id in members:
+            close_timeout = budget_left()
+            if close_timeout is not None and close_timeout <= 0:
+                timed_out = True
+                break
+            attempted.add(tab_id)
             try:
-                await self._relay.close_tab(tab_id)
+                if close_timeout is None:
+                    await self._relay.close_tab(
+                        tab_id, expected_generation=teardown_generation)
+                else:
+                    await self._relay.close_tab(
+                        tab_id, timeout=min(5.0, close_timeout),
+                        expected_generation=teardown_generation)
                 closed.append(tab_id)
                 # Evict only after Chrome confirmed the tab is gone.
                 self.evict_tab_sessions(tab_id)
+                survivors = sorted(set(members) - set(closed))
+                self._persist_retry_anchors(
+                    session_id, group_id, survivors,
+                    current=survivors[0] if len(survivors) == 1 else None)
+            except asyncio.TimeoutError:
+                uncertain.append(tab_id)
+                timed_out = True
+                break
+            except asyncio.CancelledError:
+                # The close outcome is unknown. Commit every possible survivor
+                # before propagating cancellation so durable recovery cannot
+                # point only at a tab that may already be gone.
+                candidates = sorted(set(members) - set(closed))
+                self._persist_retry_anchors(
+                    session_id, group_id, candidates, current=None)
+                raise
+            except ConnectionError as e:
+                uncertain.append(tab_id)
+                logger.warning(
+                    "end_session(%s) stopped at generation boundary: %r",
+                    session_id, e)
+                break
             except Exception as e:  # noqa: BLE001 — report every failed tab
                 uncertain.append(tab_id)
                 logger.warning(
                     "end_session(%s) could not close tab %d: %r",
                     session_id, tab_id, e)
+        unattempted = sorted(set(members) - attempted)
         membership_unknown = False
-        if uncertain:
+        if uncertain and not timed_out:
             try:
+                query_timeout = budget_left()
+                if query_timeout is not None and query_timeout <= 0:
+                    raise asyncio.TimeoutError
                 _live_gid, remaining = await self._group_member_tabs(
-                    session_id, group_id)
+                    session_id, group_id, timeout=query_timeout)
             except Exception as e:  # noqa: BLE001 - uncertainty is the result
                 membership_unknown = True
                 remaining = list(uncertain)
+                if isinstance(e, asyncio.TimeoutError):
+                    timed_out = True
                 logger.warning(
                     "end_session(%s) could not reconcile close results: %r",
                     session_id, e)
@@ -538,10 +622,16 @@ class ExtensionUpstream:
                 closed = sorted(set(closed) | (set(uncertain) - remaining_set))
                 for tab_id in closed:
                     self.evict_tab_sessions(tab_id)
+        elif uncertain:
+            membership_unknown = True
+            remaining = list(uncertain)
+        else:
+            remaining = []
         # Symmetric to `closed` above: a tab we watched close is not "failed"
         # just because a lagging membership query still lists it. Only tabs we
         # could not confirm gone are failures.
-        failed = sorted(set(remaining) - set(closed)) if uncertain else []
+        failed = sorted(
+            (set(remaining) | set(unattempted)) - set(closed))
         if not failed:
             self._groups.pop(session_id, None)
             self._group_generations.pop(session_id, None)
@@ -555,29 +645,85 @@ class ExtensionUpstream:
                     runtime = dict(record.get("runtime") or {})
                     runtime["group_id"] = group_id
                     runtime["updated_at"] = time.time()
-                    if membership_unknown:
-                        # No single failed close is a truthful anchor. Preserve
-                        # the whole pre-close candidate set so restart recovery
-                        # can prove ownership if any real survivor remains.
-                        runtime["current_target_id"] = None
-                        runtime["retry_target_ids"] = [
-                            f"ext-tab-{tab_id}" for tab_id in sorted(set(members))]
-                    else:
-                        runtime["current_target_id"] = f"ext-tab-{failed[0]}"
-                        runtime.pop("retry_target_ids", None)
+                    # A successful re-query can still be stale. Recovery uses
+                    # set intersection, so multiple candidates must never be
+                    # reduced to one guessed numeric tab id.
+                    runtime["current_target_id"] = (
+                        f"ext-tab-{failed[0]}" if len(failed) == 1 else None)
+                    runtime["retry_target_ids"] = [
+                        f"ext-tab-{tab_id}" for tab_id in failed]
                     session_registry.update(session_id, runtime=runtime)
             except Exception as e:  # noqa: BLE001 - retain live binding anyway
                 logger.warning(
                     "end_session(%s) could not persist retry anchor: %r",
                     session_id, e)
         return {
-            "ok": not failed,
+            "ok": not failed and not timed_out,
             "closed": closed,
             "failed": failed,
             "unknown": sorted(set(uncertain)) if membership_unknown else [],
             "kept": [],
             "backend": "extension",
+            **({"partial": True, "timedOut": True} if timed_out else {}),
         }
+
+    def _budget_exhausted_result(self, session_id: str) -> dict:
+        record = session_registry.get(session_id)
+        known = sorted(
+            self._runtime_tab_ids(record) if isinstance(record, dict) else set())
+        return {
+            "ok": False,
+            "partial": True,
+            "timedOut": True,
+            "closed": [],
+            "failed": known,
+            "unknown": known,
+            "kept": [],
+            "backend": "extension",
+        }
+
+    @staticmethod
+    def _persist_retry_anchors(
+        session_id: str, group_id: int, candidates: list[int], *,
+        current: int | None,
+    ) -> None:
+        record = session_registry.get(session_id)
+        if not isinstance(record, dict):
+            return
+        runtime = dict(record.get("runtime") or {})
+        runtime["group_id"] = group_id
+        runtime["updated_at"] = time.time()
+        runtime["current_target_id"] = (
+            f"ext-tab-{current}" if current is not None else None)
+        runtime["retry_target_ids"] = [
+            f"ext-tab-{tab_id}" for tab_id in sorted(set(candidates))]
+        session_registry.update(session_id, runtime=runtime)
+
+    async def close_session_tab(self, session_id: str, target_id: str) -> dict:
+        """Authorize, close, and durably re-anchor one extension tab."""
+        tab_id = _tab_id_from_target_id(target_id)
+        if tab_id is None:
+            raise ValueError(f"unknown targetId {target_id!r}")
+        async with self._lock_for(session_id):
+            group_id, members = await self._group_member_tabs(session_id)
+            validated_generation = self._relay_generation()
+            if tab_id not in set(members):
+                raise ValueError(
+                    f"target {target_id} does not belong to session "
+                    f"{session_id!r}")
+            self._persist_retry_anchors(
+                session_id, group_id, members, current=None)
+            await self._relay.close_tab(
+                tab_id, expected_generation=validated_generation)
+            self.evict_tab_sessions(tab_id)
+            survivors = sorted(set(members) - {tab_id})
+            self._persist_retry_anchors(
+                session_id, group_id, survivors,
+                current=survivors[0] if survivors else None)
+            if not survivors:
+                self._groups.pop(session_id, None)
+                self._group_generations.pop(session_id, None)
+            return {"ok": True, "tabId": tab_id}
 
     async def scoped_target_infos(self, session_id: str | None) -> list[dict]:
         """CDP ``targetInfos`` for the session's browser = its tab group ONLY.
@@ -788,8 +934,10 @@ class ExtensionUpstream:
         self, *, session_id: str | None, group_name: str | None,
     ) -> dict:
         gid, _info = await self._resolve_session_group(session_id)
+        validated_generation = self._relay_generation()
         ghost = await self._relay.attach_active_tab(
-            group_name=group_name, group_id=gid, timeout=10.0)
+            group_name=group_name, group_id=gid, timeout=10.0,
+            expected_generation=validated_generation)
         group_id = getattr(ghost, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
         if self._group_required(
@@ -845,6 +993,7 @@ class ExtensionUpstream:
         skip_post_attach_commands: bool,
     ) -> dict:
         gid, _info = await self._resolve_session_group(session_id)
+        validated_generation = self._relay_generation()
         self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
             url,
@@ -852,6 +1001,7 @@ class ExtensionUpstream:
             group_id=gid,
             background=background,
             skip_post_attach_commands=skip_post_attach_commands,
+            expected_generation=validated_generation,
         )
         group_id = getattr(gt, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
@@ -1031,7 +1181,9 @@ class ExtensionUpstream:
         self.evict_tab_sessions(tab_id)
         return {"ok": True, "tabId": tab_id}
 
-    async def close_tab_by_target_id(self, target_id: str) -> dict:
+    async def close_tab_by_target_id(
+        self, target_id: str, *, expected_generation: int | None = None,
+    ) -> dict:
         """Close-tab path used when the daemon proxy can't resolve a session
         binding (e.g. the original opener's transient ws disconnected and the
         per-client attacher was reaped). Derives tabId from ``ext-tab-N`` and
@@ -1040,7 +1192,8 @@ class ExtensionUpstream:
         tab_id = _tab_id_from_target_id(target_id)
         if tab_id is None:
             raise ValueError(f"unknown targetId {target_id!r}")
-        await self._relay.close_tab(tab_id)
+        await self._relay.close_tab(
+            tab_id, expected_generation=expected_generation)
         # Drop sessions only after the relay confirmed Chrome closed the tab.
         self.evict_tab_sessions(tab_id)
         return {"ok": True, "tabId": tab_id}
@@ -1081,6 +1234,21 @@ class ExtensionUpstream:
         equivalent CDP event frame so the daemon's router can fan it out.
         """
         tab_id = ext_msg.get("tabId")
+        if ext_msg.get("type") == "detached" and isinstance(tab_id, int):
+            sessions = [
+                sid for sid, bound_tab in self._sessions.items()
+                if bound_tab == tab_id
+            ]
+            self.evict_tab_sessions(tab_id)
+            for sid in sessions:
+                await self._on_frame(json.dumps({
+                    "method": "Target.detachedFromTarget",
+                    "params": {
+                        "sessionId": sid,
+                        "targetId": f"ext-tab-{tab_id}",
+                    },
+                }))
+            return
         method = ext_msg.get("method")
         params = ext_msg.get("params") or {}
         if not isinstance(tab_id, int) or not isinstance(method, str):

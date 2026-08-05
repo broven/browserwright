@@ -747,6 +747,21 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
     assert reg.get(ext_sid) is None
 
 
+def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
+    tmp_bs_home, monkeypatch,
+):
+    from browserwright import session_create, session_registry as reg
+    from browserwright.errors import DaemonUnavailable
+
+    sid = reg.allocate(backend="rdp", owner="create", name="owned")
+    record = reg.get(sid)
+    monkeypatch.setattr(session_create, "_run", lambda _cmd: 3)
+
+    with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
+        session_create.end(record)
+    assert reg.get(sid) is not None
+
+
 def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
     from browserwright import session_create, session_registry as reg
 

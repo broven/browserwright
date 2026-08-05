@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
+import time
 from typing import Any, Awaitable, Callable, Protocol, TYPE_CHECKING, runtime_checkable
 from urllib.parse import urlparse
 
@@ -118,7 +120,7 @@ class CdpUpstream:
         on_close: Callable[[str], Awaitable[None]],
         *,
         state: Any | None = None,
-        on_end_session: Callable[[str], Awaitable[bool]] | None = None,
+        on_end_session: Callable[..., Awaitable[bool | None]] | None = None,
     ):
         self._on_frame = on_frame
         self._on_close = on_close
@@ -407,10 +409,45 @@ class CdpUpstream:
     async def end_session(self, session_id: str,
                           group_id: int | None = None) -> dict:
         """End an rdp workspace; env/attach ownership remains external."""
+        ended: bool | None = None
         if self._on_end_session is not None:
-            await self._on_end_session(session_id)
-        return {"ok": True, "closed": [], "failed": [], "kept": [],
+            ended = await self._on_end_session(session_id)
+        return {"ok": ended is not False, "closed": [],
+                "failed": [] if ended is not False else ["workspace"],
+                "kept": [],
                 "backend": self.backend_name}
+
+    async def end_session_before(
+        self, session_id: str, group_id: int | None = None, *, deadline: float,
+    ) -> dict:
+        """Bounded raw-workspace teardown with an honest retryable result."""
+        ended: bool | None = None
+        if self._on_end_session is not None:
+            parameters = inspect.signature(
+                self._on_end_session).parameters.values()
+            accepts_deadline = any(
+                parameter.name == "deadline"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters)
+            if accepts_deadline:
+                ended = await self._on_end_session(
+                    session_id, deadline=deadline)
+            else:
+                # Compatibility for embedders/test doubles predating the
+                # cooperative-deadline callback. Production's daemon callback
+                # accepts the keyword.
+                ended = await self._on_end_session(session_id)
+        ok = ended is not False
+        return {
+            "ok": ok,
+            "partial": not ok,
+            "timedOut": not ok and time.monotonic() >= deadline,
+            "closed": [],
+            "failed": [] if ok else ["workspace"],
+            "unknown": [] if ok else ["workspace"],
+            "kept": [],
+            "backend": self.backend_name,
+        }
 
     async def recover(self, session_id: str | None = None, *,
                       group_id: int | None = None) -> dict:

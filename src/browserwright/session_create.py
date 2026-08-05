@@ -78,17 +78,20 @@ def _ensure_daemon_running() -> None:
     _spawn_detached(["browserwright-daemon", "serve"])
 
 
-def _close_browser(record: dict) -> None:
+def _close_browser(record: dict) -> bool:
     """Tear down a create-owned rdp session's browser via the single daemon.
 
     The daemon owns the per-session Chrome (launched on ``ensureSession``), so
     ``endSession`` closes the upstream + SIGTERMs that Chrome + drops the
-    context. Best-effort: a dead daemon just means the (ephemeral, C2) Chrome
-    already died with it. Only create-owned sessions reach here — attach
-    sessions never launched a browser we own."""
+    context. Returns whether the daemon confirmed a complete teardown; callers
+    retain the ledger on failure so the operation can be retried. Only
+    create-owned sessions reach here — attach sessions never launched a browser
+    we own."""
     sid = record.get("id")
     if sid:
-        _run(["browserwright-daemon", "end-session", "--session", str(sid)])
+        return _run([
+            "browserwright-daemon", "end-session", "--session", str(sid)]) == 0
+    return True
 
 
 def _reap_executor(record: dict) -> None:
@@ -148,7 +151,8 @@ def reap(*, idle_seconds: float) -> list[dict]:
                 and not _end_extension_workspace(rec)):
             continue
         if rec.get("owner") == "create":
-            _close_browser(rec)
+            if _close_browser(rec) is False:
+                continue
         removed = reg.remove(str(rec.get("id")))
         if removed is not None:
             pruned.append(removed)
@@ -238,7 +242,7 @@ def end(record: dict) -> str:
     create-owned → the daemon closes the browser it launched (endSession).
     attach       → leave the browser running, remind the user.
     extension    → also close the session's agent-owned tabs (browser stays).
-    Removes the ledger entry only after extension teardown is confirmed.
+    Removes the ledger entry only after owned workspace teardown is confirmed.
     """
     sid = record["id"]
     if record.get("backend") == "extension":
@@ -251,7 +255,12 @@ def end(record: dict) -> str:
     if record.get("owner") == "create":
         # `_close_browser` → daemon `endSession`, which ALSO kills the executor
         # (symmetric in `_handle_end_session`), so no separate reap needed here.
-        _close_browser(record)
+        if _close_browser(record) is False:
+            from .errors import DaemonUnavailable
+
+            raise DaemonUnavailable(
+                f"session {sid} browser teardown was incomplete; its ledger "
+                "entry was kept for retry")
         msg = f"session {sid} ended; the browser it launched was closed."
     else:
         # attach: leave the browser running (semantics unchanged) but still reap
