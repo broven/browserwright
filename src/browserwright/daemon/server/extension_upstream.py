@@ -546,6 +546,20 @@ class ExtensionUpstream:
         except asyncio.TimeoutError:
             return self._budget_exhausted_result(session_id)
 
+        if members:
+            try:
+                # Establish a durable retry proof before the first destructive
+                # browser write. Recovery intersects these candidates with
+                # live membership, so retaining a subsequently-closed id is
+                # safe; omitting a surviving id is not.
+                self._persist_retry_anchors(
+                    session_id, group_id, members, current=None)
+            except Exception as e:
+                raise RuntimeError(
+                    f"end_session({session_id}) retry checkpoint failed "
+                    "before closing any tabs"
+                ) from e
+
         teardown_generation = self._relay_generation()
         closed: list[int] = []
         uncertain: list[int] = []
@@ -565,24 +579,14 @@ class ExtensionUpstream:
                     await self._relay.close_tab(
                         tab_id, timeout=min(5.0, close_timeout),
                         expected_generation=teardown_generation)
-                closed.append(tab_id)
-                # Evict only after Chrome confirmed the tab is gone.
-                self.evict_tab_sessions(tab_id)
-                survivors = sorted(set(members) - set(closed))
-                self._persist_retry_anchors(
-                    session_id, group_id, survivors,
-                    current=survivors[0] if len(survivors) == 1 else None)
             except asyncio.TimeoutError:
                 uncertain.append(tab_id)
                 timed_out = True
                 break
             except asyncio.CancelledError:
-                # The close outcome is unknown. Commit every possible survivor
-                # before propagating cancellation so durable recovery cannot
-                # point only at a tab that may already be gone.
-                candidates = sorted(set(members) - set(closed))
-                self._persist_retry_anchors(
-                    session_id, group_id, candidates, current=None)
+                # The pre-close checkpoint already contains every possible
+                # survivor. Do not risk masking cancellation with another
+                # persistence error while the close outcome is unknown.
                 raise
             except ConnectionError as e:
                 uncertain.append(tab_id)
@@ -595,6 +599,25 @@ class ExtensionUpstream:
                 logger.warning(
                     "end_session(%s) could not close tab %d: %r",
                     session_id, tab_id, e)
+            else:
+                closed.append(tab_id)
+                # Evict only after Chrome confirmed the tab is gone.
+                self.evict_tab_sessions(tab_id)
+                survivors = sorted(set(members) - set(closed))
+                try:
+                    self._persist_retry_anchors(
+                        session_id, group_id, survivors,
+                        current=(
+                            survivors[0] if len(survivors) == 1 else None))
+                except Exception as e:
+                    # Chrome mutation and ledger mutation are distinct facts.
+                    # Stop immediately: the initial checkpoint is still a safe
+                    # (possibly stale) retry superset, and calling this a close
+                    # failure would invite another destructive write.
+                    raise RuntimeError(
+                        f"end_session({session_id}) tab {tab_id} closed but "
+                        "survivor checkpoint failed"
+                    ) from e
         unattempted = sorted(set(members) - attempted)
         membership_unknown = False
         if uncertain and not timed_out:
@@ -689,7 +712,9 @@ class ExtensionUpstream:
     ) -> None:
         record = session_registry.get(session_id)
         if not isinstance(record, dict):
-            return
+            raise RuntimeError(
+                f"cannot persist retry anchors: session {session_id!r} "
+                "is missing from the ledger")
         runtime = dict(record.get("runtime") or {})
         runtime["group_id"] = group_id
         runtime["updated_at"] = time.time()
@@ -697,7 +722,11 @@ class ExtensionUpstream:
             f"ext-tab-{current}" if current is not None else None)
         runtime["retry_target_ids"] = [
             f"ext-tab-{tab_id}" for tab_id in sorted(set(candidates))]
-        session_registry.update(session_id, runtime=runtime)
+        updated = session_registry.update(session_id, runtime=runtime)
+        if not isinstance(updated, dict):
+            raise RuntimeError(
+                f"cannot persist retry anchors: session {session_id!r} "
+                "disappeared from the ledger")
 
     async def close_session_tab(self, session_id: str, target_id: str) -> dict:
         """Authorize, close, and durably re-anchor one extension tab."""

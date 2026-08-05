@@ -477,6 +477,107 @@ async def test_await_ready_requires_matching_executor_instance(
     assert sock == "/tmp/current.sock"
 
 
+@pytest.mark.asyncio
+async def test_cancelled_spawn_holds_fixed_path_until_exact_reap(monkeypatch):
+    reg = ExecutorRegistry()
+    readiness_started = asyncio.Event()
+    never_ready = asyncio.Event()
+    reaping_started = threading.Event()
+    allow_death = threading.Event()
+    procs: list[_FakeProc] = []
+
+    def fake_popen(*_args, **_kwargs):
+        proc = _FakeProc(alive=True)
+        proc.pid += len(procs)
+        procs.append(proc)
+        return proc
+
+    async def blocked_readiness(*_args, **_kwargs):
+        readiness_started.set()
+        await never_ready.wait()
+
+    def blocked_reap(handle):
+        reaping_started.set()
+        assert allow_death.wait(timeout=2)
+        handle.proc.terminate()
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(reg, "_await_ready", blocked_readiness)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        blocked_reap,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    first = asyncio.create_task(reg.ensure("sess-spawn-cancel"))
+    await asyncio.wait_for(readiness_started.wait(), timeout=1)
+    first.cancel()
+    second = asyncio.create_task(reg.ensure("sess-spawn-cancel"))
+    try:
+        await asyncio.sleep(0.05)
+        assert reaping_started.is_set()
+        assert len(procs) == 1
+        assert first.done() is False
+        assert second.done() is False
+    finally:
+        allow_death.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+
+@pytest.mark.asyncio
+async def test_spawn_readiness_timeout_confirms_exact_process_death(monkeypatch):
+    class _StubbornProc(_FakeProc):
+        def __init__(self):
+            super().__init__(alive=True)
+            self.terminate_calls = 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+    proc = _StubbornProc()
+    reaped: list[ExecutorHandle] = []
+
+    def reap(handle):
+        reaped.append(handle)
+        handle.proc._alive = False
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry.subprocess.Popen",
+        lambda *_args, **_kwargs: proc,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._SPAWN_READY_TIMEOUT_S",
+        0,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        reap,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    reg = ExecutorRegistry()
+    with pytest.raises(RuntimeError, match="never became ready"):
+        await reg.ensure("sess-spawn-timeout")
+
+    assert proc.poll() is not None
+    assert len(reaped) == 1
+    assert reaped[0].proc is proc
+    assert reg.get("sess-spawn-timeout") is None
+
+
 # ---- ensureExecutor verb dispatch ------------------------------------------
 
 
