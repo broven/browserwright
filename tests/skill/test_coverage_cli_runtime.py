@@ -772,6 +772,10 @@ def test_session_create_reset_executor_refuses_unconfirmed_reap(
 
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    # Same reason as the line above: allocation-logic unit tests must not
+    # shell out to a real daemon. `None` means "could not establish", which
+    # the guard treats as "do not block".
+    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
     monkeypatch.setattr(session_create, "_run", lambda _cmd: 1)
 
     with pytest.raises(DaemonUnavailable, match="could not confirm"):
@@ -904,6 +908,10 @@ def test_session_create_new_env_is_attach_shared_context(tmp_bs_home, monkeypatc
     from browserwright import session_create, session_registry as reg
 
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    # Same reason as the line above: allocation-logic unit tests must not
+    # shell out to a real daemon. `None` means "could not establish", which
+    # the guard treats as "do not block".
+    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
 
     sid = session_create.new(backend="env", name="cloak")
     rec = reg.get(sid)
@@ -919,6 +927,10 @@ def test_session_create_rejects_second_env_on_same_daemon(
     from browserwright import session_create, session_registry as reg
 
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    # Same reason as the line above: allocation-logic unit tests must not
+    # shell out to a real daemon. `None` means "could not establish", which
+    # the guard treats as "do not block".
+    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
 
     first = session_create.new(backend="env", name="profile-a")
     with pytest.raises(ValueError, match="N isolated daemons"):
@@ -935,6 +947,10 @@ def test_session_create_allows_one_env_per_isolated_daemon(
     from browserwright import session_create, session_registry as reg
 
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    # Same reason as the line above: allocation-logic unit tests must not
+    # shell out to a real daemon. `None` means "could not establish", which
+    # the guard treats as "do not block".
+    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "daemon-a"))
     first = session_create.new(backend="env", name="profile-a")
@@ -950,6 +966,10 @@ def test_session_create_treats_legacy_unscoped_env_as_conflict(
     from browserwright import session_create, session_registry as reg
 
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    # Same reason as the line above: allocation-logic unit tests must not
+    # shell out to a real daemon. `None` means "could not establish", which
+    # the guard treats as "do not block".
+    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
     legacy = reg.allocate(backend="env", owner="attach", name="legacy")
 
     with pytest.raises(ValueError, match=legacy):

@@ -384,7 +384,15 @@ class ExtensionUpstream:
             raise RuntimeError(
                 f"group ownership could not be proven for session {session_id!r}: "
                 "ledger has no session name")
-        if group_title != name:
+        # An extension from before this reply carried `groupTitle` omits it,
+        # and it is still accepted at the door because the protocol constant did
+        # not change. Rejecting on an absent title would break every persisted
+        # group of anyone whose daemon upgraded ahead of their browser —
+        # recovery, opening a tab and endSession all fail until they reload the
+        # extension. Title is one of two anchors, so an absent one degrades to
+        # the membership check below rather than failing the session outright.
+        # A title that IS supplied must still match.
+        if group_title is not None and group_title != name:
             raise RuntimeError(
                 f"group ownership mismatch for session {session_id!r}: "
                 f"expected title {name!r}, found {group_title!r}")

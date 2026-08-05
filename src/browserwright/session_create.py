@@ -22,6 +22,7 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 """
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 from typing import Optional
@@ -55,6 +56,30 @@ def _run(cmd: list[str]) -> int:
         return subprocess.run(cmd, capture_output=True, timeout=10).returncode
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return 1
+
+
+def _running_daemon_backend() -> str | None:
+    """The shared backend of the daemon on this socket, or None if unknown.
+
+    None means "could not establish", never "mismatch" — callers must not
+    block a legitimate action on a probe they could not read.
+    """
+    try:
+        out = subprocess.run(
+            ["browserwright-daemon", "backend-info", "--json"],
+            capture_output=True, timeout=10, text=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        data = json.loads(out.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not data.get("running"):
+        return None
+    name = data.get("backend") or data.get("name")
+    return name if isinstance(name, str) and name else None
 
 
 def _daemon_is_running() -> bool:
@@ -203,6 +228,20 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         # socket (XDG_RUNTIME_DIR) rather than by the global BS_HOME ledger;
         # this preserves the documented N-isolated-daemon fleet pattern.
         daemon_scope = str(_ipc.sock_path().resolve())
+        # Check the running daemon's backend BEFORE writing the row. The
+        # routing guard rejects every connection whose record does not match
+        # the shared context, so allocating first against, say, the default
+        # extension daemon reports success and leaves a row that nothing —
+        # not even endSession — can use, while it holds this daemon's only
+        # env slot. An unreadable probe returns None and is not treated as a
+        # mismatch: never block a legitimate create on a probe that failed.
+        running = _running_daemon_backend()
+        if running is not None and running != "env":
+            raise ValueError(
+                f"the daemon on this socket is serving backend {running!r}, "
+                "so an env session created here could never connect. Start an "
+                "env daemon with its own XDG_RUNTIME_DIR and BD_CDP_WS (see "
+                "docs/session-workspaces.md, 'Scaling env to N profiles').")
         sid = reg.allocate(
             backend="env", owner="attach", name=name,
             env_daemon_scope=daemon_scope,

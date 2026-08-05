@@ -854,8 +854,25 @@ async function doQueryGroup(id, groupName, sessionGroupId) {
       safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
       return;
     }
-    const group = await chrome.tabGroups.get(groupId);
-    const tabs = await chrome.tabs.query({ groupId });
+    // Chrome deletes a group the moment its last tab goes, so the user closing
+    // or dragging out that tab between the resolve above and these two calls
+    // makes them reject. That is the documented empty-group state, not a
+    // failure: reporting -32000 here makes enumeration and teardown fail and
+    // keeps the ledger row for a retry that has nothing left to do.
+    let group;
+    try {
+      group = await chrome.tabGroups.get(groupId);
+    } catch (_e) {
+      safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
+      return;
+    }
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({ groupId });
+    } catch (_e) {
+      safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
+      return;
+    }
     const out = (Array.isArray(tabs) ? tabs : []).map((tab) => ({
       tabId: tab.id,
       url: tab.url || "",
