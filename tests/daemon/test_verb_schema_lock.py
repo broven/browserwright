@@ -49,6 +49,7 @@ from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 #: here means it is not covered; renaming one turns this file red.
 DAEMON_VERBS: tuple[str, ...] = (
     "BrowserwrightDaemon.getBackendInfo",
+    "BrowserwrightDaemon.status",
     "BrowserwrightDaemon.waitForSessionAnnounce",
     "BrowserwrightDaemon.attachActiveTab",
     "BrowserwrightDaemon.openBackgroundTab",
@@ -77,6 +78,7 @@ RAW_CDP_BACKENDS: tuple[str, ...] = ("rdp", "env")
 #: comments existed to protect.
 VERBS_NEVER_METHOD_NOT_FOUND: frozenset[str] = frozenset({
     "BrowserwrightDaemon.getBackendInfo",
+    "BrowserwrightDaemon.status",
     "BrowserwrightDaemon.openBackgroundTab",
     "BrowserwrightDaemon.closeTab",
     "BrowserwrightDaemon.endSession",

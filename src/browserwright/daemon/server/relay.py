@@ -102,6 +102,61 @@ class GhostTarget:
 
 
 @dataclass
+class _InflightCall:
+    """What one entry of ``_ExtensionConn.pending`` is *for*, and since when.
+
+    ``pending`` itself stays a bare ``dict[int, Future]`` (several tests hand-
+    insert futures into it, and a Future is all the resolve path needs). This
+    parallel table carries the operator-facing answer — "which call, how long"
+    — so a stuck relay hop can name itself in `browserwright-daemon ps` instead
+    of showing up as an anonymous count. Entries are best-effort: a future
+    inserted directly into ``pending`` simply has no meta row.
+    """
+
+    id: int
+    kind: str                    # the app-level `type` (command / createTab / …)
+    method: str = ""             # CDP method, for `type == "command"`
+    tab_id: int | None = None
+    started_at: float = field(default_factory=time.monotonic)
+    attempt: int = 1             # 2 on a post-reconnect retry
+
+    def elapsed_s(self, *, now: float | None = None) -> float:
+        now = time.monotonic() if now is None else now
+        return max(0.0, now - self.started_at)
+
+    def describe(self, *, now: float | None = None) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "method": self.method,
+            "tab_id": self.tab_id,
+            "attempt": self.attempt,
+            "elapsed_s": round(self.elapsed_s(now=now), 3),
+        }
+
+
+def _oldest_pending_s(ext: "_ExtensionConn") -> float | None:
+    """Age of this connection's longest-outstanding relay call, or None when it
+    is idle (or when every pending future was inserted without meta)."""
+    metas = getattr(ext, "pending_meta", None)
+    if not metas:
+        return None
+    now = time.monotonic()
+    return round(max(m.elapsed_s(now=now) for m in metas.values()), 3)
+
+
+def _inflight_from_body(body: dict, cmd_id: int, *, attempt: int = 1) -> _InflightCall:
+    tab_id = body.get("tabId")
+    return _InflightCall(
+        id=cmd_id,
+        kind=str(body.get("type") or "?"),
+        method=str(body.get("method") or ""),
+        tab_id=tab_id if isinstance(tab_id, int) else None,
+        attempt=attempt,
+    )
+
+
+@dataclass
 class _ExtensionConn:
     """One connected extension. v0.4 supports multiple in theory (e.g., user
     runs Chrome + Edge with the extension installed in both); the daemon
@@ -116,6 +171,9 @@ class _ExtensionConn:
     version_drift: str = VersionDrift.UNKNOWN.value
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     pending: dict[int, asyncio.Future] = field(default_factory=dict)
+    #: Same keys as `pending`, describing what each awaited call is (see
+    #: `_InflightCall`). Maintained only by `_request` / the retry path.
+    pending_meta: dict[int, _InflightCall] = field(default_factory=dict)
     tabs: dict[int, GhostTarget] = field(default_factory=dict)
     last_frame_ts: float = field(default_factory=time.monotonic)
     app_ping_task: asyncio.Task | None = None
@@ -536,6 +594,30 @@ class RelayServer:
         return await self._request(
             ext, {"type": f"userscript.{verb}", **payload}, timeout=timeout)
 
+    def inflight_snapshot(self) -> list[dict]:
+        """Every relay call currently awaiting an extension response.
+
+        This is the hop the original diagnosis could not see: a future left in
+        `_ExtensionConn.pending` forever produced no log line, no `/__status__`
+        change, and no error — the daemon just went quiet. One row per awaited
+        call, newest last, each carrying how long it has been outstanding.
+
+        Read-only and allocation-cheap; safe to call from an RPC handler.
+        """
+        now = time.monotonic()
+        rows: list[dict] = []
+        for ext in self._extensions.values():
+            for cmd_id, fut in sorted(ext.pending.items()):
+                meta = ext.pending_meta.get(cmd_id)
+                row = (meta.describe(now=now) if meta is not None
+                       else {"id": cmd_id, "kind": "?", "method": "",
+                             "tab_id": None, "attempt": 1, "elapsed_s": None})
+                row["install_id"] = ext.install_id
+                row["done"] = fut.done()
+                rows.append(row)
+        rows.sort(key=lambda r: (r["elapsed_s"] is None, -(r["elapsed_s"] or 0.0)))
+        return rows
+
     def status_payload(self) -> dict:
         extensions = [
             self._extension_status(ext)
@@ -613,6 +695,11 @@ class RelayServer:
             "protocol_compatible": protocol_compatible,
             "app_compatible": app_compatible,
             "version_drift": drift,
+            # How many relay calls this connection is currently awaiting. The
+            # diagnosis that motivated C1 had exactly one stuck entry here while
+            # `/__status__` reported a perfectly healthy `extensions=1`.
+            "pending": len(getattr(ext, "pending", ())),
+            "oldest_pending_s": _oldest_pending_s(ext),
         }
 
     async def _send_reload_extension(
@@ -785,11 +872,14 @@ class RelayServer:
         retry_body = {**{k: v for k, v in body.items() if k != "id"}, "id": retry_id}
         retry_fut: asyncio.Future = loop.create_future()
         replacement.pending[retry_id] = retry_fut
+        replacement.pending_meta[retry_id] = _inflight_from_body(
+            retry_body, retry_id, attempt=2)
         try:
             await replacement.conn.send(json.dumps(retry_body))
             return await asyncio.wait_for(retry_fut, timeout=timeout)
         finally:
             replacement.pending.pop(retry_id, None)
+            replacement.pending_meta.pop(retry_id, None)
 
     async def _request(self, ext: _ExtensionConn, body: dict, *,
                        timeout: float) -> dict | None:
@@ -798,6 +888,7 @@ class RelayServer:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ext.pending[cmd_id] = fut
+        ext.pending_meta[cmd_id] = _inflight_from_body(body, cmd_id)
         try:
             await ext.conn.send(json.dumps(body))
             return await asyncio.wait_for(fut, timeout=timeout)
@@ -814,6 +905,7 @@ class RelayServer:
                 with contextlib.suppress(BaseException):
                     fut.exception()
             ext.pending.pop(cmd_id, None)
+            ext.pending_meta.pop(cmd_id, None)
 
     # ---- ws handlers -----------------------------------------------------
 
@@ -1013,6 +1105,7 @@ class RelayServer:
             rid = msg.get("id")
             if isinstance(rid, int) and rid in ext.pending:
                 fut = ext.pending.pop(rid)
+                ext.pending_meta.pop(rid, None)
                 if not fut.done():
                     if "error" in msg:
                         err = msg["error"] or {}

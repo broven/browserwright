@@ -35,7 +35,10 @@ from .. import __version__
 from ..config import Config
 from ..errors import Unavailable
 from ..resolver import resolve
-from ..observability import install_json_logging_if_requested
+from ..observability import (
+    install_json_logging_if_requested,
+    install_sigusr1_traceback,
+)
 from .state import CloseReason, DaemonState, UpstreamPhase
 from .proxy import Router
 from .daemon import Daemon, UnknownSessionError, UpstreamContext
@@ -189,6 +192,10 @@ async def run_serve(cfg: Config) -> int:
     # v0.5: opt-in JSON log formatter. After _wire_logging adds the
     # file/console handlers, swap formatters in place if BD_LOG_JSON=1.
     install_json_logging_if_requested()
+    # `kill -USR1 <daemon pid>` dumps every thread's stack into the daemon log.
+    # `ps` answers "who is waiting"; this answers "on what line". Armed before
+    # anything can hang, and a no-op until someone signals.
+    install_sigusr1_traceback("daemon")
     logger.info("browserwright-daemon %s starting (backend=%s)",
                 __version__, cfg.backend or "extension")
 

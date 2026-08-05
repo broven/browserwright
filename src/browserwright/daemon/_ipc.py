@@ -127,6 +127,49 @@ def executor_file_path(session_id: str) -> Path:
     return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.json"
 
 
+def executor_inflight_path(session_id: str) -> Path:
+    """Sidecar file describing what the executor's worker thread is doing NOW.
+
+    Why a file and not an RPC: the executor's accept loop is deliberately
+    one-request-per-connection and BLOCKS on ``worker.submit`` (thread-affine
+    Playwright, Fork 3), so a hung call is exactly the state in which the
+    executor cannot answer a query. A file the worker writes *before* it starts
+    the call is readable precisely when asking would fail — which is the only
+    time anyone wants to know.
+
+    Deliberately NOT a ``*.json`` name: ``cleanup_orphan_executors`` globs
+    ``bw-exec-*.json`` and SIGTERMs whatever ``pid`` it finds inside, so a
+    sidecar matching that glob would be read as a second discovery record."""
+    return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.inflight"
+
+
+def write_executor_inflight(session_id: str, payload: dict | None) -> None:
+    """Publish (or clear, with ``payload=None``) the executor's current call.
+
+    Best-effort on every path: an unwritable runtime dir costs observability,
+    never correctness, and this runs on the executor's hot path."""
+    fp = executor_inflight_path(session_id)
+    try:
+        if payload is None:
+            fp.unlink(missing_ok=True)
+            return
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_name(fp.name + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, fp)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def read_executor_inflight(session_id: str) -> dict | None:
+    """Read the executor's current-call sidecar, or ``None`` when idle/absent."""
+    try:
+        d = json.loads(executor_inflight_path(session_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
 def write_executor_file(
     session_id: str,
     sock: str,
@@ -192,7 +235,8 @@ def read_executor_file(session_id: str) -> tuple[str | None, int | None]:
 def cleanup_executor(session_id: str) -> None:
     """Best-effort: nuke a session's executor socket + discovery file. Called by
     the executor on exit and by the daemon when it reaps/kills the executor."""
-    for p in (executor_sock_path(session_id), executor_file_path(session_id)):
+    for p in (executor_sock_path(session_id), executor_file_path(session_id),
+              executor_inflight_path(session_id)):
         try:
             p.unlink()
         except (FileNotFoundError, IsADirectoryError, OSError):

@@ -316,6 +316,18 @@ class SessionVerbsMixin:
                 "schema_version": 1,
             }))
             return
+        if method == "BrowserwrightDaemon.status":
+            # In-flight introspection (C1). Deliberately NOT session-scoped:
+            # the question it answers ("who is waiting on what, and for how
+            # long") is a whole-daemon question, and the operator asking it is
+            # usually asking *because* their session is wedged. Read-only, so
+            # it neither requires nor touches the upstream — a status call must
+            # be answerable by exactly the daemon that can answer nothing else.
+            from .status import snapshot
+            await self._send_to_client(
+                client.client_id,
+                _result_response(req_id, snapshot(self.daemon, state=self.state)))
+            return
         if method == "BrowserwrightDaemon.waitForSessionAnnounce":
             session_id = await self._require_browser_session(
                 client, req_id, method, params)

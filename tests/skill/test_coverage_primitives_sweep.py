@@ -333,6 +333,7 @@ def test_cdp_send_attach_close_and_read_loop():
     cdp._inflight_cv = threading.Condition(cdp._lock)
     cdp._next_id = 1
     cdp._inflight = {}
+    cdp._inflight_meta = {}
     cdp._sessions = {}
     cdp._closed = False
     cdp._closed_reason = None
