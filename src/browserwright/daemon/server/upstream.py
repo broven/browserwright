@@ -386,9 +386,15 @@ class CdpUpstream:
 
     async def recover(self, session_id: str | None = None, *,
                       group_id: int | None = None) -> dict:
-        # Raw-CDP workspaces are ephemeral for v1. Existing live tabs remain
-        # enumerable, but there is no durable group-like binding to reconstruct.
-        return {"recovered": [], "groupId": -1, "tabs": []}
+        """Return the nearest honest raw-CDP recovery equivalent.
+
+        Raw workspaces have no durable group binding, so there are no group
+        members to reconstruct. Rebind the current live page (or create the
+        documented blank fallback when the workspace is empty) and return the
+        same representative-tab shape as the extension adapter.
+        """
+        result = await self.current_page(session_id)
+        return {**result, "groupId": -1, "recovered": []}
 
     async def wait_session_announce(self, session_id: str,
                                     timeout: float = 2.0) -> bool:
@@ -398,8 +404,67 @@ class CdpUpstream:
                                 expected_version: str | None = None) -> dict:
         return {
             "ok": False,
-            "reloaded": False,
+            "sent": 0,
+            "extensions": [],
+            "applicable": False,
             "reason": "not applicable to a raw-CDP backend",
+        }
+
+    async def _unregister_userscript(self, entry: dict) -> list[dict]:
+        """Remove live registrations, retaining handles for any failures."""
+        remaining: list[tuple[str, str]] = []
+        failed: list[dict] = []
+        for sid, identifier in entry.get("ids", []):
+            try:
+                await self.send_command(
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    {"identifier": identifier}, sid)
+            except Exception as e:  # noqa: BLE001 - reflected in honest result
+                remaining.append((sid, identifier))
+                failed.append({
+                    "id": entry.get("id"),
+                    "sessionId": sid,
+                    "error": repr(e),
+                })
+        entry["ids"] = remaining
+        return failed
+
+    async def _register_userscript(
+        self, entry: dict, sessions: list[str],
+    ) -> list[dict]:
+        """Register one stored script in each live page session."""
+        source = (entry.get("source") or entry.get("body")
+                  or entry.get("code") or "")
+        identifiers: list[tuple[str, str]] = []
+        failed: list[dict] = []
+        for sid in dict.fromkeys(sessions):
+            try:
+                result = self._result(await self.send_command(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": source}, sid))
+                identifier = result.get("identifier")
+                if not isinstance(identifier, str):
+                    raise RuntimeError(
+                        "Page.addScriptToEvaluateOnNewDocument returned no identifier")
+                identifiers.append((sid, identifier))
+            except Exception as e:  # noqa: BLE001 - reflected in honest result
+                failed.append({
+                    "id": entry.get("id"),
+                    "sessionId": sid,
+                    "error": repr(e),
+                })
+        entry["ids"] = identifiers
+        return failed
+
+    def _userscript_sync(self, failed: list[dict] | None = None) -> dict:
+        failures = failed or []
+        registered = sum(
+            len(script.get("ids", []))
+            for script in self._userscripts.values())
+        return {
+            "ok": not failures,
+            "registered": registered,
+            "failed": failures,
         }
 
     async def userscript_request(self, verb: str, payload: dict,
@@ -409,55 +474,95 @@ class CdpUpstream:
                     if isinstance(sid, str)]
         if verb == "install":
             script = payload.get("script") if isinstance(payload.get("script"), dict) else {}
-            source = script.get("source") or script.get("body") or ""
-            identity = script.get("identity") or script.get("id") or (
+            source = (script.get("source") or script.get("body")
+                      or script.get("code") or "")
+            script_id = script.get("id") or (
                 f"rdp-us-{len(self._userscripts) + 1}")
+            identity = script.get("identity") or script_id
             if not isinstance(source, str) or not source:
                 raise ValueError("userscript install requires script.source")
-            identifiers: list[tuple[str, str]] = []
-            for sid in dict.fromkeys(sessions):
-                result = self._result(await self.send_command(
-                    "Page.addScriptToEvaluateOnNewDocument", {"source": source}, sid))
-                identifier = result.get("identifier")
-                if isinstance(identifier, str):
-                    identifiers.append((sid, identifier))
-            self._userscripts[str(identity)] = {
-                "identity": str(identity), "ids": identifiers, "enabled": True,
+            existing = self._userscripts.get(str(script_id))
+            if existing is not None:
+                failed = await self._unregister_userscript(existing)
+                if failed:
+                    raise RuntimeError(
+                        f"could not replace userscript {script_id!r}: {failed!r}")
+            entry = {
+                **script,
+                "id": str(script_id),
+                "identity": str(identity),
+                "ids": [],
+                "enabled": True,
             }
+            self._userscripts[str(script_id)] = entry
+            failed = await self._register_userscript(entry, sessions)
             return {
-                "id": identity,
+                "ok": True,
+                "id": script_id,
                 "identity": identity,
-                "sync": {
-                    "ok": True,
-                    "backend": self.backend_name,
-                    "note": "MAIN-world, no @match filtering (rdp shim)",
-                },
+                "warnings": [
+                    *list(script.get("warnings") or []),
+                    "raw-CDP shim runs in MAIN world without match filtering",
+                ],
+                "sync": self._userscript_sync(failed),
             }
         if verb == "list":
-            return {"scripts": [
-                {"identity": key, "enabled": value.get("enabled", True),
-                 "backend": self.backend_name}
-                for key, value in self._userscripts.items()
-            ]}
+            return {
+                "scripts": [
+                    {k: v for k, v in value.items() if k != "ids"}
+                    for value in self._userscripts.values()
+                ],
+                "master": True,
+            }
         if verb in ("remove", "toggle"):
             key = payload.get("key")
-            entry = self._userscripts.get(key) if isinstance(key, str) else None
+            entry_key = key if isinstance(key, str) and key in self._userscripts else next(
+                (script_id for script_id, script in self._userscripts.items()
+                 if script.get("identity") == key),
+                None,
+            )
+            entry = self._userscripts.get(entry_key) if entry_key else None
             if entry is None:
-                return {"ok": False, "reason": f"no such userscript {key!r}"}
-            for sid, identifier in entry.get("ids", []):
-                try:
-                    await self.send_command(
-                        "Page.removeScriptToEvaluateOnNewDocument",
-                        {"identifier": identifier}, sid)
-                except Exception:
-                    pass
+                if verb == "remove":
+                    return {
+                        "ok": True,
+                        "removed": None,
+                        "sync": self._userscript_sync(),
+                    }
+                raise ValueError(f"userscript not found: {key}")
+            failed = await self._unregister_userscript(entry)
             if verb == "remove":
-                self._userscripts.pop(key, None)
-            else:
-                entry["enabled"] = bool(payload.get("enabled"))
-            return {"ok": True, "backend": self.backend_name}
+                if failed:
+                    return {
+                        "ok": False,
+                        "removed": None,
+                        "sync": self._userscript_sync(failed),
+                    }
+                self._userscripts.pop(entry_key, None)
+                return {
+                    "ok": True,
+                    "removed": entry_key,
+                    "sync": self._userscript_sync(),
+                }
+            enabled = bool(payload.get("enabled"))
+            if failed:
+                return {
+                    "ok": False,
+                    "id": entry["id"],
+                    "enabled": bool(entry.get("enabled", True)),
+                    "sync": self._userscript_sync(failed),
+                }
+            if enabled:
+                failed = await self._register_userscript(entry, sessions)
+            entry["enabled"] = enabled
+            return {
+                "ok": not failed,
+                "id": entry["id"],
+                "enabled": enabled,
+                "sync": self._userscript_sync(failed),
+            }
         if verb == "logs":
-            return {"logs": [], "backend": self.backend_name}
+            return {"logs": []}
         return {"ok": False,
                 "reason": (f"unsupported userscript verb {verb!r} on "
                            f"{self.backend_name}")}

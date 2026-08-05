@@ -11,10 +11,24 @@ import json
 import logging
 import os
 import secrets
+from functools import partial
+from typing import Any, Awaitable, Callable, Protocol
 
 from .state import ClientState, UpstreamPhase
 
 logger = logging.getLogger(__name__)
+
+
+class Handler(Protocol):
+    """Uniform call shape for one ``BrowserwrightDaemon.*`` verb."""
+
+    async def __call__(
+        self,
+        router: "SessionVerbsMixin",
+        client: ClientState,
+        params: dict,
+        req_id: int | None,
+    ) -> None: ...
 
 
 # How long the executor control plane (`ensureExecutor`) waits for an extension
@@ -94,19 +108,6 @@ class SessionVerbsMixin:
     methods. Never instantiated on its own.
     """
 
-    @property
-    def _raw_cdp_backend(self) -> bool:
-        """True when this context speaks real browser-level CDP (rdp / env)
-        rather than the extension relay.
-
-        The unified tab-lifecycle verbs dispatch through ``self.upstream`` for
-        every backend. Extension is
-        the sole LOCAL_RELAY backend, so "not extension" is exactly "raw
-        browser-level CDP". (issue #20: env joined this family — it resolves
-        BD_CDP_WS and shares ``_open_chrome_upstream``'s raw command channel,
-        same as rdp.)"""
-        return self.state.backend_name != "extension"
-
     def _session_group_name(
         self, client: ClientState, session_id: str,
         explicit: str | None = None,
@@ -175,6 +176,32 @@ class SessionVerbsMixin:
             return None
         return self.upstream
 
+    async def _invoke_upstream(
+        self,
+        client: ClientState,
+        req_id: int | None,
+        fail_prefix: str,
+        invoke: Callable[[Any], Awaitable[Any]],
+        *,
+        error_code: int = -32603,
+        value_error_code: int | None = None,
+    ) -> Any | None:
+        """One readiness → invoke → error-response skeleton for verb handlers."""
+        upstream = await self._ready_upstream(client, req_id, fail_prefix)
+        if upstream is None:
+            return None
+        try:
+            return await invoke(upstream)
+        except ValueError as e:
+            code = value_error_code or error_code
+            detail = str(e) if value_error_code is not None else repr(e)
+        except Exception as e:  # noqa: BLE001 - surface adapter failures
+            code = error_code
+            detail = repr(e)
+        await self._send_to_client(client.client_id, _error_response(
+            req_id, code, f"{fail_prefix}: {detail}"))
+        return None
+
     async def _register_and_respond(
         self, client: ClientState, req_id: int | None, result: dict, *,
         malformed_msg: str, extra: dict | None = None,
@@ -233,158 +260,128 @@ class SessionVerbsMixin:
         await self._send_to_client(
             client.client_id, _result_response(req_id, payload))
 
+    def _forget_tab_binding(
+        self, target_id: str, owner_client_id: int | None = None,
+        owner_local_sid: str | None = None,
+    ) -> None:
+        """Drop the router bookkeeping for one tab exactly once."""
+        if owner_client_id is not None and owner_local_sid is not None:
+            self.state.unbind_session_by_local(
+                owner_client_id, owner_local_sid)
+        self.state.note_target_destroyed(target_id)
+
     # ---- BrowserwrightDaemon.* (per-client RPC) -------------------------------
 
     async def _handle_browserdaemon(self, client: ClientState, msg: dict) -> None:
         method = msg["method"]
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        if isinstance(method, str) and method.startswith("BrowserwrightDaemon.userscript."):
-            session_id = await self._require_browser_session(
-                client, req_id, method, params)
-            if session_id is None:
-                return
-            verb = method.split(".", 2)[2]
-            upstream = await self._ready_upstream(
-                client, req_id, f"userscript {verb} failed")
-            if upstream is None:
-                return
-            try:
-                result = await upstream.userscript_request(
-                    verb, params,
-                    session_ids=[b.upstream_session_id
-                                 for b in client.sessions.values()])
-            except Exception as e:  # noqa: BLE001 - surface to client
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32000, f"userscript {verb} failed: {e}"))
-                return
-            await self._send_to_client(
-                client.client_id, _result_response(req_id, result or {}))
+        handler = VERBS.get(method)
+        if handler is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32601, f"unknown BrowserwrightDaemon method: {method}"))
             return
-        if method == "BrowserwrightDaemon.getBackendInfo":
-            from ..backends import kind_for
-            # Report the live backend's real kind (extension is LOCAL_RELAY),
-            # not a hardcoded UPSTREAM_WS. Unknown/unresolved names ("auto")
-            # fall back to UPSTREAM_WS.
-            kind = kind_for(self.state.backend_name) or "UPSTREAM_WS"
-            await self._send_to_client(client.client_id, _result_response(req_id, {
-                "name": self.state.backend_name,
-                "kind": kind,
-                "ux_warnings": [],
-                "schema_version": 1,
-            }))
+        await handler(self, client, params, req_id)
+
+    async def _handle_get_backend_info(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        from ..backends import kind_for
+        kind = kind_for(self.state.backend_name) or "UPSTREAM_WS"
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "name": self.state.backend_name,
+            "kind": kind,
+            "ux_warnings": [],
+            "schema_version": 1,
+        }))
+
+    async def _handle_status(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        # Status is deliberately whole-daemon and upstream-independent: it must
+        # remain answerable precisely when browser work is wedged.
+        from .status import snapshot
+        await self._send_to_client(
+            client.client_id,
+            _result_response(req_id, snapshot(self.daemon, state=self.state)))
+
+    async def _handle_wait_for_session_announce(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        session_id = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.waitForSessionAnnounce", params)
+        if session_id is None:
             return
-        if method == "BrowserwrightDaemon.status":
-            # In-flight introspection (C1). Deliberately NOT session-scoped:
-            # the question it answers ("who is waiting on what, and for how
-            # long") is a whole-daemon question, and the operator asking it is
-            # usually asking *because* their session is wedged. Read-only, so
-            # it neither requires nor touches the upstream — a status call must
-            # be answerable by exactly the daemon that can answer nothing else.
-            from .status import snapshot
-            await self._send_to_client(
-                client.client_id,
-                _result_response(req_id, snapshot(self.daemon, state=self.state)))
+        timeout = params.get("timeout")
+        timeout = float(timeout) if isinstance(timeout, (int, float)) else 2.0
+        announced = await self._invoke_upstream(
+            client, req_id, "waitForSessionAnnounce failed",
+            lambda upstream: upstream.wait_session_announce(
+                session_id, timeout))
+        if announced is None:
             return
-        if method == "BrowserwrightDaemon.waitForSessionAnnounce":
-            session_id = await self._require_browser_session(
-                client, req_id, method, params)
-            if session_id is None:
-                return
-            timeout = params.get("timeout")
-            timeout = float(timeout) if isinstance(timeout, (int, float)) else 2.0
-            if self.state.backend_name != "extension":
-                await self._send_to_client(client.client_id, _result_response(
-                    req_id, {"announced": True}))
-                return
-            upstream = await self._ready_upstream(
-                client, req_id, "waitForSessionAnnounce failed")
-            if upstream is None:
-                return
-            announced = await upstream.wait_session_announce(session_id, timeout)
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {"announced": bool(announced)}))
+        await self._send_to_client(client.client_id, _result_response(
+            req_id, {"announced": bool(announced)}))
+
+    async def _handle_extension_reload(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        result = await self._invoke_upstream(
+            client, req_id, "extension reload failed",
+            lambda upstream: upstream.reload_extensions(
+                reason=str(params.get("reason") or "manual"),
+                expected_version=(str(params["expectedVersion"])
+                                  if params.get("expectedVersion") else None)),
+            error_code=-32000)
+        if result is None:
             return
-        if method == "BrowserwrightDaemon.extension.reload":
-            upstream = await self._ready_upstream(
-                client, req_id, "extension reload failed")
-            if upstream is None:
-                return
-            try:
-                result = await upstream.reload_extensions(
-                    reason=str(params.get("reason") or "manual"),
-                    expected_version=(
-                        str(params.get("expectedVersion"))
-                        if params.get("expectedVersion") else None
-                    ),
-                )
-            except Exception as e:  # noqa: BLE001
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32000, f"extension reload failed: {e!r}"))
-                return
-            await self._send_to_client(
-                client.client_id, _result_response(req_id, result or {}))
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, result or {}))
+
+    async def _handle_attach_active_tab(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        session_id = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.attachActiveTab", params)
+        if session_id is None:
             return
-        if method == "BrowserwrightDaemon.attachActiveTab":
-            # Unified verb. On extension this adopts the user's focused-window
-            # active tab (the targetId isn't known until the extension picks
-            # it). On rdp the daemon owns the Chrome, so "the active tab" is
-            # the session's current front target (most-recently-fronted), and
-            # we create+attach one if none exists — an honest equivalent, NOT
-            # -32601 (docs §C1). Either path registers the resulting session
-            # in the binding tables so subsequent CDP commands route the same
-            # way an explicit attach would.
-            attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-            attach_session = await self._require_browser_session(
-                client, req_id, method, attach_params)
-            if attach_session is None:
-                return
-            upstream = await self._ready_upstream(
-                client, req_id, "attach active failed")
-            if upstream is None:
-                return
-            try:
-                # Adopt into THIS session's tab group. The title is cosmetic:
-                # prefer the ledger name when the daemon can see it, otherwise
-                # fall back to the bound session id. The durable association is
-                # still the returned numeric groupId.
-                info = await upstream.attach_active(
-                    session_id=attach_session,
-                    group_name=self._session_group_name(client, attach_session))
-            except Exception as e:
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32000, f"attach active failed: {e!r}"))
-                return
-            await self._register_and_respond(
-                client, req_id, info,
-                malformed_msg="attach active returned malformed payload",
-                reuse_existing=True)
+        info = await self._invoke_upstream(
+            client, req_id, "attach active failed",
+            lambda upstream: upstream.attach_active(
+                session_id=session_id,
+                group_name=self._session_group_name(client, session_id)),
+            error_code=-32000)
+        if info is None:
             return
-        if method == "BrowserwrightDaemon.openBackgroundTab":
-            await self._handle_open_background_tab(client, msg, req_id)
+        await self._register_and_respond(
+            client, req_id, info,
+            malformed_msg="attach active returned malformed payload",
+            reuse_existing=True)
+
+    async def _handle_userscript(
+        self, client: ClientState, params: dict, req_id: int | None, verb: str,
+    ) -> None:
+        method = f"BrowserwrightDaemon.userscript.{verb}"
+        session_id = await self._require_browser_session(
+            client, req_id, method, params)
+        if session_id is None:
             return
-        if method == "BrowserwrightDaemon.closeTab":
-            await self._handle_close_tab(client, msg, req_id)
+        result = await self._invoke_upstream(
+            client, req_id, f"userscript {verb} failed",
+            lambda upstream: upstream.userscript_request(
+                verb, params,
+                session_ids=[b.upstream_session_id
+                             for b in client.sessions.values()]),
+            error_code=-32000)
+        if result is None:
             return
-        if method == "BrowserwrightDaemon.endSession":
-            await self._handle_end_session(client, msg, req_id)
-            return
-        if method == "BrowserwrightDaemon.ensureExecutor":
-            await self._handle_ensure_executor(client, msg, req_id)
-            return
-        if method == "BrowserwrightDaemon.killExecutor":
-            await self._handle_kill_executor(client, msg, req_id)
-            return
-        if method == "BrowserwrightDaemon.recoverSession":
-            await self._handle_recover_session(client, msg, req_id)
-            return
-        await self._send_to_client(client.client_id, _error_response(
-            req_id, -32601, f"unknown BrowserwrightDaemon method: {method}"))
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, result or {}))
 
     # ---- Phase B: BrowserwrightDaemon.openBackgroundTab / closeTab ----------
 
     async def _handle_open_background_tab(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Spec Phase B Feature 1.
 
@@ -401,7 +398,6 @@ class SessionVerbsMixin:
         # unimplemented verb. Enforced by
         # tests/daemon/test_verb_schema_lock.py::
         # test_param_validation_runs_before_backend_wiring.
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         url = params.get("url")
         if not isinstance(url, str) or not url:
             await self._send_to_client(client.client_id, _error_response(
@@ -418,10 +414,6 @@ class SessionVerbsMixin:
             client, req_id, "BrowserwrightDaemon.openBackgroundTab", params)
         if session is None:
             return
-        upstream = await self._ready_upstream(
-            client, req_id, "openBackgroundTab failed")
-        if upstream is None:
-            return
         # Extension-only: the tab-group title comes from the session label in
         # the ledger unless explicitly overridden. The durable identity is the
         # numeric groupId returned by the extension path, not this title.
@@ -431,14 +423,13 @@ class SessionVerbsMixin:
         background = params.get("background")
         background = background if isinstance(background, bool) else True
         skip_post_attach_commands = params.get("skipPostAttachCommands") is True
-        try:
-            result = await upstream.open_tab(
+        result = await self._invoke_upstream(
+            client, req_id, "openBackgroundTab failed",
+            lambda upstream: upstream.open_tab(
                 url, group_name=group_name, session_id=session,
                 background=background,
-                skip_post_attach_commands=skip_post_attach_commands)
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"openBackgroundTab failed: {e!r}"))
+                skip_post_attach_commands=skip_post_attach_commands))
+        if result is None:
             return
         # groupId is just metadata for the caller.
         await self._register_and_respond(
@@ -447,7 +438,7 @@ class SessionVerbsMixin:
             extra={"groupId": result.get("groupId", -1)})
 
     async def _handle_recover_session(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Session-reconnect-recovery.
 
@@ -457,59 +448,37 @@ class SessionVerbsMixin:
         Recover the tabs from that group, re-attach, and register a regular
         client-side binding for the representative tab so subsequent CDP
         commands route through the normal sessionId translation path (mirrors
-        openBackgroundTab). Requires backend=extension."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        # Raw CDP has no durable group id; its adapter implements recover as an
-        # honest ephemeral no-op. Extension validates its durable anchor below.
-        # Recovery keys on the persisted numeric groupId (the session's durable
-        # tab-group id from the ledger), NOT the title — names aren't unique.
-        # Validation FIRST so an empty-params call sees -32602, never -32601.
+        openBackgroundTab). The adapter decides whether recovery means durable
+        group reconstruction or raw-CDP current-page rebinding."""
         group_id = params.get("groupId")
-        if (not self._raw_cdp_backend
-                and (not isinstance(group_id, int) or group_id < 0)):
+        if group_id is not None and (
+                not isinstance(group_id, int) or group_id < 0):
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserwrightDaemon.recoverSession requires params.groupId"))
+                "BrowserwrightDaemon.recoverSession params.groupId must be "
+                "a non-negative integer"))
             return
-        if self._raw_cdp_backend:
-            # Raw workspaces have no durable group binding. Preserve the
-            # historical unscoped no-op while still routing it through the
-            # adapter that owns raw lifecycle semantics.
-            bs_session = client.session_id
-        else:
-            bs_session = await self._require_browser_session(
-                client, req_id, "BrowserwrightDaemon.recoverSession", params)
-            if bs_session is None:
-                return
-        upstream = await self._ready_upstream(
-            client, req_id, "recoverSession failed")
-        if upstream is None:
+        session_id = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.recoverSession", params)
+        if session_id is None:
             return
-        try:
-            result = await upstream.recover(
-                bs_session,
-                group_id=group_id if isinstance(group_id, int) else None)
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"recoverSession failed: {e!r}"))
+        result = await self._invoke_upstream(
+            client, req_id, "recoverSession failed",
+            lambda upstream: upstream.recover(
+                session_id,
+                group_id=group_id if isinstance(group_id, int) else None),
+            value_error_code=-32602)
+        if result is None:
             return
-        # Raw recovery is an honest no-op and therefore has no representative
-        # target to bind. Extension recovery returns one and follows the same
-        # binding path as openBackgroundTab.
-        if self._raw_cdp_backend:
-            await self._send_to_client(
-                client.client_id, _result_response(req_id, result))
-            return
-        # Register the representative tab's session binding (same as
-        # openBackgroundTab) so the client can drive it immediately.
         await self._register_and_respond(
             client, req_id, result,
             malformed_msg="recoverSession returned malformed result",
             extra={"groupId": result.get("groupId", -1),
-                   "recovered": result.get("recovered", [])})
+                   "recovered": result.get("recovered", [])},
+            reuse_existing=True)
 
     async def _handle_end_session(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """P5.4 / Phase 2: tear down a browserwright session.
 
@@ -518,7 +487,6 @@ class SessionVerbsMixin:
         rdp: the per-session context owns a dedicated Chrome. Close that Chrome
         (SIGTERM the launched pid), close the upstream, and drop the context —
         the uniform, non-`-32601` success shape (docs §RPCs)."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = params.get("session")
         if not isinstance(session, str) or not session:
             await self._send_to_client(client.client_id, _error_response(
@@ -545,20 +513,15 @@ class SessionVerbsMixin:
 
         group_id = params.get("groupId")
         group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
-        upstream = await self._ready_upstream(
-            client, req_id, "endSession failed")
-        if upstream is None:
-            return
-        try:
-            result = await upstream.end_session(session, group_id)
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"endSession failed: {e!r}"))
+        result = await self._invoke_upstream(
+            client, req_id, "endSession failed",
+            lambda upstream: upstream.end_session(session, group_id))
+        if result is None:
             return
         await self._send_to_client(client.client_id, _result_response(req_id, result))
 
     async def _handle_ensure_executor(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Phase B (Fork 2 control plane): lazily spawn the session's persistent
         executor and return its data-plane socket path.
@@ -568,7 +531,6 @@ class SessionVerbsMixin:
         waits for it to bind + write its `_ipc` discovery file, and returns
         ``{exec_sock}``. The thin heredoc client then connects DIRECTLY to that
         socket to ship code (bulk data never touches this event loop)."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.ensureExecutor", params)
         if session is None:
@@ -637,7 +599,7 @@ class SessionVerbsMixin:
             client.client_id, _result_response(req_id, result))
 
     async def _handle_kill_executor(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Reap ONLY this session's persistent executor — no browser teardown.
 
@@ -647,7 +609,6 @@ class SessionVerbsMixin:
         Idempotent: a no-op `{ok: True, killed: False}` when no executor exists.
         Best-effort — a missing registry still answers a clean (non-`-32601`)
         result so a stale-daemon caller never errors on `session end`."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.killExecutor", params)
         if session is None:
@@ -683,7 +644,7 @@ class SessionVerbsMixin:
             client.client_id, _result_response(req_id, response))
 
     async def _handle_close_tab(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Spec Phase B Feature 2.
 
@@ -697,7 +658,6 @@ class SessionVerbsMixin:
         # Accept either `sessionId` (per-client; for persistent-ws callers like
         # Skill REPL) or `targetId` (global; for CLI subcommands whose
         # transient ws can't share per-client session state).
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         local_sid = params.get("sessionId")
         target_id_param = params.get("targetId")
         has_sid = isinstance(local_sid, str) and local_sid
@@ -743,16 +703,11 @@ class SessionVerbsMixin:
             try:
                 result = await upstream.close_tab(target_id)
             except Exception as e:
-                # Match the regular path's policy: tear down bookkeeping even
-                # on error so callers can't reuse the stale targetId. There's
-                # no session/attacher binding to drop here by construction —
-                # that's why the attacher lookup failed in the first place —
-                # so just dropping the target visibility entry is enough.
-                self.state.note_target_destroyed(target_id)
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603, f"closeTab failed: {e!r}"))
                 return
-            self.state.note_target_destroyed(target_id)
+            finally:
+                self._forget_tab_binding(target_id)
             await self._send_to_client(client.client_id, _result_response(req_id, {
                 "ok": True,
                 "tabId": result.get("tabId"),
@@ -766,21 +721,40 @@ class SessionVerbsMixin:
         try:
             result = await upstream.close_tab(upstream_sid)
         except Exception as e:
-            # Even when upstream signals an error, tear down our bookkeeping
-            # so the caller can't reuse the (now-invalid) sessionId.
-            if owner_client_id is not None and owner_local_sid is not None:
-                self.state.unbind_session_by_local(
-                    owner_client_id, owner_local_sid)
-            self.state.note_target_destroyed(target_id)
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"closeTab failed: {e!r}"))
             return
-        # Success: clean up the session + attacher bindings; drop the target.
-        if owner_client_id is not None and owner_local_sid is not None:
-            self.state.unbind_session_by_local(
-                owner_client_id, owner_local_sid)
-        self.state.note_target_destroyed(target_id)
+        finally:
+            self._forget_tab_binding(
+                target_id, owner_client_id, owner_local_sid)
         await self._send_to_client(client.client_id, _result_response(req_id, {
             "ok": True,
             "tabId": result.get("tabId"),
         }))
+
+
+# The complete declared daemon-verb surface. Keep this explicit: recognition is
+# data, while each handler shares the same four-argument skeleton above.
+VERBS: dict[str, Handler] = {
+    "BrowserwrightDaemon.getBackendInfo": SessionVerbsMixin._handle_get_backend_info,
+    "BrowserwrightDaemon.status": SessionVerbsMixin._handle_status,
+    "BrowserwrightDaemon.waitForSessionAnnounce": SessionVerbsMixin._handle_wait_for_session_announce,
+    "BrowserwrightDaemon.attachActiveTab": SessionVerbsMixin._handle_attach_active_tab,
+    "BrowserwrightDaemon.openBackgroundTab": SessionVerbsMixin._handle_open_background_tab,
+    "BrowserwrightDaemon.closeTab": SessionVerbsMixin._handle_close_tab,
+    "BrowserwrightDaemon.endSession": SessionVerbsMixin._handle_end_session,
+    "BrowserwrightDaemon.ensureExecutor": SessionVerbsMixin._handle_ensure_executor,
+    "BrowserwrightDaemon.killExecutor": SessionVerbsMixin._handle_kill_executor,
+    "BrowserwrightDaemon.recoverSession": SessionVerbsMixin._handle_recover_session,
+    "BrowserwrightDaemon.extension.reload": SessionVerbsMixin._handle_extension_reload,
+    "BrowserwrightDaemon.userscript.install": partial(
+        SessionVerbsMixin._handle_userscript, verb="install"),
+    "BrowserwrightDaemon.userscript.list": partial(
+        SessionVerbsMixin._handle_userscript, verb="list"),
+    "BrowserwrightDaemon.userscript.remove": partial(
+        SessionVerbsMixin._handle_userscript, verb="remove"),
+    "BrowserwrightDaemon.userscript.toggle": partial(
+        SessionVerbsMixin._handle_userscript, verb="toggle"),
+    "BrowserwrightDaemon.userscript.logs": partial(
+        SessionVerbsMixin._handle_userscript, verb="logs"),
+}

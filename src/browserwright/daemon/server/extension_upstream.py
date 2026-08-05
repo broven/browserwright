@@ -177,10 +177,15 @@ class ExtensionUpstream:
         reason: str = "manual",
         expected_version: str | None = None,
     ) -> dict:
-        return await self._relay.reload_extensions(
+        result = await self._relay.reload_extensions(
             reason=reason,
             expected_version=expected_version,
         )
+        return {
+            **result,
+            "applicable": True,
+            "reason": "extension backend supports reload",
+        }
 
     # ---- per-session group binding helpers -------------------------------
 
@@ -288,7 +293,12 @@ class ExtensionUpstream:
                 pass
             # Evict any fabricated CDP sessions bound to a closed tab.
             self.evict_tab_sessions(tab_id)
-        return {"closed": closed, "kept": []}
+        return {
+            "ok": True,
+            "closed": closed,
+            "kept": [],
+            "backend": "extension",
+        }
 
     async def scoped_target_infos(self, session_id: str | None) -> list[dict]:
         """CDP ``targetInfos`` for the session's browser = its tab group ONLY.
