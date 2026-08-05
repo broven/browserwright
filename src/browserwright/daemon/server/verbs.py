@@ -281,11 +281,6 @@ class SessionVerbsMixin:
                 client, req_id, method, params)
             if session_id is None:
                 return
-            # The schema-lock test scans this file for `method == "..."` string
-            # literals; this no-op registers the userscript.install verb literal
-            # for that scan (userscript.* is otherwise dispatched by prefix).
-            if False and method == "BrowserwrightDaemon.userscript.install":
-                pass
             verb = method.split(".", 2)[2]
             # rdp dispatch: the extension's userScripts API doesn't exist on a
             # daemon-owned Chrome. Provide an honest shim via
@@ -440,11 +435,12 @@ class SessionVerbsMixin:
         subsequent CDP commands work through the same session-id translation
         path as Target.attachToTarget.
         """
-        # Param validation runs FIRST: the schema-lock smoke test calls
-        # every BrowserwrightDaemon.* method with no params and asserts the
-        # response code is NOT -32601 ("unknown method"). Returning -32602
-        # here for the missing required param keeps the lock satisfied
-        # without us wiring a real extension upstream in unit tests.
+        # Param validation runs FIRST so an empty-params call answers -32602
+        # ("bad params"), never -32601 ("unknown method") — checking backend
+        # wiring first would make a missing param indistinguishable from an
+        # unimplemented verb. Enforced by
+        # tests/daemon/test_verb_schema_lock.py::
+        # test_param_validation_runs_before_backend_wiring.
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         url = params.get("url")
         if not isinstance(url, str) or not url:
@@ -518,15 +514,15 @@ class SessionVerbsMixin:
         # daemon, so there is nothing durable to recover. Surviving targets are
         # re-attached by the skill's in-process / ledger fast paths, so recover
         # is an honest no-op here — NEVER -32601 (revised Rule: same-shape,
-        # honest, nearest equivalent). This runs before param validation so the
-        # schema-lock smoke test (no params) sees a result, not an error.
+        # honest, nearest equivalent). This runs before param validation so an
+        # empty-params call on rdp/env sees a result, not an error.
         if self._raw_cdp_backend:
             await self._send_to_client(client.client_id, _result_response(
                 req_id, {"recovered": [], "groupId": -1, "tabs": []}))
             return
         # Recovery keys on the persisted numeric groupId (the session's durable
         # tab-group id from the ledger), NOT the title — names aren't unique.
-        # Validation FIRST so the schema-lock smoke test sees -32602, != -32601.
+        # Validation FIRST so an empty-params call sees -32602, never -32601.
         group_id = params.get("groupId")
         if not isinstance(group_id, int) or group_id < 0:
             await self._send_to_client(client.client_id, _error_response(
@@ -765,7 +761,8 @@ class SessionVerbsMixin:
         and tears down the local state bindings whether the close succeeded
         or not — the tab is gone either way.
         """
-        # Param validation runs FIRST (same rationale as openBackgroundTab).
+        # Param validation runs FIRST (same rationale as openBackgroundTab:
+        # empty params must answer -32602, never -32601).
         # Accept either `sessionId` (per-client; for persistent-ws callers like
         # Skill REPL) or `targetId` (global; for CLI subcommands whose
         # transient ws can't share per-client session state).

@@ -25,3 +25,45 @@ jobs:
 
       - name: Run the fast gate
         run: mise run test
+
+  e2e:
+    # The real-Chrome suite is the only thing that tests the actual system:
+    # a real Chrome for Testing, the unpacked extension, the relay, and a live
+    # daemon. It has never run in CI, so every extension-backend regression has
+    # had to be caught by hand.
+    #
+    # NON-BLOCKING FOR NOW (continue-on-error). A separate work item is
+    # establishing the current pass/fail baseline for this suite; flip
+    # `continue-on-error` off once that baseline is known and green. Until then
+    # this job exists to produce the signal, not to gate merges.
+    name: Real-Chrome E2E (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mise (python + uv per mise.toml)
+        uses: jdx/mise-action@v2
+
+      - name: Install dependencies
+        run: mise run install
+
+      - name: Install Chrome for Testing
+        # The e2e harness probes /tmp/chrome-for-testing first
+        # (tests/daemon/e2e/_real_browser.py).
+        run: npx --yes @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing
+
+      - name: Install xvfb
+        # The harness launches Chrome headed with --load-extension; MV3 service
+        # workers are exercised for real, so it needs a display.
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Run the real-Chrome E2E suite
+        run: xvfb-run -a mise run test:e2e
+
+      - name: Reclaim leaked daemons / Chrome
+        if: always()
+        run: mise run teardown
