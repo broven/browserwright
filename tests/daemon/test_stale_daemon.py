@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from browserwright.daemon import _stale
+from browserwright.daemon import _stale, supervise
 
 
 def test_port_is_listening_true_and_false():
@@ -70,25 +70,25 @@ def test_confirmed_stale_holder_skips_self(monkeypatch):
 
 def test_reclaim_ports_sigterm_frees(monkeypatch):
     killed = []
-    monkeypatch.setattr(_stale.os, "kill",
+    monkeypatch.setattr(supervise.os, "kill",
                         lambda pid, sig: killed.append((pid, sig)))
     # Port frees immediately after SIGTERM.
     monkeypatch.setattr(_stale, "port_is_listening", lambda h, p: False)
     assert _stale.reclaim_ports(999, [19989, 19990]) is True
-    assert killed == [(999, _stale.signal.SIGTERM)]
+    assert killed == [(999, supervise.signal.SIGTERM)]
 
 
 def test_reclaim_ports_escalates_to_sigkill(monkeypatch):
     killed = []
-    monkeypatch.setattr(_stale.os, "kill",
+    monkeypatch.setattr(supervise.os, "kill",
                         lambda pid, sig: killed.append((pid, sig)))
-    monkeypatch.setattr(_stale.time, "sleep", lambda s: None)
+    monkeypatch.setattr(supervise.time, "sleep", lambda s: None)
     # Never frees → SIGTERM wait times out → SIGKILL, still held.
     monkeypatch.setattr(_stale, "port_is_listening", lambda h, p: True)
-    monkeypatch.setattr(_stale.time, "monotonic",
+    monkeypatch.setattr(supervise.time, "monotonic",
                         _fake_monotonic([0, 6, 6, 9]))
     assert _stale.reclaim_ports(999, [19989]) is False
-    assert (999, _stale.signal.SIGKILL) in killed
+    assert (999, supervise.signal.SIGKILL) in killed
 
 
 def _fake_monotonic(values):
