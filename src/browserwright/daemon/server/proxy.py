@@ -137,6 +137,7 @@ class Router(SessionVerbsMixin):
         self._client_sends: dict[int, Callable[[str], Awaitable[None]]] = {}
         self._ensure_upstream: Callable[[], Awaitable[None]] | None = None
         self._trigger_disconnect: Callable[[str], Awaitable[None]] | None = None
+        self._prepare_executor: Callable[[str], Awaitable[None]] | None = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -194,9 +195,11 @@ class Router(SessionVerbsMixin):
         self,
         ensure_upstream: Callable[[], Awaitable[None]],
         trigger_disconnect: Callable[[str], Awaitable[None]],
+        prepare_executor: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._ensure_upstream = ensure_upstream
         self._trigger_disconnect = trigger_disconnect
+        self._prepare_executor = prepare_executor
 
     # ---- downstream → upstream ------------------------------------------
 
@@ -243,14 +246,12 @@ class Router(SessionVerbsMixin):
         if not await self._gate_upstream_ready(client, text, msg=msg):
             return
 
-        # --- Target.getTargets scoping (extension: this session's group only) ---
-        # The skill's list_tabs / current_page enumerate via Target.getTargets.
-        # On the shared extension upstream the raw handler returns EVERY ghost
-        # across all sessions; scope it to the requesting client's tab group so
-        # sessions stay mutually invisible. rdp keeps the normal forward (its
-        # Chrome is already private to the session).
+        # --- session-aware Target.getTargets enumeration -------------------
+        # Every adapter owns its workspace boundary. In particular, extension
+        # filters the relay's global ghost table to this session's tab group;
+        # raw-CDP adapters enumerate their private browser. Router must not
+        # infer either behavior from a backend name.
         if (method == "Target.getTargets"
-                and self.state.backend_name == "extension"
                 and self.upstream is not None
                 and client.session_id):
             try:

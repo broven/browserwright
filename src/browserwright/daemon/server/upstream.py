@@ -283,13 +283,16 @@ class CdpUpstream:
             target_id = raw.get("targetId")
             if not isinstance(target_id, str):
                 continue
-            tabs.append({
+            tab = dict(raw)
+            tab.update({
                 "targetId": target_id,
+                "type": "page",
                 "url": str(raw.get("url", "")),
                 "title": str(raw.get("title", "")),
                 "attached": bool(raw.get("attached", False)
                                  or target_id in self._target_sessions),
             })
+            tabs.append(tab)
             self._target_info[target_id] = tabs[-1]
         return tabs
 

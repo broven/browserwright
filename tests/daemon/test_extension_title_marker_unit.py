@@ -56,6 +56,204 @@ def _marker_sources() -> dict[str, str]:
     }
 
 
+def _service_worker_marker_sources() -> dict[str, str]:
+    """Extract the real SW marker lifecycle without loading the extension."""
+    source = BACKGROUND_JS.read_text(encoding="utf-8")
+    marker_start = source.index("const markedTabs")
+    marker_end = source.index("// ---- chrome.debugger event fan-out", marker_start)
+    detach_start = source.index("async function detachTab(")
+    detach_end = source.index("\n\nasync function doAttach(", detach_start)
+    handler_start = source.index("async function handleDaemonMessage(")
+    handler_end = source.index("// Shared attach sequence", handler_start)
+    return {
+        **_marker_sources(),
+        "workerMarkerRegion": source[marker_start:marker_end],
+        "detachTab": source[detach_start:detach_end],
+        "handleDaemonMessage": source[handler_start:handler_end],
+    }
+
+
+def _run_service_worker_realm_rebuild_probe(payload: dict[str, str]) -> dict:
+    """Mark in one SW realm, then detach through a fresh realm.
+
+    The page sandbox deliberately survives the service-worker sandbox. This is
+    the upgrade/reload shape: extension globals are rebuilt while the old tab's
+    injected accessor, observer, and visible title marker remain live.
+    """
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const EYE = "\u{1F440}";
+
+class Document {}
+Object.defineProperty(Document.prototype, "title", {
+  configurable: true,
+  enumerable: true,
+  get() { return this._rawTitle || ""; },
+  set(value) { this._rawTitle = String(value); },
+});
+class MutationObserver {
+  constructor(callback) {
+    this.callback = callback;
+    this.disconnected = false;
+  }
+  observe() { this.callback(); }
+  disconnect() { this.disconnected = true; }
+}
+
+const document = new Document();
+document._rawTitle = `${EYE} Legacy`;
+document.head = { appendChild() {} };
+document.querySelector = () => null;
+document.createElement = () => ({ textContent: "" });
+document.addEventListener = () => {};
+const page = vm.createContext({
+  window: {}, document, Document, HTMLDocument: Document, MutationObserver,
+});
+
+const calls = [];
+const chrome = {
+  debugger: {
+    async sendCommand(target, method, params) {
+      calls.push({ kind: "command", method, params });
+      if (method === "Page.addScriptToEvaluateOnNewDocument") {
+        return { identifier: "old-realm-script" };
+      }
+      if (method === "Runtime.evaluate") {
+        vm.runInContext(params.expression, page);
+      }
+      return {};
+    },
+    async detach(target) {
+      calls.push({ kind: "detach", tabId: target.tabId });
+    },
+  },
+};
+
+function newWorkerRealm(attached) {
+  const realm = vm.createContext({ chrome, console, sleep: async () => {} });
+  vm.runInContext(`
+    const TITLE_PREFIX = "\\u{1F440} ";
+    const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
+    const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+    ${input.workerMarkerRegion}
+    const attachedTabs = new Set(${attached ? "[17]" : "[]"});
+    function safeSend() {}
+    ${input.detachTab}
+  `, realm);
+  return realm;
+}
+
+(async () => {
+  const firstRealm = newWorkerRealm(true);
+  await vm.runInContext("markTabAttached(17)", firstRealm);
+  const titleAfterMark = document._rawTitle;
+
+  // A service-worker update/reload rebuilds all extension globals. The page
+  // and its injected marker survive, but markedTabs is now an empty Map.
+  const secondRealm = newWorkerRealm(false);
+  await vm.runInContext("detachTab(17)", secondRealm);
+
+  process.stdout.write(JSON.stringify({
+    titleAfterMark,
+    titleAfterDetach: document._rawTitle,
+    markerAfterDetach: !!page.window.__bdTitleMarker,
+    callsAfterRealmRebuild: calls.slice(3),
+  }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", probe],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+        cwd=ROOT,
+    )
+    return json.loads(proc.stdout)
+
+
+def _run_controlled_reload_probe(payload: dict[str, object]) -> list[dict]:
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const calls = [];
+const chrome = {
+  debugger: {
+    async sendCommand(target, method, params) {
+      calls.push({ kind: "command", tabId: target.tabId, method, params });
+      if (method === "Page.addScriptToEvaluateOnNewDocument") {
+        if (input.markInFlight) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        return { identifier: "known-script" };
+      }
+      if (input.failRemove &&
+          method === "Page.removeScriptToEvaluateOnNewDocument") {
+        throw new Error("registration already gone");
+      }
+      if (input.hangRemove && method === "Runtime.evaluate" &&
+          params.expression === input.removeScript) {
+        return await new Promise(() => {});
+      }
+      return {};
+    },
+  },
+  runtime: {
+    reload() { calls.push({ kind: "reload" }); },
+  },
+};
+const realm = vm.createContext({
+  chrome,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  console: { info() {}, warn() {}, error: console.error },
+});
+vm.runInContext(`
+  const daemonVersion = "test";
+  const TITLE_PREFIX = "\\u{1F440} ";
+  const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
+  const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+  const attachedTabs = new Set([17]);
+  ${input.workerMarkerRegion.replace(
+    "const MARKER_RELOAD_CLEANUP_TIMEOUT_MS = 1500;",
+    "const MARKER_RELOAD_CLEANUP_TIMEOUT_MS = 10;",
+  )}
+  ${input.handleDaemonMessage}
+`, realm);
+(async () => {
+  let marking = null;
+  if (input.markInFlight) {
+    marking = vm.runInContext("markTabAttached(17)", realm);
+  } else {
+    vm.runInContext('markedTabs.set(17, "known-script")', realm);
+  }
+  await vm.runInContext(
+    'handleDaemonMessage({type: "reloadExtension", reason: "test"})',
+    realm,
+  );
+  if (marking) await marking;
+  process.stdout.write(JSON.stringify(calls));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", probe],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+        cwd=ROOT,
+    )
+    return json.loads(proc.stdout)
+
+
 def _run_node_probe(payload: dict[str, str]) -> dict[str, object]:
     probe = r"""
 const vm = require("node:vm");
@@ -481,3 +679,78 @@ def test_title_marker_helpers_normalize_and_remove_all_leading_markers() -> None
         "rawTitle": "After",
         "pageTitle": "After",
     }
+
+
+def test_detach_cleans_marker_after_service_worker_realm_rebuild() -> None:
+    results = _run_service_worker_realm_rebuild_probe(
+        _service_worker_marker_sources())
+
+    assert results["titleAfterMark"] == f"{PREFIX}Legacy"
+    assert results["titleAfterDetach"] == "Legacy"
+    assert results["markerAfterDetach"] is False
+    assert results["callsAfterRealmRebuild"] == [
+        {
+            "kind": "command",
+            "method": "Runtime.evaluate",
+            "params": {"expression": _marker_sources()["removeScript"]},
+        },
+        {"kind": "detach", "tabId": 17},
+    ]
+
+
+def test_controlled_reload_cleans_known_tabs_before_reloading() -> None:
+    sources = _service_worker_marker_sources()
+    assert _run_controlled_reload_probe(sources) == [
+        {
+            "kind": "command",
+            "tabId": 17,
+            "method": "Page.removeScriptToEvaluateOnNewDocument",
+            "params": {"identifier": "known-script"},
+        },
+        {
+            "kind": "command",
+            "tabId": 17,
+            "method": "Runtime.evaluate",
+            "params": {"expression": sources["removeScript"]},
+        },
+        {"kind": "reload"},
+    ]
+
+
+def test_marker_cleanup_is_ordered_and_reload_remains_best_effort() -> None:
+    sources: dict[str, object] = _service_worker_marker_sources()
+
+    remove_failed = _run_controlled_reload_probe({
+        **sources,
+        "failRemove": True,
+    })
+    assert [call.get("method") or call["kind"] for call in remove_failed] == [
+        "Page.removeScriptToEvaluateOnNewDocument",
+        "Runtime.evaluate",
+        "reload",
+    ]
+
+    remove_hung = _run_controlled_reload_probe({
+        **sources,
+        "hangRemove": True,
+    })
+    assert [call.get("method") or call["kind"] for call in remove_hung] == [
+        "Page.removeScriptToEvaluateOnNewDocument",
+        "Runtime.evaluate",
+        "reload",
+    ]
+
+    mark_in_flight = _run_controlled_reload_probe({
+        **sources,
+        "markInFlight": True,
+    })
+    assert [call.get("method") or call["kind"] for call in mark_in_flight] == [
+        "Page.enable",
+        "Page.addScriptToEvaluateOnNewDocument",
+        "Runtime.evaluate",
+        "Page.removeScriptToEvaluateOnNewDocument",
+        "Runtime.evaluate",
+        "reload",
+    ]
+    assert mark_in_flight[2]["params"]["expression"] == sources["installScript"]
+    assert mark_in_flight[4]["params"]["expression"] == sources["removeScript"]

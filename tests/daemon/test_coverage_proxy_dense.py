@@ -171,7 +171,7 @@ async def test_wait_session_announce_uses_upstream_shim_for_rdp():
 
 
 @pytest.mark.asyncio
-async def test_extension_scoped_get_targets_success_error_and_fallback():
+async def test_adapter_scoped_get_targets_success_and_error():
     state, router, cap, (scoped, sessionless) = setup_router(
         "scoped", "sessionless", backend="extension")
     scoped.session_id = "sess-1"
@@ -198,12 +198,82 @@ async def test_extension_scoped_get_targets_success_error_and_fallback():
     }))
     assert last_error(cap, scoped)["code"] == -32603
 
+    async def raw_tabs(session_id: str):
+        return [{"targetId": "raw-page", "type": "page"}]
+
+    router.upstream.list_tabs = raw_tabs
     state.backend_name = "rdp"
     await router.route_from_client(sessionless, json.dumps({
         "id": 12, "method": "Target.getTargets",
     }))
-    assert cap.upstream[-1]["method"] == "Target.getTargets"
-    assert state.pending_requests[cap.upstream[-1]["id"]].client_request_id == 12
+    assert cap.per_client[sessionless.client_id][-1]["result"] == {
+        "targetInfos": [{"targetId": "raw-page", "type": "page"}],
+    }
+    assert cap.upstream == []
+
+
+@pytest.mark.asyncio
+async def test_get_targets_delegates_to_adapter_regardless_of_backend_name():
+    """Session isolation is an adapter capability, not a backend-name branch."""
+    _state, router, cap, (client,) = setup_router(
+        "wrapped", backend="wrapped-extension")
+    seen: list[str] = []
+
+    async def list_tabs(session_id: str):
+        seen.append(session_id)
+        return [{
+            "targetId": "only-this-session",
+            "type": "page",
+            "url": "https://example.test/",
+            "title": "Example",
+            "attached": True,
+        }]
+
+    router.upstream.list_tabs = list_tabs
+    await router.route_from_client(client, json.dumps({
+        "id": 13, "method": "Target.getTargets",
+    }))
+
+    assert seen == ["s-wrapped"]
+    assert cap.upstream == []
+    assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == [
+        {
+            "targetId": "only-this-session",
+            "type": "page",
+            "url": "https://example.test/",
+            "title": "Example",
+            "attached": True,
+        }
+    ]
+
+    async def raw_command(method, params=None, session_id=None, timeout=10.0):
+        assert method == "Target.getTargets"
+        return {"result": {"targetInfos": [
+            {"targetId": "browser", "type": "browser", "url": ""},
+            {
+                "targetId": "raw-page",
+                "type": "page",
+                "url": "https://raw.test/",
+                "title": "Raw",
+                "attached": False,
+                "browserContextId": "context-1",
+                "canAccessOpener": False,
+            },
+        ]}}
+
+    attach_cdp(router, cap, raw_command)
+    await router.route_from_client(client, json.dumps({
+        "id": 14, "method": "Target.getTargets",
+    }))
+    assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == [{
+        "targetId": "raw-page",
+        "type": "page",
+        "url": "https://raw.test/",
+        "title": "Raw",
+        "attached": False,
+        "browserContextId": "context-1",
+        "canAccessOpener": False,
+    }]
 
 
 @pytest.mark.asyncio

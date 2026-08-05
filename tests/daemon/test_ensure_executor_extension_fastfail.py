@@ -16,15 +16,19 @@ from typing import Any
 
 import pytest
 
-from browserwright.daemon.server import verbs as verbs_mod
+from browserwright.daemon.config import Config
+from browserwright.daemon.errors import Unavailable
+from browserwright.daemon.server import listener as listener_mod
 from browserwright.daemon.server.proxy import Router
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
 
 class _Cap:
-    def __init__(self) -> None:
+    def __init__(self, relay=None) -> None:
         self.sent: dict[int, list[Any]] = {}
         self.ensure_calls = 0
+        self.prepare_calls = 0
+        self.relay = relay
 
     def send_for(self, cid: int):
         self.sent[cid] = []
@@ -36,6 +40,19 @@ class _Cap:
 
     async def ensure_upstream(self) -> None:
         self.ensure_calls += 1
+
+    async def prepare_executor(self, session_id: str) -> None:
+        self.prepare_calls += 1
+        if self.relay is None or self.relay.is_ready:
+            return
+        try:
+            await self.relay.wait_ready(timeout=0.05)
+        except asyncio.TimeoutError:
+            pass
+        if not self.relay.is_ready:
+            raise RuntimeError(
+                "no browserwright extension is connected; reload at "
+                "chrome://extensions")
 
     async def trigger_disconnect(self, reason: str) -> None:  # pragma: no cover
         pass
@@ -87,8 +104,9 @@ def _build(backend: str, *, relay: _FakeRelay | None,
     state = DaemonState(backend_name=backend)
     state.upstream_phase = phase
     router = Router(state)
-    cap = _Cap()
-    router.bind_lifecycle(cap.ensure_upstream, cap.trigger_disconnect)
+    cap = _Cap(relay)
+    router.bind_lifecycle(
+        cap.ensure_upstream, cap.trigger_disconnect, cap.prepare_executor)
     registry = _FakeRegistry()
     router.daemon = _FakeDaemon(relay=relay, registry=registry)
     client = state.allocate_client("agent")
@@ -106,8 +124,23 @@ async def _ensure_executor(router: Router, client) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_extension_no_extension_connected_fast_actionable_error(monkeypatch):
-    monkeypatch.setattr(verbs_mod, "_EXT_READY_BUDGET_S", 0.05)
+async def test_extension_holder_owns_executor_readiness_fastfail(monkeypatch):
+    monkeypatch.setattr(listener_mod, "_EXECUTOR_READY_BUDGET_S", 0.05)
+    relay = _FakeRelay(ready=False)
+    state = DaemonState(backend_name="renamed-extension-wrapper")
+    holder = listener_mod._UpstreamHolder(
+        state, Router(state), Config(backend="renamed-extension-wrapper"))
+    holder.relay = relay
+
+    with pytest.raises(Unavailable, match="chrome://extensions"):
+        await holder.prepare_executor("246")
+
+    assert relay.wait_calls == 1
+    assert state.upstream_phase == UpstreamPhase.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_extension_no_extension_connected_fast_actionable_error():
     relay = _FakeRelay(ready=False)
     state, router, cap, client, registry = _build("extension", relay=relay)
 
@@ -125,6 +158,7 @@ async def test_extension_no_extension_connected_fast_actionable_error(monkeypatc
     # Fast-fail path: we gave the relay a chance, then bailed WITHOUT opening
     # the upstream (no state-machine mutation) and WITHOUT spawning an executor.
     assert relay.wait_calls == 1
+    assert cap.prepare_calls == 1
     assert cap.ensure_calls == 0
     assert registry.ensure_calls == 0
     # Upstream state is untouched — a later reconnect can still open it.
@@ -132,8 +166,7 @@ async def test_extension_no_extension_connected_fast_actionable_error(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_extension_ready_proceeds_to_spawn(monkeypatch):
-    monkeypatch.setattr(verbs_mod, "_EXT_READY_BUDGET_S", 0.05)
+async def test_extension_ready_proceeds_to_spawn():
     relay = _FakeRelay(ready=True)
     state, router, cap, client, registry = _build("extension", relay=relay)
 
@@ -145,15 +178,15 @@ async def test_extension_ready_proceeds_to_spawn(monkeypatch):
     assert reply["result"]["exec_sock"] == "/tmp/bw-exec-246.sock"
     # Relay was already ready → no readiness wait; normal open + spawn ran.
     assert relay.wait_calls == 0
+    assert cap.prepare_calls == 1
     assert cap.ensure_calls == 1
     assert registry.ensure_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_rdp_skips_extension_fastfail(monkeypatch):
+async def test_rdp_skips_extension_fastfail():
     """The fast-fail is extension-only: an rdp session never consults the relay
     (it has none) and proceeds through the normal upstream-open + spawn path."""
-    monkeypatch.setattr(verbs_mod, "_EXT_READY_BUDGET_S", 0.05)
     state, router, cap, client, registry = _build("rdp", relay=None)
 
     await _ensure_executor(router, client)
@@ -162,4 +195,5 @@ async def test_rdp_skips_extension_fastfail(monkeypatch):
     assert "result" in reply, f"expected a result, got {reply!r}"
     assert reply["result"]["exec_sock"] == "/tmp/bw-exec-246.sock"
     assert cap.ensure_calls == 1
+    assert cap.prepare_calls == 1
     assert registry.ensure_calls == 1
