@@ -25,6 +25,7 @@ import pytest
 import websockets
 
 from browserwright import session_registry as reg
+from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.facade_extension import ExtensionFacadeBridge
 from browserwright.daemon.server.relay import RelayServer
 
@@ -368,7 +369,16 @@ async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
     client = _FakeClient()
-    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    async def _noop_frame(_text):
+        return None
+
+    async def _noop_close(_reason):
+        return None
+
+    binding_owner = ExtensionUpstream(relay, _noop_frame, _noop_close)
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay, session_id=sid,
+        binding_owner=binding_owner)
     run_task = asyncio.create_task(bridge.run())
     try:
         client.feed({"id": 3, "method": "Target.createTarget",
@@ -428,14 +438,22 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
     client = _FakeClient()
-    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    async def _noop_frame(_text):
+        return None
+
+    async def _noop_close(_reason):
+        return None
+
+    binding_owner = ExtensionUpstream(relay, _noop_frame, _noop_close)
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay, session_id=sid,
+        binding_owner=binding_owner)
     run_task = asyncio.create_task(bridge.run())
     try:
         # Simulate the agent path winning the race after the facade bridge was
-        # constructed: the group id is now in the shared in-process truth, but
-        # not in bridge._group_id's constructor-time cache.
-        relay.bind_session_group(sid, 88)
-        assert bridge._group_id is None  # noqa: SLF001
+        # constructed: the adapter-owned live binding is immediately visible
+        # to the facade; neither the relay nor bridge keeps a duplicate cache.
+        binding_owner._bind_group(sid, 88)  # noqa: SLF001
 
         client.feed({"id": 3, "method": "Target.createTarget",
                      "params": {"url": "https://new/"}})
@@ -443,7 +461,7 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
         tid = res["result"]["targetId"]
         tab_id = int(tid.rsplit("-", 1)[1])
         assert ext.tabs_meta[tab_id]["groupId"] == 88
-        assert bridge._group_id == 88  # noqa: SLF001
+        assert binding_owner.group_for_session(sid) == 88
         assert (reg.get(sid).get("runtime") or {})["group_id"] == 88
     finally:
         client.eof()

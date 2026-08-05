@@ -298,21 +298,22 @@ class PlaywrightFacade:
                 await conn.close(code=1011, reason="extension relay unavailable")
             return
         session_id = self._session_for_connection(conn)
-        session_name = None
-        session_group_id = None
-        if session_id:
-            from ... import session_registry
-            rec = session_registry.get(session_id)
-            if isinstance(rec, dict):
-                session_name = rec.get("name")
-                runtime = rec.get("runtime") or {}
-                gid = runtime.get("group_id") if isinstance(runtime, dict) else None
-                if isinstance(gid, int) and gid >= 0:
-                    session_group_id = gid
+        binding_owner = None
+        if ctx is not None:
+            try:
+                await ctx.holder.ensure_open()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("facade(ext): upstream unavailable: %r", e)
+                with contextlib.suppress(Exception):
+                    await conn.close(code=1011, reason="extension upstream unavailable")
+                return
+            from .extension_upstream import ExtensionUpstream
+            candidate = ctx.router.upstream
+            if isinstance(candidate, ExtensionUpstream):
+                binding_owner = candidate
         bridge = ExtensionFacadeBridge(
             client=conn, relay=relay,
-            session_id=session_id, session_name=session_name,
-            session_group_id=session_group_id)
+            session_id=session_id, binding_owner=binding_owner)
         try:
             await bridge.run()
         except websockets.exceptions.ConnectionClosed:

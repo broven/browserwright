@@ -7,6 +7,7 @@ import pytest
 
 from browserwright.daemon.server.proxy import Router, _cmd_result
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+from browserwright.daemon.server.upstream import CdpUpstream
 
 
 class Capture:
@@ -79,6 +80,20 @@ def last_error(cap: Capture, client) -> dict:
     return cap.per_client[client.client_id][-1]["error"]
 
 
+def attach_cdp(router: Router, cap: Capture, command, *, on_end_session=None):
+    async def on_close(_reason: str) -> None:
+        return None
+
+    upstream = CdpUpstream(
+        router.forward_from_upstream, on_close, state=router.state,
+        on_end_session=on_end_session)
+    upstream.send_command = command
+    upstream.send_cdp = cap.upstream_send
+    router.upstream = None
+    upstream.attach(router)
+    return upstream
+
+
 @pytest.mark.asyncio
 async def test_raw_frames_lifecycle_failure_and_broadcast_edges():
     state, router, cap, (client,) = setup_router()
@@ -144,7 +159,7 @@ async def test_wait_session_announce_is_extension_only_noop_for_rdp():
         called = True
         return False
 
-    router._wait_session_announce = wait_session_announce
+    router.upstream.wait_session_announce = wait_session_announce
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.waitForSessionAnnounce",
@@ -166,7 +181,7 @@ async def test_extension_scoped_get_targets_success_error_and_fallback():
         seen.append(session_id)
         return [{"targetId": "only-mine", "type": "page"}]
 
-    router._scoped_targets = scoped_targets
+    router.upstream.list_tabs = scoped_targets
     await router.route_from_client(scoped, json.dumps({
         "id": 10, "method": "Target.getTargets",
     }))
@@ -177,13 +192,13 @@ async def test_extension_scoped_get_targets_success_error_and_fallback():
     async def broken_scoped(session_id: str):
         raise RuntimeError(f"bad scope {session_id}")
 
-    router._scoped_targets = broken_scoped
+    router.upstream.list_tabs = broken_scoped
     await router.route_from_client(scoped, json.dumps({
         "id": 11, "method": "Target.getTargets",
     }))
     assert last_error(cap, scoped)["code"] == -32603
 
-    router._scoped_targets = None
+    state.backend_name = "rdp"
     await router.route_from_client(sessionless, json.dumps({
         "id": 12, "method": "Target.getTargets",
     }))
@@ -326,7 +341,8 @@ async def test_upstream_event_table_orphan_and_pending_auto_attach_edges():
 @pytest.mark.asyncio
 async def test_attach_active_extension_lazy_malformed_reuse_and_conflict():
     state, router, cap, (alice, bob) = setup_router(
-        "alice", "bob", backend="extension", phase=UpstreamPhase.DISCONNECTED)
+        "alice", "bob", backend="extension", phase=UpstreamPhase.DISCONNECTED,
+        wire_upstream=False)
 
     async def failing_ensure() -> None:
         raise RuntimeError("offline")
@@ -338,11 +354,12 @@ async def test_attach_active_extension_lazy_malformed_reuse_and_conflict():
     assert last_error(cap, alice)["code"] == -32603
 
     state.upstream_phase = UpstreamPhase.CONNECTED
+    router.update_upstream_send(cap.upstream_send)
 
     async def malformed_attach(**kwargs):
         return {"sessionId": 123, "targetId": None}
 
-    router._attach_active_tab = malformed_attach
+    router.upstream.attach_active = malformed_attach
     await router.route_from_client(alice, json.dumps({
         "id": 2, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -354,7 +371,7 @@ async def test_attach_active_extension_lazy_malformed_reuse_and_conflict():
             "tabId": 7, "url": "https://active/", "title": "Active",
         }
 
-    router._attach_active_tab = attach
+    router.upstream.attach_active = attach
     await router.route_from_client(alice, json.dumps({
         "id": 3, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -384,7 +401,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def bad_open(*args, **kwargs):
         return {"sessionId": "UP"}
 
-    router._open_background_tab = bad_open
+    router.upstream.open_tab = bad_open
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -395,7 +412,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def ok_open(*args, **kwargs):
         return {"sessionId": "UP", "targetId": "T", "tabId": 1}
 
-    router._open_background_tab = ok_open
+    router.upstream.open_tab = ok_open
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -406,7 +423,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def failing_close(upstream_sid: str):
         raise RuntimeError(f"nope {upstream_sid}")
 
-    router._close_tab = failing_close
+    router.upstream.close_tab = failing_close
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.closeTab",
@@ -421,7 +438,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def failing_close_by_target(target_id: str):
         raise RuntimeError(target_id)
 
-    router._close_tab_by_target_id = failing_close_by_target
+    router.upstream.close_tab = failing_close_by_target
     await router.route_from_client(client, json.dumps({
         "id": 5,
         "method": "BrowserwrightDaemon.closeTab",
@@ -433,7 +450,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def malformed_recover(*args, **kwargs):
         return {"sessionId": "UP"}
 
-    router._recover_session = malformed_recover
+    router.upstream.recover = malformed_recover
     await router.route_from_client(client, json.dumps({
         "id": 6,
         "method": "BrowserwrightDaemon.recoverSession",
@@ -444,7 +461,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def end_with_group(session: str, group_id: int):
         return {"session": session, "groupId": group_id}
 
-    router._end_session = end_with_group
+    router.upstream.end_session = end_with_group
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.endSession",
@@ -473,6 +490,11 @@ async def test_end_session_daemon_edge_cases():
 
     good = TeardownDaemon()
     router.daemon = good
+    async def unused_command(*args, **kwargs):
+        raise AssertionError("endSession must not send CDP")
+    attach_cdp(
+        router, cap, unused_command,
+        on_end_session=good.teardown_rdp_context)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.endSession",
@@ -483,6 +505,7 @@ async def test_end_session_daemon_edge_cases():
 
     bad = TeardownDaemon(fail=True)
     router.daemon = bad
+    router.upstream._on_end_session = bad.teardown_rdp_context
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.endSession",
@@ -507,7 +530,7 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = malformed_create
+    attach_cdp(router, cap, malformed_create)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -522,13 +545,13 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = malformed_attach
+    attach_cdp(router, cap, malformed_attach)
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://x/"},
     }))
-    assert "attach returned" in last_error(cap, client)["message"]
+    assert "Target.attachToTarget returned" in last_error(cap, client)["message"]
 
     calls: list[tuple[str, Any, Any]] = []
 
@@ -542,7 +565,7 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             raise RuntimeError("close boom")
         raise AssertionError(method)
 
-    router._upstream_command = rdp_cmd
+    attach_cdp(router, cap, rdp_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -587,7 +610,7 @@ async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
             return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = env_cmd
+    attach_cdp(router, cap, env_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -621,7 +644,7 @@ async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targ
         calls.append(method)
         raise AssertionError(method)
 
-    router._upstream_command = should_not_call
+    attach_cdp(router, cap, should_not_call)
     await router.route_from_client(client, json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -640,7 +663,7 @@ async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targ
             return {"id": -1, "result": {"sessionId": "UP-NEW"}}
         raise AssertionError(method)
 
-    router._upstream_command = fallback_cmd
+    attach_cdp(router, cap, fallback_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 2, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -656,7 +679,7 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
         "method": "BrowserwrightDaemon.userscript.install",
         "params": {"script": {"source": "1"}},
     }))
-    assert last_error(cap, client)["code"] == -32603
+    assert last_error(cap, client)["code"] == -32000
 
     state.bind_session(client.client_id, "l1", "UP1", "T1")
     state.bind_session(client.client_id, "l2", "UP1", "T1")
@@ -670,7 +693,7 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
             raise RuntimeError("ignored")
         raise AssertionError(method)
 
-    router._upstream_command = us_cmd
+    attach_cdp(router, cap, us_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.userscript.install",

@@ -36,15 +36,7 @@ class _Router:
         self.lifecycle: tuple[object, object] | None = None
         self.drained = 0
         self.daemon = None
-        self._attach_active_tab = None
-        self._open_background_tab = None
-        self._close_tab = None
-        self._close_tab_by_target_id = None
-        self._end_session = None
-        self._recover_session = None
-        self._userscript_request = None
-        self._scoped_targets = None
-        self._upstream_command = None
+        self.upstream = None
 
     async def _send_to_client(self, cid: int, text: str) -> None:
         self.sent.append((cid, json.loads(text)))
@@ -60,9 +52,6 @@ class _Router:
 
     def bind_lifecycle(self, ensure_upstream, trigger_disconnect) -> None:
         self.lifecycle = (ensure_upstream, trigger_disconnect)
-
-    def update_upstream_send(self, fn) -> None:
-        self.upstream_senders.append(fn)
 
     async def route_from_client(self, client, text: str) -> None:
         self.routes.append((client.client_id, text))
@@ -184,6 +173,7 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
 
     class Holder:
         is_open = True
+        upstream = object()
 
         async def send_text(self, text: str) -> None:
             return None
@@ -211,6 +201,7 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
             raise AssertionError("send should not be used by this test")
 
     holder = Holder()
+    router.upstream = holder.upstream
     ctx = SimpleNamespace(state=state, router=router, holder=holder, backend="env")
     daemon = SimpleNamespace(context_for_required=lambda session_id: ctx, _next_client_id=iter([77]))
     monkeypatch.setattr("browserwright.session_registry.get", lambda sid: {"name": "Session One"})
@@ -221,7 +212,7 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
     assert router.unregistered == [77]
     assert router.released == [77]
     assert router.lifecycle == (holder.ensure_open, holder.trigger_close)
-    assert router.upstream_senders == [holder.send_text]
+    assert router.upstream is holder.upstream
     assert [(cid, json.loads(text)) for cid, text in router.routes] == [
         (77, {"id": 1}),
         (77, {"id": 2}),
@@ -247,15 +238,17 @@ async def test_extension_upstream_success_wires_callbacks_and_ready_events(monke
 
         def __init__(self, *, relay, on_frame, on_close):
             assert relay is holder.relay
-            self.send_text = self.attach_active_tab = self.open_background_tab = object()
-            self.close_tab = self.close_tab_by_target_id = self.end_session = object()
-            self.recover_session = self.userscript_request = object()
-            self.reload_extensions = object()
-            self.wait_session_announce = object()
-            self.scoped_target_infos = object()
+            self._relay = relay
 
         async def open(self, *, timeout):
             opened.append(timeout)
+
+        def attach(self, router):
+            router.upstream = self
+
+        def detach(self, router):
+            if router.upstream is self:
+                router.upstream = None
 
     monkeypatch.setattr(listener_mod, "ExtensionUpstream", FakeExtensionUpstream)
 
@@ -274,11 +267,7 @@ async def test_extension_upstream_success_wires_callbacks_and_ready_events(monke
         {"method": "BrowserwrightDaemon.upstreamConnecting", "params": {"backend": "extension"}},
     )
     assert router.sent[1][1]["params"] == {"backend": "extension", "ws_url": "ext://ready"}
-    assert router._attach_active_tab is holder.upstream.attach_active_tab
-    assert router._open_background_tab is holder.upstream.open_background_tab
-    assert router._wait_session_announce is holder.upstream.wait_session_announce
-    assert router._scoped_targets is holder.upstream.scoped_target_infos
-    assert router.upstream_senders[-1] is holder.upstream.send_text
+    assert router.upstream is holder.upstream
 
 
 @pytest.mark.asyncio
@@ -313,13 +302,24 @@ async def test_rdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
     dropped: list[str] = []
     router.daemon = SimpleNamespace(drop_rdp_context=lambda sid: dropped.append(sid))
     closing_holder = listener_mod._UpstreamHolder(state, router, Config(backend="rdp"), session_id="abc")
-    closing_holder.upstream = SimpleNamespace(is_open=True, close=lambda **kwargs: asyncio.sleep(0))
+    class ClosingUpstream:
+        is_open = True
+
+        async def close(self, **kwargs):
+            return None
+
+        def detach(self, bound_router):
+            if bound_router.upstream is self:
+                bound_router.upstream = None
+
+    closing_holder.upstream = ClosingUpstream()
+    router.upstream = closing_holder.upstream
 
     await closing_holder._on_upstream_closed("upstream-eof")
 
     assert dropped == ["abc"]
     assert state.upstream_phase == UpstreamPhase.DISCONNECTED
-    assert router.upstream_senders[-1] is None
+    assert router.upstream is None
 
 
 @pytest.mark.asyncio
@@ -342,8 +342,8 @@ async def test_rdp_attach_session_ensure_open_does_not_launch(monkeypatch):
     class FakeConn:
         is_open = True
 
-        def __init__(self, *, on_frame, on_close):
-            self.send_text = object()
+        def __init__(self, *, on_frame, on_close, state=None,
+                     on_end_session=None):
             self.send_command = self._send_command
 
         async def open(self, ws_url, **kwargs):
@@ -352,9 +352,16 @@ async def test_rdp_attach_session_ensure_open_does_not_launch(monkeypatch):
         async def _send_command(self, method, params):
             return {}
 
+        def attach(self, bound_router):
+            bound_router.upstream = self
+
+        def detach(self, bound_router):
+            if bound_router.upstream is self:
+                bound_router.upstream = None
+
     monkeypatch.setattr(holder, "_launch_rdp_chrome", fake_launch)
     monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
-    monkeypatch.setattr(listener_mod, "UpstreamConnection", FakeConn)
+    monkeypatch.setattr(listener_mod, "CdpUpstream", FakeConn)
 
     await holder.ensure_open()
 

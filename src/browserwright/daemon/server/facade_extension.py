@@ -129,17 +129,13 @@ class ExtensionFacadeBridge:
         self, *, client: ServerConnection, relay: RelayServer,
         session_id: str | None = None, session_name: str | None = None,
         session_group_id: int | None = None,
+        binding_owner: ExtensionUpstream | None = None,
     ):
         self._client = client
         self._relay = relay
         self._session_id = session_id
         loaded_name, loaded_group_id = self._load_session_scope(session_id)
         self._session_name = session_name or loaded_name or session_id
-        self._group_id = (
-            session_group_id
-            if isinstance(session_group_id, int) and session_group_id >= 0
-            else loaded_group_id
-        )
         # A dedicated ExtensionUpstream over the SAME relay. on_frame routes
         # synthesized/forwarded frames back to THIS Playwright client. on_close
         # is a no-op — the facade owns connection teardown, not the upstream.
@@ -147,9 +143,17 @@ class ExtensionFacadeBridge:
             relay=relay,
             on_frame=self._send_to_client,
             on_close=self._noop_close,
+            group_owner=binding_owner,
         )
-        if self._session_id is not None and self._group_id is not None:
-            self._ext._bind_group(self._session_id, self._group_id)  # noqa: SLF001
+        self._binding_owner = binding_owner or self._ext
+        initial_group_id = (
+            session_group_id
+            if isinstance(session_group_id, int) and session_group_id >= 0
+            else loaded_group_id
+        )
+        if self._session_id is not None and initial_group_id is not None:
+            self._binding_owner._bind_group(  # noqa: SLF001
+                self._session_id, initial_group_id)
         # tab_id → synthetic flat sessionId we've handed Playwright for it. One
         # entry per tab we've announced via attachedToTarget, so a later
         # `targetDestroyed`/`detachedFromTarget` references the same session and
@@ -210,11 +214,10 @@ class ExtensionFacadeBridge:
         gid = gid if isinstance(gid, int) and gid >= 0 else None
         return name, gid
 
-    def _persist_group_id(self, group_id: int) -> None:
+    def _record_group_binding(self, group_id: int) -> None:
         if not self._session_id or group_id < 0:
             return
-        self._group_id = group_id
-        self._ext._bind_group(self._session_id, group_id)  # noqa: SLF001
+        self._binding_owner._bind_group(self._session_id, group_id)  # noqa: SLF001
         try:
             rec = session_registry.get(self._session_id) or {}
             runtime = dict(rec.get("runtime") or {})
@@ -223,23 +226,6 @@ class ExtensionFacadeBridge:
             session_registry.update(self._session_id, runtime=runtime)
         except Exception:
             pass
-
-    def _refresh_session_group_id(self) -> int | None:
-        """Refresh the session group before creating a tab.
-
-        The daemon's agent path may have bound the group after this facade
-        bridge was constructed. The relay-scoped map is the same-process fast
-        path; the ledger is the restart/reconnect fallback.
-        """
-        if not self._session_id:
-            return self._group_id
-        gid = self._relay.session_group(self._session_id)
-        if gid is None:
-            _name, gid = self._load_session_scope(self._session_id)
-        if gid is not None:
-            self._group_id = gid
-            self._ext._bind_group(self._session_id, gid)  # noqa: SLF001
-        return self._group_id
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -495,13 +481,19 @@ class ExtensionFacadeBridge:
         self._creating += 1
         try:
             group_name = self._session_name or "Agent"
-            group_id = self._refresh_session_group_id()
+            group_id = self._binding_owner.group_for_session(self._session_id)
+            if group_id is None and self._session_id is not None:
+                _name, group_id = self._load_session_scope(self._session_id)
+                if group_id is not None:
+                    self._binding_owner._bind_group(  # noqa: SLF001
+                        self._session_id, group_id)
             # Same session-group discipline as the agent `open_background`
             # verb: when the Playwright facade is session-scoped, tabs created
             # by context.new_page() must belong to that session so session end
             # can close them.
             if self._session_id is not None and group_id is not None:
-                self._ext._bind_group(self._session_id, group_id)  # noqa: SLF001
+                self._binding_owner._bind_group(  # noqa: SLF001
+                    self._session_id, group_id)
             gt = await self._ext.open_background_tab(
                 url, group_name=group_name,
                 session_id=self._session_id,
@@ -510,7 +502,7 @@ class ExtensionFacadeBridge:
             tab_id = int(gt["tabId"])
             created_group = gt.get("groupId")
             if isinstance(created_group, int) and created_group >= 0:
-                self._persist_group_id(created_group)
+                self._record_group_binding(created_group)
             # PR3 (research delta #2): a brand-new, not-yet-navigated tab must be
             # reported to Playwright with the initial-empty-document url ":" (NOT
             # "about:blank"), so CRPage's `isInitialEmptyPage = mainFrame().url()

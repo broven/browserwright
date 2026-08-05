@@ -1,6 +1,4 @@
-"""Extension upstream adapter — makes a RelayServer look like an
-`UpstreamConnection` so the listener / router don't need extension-specific
-branches in their hot paths.
+"""Extension implementation of the session-shaped ``Upstream`` protocol.
 
 When `backend=extension` is active in Mode B, the daemon's "upstream" is no
 longer a real Chrome CDP ws — it's the RelayServer plus the connected
@@ -29,12 +27,15 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from .. import __version__
 from .relay import RelayServer, GhostTarget, _CommandError
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .proxy import Router
 
 
 # Browser-level methods that have no meaningful chrome.debugger analog.
@@ -132,8 +133,7 @@ def _ghost_target_info(g: GhostTarget) -> dict:
 
 
 class ExtensionUpstream:
-    """Adapter that quacks like `UpstreamConnection` but talks to a
-    `RelayServer`.
+    """Tab-group-backed implementation of the declared ``Upstream`` protocol.
 
     The listener wires this in as `self.upstream` when backend=extension; the
     router calls `send_text` on every client frame, and the adapter handles
@@ -145,6 +145,8 @@ class ExtensionUpstream:
         relay: RelayServer,
         on_frame: Callable[[str], Awaitable[None]],
         on_close: Callable[[str], Awaitable[None]],
+        *,
+        group_owner: "ExtensionUpstream | None" = None,
     ):
         self._relay = relay
         self._on_frame = on_frame
@@ -159,7 +161,8 @@ class ExtensionUpstream:
         # SINGLE source of truth for what's in the session — there is no
         # owned/borrowed bookkeeping. ``group_name`` (= session name) is only a
         # human-visible title used when creating a new group.
-        self._groups: dict[str, int] = {}        # bs session → tab-group id
+        self._groups: dict[str, int] = (
+            group_owner._groups if group_owner is not None else {})
 
     def reset_session_announce(self, session_id: str | None) -> None:
         self._relay.reset_session_announce(session_id)
@@ -187,7 +190,10 @@ class ExtensionUpstream:
         (empty) and will be recreated on the next open."""
         if isinstance(group_id, int) and group_id >= 0:
             self._groups[session_id] = group_id
-            self._relay.bind_session_group(session_id, group_id)
+
+    def group_for_session(self, session_id: str | None) -> int | None:
+        """Return the adapter-owned live group binding for ``session_id``."""
+        return self._groups.get(session_id) if session_id else None
 
     @staticmethod
     def _group_required(*, group_name: str | None,
@@ -213,8 +219,6 @@ class ExtensionUpstream:
         decision 6). Empty list when the session has no live group (never opened
         a tab, or its last tab closed and Chrome auto-deleted the group)."""
         gid = self._groups.get(session_id) if session_id else None
-        if gid is None:
-            gid = self._relay.session_group(session_id)
         if gid is None:
             gid = group_id
         info = await self._relay.query_group_tabs(group_id=gid)
@@ -314,14 +318,23 @@ class ExtensionUpstream:
     def is_open(self) -> bool:
         return self._open
 
+    def attach(self, router: "Router") -> None:
+        current = router.upstream
+        if current is not None and current is not self:
+            raise RuntimeError("router already has an upstream")
+        router.upstream = self
+
+    def detach(self, router: "Router") -> None:
+        if router.upstream is self:
+            router.upstream = None
+
     # ---- lifecycle -------------------------------------------------------
 
     async def open(self, ws_url: str | None = None, *,
                    timeout: float = 30.0) -> None:
         """Wait for the relay to have at least one extension connected.
 
-        `ws_url` is ignored — kept for signature compatibility with
-        UpstreamConnection.open. `timeout` matches the same arg shape.
+        `ws_url` is ignored; `timeout` matches the shared protocol shape.
         """
         await self._relay.wait_ready(timeout=timeout)
         # Wire event fan-in so async events (Page.frameNavigated etc.) get
@@ -459,6 +472,9 @@ class ExtensionUpstream:
         except Exception as e:
             await self._error(req_id, -32603, f"relay send failed: {e!r}")
 
+    async def send_cdp(self, frame: str) -> None:
+        await self.send_text(frame)
+
     async def attach_active_tab(self, *, session_id: str | None = None,
                                 group_name: str | None = None) -> dict:
         """Daemon-driven ADOPT (docs C1): the relay asks the extension to move
@@ -510,8 +526,6 @@ class ExtensionUpstream:
         created. The returned groupId is (re)bound to the session — that's the
         only per-session state we keep; membership comes from the live group."""
         gid = self._groups.get(session_id) if session_id else None
-        if gid is None:
-            gid = self._relay.session_group(session_id)
         self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
             url,
@@ -536,6 +550,54 @@ class ExtensionUpstream:
             "title": gt.title,
             "groupId": group_id,
         }
+
+    async def open_tab(
+        self,
+        url: str,
+        *,
+        background: bool = True,
+        session_id: str | None = None,
+        group_name: str | None = None,
+        skip_post_attach_commands: bool = False,
+    ) -> dict:
+        return await self.open_background_tab(
+            url,
+            group_name=group_name,
+            session_id=session_id,
+            background=background,
+            skip_post_attach_commands=skip_post_attach_commands,
+        )
+
+    async def list_tabs(self, session_id: str | None = None) -> list[dict]:
+        return await self.scoped_target_infos(session_id)
+
+    async def current_page(self, session_id: str | None = None) -> dict:
+        infos = await self.scoped_target_infos(session_id)
+        if not infos:
+            return await self.open_tab(
+                "about:blank", session_id=session_id,
+                group_name=session_id or "Agent")
+        info = infos[0]
+        tab_id = _tab_id_from_target_id(str(info.get("targetId", "")))
+        if tab_id is None:
+            raise RuntimeError(f"malformed extension target: {info!r}")
+        sid = self.session_for_tab(tab_id)
+        if sid is None:
+            sid = await self.attach_target(tab_id)
+        group_id = self.group_for_session(session_id)
+        return {
+            "sessionId": sid,
+            "targetId": info["targetId"],
+            "tabId": tab_id,
+            "url": info.get("url", ""),
+            "title": info.get("title", ""),
+            "groupId": group_id if group_id is not None else -1,
+        }
+
+    async def attach_active(self, *, session_id: str | None = None,
+                            group_name: str | None = None) -> dict:
+        return await self.attach_active_tab(
+            session_id=session_id, group_name=group_name)
 
     async def recover_session(self, session_id: str | None, *,
                               group_id: int) -> dict:
@@ -599,14 +661,27 @@ class ExtensionUpstream:
             "recovered": recovered,
         }
 
-    async def close_tab(self, session_id: str) -> dict:
-        """Close the tab bound to ``session_id`` (UPSTREAM sessionId). Raises
-        ValueError if unknown — proxy translates to a CDP error."""
-        tab_id = self._sessions.pop(session_id, None)
+    async def recover(self, session_id: str | None = None, *,
+                      group_id: int | None = None) -> dict:
+        if group_id is None:
+            raise ValueError("extension recovery requires group_id")
+        return await self.recover_session(session_id, group_id=group_id)
+
+    async def close_tab(self, target: str) -> dict:
+        """Close a tab addressed by upstream sessionId or targetId.
+
+        Supporting both forms keeps the protocol session-shaped while covering
+        the targetId fallback used after the original downstream opener has
+        disconnected and its per-client binding was reaped.
+        """
+        tab_id = self._sessions.pop(target, None)
         if tab_id is None:
-            tab_id = _tab_id_from_session_id(session_id)
+            tab_id = _tab_id_from_session_id(target)
         if tab_id is None:
-            raise ValueError(f"unknown sessionId {session_id!r}")
+            tab_id = _tab_id_from_target_id(target)
+        if tab_id is None:
+            raise ValueError(f"unknown sessionId/targetId {target!r}")
+        self.evict_tab_sessions(tab_id)
         await self._relay.close_tab(tab_id)
         return {"ok": True, "tabId": tab_id}
 

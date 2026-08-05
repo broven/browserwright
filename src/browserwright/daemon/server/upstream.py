@@ -20,13 +20,70 @@ import contextlib
 import json
 import logging
 import os
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol, TYPE_CHECKING, runtime_checkable
 from urllib.parse import urlparse
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .proxy import Router
+
+
+@runtime_checkable
+class Upstream(Protocol):
+    """Session-shaped browser upstream used by :class:`proxy.Router`.
+
+    ``attach`` / ``detach`` make publication to the router atomic.  An adapter
+    is attached before the state becomes CONNECTED and detached only after the
+    state becomes DISCONNECTED, so a verb can never observe a connected router
+    with a partially-wired implementation.
+    """
+
+    @property
+    def is_open(self) -> bool: ...
+
+    def attach(self, router: "Router") -> None: ...
+
+    def detach(self, router: "Router") -> None: ...
+
+    async def open_tab(self, url: str, *, background: bool = True,
+                       session_id: str | None = None,
+                       group_name: str | None = None,
+                       skip_post_attach_commands: bool = False) -> dict: ...
+
+    async def close_tab(self, target: str) -> dict: ...
+
+    async def list_tabs(self, session_id: str | None = None) -> list[dict]: ...
+
+    async def current_page(self, session_id: str | None = None) -> dict: ...
+
+    async def attach_active(self, *, session_id: str | None = None,
+                            group_name: str | None = None) -> dict: ...
+
+    async def end_session(self, session_id: str,
+                          group_id: int | None = None) -> dict: ...
+
+    async def recover(self, session_id: str | None = None, *,
+                      group_id: int | None = None) -> dict: ...
+
+    async def send_cdp(self, frame: str) -> None: ...
+
+    async def open(self, ws_url: str | None = None, *,
+                   timeout: float = 30.0) -> None: ...
+
+    async def close(self, *, code: int = 1000, reason: str = "") -> None: ...
+
+    async def wait_session_announce(self, session_id: str,
+                                    timeout: float = 2.0) -> bool: ...
+
+    async def userscript_request(self, verb: str, payload: dict,
+                                 **kwargs: Any) -> dict: ...
+
+    async def reload_extensions(self, *, reason: str = "manual",
+                                expected_version: str | None = None) -> dict: ...
 
 # 30s upstream heartbeat — spec §10 open question "Browser.getVersion 心跳频率"
 # resolved to 30s.
@@ -37,7 +94,7 @@ HEARTBEAT_INTERVAL = 30.0
 _DAEMON_ID_BASE = -2_000_000_000
 
 
-class UpstreamConnection:
+class CdpUpstream:
     """Wraps a single ws to Chrome's browser-level CDP endpoint.
 
     Lifecycle:
@@ -52,6 +109,9 @@ class UpstreamConnection:
         self,
         on_frame: Callable[[str], Awaitable[None]],
         on_close: Callable[[str], Awaitable[None]],
+        *,
+        state: Any | None = None,
+        on_end_session: Callable[[str], Awaitable[bool]] | None = None,
     ):
         self._on_frame = on_frame
         self._on_close = on_close
@@ -61,6 +121,17 @@ class UpstreamConnection:
         self._next_internal_id = _DAEMON_ID_BASE
         self._pending_internal: dict[int, asyncio.Future] = {}
         self._ws_url: str | None = None
+        self._current_target_id: str | None = None
+        self._target_sessions: dict[str, str] = {}
+        self._target_info: dict[str, dict] = {}
+        self._userscripts: dict[str, dict] = {}
+        self._state = state
+        self._on_end_session = on_end_session
+
+    @property
+    def backend_name(self) -> str:
+        name = getattr(self._state, "backend_name", None)
+        return name if isinstance(name, str) and name else "raw-cdp"
 
     # ---- public API -------------------------------------------------------
 
@@ -72,8 +143,20 @@ class UpstreamConnection:
     def is_open(self) -> bool:
         return self._ws is not None
 
-    async def open(self, ws_url: str, *, timeout: float = 30.0) -> None:
+    def attach(self, router: "Router") -> None:
+        current = router.upstream
+        if current is not None and current is not self:
+            raise RuntimeError("router already has an upstream")
+        router.upstream = self
+
+    def detach(self, router: "Router") -> None:
+        if router.upstream is self:
+            router.upstream = None
+
+    async def open(self, ws_url: str | None = None, *, timeout: float = 30.0) -> None:
         """Connect to upstream. Raises on failure; caller transitions state."""
+        if not ws_url:
+            raise ValueError("raw-CDP upstream requires a websocket URL")
         if self._ws is not None:
             raise RuntimeError("upstream already open")
         with _localhost_bypass_proxy(ws_url):
@@ -112,6 +195,10 @@ class UpstreamConnection:
             raise RuntimeError("upstream not open")
         await self._ws.send(frame)
 
+    async def send_cdp(self, frame: str) -> None:
+        """Forward one downstream CDP frame through this upstream."""
+        await self.send_text(frame)
+
     async def send_command(self, method: str, params: dict | None = None,
                            session_id: str | None = None,
                            timeout: float = 10.0) -> dict:
@@ -139,6 +226,242 @@ class UpstreamConnection:
         finally:
             self._pending_internal.pop(cmd_id, None)
 
+    @staticmethod
+    def _result(envelope: object) -> dict:
+        if not isinstance(envelope, dict):
+            raise RuntimeError(f"malformed CDP response: {envelope!r}")
+        if envelope.get("error"):
+            raise RuntimeError(f"CDP error: {envelope['error']!r}")
+        result = envelope.get("result")
+        return result if isinstance(result, dict) else {}
+
+    async def open_tab(self, url: str, *, background: bool = True,
+                       session_id: str | None = None,
+                       group_name: str | None = None,
+                       skip_post_attach_commands: bool = False) -> dict:
+        """Create and attach a raw browser target.
+
+        ``background`` and ``group_name`` are intentionally ignored: a raw-CDP
+        workspace has no user-owned focus to protect and never uses tab groups.
+        """
+        created = self._result(await self.send_command(
+            "Target.createTarget", {"url": url}))
+        target_id = created.get("targetId")
+        if not isinstance(target_id, str):
+            raise RuntimeError(f"Target.createTarget returned {created!r}")
+        attached = self._result(await self.send_command(
+            "Target.attachToTarget", {"targetId": target_id, "flatten": True}))
+        upstream_sid = attached.get("sessionId")
+        if not isinstance(upstream_sid, str):
+            raise RuntimeError(f"Target.attachToTarget returned {attached!r}")
+        self._target_sessions[target_id] = upstream_sid
+        state_meta = (
+            self._state.targets.get(target_id)
+            if self._state is not None else None
+        ) or {}
+        self._target_info[target_id] = {
+            "url": state_meta.get("url", url),
+            "title": state_meta.get("title", ""),
+            "attached": True,
+        }
+        self._current_target_id = target_id
+        return {
+            "sessionId": upstream_sid,
+            "targetId": target_id,
+            "tabId": None,
+            "url": self._target_info[target_id]["url"],
+            "title": self._target_info[target_id]["title"],
+            "groupId": -1,
+        }
+
+    async def list_tabs(self, session_id: str | None = None) -> list[dict]:
+        result = self._result(await self.send_command("Target.getTargets", {}))
+        tabs: list[dict] = []
+        for raw in result.get("targetInfos", []):
+            if not isinstance(raw, dict) or raw.get("type") != "page":
+                continue
+            target_id = raw.get("targetId")
+            if not isinstance(target_id, str):
+                continue
+            tabs.append({
+                "targetId": target_id,
+                "url": str(raw.get("url", "")),
+                "title": str(raw.get("title", "")),
+                "attached": bool(raw.get("attached", False)
+                                 or target_id in self._target_sessions),
+            })
+            self._target_info[target_id] = tabs[-1]
+        return tabs
+
+    async def current_page(self, session_id: str | None = None) -> dict:
+        if self._state is not None:
+            for target_id, attacher in self._state.attachers.items():
+                owner = self._state.clients.get(attacher.primary_client_id)
+                if (session_id is not None
+                        and getattr(owner, "session_id", None) != session_id):
+                    continue
+                meta = self._state.targets.get(target_id) or {}
+                if meta.get("type", "page") != "page":
+                    continue
+                self._target_sessions[target_id] = attacher.upstream_session_id
+                self._current_target_id = target_id
+                return {
+                    "sessionId": attacher.upstream_session_id,
+                    "targetId": target_id,
+                    "tabId": None,
+                    "url": meta.get("url", ""),
+                    "title": meta.get("title", ""),
+                    "groupId": -1,
+                }
+        if (self._current_target_id is not None
+                and self._current_target_id in self._target_sessions):
+            target_id = self._current_target_id
+            meta = self._target_info.get(target_id) or {}
+            return {
+                "sessionId": self._target_sessions[target_id],
+                "targetId": target_id,
+                "tabId": None,
+                "url": meta.get("url", ""),
+                "title": meta.get("title", ""),
+                "groupId": -1,
+            }
+        try:
+            tabs = await self.list_tabs(session_id)
+        except Exception:
+            tabs = []
+        current = next((tab for tab in tabs
+                        if tab["targetId"] == self._current_target_id), None)
+        if current is None:
+            current = tabs[0] if tabs else None
+        if current is None:
+            return await self.open_tab("about:blank", session_id=session_id)
+        target_id = current["targetId"]
+        upstream_sid = self._target_sessions.get(target_id)
+        if upstream_sid is None:
+            attached = self._result(await self.send_command(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True}))
+            upstream_sid = attached.get("sessionId")
+            if not isinstance(upstream_sid, str):
+                raise RuntimeError(f"Target.attachToTarget returned {attached!r}")
+            self._target_sessions[target_id] = upstream_sid
+        self._current_target_id = target_id
+        return {
+            "sessionId": upstream_sid,
+            "targetId": target_id,
+            "tabId": None,
+            "url": current.get("url", ""),
+            "title": current.get("title", ""),
+            "groupId": -1,
+        }
+
+    async def attach_active(self, *, session_id: str | None = None,
+                            group_name: str | None = None) -> dict:
+        """Nearest honest raw-CDP equivalent: return the current page."""
+        return await self.current_page(session_id)
+
+    async def close_tab(self, target: str) -> dict:
+        target_id = target
+        for known_target, upstream_sid in self._target_sessions.items():
+            if upstream_sid == target:
+                target_id = known_target
+                break
+        closed = self._result(await self.send_command(
+            "Target.closeTarget", {"targetId": target_id}))
+        if closed.get("success") is False:
+            raise RuntimeError(f"Target.closeTarget refused {target_id!r}")
+        self._target_sessions.pop(target_id, None)
+        self._target_info.pop(target_id, None)
+        if self._current_target_id == target_id:
+            self._current_target_id = None
+        return {"ok": True, "tabId": None}
+
+    async def end_session(self, session_id: str,
+                          group_id: int | None = None) -> dict:
+        """End an rdp workspace; env/attach ownership remains external."""
+        if self._on_end_session is not None:
+            await self._on_end_session(session_id)
+        return {"ok": True, "closed": [], "kept": [],
+                "backend": self.backend_name}
+
+    async def recover(self, session_id: str | None = None, *,
+                      group_id: int | None = None) -> dict:
+        # Raw-CDP workspaces are ephemeral for v1. Existing live tabs remain
+        # enumerable, but there is no durable group-like binding to reconstruct.
+        return {"recovered": [], "groupId": -1, "tabs": []}
+
+    async def wait_session_announce(self, session_id: str,
+                                    timeout: float = 2.0) -> bool:
+        return True
+
+    async def reload_extensions(self, *, reason: str = "manual",
+                                expected_version: str | None = None) -> dict:
+        return {
+            "ok": False,
+            "reloaded": False,
+            "reason": "not applicable to a raw-CDP backend",
+        }
+
+    async def userscript_request(self, verb: str, payload: dict,
+                                 **kwargs: Any) -> dict:
+        """Raw-CDP userscript shim using new-document page scripts."""
+        sessions = [sid for sid in kwargs.get("session_ids", [])
+                    if isinstance(sid, str)]
+        if verb == "install":
+            script = payload.get("script") if isinstance(payload.get("script"), dict) else {}
+            source = script.get("source") or script.get("body") or ""
+            identity = script.get("identity") or script.get("id") or (
+                f"rdp-us-{len(self._userscripts) + 1}")
+            if not isinstance(source, str) or not source:
+                raise ValueError("userscript install requires script.source")
+            identifiers: list[tuple[str, str]] = []
+            for sid in dict.fromkeys(sessions):
+                result = self._result(await self.send_command(
+                    "Page.addScriptToEvaluateOnNewDocument", {"source": source}, sid))
+                identifier = result.get("identifier")
+                if isinstance(identifier, str):
+                    identifiers.append((sid, identifier))
+            self._userscripts[str(identity)] = {
+                "identity": str(identity), "ids": identifiers, "enabled": True,
+            }
+            return {
+                "id": identity,
+                "identity": identity,
+                "sync": {
+                    "ok": True,
+                    "backend": self.backend_name,
+                    "note": "MAIN-world, no @match filtering (rdp shim)",
+                },
+            }
+        if verb == "list":
+            return {"scripts": [
+                {"identity": key, "enabled": value.get("enabled", True),
+                 "backend": self.backend_name}
+                for key, value in self._userscripts.items()
+            ]}
+        if verb in ("remove", "toggle"):
+            key = payload.get("key")
+            entry = self._userscripts.get(key) if isinstance(key, str) else None
+            if entry is None:
+                return {"ok": False, "reason": f"no such userscript {key!r}"}
+            for sid, identifier in entry.get("ids", []):
+                try:
+                    await self.send_command(
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        {"identifier": identifier}, sid)
+                except Exception:
+                    pass
+            if verb == "remove":
+                self._userscripts.pop(key, None)
+            else:
+                entry["enabled"] = bool(payload.get("enabled"))
+            return {"ok": True, "backend": self.backend_name}
+        if verb == "logs":
+            return {"logs": [], "backend": self.backend_name}
+        return {"ok": False,
+                "reason": (f"unsupported userscript verb {verb!r} on "
+                           f"{self.backend_name}")}
+
     async def close(self, *, code: int = 1000, reason: str = "") -> None:
         """Close the upstream cleanly. Idempotent."""
         if self._reader_task is not None:
@@ -157,6 +480,9 @@ class UpstreamConnection:
             except Exception:
                 pass
         self._ws_url = None
+        self._target_sessions.clear()
+        self._target_info.clear()
+        self._current_target_id = None
 
     # ---- internal ---------------------------------------------------------
 
@@ -249,3 +575,9 @@ def _localhost_bypass_proxy(ws_url: str):
             os.environ["NO_PROXY"] = prev
         else:
             os.environ.pop("NO_PROXY", None)
+
+
+# Compatibility name for callers/tests that still import the old transport-
+# shaped class.  The concrete implementation is now the raw-CDP Upstream
+# adapter, covering both rdp and env.
+UpstreamConnection = CdpUpstream

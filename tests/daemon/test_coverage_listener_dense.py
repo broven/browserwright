@@ -40,20 +40,10 @@ class _FakeRouter:
         self.drained = 0
         self.forwarded: list[str] = []
         self.daemon = None
-        self._attach_active_tab = object()
-        self._open_background_tab = object()
-        self._close_tab = object()
-        self._close_tab_by_target_id = object()
-        self._end_session = object()
-        self._recover_session = object()
-        self._userscript_request = object()
-        self._upstream_command = object()
+        self.upstream = None
 
     async def _send_to_client(self, cid: int, text: str) -> None:
         self.sent.append((cid, json.loads(text)))
-
-    def update_upstream_send(self, fn):
-        self.upstream_senders.append(fn)
 
     async def drain_pre_open_buffers(self):
         self.drained += 1
@@ -97,7 +87,8 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
     class FakeConn:
         is_open = True
 
-        def __init__(self, *, on_frame, on_close):
+        def __init__(self, *, on_frame, on_close, state=None,
+                     on_end_session=None):
             opened["callbacks"] = (on_frame, on_close)
 
         async def open(self, ws_url, **kwargs):
@@ -106,6 +97,16 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
 
         async def send_text(self, frame):
             return None
+
+        async def send_cdp(self, frame):
+            return None
+
+        def attach(self, router):
+            router.upstream = self
+
+        def detach(self, router):
+            if router.upstream is self:
+                router.upstream = None
 
         async def send_command(self, method, params=None, **kwargs):  # type: ignore[no-redef]
             commands.append((method, params))
@@ -116,7 +117,7 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
         return SimpleNamespace(ws_url="ws://127.0.0.1/devtools/browser/fake")
 
     monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
-    monkeypatch.setattr(listener_mod, "UpstreamConnection", FakeConn)
+    monkeypatch.setattr(listener_mod, "CdpUpstream", FakeConn)
 
     await holder._open_chrome_upstream(holder._cfg)
 
@@ -125,8 +126,7 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
     assert commands == [("Target.setDiscoverTargets", {"discover": True})]
     assert state.upstream_phase == UpstreamPhase.CONNECTED
     assert state.upstream_ws_url == "ws://127.0.0.1/devtools/browser/fake"
-    assert router.upstream_senders[-1].__self__ is holder.upstream
-    assert router._upstream_command.__self__ is holder.upstream
+    assert router.upstream is holder.upstream
 
 
 @pytest.mark.asyncio
@@ -138,6 +138,7 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
     router = _FakeRouter()
     holder = listener_mod._UpstreamHolder(state, router, Config(backend="rdp"), session_id="s1")
     closed: list[tuple[int, str]] = []
+    detached_phases: list[UpstreamPhase] = []
 
     class FakeUpstream:
         is_open = True
@@ -145,7 +146,13 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
         async def close(self, *, code=1000, reason=""):
             closed.append((code, reason))
 
+        def detach(self, router):
+            detached_phases.append(state.upstream_phase)
+            if router.upstream is self:
+                router.upstream = None
+
     holder.upstream = FakeUpstream()
+    router.upstream = holder.upstream
     holder.rdp_pid = 999
     killed: list[int | None] = []
     monkeypatch.setattr(holder, "_kill_rdp_chrome", lambda: killed.append(holder.rdp_pid))
@@ -158,11 +165,10 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
     ]
     assert router.sent[0][1]["params"] == {"sessionId": "local-1", "targetId": "target-1"}
     assert router.sent[1][1]["params"] == {"reason": "skill_disconnect"}
-    assert router.upstream_senders[-1] is None
     assert holder.upstream is None
-    assert router._attach_active_tab is None
-    assert router._upstream_command is None
+    assert router.upstream is None
     assert closed == [(1000, "skill_disconnect")]
+    assert detached_phases == [UpstreamPhase.DISCONNECTED]
     assert killed == [999]
     assert state.upstream_phase == UpstreamPhase.DISCONNECTED
 

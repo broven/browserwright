@@ -26,7 +26,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 from .state import (
     ClientState, DaemonState, UpstreamPhase, PRE_OPEN_BUFFER_LIMIT,
@@ -40,6 +40,60 @@ from .verbs import (  # noqa: F401 - re-exports are part of proxy's surface
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .upstream import Upstream
+
+
+class _SendOnlyUpstream:
+    """Compatibility adapter for Router's historical public test harness.
+
+    Production attaches a real Upstream. ``update_upstream_send`` remains as a
+    public surface for cold-router contract tests, but it now installs this one
+    adapter reference instead of restoring a mutable callback slot.
+    """
+
+    def __init__(self, send: Callable[[str], Awaitable[None]]):
+        self._send = send
+
+    ws_url = None
+    is_open = True
+
+    def attach(self, router: "Router") -> None:
+        router.upstream = self  # type: ignore[assignment]
+
+    def detach(self, router: "Router") -> None:
+        if router.upstream is self:
+            router.upstream = None
+
+    async def send_cdp(self, frame: str) -> None:
+        await self._send(frame)
+
+    async def open(self, ws_url=None, *, timeout: float = 30.0) -> None:
+        return None
+
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        return None
+
+    async def _unavailable(self, *args, **kwargs):
+        raise RuntimeError("upstream adapter is unavailable in cold-router harness")
+
+    open_tab = close_tab = list_tabs = current_page = attach_active = _unavailable
+    end_session = _unavailable
+
+    async def recover(self, *args, **kwargs) -> dict:
+        return {"recovered": [], "groupId": -1, "tabs": []}
+
+    async def wait_session_announce(self, session_id: str,
+                                    timeout: float = 2.0) -> bool:
+        return True
+
+    async def userscript_request(self, *args, **kwargs) -> dict:
+        raise RuntimeError("userscript upstream unavailable")
+
+    async def reload_extensions(self, **kwargs) -> dict:
+        return {"ok": False, "reloaded": False,
+                "reason": "upstream adapter unavailable"}
 
 
 # ---- helpers --------------------------------------------------------------
@@ -62,63 +116,22 @@ class Router(SessionVerbsMixin):
     Bindings change shape from v0.2:
     - `client_send` becomes a `dict[client_id, send_fn]` registry, so the
       router can fan out events to the right subset of clients.
-    - `upstream_send` remains a single callable (only one upstream conn).
+    - `upstream` is one session-shaped adapter (only one upstream connection).
     """
 
     def __init__(self, state: DaemonState):
         self.state = state
         # Phase 2: back-reference to the global Daemon, set by Daemon.__init__
-        # / _ensure_rdp_context. Lets the session-verb handlers (endSession
-        # etc.) create or drop an rdp UpstreamContext. None in unit tests
+        # / _ensure_rdp_context. Lets session verbs reach global services such
+        # as the executor registry. None in unit tests
         # that build a bare Router — those handlers degrade gracefully.
         self.daemon: object | None = None
-        self._upstream_send: Callable[[str], Awaitable[None]] | None = None
+        # The one browser-facing seam.  Adapter publication is atomic through
+        # Upstream.attach()/detach(); no verb callback slots live on Router.
+        self.upstream: "Upstream | None" = None
         self._client_sends: dict[int, Callable[[str], Awaitable[None]]] = {}
         self._ensure_upstream: Callable[[], Awaitable[None]] | None = None
         self._trigger_disconnect: Callable[[str], Awaitable[None]] | None = None
-        # Extension-backend-only verbs. listener.py sets these only when
-        # backend=extension; other backends leave them None and the proxy
-        # handlers respond -32601. `_close_tab_by_target_id` is the fallback
-        # close-path used when the original opener disconnected and the
-        # per-client session binding was reaped.
-        self._attach_active_tab: Callable[[], Awaitable[dict]] | None = None
-        self._open_background_tab: (
-            Callable[[str, str | None], Awaitable[dict]] | None) = None
-        self._close_tab: Callable[[str], Awaitable[dict]] | None = None
-        self._close_tab_by_target_id: (
-            Callable[[str], Awaitable[dict]] | None) = None
-        # P5: per-session teardown (extension backend only). Closes the
-        # session's owned tabs, keeps borrowed ones.
-        self._end_session: Callable[[str], Awaitable[dict]] | None = None
-        # Session-reconnect-recovery (extension backend only). Rebuilds a
-        # session's tab bindings from the durable tab group, found by its
-        # persisted numeric groupId (not the title). Signature:
-        # (bs_session | None, *, group_id) -> dict.
-        self._recover_session: (
-            Callable[..., Awaitable[dict]] | None) = None
-        self._wait_session_announce: (
-            Callable[[str, float], Awaitable[bool]] | None) = None
-        self._userscript_request: (
-            Callable[[str, dict], Awaitable[dict | None]] | None) = None
-        self._reload_extensions: (
-            Callable[..., Awaitable[dict]] | None) = None
-        # Extension-backend-only: scope Target.getTargets to a session's tab
-        # group so sessions sharing the one Chrome are mutually invisible.
-        # listener wires this to ExtensionUpstream.scoped_target_infos.
-        # Signature: (session_id) -> list[targetInfo dict]; scopes by the
-        # session's bound groupId.
-        self._scoped_targets: (
-            Callable[[str | None], Awaitable[list[dict]]] | None) = None
-        # Phase 3 (docs/refactor-single-daemon.md): rdp raw-CDP command channel.
-        # Set by listener._open_chrome_upstream to the UpstreamConnection's
-        # daemon-internal `send_command` when this is an rdp (or env)
-        # context. The unified session verbs (openBackgroundTab / closeTab /
-        # userscript) dispatch to a CDP implementation through this when the
-        # context's backend is rdp, instead of the extension callbacks (which
-        # stay None on an rdp context). Signature mirrors
-        # UpstreamConnection.send_command: (method, params?, session_id?) -> result.
-        self._upstream_command: (
-            Callable[..., Awaitable[dict]] | None) = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -132,6 +145,16 @@ class Router(SessionVerbsMixin):
 
     def unregister_client(self, client_id: int) -> None:
         self._client_sends.pop(client_id, None)
+
+    def update_upstream_send(
+        self, fn: Callable[[str], Awaitable[None]] | None,
+    ) -> None:
+        """Compatibility shim: install/remove one forwarding-only adapter."""
+        if fn is None:
+            if isinstance(self.upstream, _SendOnlyUpstream):
+                self.upstream = None
+            return
+        _SendOnlyUpstream(fn).attach(self)
 
     async def release_client(self, client_id: int) -> ClientState | None:
         """Release a downstream client and close its primary upstream sessions.
@@ -149,7 +172,7 @@ class Router(SessionVerbsMixin):
 
     async def _detach_upstream_best_effort(self, upstream_session_id: str) -> None:
         """Send an upstream detach without expecting a client response."""
-        if self._upstream_send is None:
+        if self.upstream is None:
             return
         upstream_id = self.state.allocate_upstream_id()
         msg = {
@@ -158,12 +181,9 @@ class Router(SessionVerbsMixin):
             "params": {"sessionId": upstream_session_id},
         }
         try:
-            await self._upstream_send(json.dumps(msg))
+            await self.upstream.send_cdp(json.dumps(msg))
         except Exception as e:  # noqa: BLE001 - disconnect cleanup is best-effort.
             logger.warning("best-effort upstream detach failed: %r", e)
-
-    def update_upstream_send(self, fn: Callable[[str], Awaitable[None]] | None) -> None:
-        self._upstream_send = fn
 
     def bind_lifecycle(
         self,
@@ -226,10 +246,10 @@ class Router(SessionVerbsMixin):
         # Chrome is already private to the session).
         if (method == "Target.getTargets"
                 and self.state.backend_name == "extension"
-                and self._scoped_targets is not None
+                and self.upstream is not None
                 and client.session_id):
             try:
-                infos = await self._scoped_targets(client.session_id)
+                infos = await self.upstream.list_tabs(client.session_id)
             except Exception as e:  # noqa: BLE001
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603, f"getTargets scoping failed: {e!r}"))
@@ -277,10 +297,10 @@ class Router(SessionVerbsMixin):
         rejected (overflow → -32603 sent to client).
 
         We treat upstream as "ready" only when the daemon has a live
-        `_upstream_send` callable AND DaemonState.upstream_phase is CONNECTED.
+        attached ``upstream`` AND DaemonState.upstream_phase is CONNECTED.
         Any other phase (DISCONNECTED / CONNECTING / CLOSING) → buffer.
         """
-        if (self._upstream_send is not None
+        if (self.upstream is not None
                 and self.state.upstream_phase == UpstreamPhase.CONNECTED):
             return True
 
@@ -477,11 +497,11 @@ class Router(SessionVerbsMixin):
         which case a dropped frame is acceptable, the client will see
         `upstreamClosed` shortly).
         """
-        if self._upstream_send is None:
+        if self.upstream is None:
             # Defensive: this is only reachable if upstream torn down mid-call.
             logger.warning("dropped frame (no upstream): %s", text[:80])
             return
-        await self._upstream_send(text)
+        await self.upstream.send_cdp(text)
 
     # ---- upstream → downstream -------------------------------------------
 
