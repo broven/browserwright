@@ -105,6 +105,9 @@ async def test_target_attach_and_close_are_authorized_by_browser_session():
             self.closed.append(target)
             return {"ok": True, "tabId": int(target.rsplit("-", 1)[1])}
 
+        async def close_session_tab(self, _session_id, target_id):
+            return await self.close_tab(target_id)
+
     upstream = _ScopedUpstream()
     router.upstream = upstream
 
@@ -156,6 +159,9 @@ async def test_close_tab_session_id_rechecks_live_ownership():
             self.closed.append(target)
             return {"ok": True, "tabId": 1}
 
+        async def close_session_tab(self, _session_id, target_id):
+            return await self.close_tab(target_id)
+
     upstream = _MovedTabUpstream()
     router.upstream = upstream
 
@@ -181,6 +187,9 @@ async def test_close_tab_rejects_mismatched_session_and_target_ids():
 
         async def close_tab(self, _target):
             raise AssertionError("mismatched addresses must not close a tab")
+
+        async def close_session_tab(self, _session_id, target_id):
+            return await self.close_tab(target_id)
 
     router.upstream = _Upstream()
     await router.route_from_client(client, json.dumps({

@@ -58,6 +58,14 @@ class Upstream(Protocol):
 
     async def close_tab(self, target: str) -> dict: ...
 
+    #: Close one tab *on behalf of a session* and leave that session's durable
+    #: recovery anchor consistent. Declared here rather than probed for with
+    #: `hasattr`: dispatching on whether a method exists is the backend fork
+    #: this protocol removed, and it hides the change when an adapter later
+    #: grows the method.
+    async def close_session_tab(self, session_id: str,
+                                target_id: str) -> dict: ...
+
     async def list_tabs(self, session_id: str | None = None) -> list[dict]: ...
 
     async def get_targets(self, params: dict,
@@ -74,6 +82,13 @@ class Upstream(Protocol):
 
     async def end_session(self, session_id: str,
                           group_id: int | None = None) -> dict: ...
+
+    #: Deadline-aware end_session. Declared here so the caller does not have to
+    #: probe for it — a `hasattr` fallback to the unbounded variant would make
+    #: the teardown budget silently optional.
+    async def end_session_before(self, session_id: str,
+                                 group_id: int | None = None, *,
+                                 deadline: float) -> dict: ...
 
     async def recover(self, session_id: str | None = None, *,
                       group_id: int | None = None) -> dict: ...
@@ -405,6 +420,32 @@ class CdpUpstream:
         if self._current_target_id == target_id:
             self._current_target_id = None
         return {"ok": True, "tabId": None}
+
+    async def close_session_tab(self, session_id: str,
+                                target_id: str) -> dict:
+        """Close one of this session's tabs and clear a stale ledger anchor.
+
+        A raw-CDP session's workspace is the browser instance, so there is no
+        tab-group ownership to re-prove — but the ledger still records a
+        `current_target_id`, and leaving it pointing at a target we just closed
+        makes the next bind resolve a target that no longer exists. Symmetric
+        to the extension adapter's re-anchoring, minus the group.
+        """
+        result = await self.close_tab(target_id)
+        try:
+            from ... import session_registry
+            record = session_registry.get(session_id)
+            if isinstance(record, dict):
+                runtime = dict(record.get("runtime") or {})
+                if runtime.get("current_target_id") == target_id:
+                    runtime["current_target_id"] = None
+                    runtime["updated_at"] = time.time()
+                    session_registry.update(session_id, runtime=runtime)
+        except Exception as e:  # noqa: BLE001 — anchor hygiene, never fatal
+            logger.warning(
+                "close_session_tab(%s): could not clear ledger anchor: %r",
+                session_id, e)
+        return result
 
     async def end_session(self, session_id: str,
                           group_id: int | None = None) -> dict:

@@ -503,11 +503,10 @@ class SessionVerbsMixin:
             upstream = self.upstream
             if upstream is None:
                 raise RuntimeError("upstream not attached")
-            end_before = getattr(upstream, "end_session_before", None)
-            if callable(end_before):
-                return await end_before(
-                    session, group_id, deadline=teardown_deadline)
-            return await upstream.end_session(session, group_id)
+            # Declared on the protocol, so called directly — see the
+            # target_belongs_to_session note below on why probing is wrong.
+            return await upstream.end_session_before(
+                session, group_id, deadline=teardown_deadline)
 
         terminate = getattr(registry, "terminate_session", None)
         if callable(terminate):
@@ -695,18 +694,16 @@ class SessionVerbsMixin:
         upstream = await self._ready_upstream(client, req_id, "closeTab failed")
         if upstream is None:
             return
-        # Resolve to (target_id, upstream_sid, owner_client_id, owner_local_sid).
+        # Resolve to (target_id, owner_client_id, owner_local_sid).
         # sessionId path = per-client lookup; targetId path = state.attachers
         # global lookup, valid even across different ws clients.
         target_id: str | None = None
-        upstream_sid: str | None = None
         owner_client_id: int | None = None
         owner_local_sid: str | None = None
         if has_sid:
             binding = client.sessions.get(local_sid)
             if binding is not None:
                 target_id = binding.target_id
-                upstream_sid = binding.upstream_session_id
                 owner_client_id = client.client_id
                 owner_local_sid = local_sid
         if target_id is None and has_tid:
@@ -715,7 +712,6 @@ class SessionVerbsMixin:
             if attacher is not None:
                 owner_client_id = attacher.primary_client_id
                 owner_local_sid = attacher.primary_local_session
-                upstream_sid = attacher.upstream_session_id
         if target_id is None:
             ident = local_sid if has_sid else target_id_param
             await self._send_to_client(client.client_id, _error_response(
@@ -731,30 +727,31 @@ class SessionVerbsMixin:
         # A local sessionId is only an address, not continuing authority. Both
         # forms are canonicalized to targetId before checking live group
         # membership, so a tab dragged to another session fails closed.
-        authorize = getattr(upstream, "target_belongs_to_session", None)
-        if callable(authorize):
-            try:
-                allowed = await authorize(browser_session, target_id)
-            except Exception as e:  # noqa: BLE001 - unknown must fail closed
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"closeTab ownership check failed: {e!r}"))
-                return
-            if not allowed:
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32602,
-                    f"target {target_id} does not belong to session "
-                    f"{browser_session!r}"))
-                return
+        # Called directly, never probed for. Wrapping an authorization check in
+        # `if callable(getattr(...))` fails OPEN — an adapter missing the
+        # method skips the check silently. Every adapter declares it.
         try:
-            close_for_session = getattr(upstream, "close_session_tab", None)
-            if callable(close_for_session):
-                result = await close_for_session(browser_session, target_id)
-            else:
-                # No attacher is required for the one-shot CLI fallback; the
-                # live ownership check above is the authorization boundary.
-                close_handle = upstream_sid if upstream_sid is not None else target_id
-                result = await upstream.close_tab(close_handle)
+            allowed = await upstream.target_belongs_to_session(
+                browser_session, target_id)
+        except Exception as e:  # noqa: BLE001 - unknown must fail closed
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"closeTab ownership check failed: {e!r}"))
+            return
+        if not allowed:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                f"target {target_id} does not belong to session "
+                f"{browser_session!r}"))
+            return
+        try:
+            # Every adapter declares close_session_tab, so this is one call and
+            # not a hasattr probe: dispatching on whether a method exists is
+            # the backend fork the Upstream protocol removed, and it hides the
+            # behaviour change when an adapter later grows the method. No
+            # attacher is required for the one-shot CLI path either — the live
+            # ownership check above is the authorization boundary.
+            result = await upstream.close_session_tab(browser_session, target_id)
         except Exception as e:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"closeTab failed: {e!r}"))
