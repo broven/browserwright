@@ -958,6 +958,20 @@ def test_session_create_treats_legacy_unscoped_env_as_conflict(
     assert [row["id"] for row in reg.list_all()] == [legacy]
 
 
+def test_session_registry_claims_legacy_env_scope_once(tmp_bs_home):
+    from browserwright import session_registry as reg
+
+    legacy = reg.allocate(backend="env", owner="attach", name="legacy")
+    non_env = reg.allocate(backend="rdp", owner="attach", name="rdp")
+
+    assert reg.claim_legacy_env_scope(legacy, "/tmp/daemon-a.sock") is True
+    assert reg.claim_legacy_env_scope(legacy, "/tmp/daemon-a.sock") is True
+    assert reg.claim_legacy_env_scope(legacy, "/tmp/daemon-b.sock") is False
+    assert reg.claim_legacy_env_scope(non_env, "/tmp/daemon-a.sock") is False
+    assert reg.claim_legacy_env_scope("missing", "/tmp/daemon-a.sock") is False
+    assert reg.get(legacy)["daemon_scope"] == "/tmp/daemon-a.sock"
+
+
 def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch):
     """Env termination revokes clients but leaves the external browser."""
     from browserwright import session_create, session_registry as reg

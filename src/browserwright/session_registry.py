@@ -96,6 +96,26 @@ def get(session_id: str) -> Optional[dict]:
     return json.loads(p.read_text())["sessions"].get(session_id)
 
 
+def claim_legacy_env_scope(session_id: str, daemon_scope: str) -> bool:
+    """Atomically bind one unscoped legacy env record to a daemon.
+
+    Records created before ``daemon_scope`` existed have no stronger ownership
+    evidence.  The first matching env daemon to route the record may migrate
+    it; an already-scoped, missing, or non-env record remains fail-closed.
+    """
+    if not isinstance(daemon_scope, str) or not daemon_scope:
+        return False
+    with _locked() as data:
+        entry = data["sessions"].get(session_id)
+        if not isinstance(entry, dict) or entry.get("backend") != "env":
+            return False
+        existing_scope = entry.get("daemon_scope")
+        if existing_scope is None:
+            entry["daemon_scope"] = daemon_scope
+            return True
+        return existing_scope == daemon_scope
+
+
 def _with_entry(session_id: str, fn: Callable[[dict], object]) -> Optional[dict]:
     """Apply ``fn`` to a session entry in-place under the lock; return the entry."""
     with _locked() as data:

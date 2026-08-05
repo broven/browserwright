@@ -159,8 +159,18 @@ class Daemon:
                 return self.shared_context
             raise UnknownSessionError(session_id)
         if backend == "env":
-            if (self.shared_context.backend == "env"
-                    and record.get("daemon_scope") == self.daemon_scope):
+            if self.shared_context.backend != "env":
+                raise UnknownSessionError(session_id)
+            record_scope = record.get("daemon_scope")
+            if record_scope == self.daemon_scope:
+                return self.shared_context
+            # Upgrade records written before daemon scoping existed.  The
+            # compare-and-set is ledger-locked so two isolated env daemons
+            # cannot both claim the same legacy session.  Explicitly foreign
+            # scopes still fail closed.
+            if (record_scope is None
+                    and session_registry.claim_legacy_env_scope(
+                        session_id, self.daemon_scope)):
                 return self.shared_context
             raise UnknownSessionError(session_id)
         # A malformed/forward-version record must never inherit the shared
@@ -243,35 +253,52 @@ class Daemon:
     ) -> tuple[dict[str, object], dict]:
         """Atomically revoke clients, reap executor, and tear down workspace."""
         lock = self._termination_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            cached = self._session_results.get(session_id)
-            if cached is not None:
-                return ({
-                    "killed": False,
-                    "reaped": True,
-                    "matched": True,
-                    "executor_id": None,
-                }, dict(cached))
-            self._session_phases[session_id] = "terminating"
-            try:
-                tokens = list(self._session_leases.get(session_id, {}))
-                for token in tokens:
-                    if token is caller_token:
-                        continue
-                    await self.revoke_session_lease(token)
-                reap, result = await self.executors.terminate_session(
-                    session_id, teardown, budget=budget)
-            except BaseException:
-                self._session_phases[session_id] = "active"
-                raise
-            if (reap.get("reaped") is True
-                    and isinstance(result, dict)
-                    and result.get("ok") is True):
-                self._session_results[session_id] = dict(result)
-                self._session_phases[session_id] = "ended"
-            else:
-                self._session_phases[session_id] = "active"
-            return reap, result
+        revocations: list[asyncio.Task[None]] = []
+        try:
+            async with lock:
+                cached = self._session_results.get(session_id)
+                if cached is not None:
+                    return ({
+                        "killed": False,
+                        "reaped": True,
+                        "matched": True,
+                        "executor_id": None,
+                    }, dict(cached))
+                self._session_phases[session_id] = "terminating"
+                try:
+                    tokens = list(self._session_leases.get(session_id, {}))
+                    for token in tokens:
+                        if token is caller_token:
+                            continue
+                        # Closing starts promptly, but a control revoker may
+                        # join its handler task.  A concurrent endSession
+                        # handler is waiting for this same lock, so joining it
+                        # here would form a lock cycle.  Await every revocation
+                        # only after terminal state is published and the lock
+                        # is released below.
+                        revocations.append(asyncio.create_task(
+                            self.revoke_session_lease(token)))
+                    if revocations:
+                        # Give every close coroutine one turn so transports
+                        # begin shutting down before workspace teardown.  We
+                        # deliberately do not join their handler tasks here.
+                        await asyncio.sleep(0)
+                    reap, result = await self.executors.terminate_session(
+                        session_id, teardown, budget=budget)
+                except BaseException:
+                    self._session_phases[session_id] = "active"
+                    raise
+                if (reap.get("reaped") is True
+                        and isinstance(result, dict)
+                        and result.get("ok") is True):
+                    self._session_results[session_id] = dict(result)
+                    self._session_phases[session_id] = "ended"
+                else:
+                    self._session_phases[session_id] = "active"
+                return reap, result
+        finally:
+            if revocations:
+                await asyncio.gather(*revocations)
 
     def _ensure_rdp_context(self, session_id: str, record: dict) -> UpstreamContext:
         """Get or create the per-session rdp context.

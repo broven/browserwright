@@ -15,6 +15,7 @@ import time
 from functools import partial
 from typing import Any, Awaitable, Callable, Protocol
 
+from ... import session_registry
 from .state import ClientState, UpstreamPhase
 
 logger = logging.getLogger(__name__)
@@ -484,6 +485,35 @@ class SessionVerbsMixin:
             # This readiness + teardown runs under ExecutorRegistry's lifecycle
             # gate in production. A queued ensure therefore cannot reopen the
             # workspace between executor reap and terminal teardown.
+            record = session_registry.get(session)
+            record_backend = (
+                record.get("backend") if isinstance(record, dict) else None)
+            attach_owned_raw = (
+                isinstance(record, dict)
+                and record.get("owner") == "attach"
+                and record_backend in ("rdp", "env")
+            )
+            if attach_owned_raw and self.upstream is None:
+                ended: bool | None = None
+                if record_backend == "rdp":
+                    ended = False
+                    teardown_rdp = getattr(
+                        daemon, "teardown_rdp_context", None)
+                    if callable(teardown_rdp):
+                        ended = await teardown_rdp(
+                            session, deadline=teardown_deadline)
+                ok = ended is not False
+                return {
+                    "ok": ok,
+                    "partial": not ok,
+                    "timedOut": (
+                        not ok and time.monotonic() >= teardown_deadline),
+                    "closed": [],
+                    "failed": [] if ok else ["workspace"],
+                    "unknown": [] if ok else ["workspace"],
+                    "kept": [],
+                    "backend": record_backend,
+                }
             if (self.upstream is None and self._ensure_upstream is not None
                     and self.state.upstream_phase != UpstreamPhase.CONNECTED):
                 remaining = max(0.0, teardown_deadline - time.monotonic())

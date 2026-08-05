@@ -884,6 +884,54 @@ async def test_end_session_cold_open_respects_budget_and_restores_phase(
     assert state.upstream_phase is UpstreamPhase.DISCONNECTED
 
 
+@pytest.mark.parametrize("backend", ["rdp", "env"])
+@pytest.mark.asyncio
+async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
+    monkeypatch, backend,
+):
+    from browserwright import session_registry
+
+    state, router, cap, (client,) = setup_router(
+        backend=backend, phase=UpstreamPhase.DISCONNECTED,
+        wire_upstream=False)
+    client.session_id = "sess"
+    monkeypatch.setattr(
+        session_registry,
+        "get",
+        lambda sid: {
+            "id": sid, "backend": backend, "owner": "attach",
+        },
+    )
+
+    class Registry:
+        async def terminate_session(self, session, teardown, *, budget=None):
+            return {"reaped": True}, await teardown()
+
+    class Daemon:
+        executors = Registry()
+
+        def __init__(self):
+            self.teardown_calls = []
+
+        async def teardown_rdp_context(self, session, *, deadline=None):
+            self.teardown_calls.append((session, deadline))
+            return True
+
+    daemon = Daemon()
+    router.daemon = daemon
+    await router.route_from_client(client, json.dumps({
+        "id": 7,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    assert cap.ensure_calls == 0
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["ok"] is True
+    assert result["backend"] == backend
+    assert len(daemon.teardown_calls) == (1 if backend == "rdp" else 0)
+
+
 @pytest.mark.asyncio
 async def test_rdp_open_attach_close_error_translation_and_cleanup():
     state, router, cap, (client,) = setup_router(backend="rdp")
