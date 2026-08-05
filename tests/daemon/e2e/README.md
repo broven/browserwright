@@ -56,12 +56,41 @@ of display and a few seconds per case, which we keep out of the inner loop.
 Nothing escapes the test boundary. You can have your daily Chrome + extension
 running while these tests run.
 
+## Headless (opt-in)
+
+A headful Chrome repeatedly steals the active window, which makes the suite
+unpleasant to run on the machine you're working on. Set `BW_E2E_HEADLESS=1` to
+launch Chrome for Testing with `--headless=new`:
+
+    BW_E2E_HEADLESS=1 tests/daemon/e2e/run.sh
+
+Default is **headful**, deliberately: these tests exist to pin what a real
+browser does. `test_l2_background_render.py` **must** run headful -- both cases
+compare a backgrounded tab against a real foreground window, and headless has no
+foreground, reports every tab visible, and never throttles rAF, so they would
+pass without exercising `keepTabRendered()` at all. They skip themselves under
+`BW_E2E_HEADLESS=1` rather than pass vacuously. Anything else asserting
+visibility, focus, or frame timing should do the same via
+`conftest.requires_headful`.
+
 ## Artifacts on failure
 
 When a test fails, `_artifacts/<test-name>/` contains:
 
 - `env.txt` -- relevant `BD_*` / `BS_*` env vars at run time
-- (session-level) `daemon.log` -- daemon stderr (everything)
+- `daemon.log` / `daemon-rdp.log` -- the daemon's own log, copied out of the
+  live daemon at the moment that test failed
+
+Session-level `_artifacts/daemon.log` and `_artifacts/daemon-rdp.log` hold the
+daemon's stdout/stderr plus its full log, appended at session teardown.
+
+Why the copying: the daemon routes its logger to `$TMPDIR/browserwright-daemon.log`
+and only echoes to stderr when stderr is a TTY (`_wire_logging` in
+`daemon/server/listener.py`). These fixtures give it a pipe (never a TTY) and a
+throwaway `TMPDIR` they delete at teardown -- so for a long time every daemon log
+line was written and then thrown away, and `_artifacts/daemon.log` was always 0
+bytes. The fixtures now harvest the file before removing the directory. If you
+ever see an empty `daemon.log` again, that harvest is what broke.
 
 This directory is gitignored.
 

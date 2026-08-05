@@ -147,6 +147,59 @@ def e2e_artifacts_dir() -> Path:
     return d
 
 
+# ---- daemon log harvesting -------------------------------------------------
+#
+# The daemon does NOT log to its stdout/stderr unless stderr is a TTY (see
+# `_wire_logging` in daemon/server/listener.py) — it routes its logger to
+# `$TMPDIR/browserwright-daemon.log` instead. These fixtures pipe the daemon's
+# stderr to a file (never a TTY) and point TMPDIR at a throwaway dir they
+# `rmtree` at teardown, so every daemon log line was written and then deleted:
+# `_artifacts/daemon.log` has always been 0 bytes despite the README promising
+# it. That is a harness bug — the test deleting its own evidence — so it is
+# fixed here rather than by rerouting production logging.
+#
+# Two harvests, because they answer different questions:
+#   - per failing test, from the *live* file, so a failure carries the log as it
+#     stood at that moment;
+#   - at session teardown, appended to the artifact file, so the full run is
+#     kept after the throwaway TMPDIR is gone.
+
+#: label -> the daemon's own log file, for daemons that are currently running.
+#: Populated by the daemon fixtures so the failure hook can snapshot without
+#: depending on (and thereby starting) a daemon for tests that need none.
+_LIVE_DAEMON_LOGS: dict[str, Path] = {}
+
+
+def _daemon_log_file(runtime_dir: str) -> Path:
+    """Where `_wire_logging()` puts the daemon's log when TMPDIR=runtime_dir.
+
+    The basename is read back off production's own `_ipc.log_path()` rather
+    than hardcoded, so a rename there surfaces here instead of silently
+    reinstating the empty-artifact bug.
+    """
+    from browserwright.daemon import _ipc
+
+    return Path(runtime_dir) / _ipc.log_path().name
+
+
+def _harvest_daemon_log(runtime_dir: str, dest: Path, label: str) -> None:
+    """Append the daemon's own log to `dest` before the runtime dir is removed."""
+    src = _daemon_log_file(runtime_dir)
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    try:
+        with open(dest, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"\n===== {label}: {src} "
+                f"(harvested at session teardown) =====\n"
+            )
+            fh.write(text)
+    except OSError:
+        pass
+
+
 @pytest.fixture(scope="session")
 def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     """Spawn `browserwright-daemon serve --extension-port N`
@@ -222,6 +275,8 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
             f"see {log_path}"
         )
 
+    _LIVE_DAEMON_LOGS["daemon"] = _daemon_log_file(runtime_dir)
+
     yield DaemonHandle(proc=proc, ext_port=TEST_EXT_PORT,
                        runtime_dir=runtime_dir, log_path=log_path)
 
@@ -233,6 +288,9 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
+    _LIVE_DAEMON_LOGS.pop("daemon", None)
+    # Keep the log before the throwaway TMPDIR that holds it is removed.
+    _harvest_daemon_log(runtime_dir, log_path, "extension daemon")
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
@@ -329,6 +387,28 @@ def _kill_chrome(pid: int):
         pass
 
 
+def e2e_headless() -> bool:
+    """Opt-in headless mode for the e2e Chrome (`BW_E2E_HEADLESS=1`).
+
+    Default OFF. Headful is the honest default: these tests exist to pin what a
+    real user's browser does, and a couple of them assert properties (tab
+    visibility, unthrottled rAF) whose meaning changes under headless. The flag
+    exists because a headful run repeatedly steals the active window, which
+    makes the suite hostile to run on the machine you are working on.
+
+    Tests whose semantics headless would quietly change must skip themselves —
+    see `requires_headful` — because a test that passes vacuously is worse than
+    one that fails.
+    """
+    return os.environ.get("BW_E2E_HEADLESS", "") == "1"
+
+
+def requires_headful(reason: str) -> None:
+    """Skip the calling test when the suite is running headless."""
+    if e2e_headless():
+        pytest.skip(f"needs a headful Chrome ({reason}); unset BW_E2E_HEADLESS")
+
+
 def _launch_cft_with_extension(
     cft_binary: Path, ext_dir: Path, *, rdp_port: int = 0,
 ) -> ChromeHandle:
@@ -336,6 +416,7 @@ def _launch_cft_with_extension(
     profile_dir = Path(tempfile.mkdtemp(prefix="bd-e2e-chrome-"))
     args = [
         str(cft_binary),
+        *(["--headless=new"] if e2e_headless() else []),
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={rdp_port}",
         "--no-first-run",
@@ -422,7 +503,14 @@ def e2e_chrome(cft_binary, patched_ext_dir):
 
 @pytest.fixture(autouse=True)
 def _e2e_dump_artifacts_on_failure(request, e2e_artifacts_dir):
-    """When a `real_chrome` test fails, write env into `_artifacts/<nodeid>/`."""
+    """When a `real_chrome` test fails, write env + the live daemon log into
+    `_artifacts/<nodeid>/`.
+
+    The daemon log is copied from the *running* daemon's log file rather than
+    from the fixture's stdout capture, which stays empty (see the harvesting
+    note above). Copying at the moment of failure also scopes the log to the
+    failing test instead of handing you the whole session.
+    """
     yield
     rep = getattr(request.node, "rep_call", None)
     if rep is not None and rep.failed:
@@ -431,6 +519,12 @@ def _e2e_dump_artifacts_on_failure(request, e2e_artifacts_dir):
         env_lines = [f"{k}={v}" for k, v in sorted(os.environ.items())
                      if k.startswith(("BD_", "BS_", "BU_"))]
         (outdir / "env.txt").write_text("\n".join(env_lines), encoding="utf-8")
+        for label, src in _LIVE_DAEMON_LOGS.items():
+            try:
+                text = src.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            (outdir / f"{label}.log").write_text(text, encoding="utf-8")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -562,6 +656,8 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
             f"see {log_path}"
         )
 
+    _LIVE_DAEMON_LOGS["daemon-rdp"] = _daemon_log_file(runtime_dir)
+
     yield runtime_dir
 
     # Teardown.
@@ -574,4 +670,6 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
+    _LIVE_DAEMON_LOGS.pop("daemon-rdp", None)
+    _harvest_daemon_log(runtime_dir, log_path, "rdp daemon")
     shutil.rmtree(runtime_dir, ignore_errors=True)

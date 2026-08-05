@@ -220,6 +220,200 @@ process.stdout.write(JSON.stringify({
     return json.loads(proc.stdout)
 
 
+#: How many raw title writes the marker is allowed before we call it a loop.
+#: Settling costs one write; a second is slack for a normalization round-trip.
+WRITE_BUDGET = 4
+
+#: How many observer callbacks may be delivered before we call it a loop.
+CALLBACK_BUDGET = 20
+
+
+def _run_fixpoint_probe(payload: dict[str, str]) -> dict[str, object]:
+    """Re-run the install script against a *spec-accurate* `document.title`.
+
+    The DOM stub used by the probe above returns whatever was written, which is
+    not what a browser does: per HTML, the `document.title` getter strips
+    leading/trailing ASCII whitespace and collapses internal runs. That
+    difference is the entire bug. The marker's prefix ends in a space, so on a
+    page with an empty title it wrote `"<eye> "`, read back `"<eye>"`, judged the
+    title wrong, and wrote again — forever. Each write mutates `<head>`, which
+    re-fires the MutationObserver, whose callbacks are delivered *asynchronously*
+    so the script's `normalizing` re-entry flag has already been released by the
+    time one arrives. The result is an unbounded microtask loop that pins the
+    renderer's main thread, which is why `chrome.debugger.sendCommand` stopped
+    answering and the daemon reported `relay send failed: TimeoutError()`.
+
+    So this stub models the two things that matter and the other stub does not:
+    a normalizing getter, and observer callbacks queued rather than invoked
+    inline. It then asserts the property the script must have — *the marked
+    title is a fixpoint*: write it, read it back, and get the same string.
+    """
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const WRITE_BUDGET = input.writeBudget;
+const CALLBACK_BUDGET = input.callbackBudget;
+
+// HTML's `document.title` getter: strip and collapse ASCII whitespace.
+function normalize(value) {
+  return String(value)
+    .replace(/[\t\n\f\r ]+/g, " ")
+    .replace(/^ /, "")
+    .replace(/ $/, "");
+}
+
+function runMarkerScript(script, initialTitle, mutate) {
+  const observers = [];
+  const queue = [];
+  let writes = 0;
+  let overBudget = false;
+
+  class Document {}
+  Object.defineProperty(Document.prototype, "title", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      return normalize(this._rawTitle || "");
+    },
+    set(value) {
+      this._rawTitle = String(value);
+      if (++writes > WRITE_BUDGET) {
+        overBudget = true;
+        throw new Error("title write budget exceeded");
+      }
+      // Writing the title mutates <head>. Real MutationObserver callbacks are
+      // delivered as microtasks, i.e. AFTER the writer's stack (and its
+      // `normalizing` guard) has unwound — queue, never call inline.
+      for (const obs of observers) {
+        if (!obs.disconnected) queue.push(() => obs.callback());
+      }
+    },
+  });
+
+  class MutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+    }
+    observe() {
+      observers.push(this);
+    }
+    disconnect() {
+      this.disconnected = true;
+    }
+  }
+
+  const document = new Document();
+  document._rawTitle = initialTitle;
+  document.head = { appendChild() {} };
+  document.querySelector = () => null;
+  document.createElement = () => ({ textContent: "" });
+  document.addEventListener = () => {};
+
+  const sandbox = { window: {}, document, Document, HTMLDocument: Document,
+                    MutationObserver };
+
+  let converged = true;
+  try {
+    vm.runInNewContext(script, sandbox);
+    if (mutate) mutate(document);
+    let steps = 0;
+    while (queue.length) {
+      if (++steps > CALLBACK_BUDGET) { converged = false; break; }
+      queue.shift()();
+    }
+  } catch (e) {
+    converged = false;
+  }
+  return {
+    converged: converged && !overBudget,
+    writes,
+    raw: document._rawTitle,
+    // What the page itself sees through the marker's accessor.
+    pageTitle: (() => { try { return document.title; } catch (e) { return null; } })(),
+    // What the DOM would hand back for the value we actually stored — the
+    // fixpoint check: these two must agree or the observer rewrites forever.
+    readBack: normalize(document._rawTitle),
+  };
+}
+
+const scenarios = {
+  // about:blank / data: URLs / a page caught before it sets a title.
+  emptyTitle: runMarkerScript(input.installScript, ""),
+  // The ordinary case, which always worked.
+  normalTitle: runMarkerScript(input.installScript, "Example"),
+  // Whitespace-only is empty once the DOM normalizes it.
+  whitespaceTitle: runMarkerScript(input.installScript, "   "),
+  // A stale marker with nothing behind it.
+  bareMarkerTitle: runMarkerScript(input.installScript, "\u{1F440}"),
+  // The other write path: the page clearing its own title through the
+  // accessor the marker installed.
+  pageClearsTitle: runMarkerScript(input.installScript, "Example", (doc) => {
+    doc.title = "";
+  }),
+  // ...and setting a real one.
+  pageSetsTitle: runMarkerScript(input.installScript, "", (doc) => {
+    doc.title = "Later";
+  }),
+};
+
+process.stdout.write(JSON.stringify(scenarios));
+"""
+    proc = subprocess.run(
+        ["node", "-e", probe],
+        input=json.dumps({**payload, "writeBudget": WRITE_BUDGET,
+                          "callbackBudget": CALLBACK_BUDGET}),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=15,
+        cwd=ROOT,
+    )
+    return json.loads(proc.stdout)
+
+
+def test_title_marker_is_a_fixpoint_under_html_title_normalization() -> None:
+    """The marked title must survive a DOM round-trip unchanged.
+
+    If `read(write(x)) != write(x)` the MutationObserver that re-asserts the
+    marker never stops firing, and the renderer's main thread never gets back to
+    the event loop — the "random freeze" this file's other test could not see,
+    because its DOM stub echoes writes back verbatim.
+    """
+    results = _run_fixpoint_probe(_marker_sources())
+
+    for label, r in results.items():
+        assert r["converged"], (
+            f"[{label}] the title marker never settled (writes={r['writes']}, "
+            f"raw={r['raw']!r}) — this is the rewrite loop that wedges the "
+            f"renderer, i.e. the freeze"
+        )
+        assert r["raw"] == r["readBack"], (
+            f"[{label}] the marker wrote {r['raw']!r} but the DOM hands back "
+            f"{r['readBack']!r}; that asymmetry is what loops"
+        )
+        assert r["writes"] <= 2, (
+            f"[{label}] settling took {r['writes']} title writes; one is "
+            f"expected, more means the marker is arguing with the DOM"
+        )
+        assert "\U0001f440" in (r["raw"] or ""), (
+            f"[{label}] the marker is missing — the user can no longer see "
+            f"which tab the agent is driving: {r}"
+        )
+
+    # The visible outcome, unchanged for pages that have a title.
+    assert results["normalTitle"]["raw"] == f"{PREFIX}Example"
+    assert results["normalTitle"]["pageTitle"] == "Example"
+    assert results["pageSetsTitle"]["raw"] == f"{PREFIX}Later"
+    assert results["pageSetsTitle"]["pageTitle"] == "Later"
+    # ...and for empty ones the marker is the bare eye, with no trailing space
+    # for the DOM to strip back off.
+    assert results["emptyTitle"]["raw"] == "\U0001f440"
+    assert results["emptyTitle"]["pageTitle"] == ""
+    assert results["pageClearsTitle"]["raw"] == "\U0001f440"
+    assert results["pageClearsTitle"]["pageTitle"] == ""
+
+
 def test_title_marker_helpers_normalize_and_remove_all_leading_markers() -> None:
     results = _run_node_probe(_marker_sources())
 
