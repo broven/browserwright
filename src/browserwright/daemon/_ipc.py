@@ -22,6 +22,8 @@ import asyncio
 import json
 import os
 import socket
+import stat
+import tempfile
 from pathlib import Path
 
 
@@ -140,7 +142,34 @@ def executor_inflight_path(session_id: str) -> Path:
     Deliberately NOT a ``*.json`` name: ``cleanup_orphan_executors`` globs
     ``bw-exec-*.json`` and SIGTERMs whatever ``pid`` it finds inside, so a
     sidecar matching that glob would be read as a second discovery record."""
-    return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.inflight"
+    return _executor_inflight_dir() / f"bw-exec-{_exec_shortid(session_id)}.inflight"
+
+
+def _executor_inflight_dir() -> Path:
+    """Per-user private home for executor observability sidecars."""
+    return _runtime_dir() / f"browserwright-{os.geteuid()}"
+
+
+def _ensure_executor_inflight_dir() -> Path:
+    """Create and verify the sidecar directory without following a symlink."""
+    directory = _executor_inflight_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(directory, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(directory)
+        if metadata.st_uid != os.geteuid():
+            raise PermissionError(
+                f"executor inflight directory is owned by uid {metadata.st_uid}, "
+                f"expected {os.geteuid()}: {directory}"
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return directory
 
 
 def write_executor_inflight(session_id: str, payload: dict | None) -> None:
@@ -148,22 +177,42 @@ def write_executor_inflight(session_id: str, payload: dict | None) -> None:
 
     Best-effort on every path: an unwritable runtime dir costs observability,
     never correctness, and this runs on the executor's hot path."""
-    fp = executor_inflight_path(session_id)
+    tmp_path: str | None = None
+    tmp_fd = -1
     try:
+        _ensure_executor_inflight_dir()
+        fp = executor_inflight_path(session_id)
         if payload is None:
             fp.unlink(missing_ok=True)
             return
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        tmp = fp.with_name(fp.name + ".tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, fp)
+        serialized = json.dumps(payload)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{fp.name}.", suffix=".tmp", dir=fp.parent)
+        os.fchmod(tmp_fd, 0o600)
+        with os.fdopen(tmp_fd, "w") as tmp_file:
+            tmp_fd = -1
+            tmp_file.write(serialized)
+        os.replace(tmp_path, fp)
+        tmp_path = None
     except (OSError, ValueError, TypeError):
         pass
+    finally:
+        if tmp_fd >= 0:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
 
 
 def read_executor_inflight(session_id: str) -> dict | None:
     """Read the executor's current-call sidecar, or ``None`` when idle/absent."""
     try:
+        _ensure_executor_inflight_dir()
         d = json.loads(executor_inflight_path(session_id).read_text())
     except (FileNotFoundError, ValueError, OSError):
         return None
@@ -235,12 +284,12 @@ def read_executor_file(session_id: str) -> tuple[str | None, int | None]:
 def cleanup_executor(session_id: str) -> None:
     """Best-effort: nuke a session's executor socket + discovery file. Called by
     the executor on exit and by the daemon when it reaps/kills the executor."""
-    for p in (executor_sock_path(session_id), executor_file_path(session_id),
-              executor_inflight_path(session_id)):
+    for p in (executor_sock_path(session_id), executor_file_path(session_id)):
         try:
             p.unlink()
         except (FileNotFoundError, IsADirectoryError, OSError):
             pass
+    write_executor_inflight(session_id, None)
 
 
 def make_executor_socket(session_id: str) -> socket.socket:

@@ -470,11 +470,16 @@ def cleanup_orphan_executors() -> None:
     # C1: in-flight sidecars belong to processes we are about to signal below;
     # a leftover one would otherwise make `ps` report a call that ended when the
     # prior daemon died.
-    for stale in runtime_dir.glob("bw-exec-*.inflight"):
-        try:
-            stale.unlink()
-        except (FileNotFoundError, IsADirectoryError, OSError):
-            pass
+    try:
+        inflight_dir = _ipc._ensure_executor_inflight_dir()
+    except OSError:
+        inflight_dir = None
+    if inflight_dir is not None:
+        for stale in inflight_dir.glob("bw-exec-*.inflight"):
+            try:
+                stale.unlink()
+            except (FileNotFoundError, IsADirectoryError, OSError):
+                pass
     for entry in runtime_dir.glob("bw-exec-*.json"):
         pid: int | None = None
         try:

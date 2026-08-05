@@ -3,6 +3,7 @@ that writes DevToolsActivePort and then sleeps."""
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -623,20 +624,71 @@ async def test_launch_chrome_env_extra_args_malformed_quotes_dont_raise(
 
 
 @pytest.mark.asyncio
-async def test_launch_chrome_env_extra_args_cannot_defeat_default_profile_guard(
-    monkeypatch, tmp_path,
+@pytest.mark.parametrize(
+    ("source", "dangerous_args"),
+    [
+        ("env", ["--user-data-dir=/tmp/daily-profile"]),
+        ("env", ["--user-data-dir", "/tmp/daily-profile"]),
+        ("env", ["--remote-debugging-address=0.0.0.0"]),
+        ("env", ["--remote-debugging-port=9222"]),
+        ("env", ["--remote-debugging-port", "9222"]),
+        ("env", ["--remote-debugging-pipe"]),
+        ("env", ["--remote-debugging-pipe=1"]),
+        ("env", ["-user-data-dir=/tmp/daily-profile"]),
+        ("env", ["-remote-debugging-address=0.0.0.0"]),
+        ("env", ["-remote-debugging-port=9222"]),
+        ("env", ["-remote-debugging-pipe"]),
+        ("env", [" --user-data-dir=/tmp/daily-profile"]),
+        ("env", ["-remote-debugging-pipe "]),
+        ("explicit", ["--user-data-dir=/tmp/daily-profile"]),
+        ("explicit", ["--user-data-dir", "/tmp/daily-profile"]),
+        ("explicit", ["--remote-debugging-address=0.0.0.0"]),
+        ("explicit", ["--remote-debugging-port=9222"]),
+        ("explicit", ["--remote-debugging-port", "9222"]),
+        ("explicit", ["--remote-debugging-pipe"]),
+        ("explicit", ["--remote-debugging-pipe=1"]),
+        ("explicit", ["-user-data-dir=/tmp/daily-profile"]),
+        ("explicit", ["-remote-debugging-address=0.0.0.0"]),
+        ("explicit", ["-remote-debugging-port=9222"]),
+        ("explicit", ["-remote-debugging-pipe"]),
+        ("explicit", [" --user-data-dir=/tmp/daily-profile"]),
+        ("explicit", ["-remote-debugging-pipe "]),
+    ],
+)
+async def test_launch_chrome_rejects_protected_extra_switches_before_spawn(
+    monkeypatch, tmp_path, fake_chrome, source, dangerous_args,
 ):
-    """The §11 guard reads `user_data_dir`, which the env hook never sets — so
-    pointing it at the default profile still refuses."""
-    default = tmp_path / "DefaultChromeProfile"
-    default.mkdir()
-    monkeypatch.setattr(lc_mod, "profile_paths", lambda: [default])
-    monkeypatch.setattr(lc_mod, "_allocate_data_dir", lambda *a, **kw: default)
-    monkeypatch.setenv(lc_mod.CHROME_EXTRA_ARGS_ENV,
-                       f"--user-data-dir={tmp_path / 'elsewhere'}")
-    cfg = load(env={})
-    with pytest.raises(UserError):
-        await lc_mod.launch_chrome(cfg, profile="isolated")
+    """Appended argv must not override browserwright's profile/CDP boundary."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    kwargs = {}
+    if source == "env":
+        monkeypatch.setenv(
+            lc_mod.CHROME_EXTRA_ARGS_ENV, shlex.join(dangerous_args))
+    else:
+        monkeypatch.delenv(lc_mod.CHROME_EXTRA_ARGS_ENV, raising=False)
+        kwargs["extra_args"] = dangerous_args
+
+    def must_not_spawn(*args, **kwargs):
+        pytest.fail("a protected Chrome switch reached Popen")
+
+    monkeypatch.setattr(lc_mod, "discover_chrome_binary", lambda _: fake_chrome)
+    monkeypatch.setattr(lc_mod.subprocess, "Popen", must_not_spawn)
+    cfg = load(env={"XDG_CACHE_HOME": str(tmp_path / "cache"),
+                    "XDG_RUNTIME_DIR": str(tmp_path / "run")})
+    expected_source = (lc_mod.CHROME_EXTRA_ARGS_ENV
+                       if source == "env" else "extra_args")
+    expected_switch = dangerous_args[0].strip().partition("=")[0]
+    with pytest.raises(UserError, match="protected Chrome switch") as exc_info:
+        await lc_mod.launch_chrome(
+            cfg,
+            profile="isolated",
+            chrome_binary=str(fake_chrome),
+            port=51236,
+            **kwargs,
+        )
+    assert expected_source in str(exc_info.value)
+    assert expected_switch in str(exc_info.value)
 
 
 # ---- v0.5 Task #12: discover_chrome_binary validates --version -----------

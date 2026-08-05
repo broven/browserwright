@@ -1112,7 +1112,7 @@ def _pretty_ps(p: dict) -> None:
             empty = False
             print(f"    IN-FLIGHT  hop=executor  what={fl.get('what')}  "
                   f"elapsed={_secs(fl.get('elapsed_s'))}  "
-                  f"code={fl.get('code_sha')}  "
+                  f"request={fl.get('request_id')}  "
                   f"budget={fl.get('timeout_ms')}ms")
 
     if empty:

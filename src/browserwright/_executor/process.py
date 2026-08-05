@@ -30,6 +30,7 @@ import io
 import json
 import os
 import queue
+import secrets
 import socket
 import sys
 import threading
@@ -216,10 +217,9 @@ class _Worker:
     def _begin_inflight(self, req: ExecuteRequest) -> None:
         """Record + publish the call about to run.
 
-        Deliberately records no code *body*: the sidecar lands in a shared
-        runtime dir and heredocs routinely carry credentials. A sha256 prefix is
-        enough to correlate a stuck worker with the call the agent sent."""
-        import hashlib
+        Deliberately records no code-derived metadata: heredocs routinely carry
+        credentials, so a random request id provides correlation without an
+        offline oracle for guessed code."""
 
         if req.task is not None:
             what = f"task:{req.task.site}/{req.task.name or '?'}"
@@ -230,9 +230,7 @@ class _Worker:
             "executor_id": self._executor_id,
             "pid": os.getpid(),
             "what": what,
-            "code_sha": hashlib.sha256(
-                (req.code or "").encode("utf-8", "replace")).hexdigest()[:12],
-            "code_chars": len(req.code or ""),
+            "request_id": secrets.token_hex(16),
             "timeout_ms": req.timeout_ms,
             "started_at": time.monotonic(),
             "started_wall": time.time(),
