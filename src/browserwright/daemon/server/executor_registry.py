@@ -204,21 +204,31 @@ class ExecutorRegistry:
 
     # ---- PR2 supervision ------------------------------------------------
 
-    def kill(self, session_id: str) -> bool:
-        """SIGTERM (escalating to SIGKILL) the session's executor and drop it
-        from the registry. Returns True if a handle was found + signalled.
+    async def kill(self, session_id: str) -> bool:
+        """Reap the current exact executor before permitting replacement.
 
-        The endSession path (rdp + extension symmetric) and the shutdown path
-        call this; it mirrors the rdp-Chrome `_kill_rdp_chrome` discipline
-        (terminate the detached process group, escalate, never raise)."""
-        handle = self._handles.pop(session_id, None)
-        if handle is None:
-            return False
-        _terminate(handle)
-        _ipc.cleanup_executor(session_id)
-        logger.info("killed executor for session %s (pid=%s)",
-                    session_id, handle.proc.pid)
-        return True
+        The fixed IPC paths are keyed only by session, so fire-and-forget death
+        is unsafe: the old process can run its final cleanup after a concurrent
+        ``ensure`` has published a replacement. Delegate to the locked current-
+        instance state machine and return only after its bounded reap attempt.
+        """
+        result = await self.kill_current_and_wait(session_id)
+        return bool(result.get("killed"))
+
+    async def kill_current_and_wait(
+        self, session_id: str,
+    ) -> dict[str, object]:
+        """Reap whichever instance is current when the session lock is won.
+
+        Session-terminal paths use this rather than snapshotting an exact id
+        before acquiring the lock. That prevents a superseded old-id request
+        from reporting success while a replacement is already current.
+        """
+        async with self._lock_for(session_id):
+            handle = self._handles.get(session_id)
+            executor_id = handle.executor_id if handle is not None else None
+            return await self._kill_and_wait_locked(
+                session_id, executor_id=executor_id)
 
     async def kill_and_wait(
         self,
@@ -239,74 +249,85 @@ class ExecutorRegistry:
         one is left untouched.
         """
         async with self._lock_for(session_id):
-            handle = self._handles.get(session_id)
-            if handle is None:
-                record = _ipc.read_executor_record(session_id)
-                if record is not None:
-                    recorded_id = record.get("executor_id")
-                    if executor_id is not None and recorded_id != executor_id:
-                        return {
-                            "killed": False,
-                            "reaped": True,
-                            "matched": False,
-                            "executor_id": executor_id,
-                            "current_executor_id": recorded_id,
-                        }
-                    if _pid_alive(int(record["pid"])):
-                        # The daemon cannot honestly confirm death for a live
-                        # process it no longer owns with a Popen handle.
-                        return {
-                            "killed": False,
-                            "reaped": False,
-                            "matched": True,
-                            "executor_id": executor_id,
-                        }
-                _ipc.cleanup_executor(session_id)
-                return {
-                    "killed": False,
-                    "reaped": True,
-                    "matched": True,
-                    "executor_id": executor_id,
-                }
-            if executor_id is not None and handle.executor_id != executor_id:
-                return {
-                    "killed": False,
-                    "reaped": True,
-                    "matched": False,
-                    "executor_id": executor_id,
-                    "current_executor_id": handle.executor_id,
-                }
+            return await self._kill_and_wait_locked(
+                session_id, executor_id=executor_id)
 
-            self._handles.pop(session_id, None)
-            await asyncio.to_thread(_terminate_and_wait, handle)
-            reaped = handle.proc.poll() is not None
-            if reaped:
-                _ipc.cleanup_executor(session_id)
-            else:
-                # Never permit a replacement at the same unix-socket path
-                # while the old process is still alive.  Preserve ownership so
-                # a later reap can retry instead of spawning alongside it.
-                self._handles[session_id] = handle
-            logger.info(
-                "synchronously reaped executor for session %s "
-                "(pid=%s, executor_id=%s, reaped=%s)",
-                session_id,
-                handle.proc.pid,
-                handle.executor_id,
-                reaped,
-            )
+    async def _kill_and_wait_locked(
+        self,
+        session_id: str,
+        *,
+        executor_id: str | None,
+    ) -> dict[str, object]:
+        handle = self._handles.get(session_id)
+        if handle is None:
+            record = _ipc.read_executor_record(session_id)
+            if record is not None:
+                recorded_id = record.get("executor_id")
+                if executor_id is not None and recorded_id != executor_id:
+                    return {
+                        "killed": False,
+                        "reaped": True,
+                        "matched": False,
+                        "executor_id": executor_id,
+                        "current_executor_id": recorded_id,
+                    }
+                if _pid_alive(int(record["pid"])):
+                    # The daemon cannot honestly confirm death for a live
+                    # process it no longer owns with a Popen handle.
+                    return {
+                        "killed": False,
+                        "reaped": False,
+                        "matched": True,
+                        "executor_id": executor_id,
+                    }
+            _ipc.cleanup_executor(session_id)
             return {
-                "killed": True,
-                "reaped": reaped,
+                "killed": False,
+                "reaped": True,
                 "matched": True,
-                "executor_id": handle.executor_id,
+                "executor_id": executor_id,
+            }
+        if executor_id is not None and handle.executor_id != executor_id:
+            return {
+                "killed": False,
+                "reaped": True,
+                "matched": False,
+                "executor_id": executor_id,
+                "current_executor_id": handle.executor_id,
             }
 
-    def kill_all(self) -> None:
-        """Shutdown path: SIGTERM every registered executor. Mirrors
-        `_graceful_shutdown` iterating `all_contexts()`."""
-        for session_id in list(self._handles.keys()):
-            self.kill(session_id)
+        self._handles.pop(session_id, None)
+        await asyncio.to_thread(_terminate_and_wait, handle)
+        reaped = handle.proc.poll() is not None
+        if reaped:
+            _ipc.cleanup_executor(session_id)
+        else:
+            # Never permit a replacement at the same unix-socket path while
+            # the old process is still alive. Preserve ownership so a later
+            # reap can retry instead of spawning alongside it.
+            self._handles[session_id] = handle
+        logger.info(
+            "synchronously reaped executor for session %s "
+            "(pid=%s, executor_id=%s, reaped=%s)",
+            session_id,
+            handle.proc.pid,
+            handle.executor_id,
+            reaped,
+        )
+        return {
+            "killed": True,
+            "reaped": reaped,
+            "matched": True,
+            "executor_id": handle.executor_id,
+        }
+
+    async def kill_all(self) -> None:
+        """Reap the current executor for every session in a key snapshot."""
+        snapshot = list(self._handles)
+        await asyncio.gather(*(
+            self.kill_current_and_wait(session_id)
+            for session_id in snapshot
+        ))
 
     def reap_dead(self) -> list[str]:
         """Crash-reap: drop every handle whose child has exited (it died on its
@@ -324,11 +345,11 @@ class ExecutorRegistry:
                             session_id, handle.proc.returncode)
         return dead
 
-    def reap_idle(self, idle_after: float) -> list[str]:
+    async def reap_idle(self, idle_after: float) -> list[str]:
         """Idle-reap: SIGTERM + drop every executor idle longer than
         `idle_after` seconds. Returns the session ids reaped. Mirrors
         `_idle_watchdog` closing idle upstreams."""
-        reaped: list[str] = []
+        candidates: list[tuple[str, str]] = []
         now = time.time()
         for session_id, handle in list(self._handles.items()):
             if not handle.is_alive():
@@ -337,9 +358,17 @@ class ExecutorRegistry:
             if idle_for >= idle_after:
                 logger.info("idle-reap: executor %s idle %.1fs >= %.1fs",
                             session_id, idle_for, idle_after)
-                self.kill(session_id)
-                reaped.append(session_id)
-        return reaped
+                candidates.append((session_id, handle.executor_id))
+        results = await asyncio.gather(*(
+            self.kill_and_wait(session_id, executor_id=executor_id)
+            for session_id, executor_id in candidates
+        ))
+        return [
+            session_id
+            for (session_id, _executor_id), result in zip(candidates, results)
+            if (result.get("reaped") is True
+                and result.get("matched", True) is True)
+        ]
 
 
 def _discovery_alive(session_id: str) -> bool:

@@ -175,66 +175,56 @@ async def test_adapter_scoped_get_targets_success_and_error():
     state, router, cap, (scoped, sessionless) = setup_router(
         "scoped", "sessionless", backend="extension")
     scoped.session_id = "sess-1"
-    seen: list[str] = []
+    seen: list[tuple[dict, str]] = []
 
-    async def scoped_targets(session_id: str):
-        seen.append(session_id)
-        return [{"targetId": "only-mine", "type": "page"}]
+    async def scoped_targets(params: dict, session_id: str):
+        seen.append((params, session_id))
+        return {"result": {
+            "targetInfos": [{"targetId": "only-mine", "type": "page"}],
+        }}
 
-    router.upstream.list_tabs = scoped_targets
+    router.upstream.get_targets = scoped_targets
     await router.route_from_client(scoped, json.dumps({
         "id": 10, "method": "Target.getTargets",
+        "params": {"filter": [{"type": "page"}]},
     }))
-    assert seen == ["sess-1"]
+    assert seen == [({"filter": [{"type": "page"}]}, "sess-1")]
     assert cap.per_client[scoped.client_id][-1]["result"]["targetInfos"][0]["targetId"] == "only-mine"
     assert cap.upstream == []
 
-    async def broken_scoped(session_id: str):
+    async def broken_scoped(params: dict, session_id: str):
         raise RuntimeError(f"bad scope {session_id}")
 
-    router.upstream.list_tabs = broken_scoped
+    router.upstream.get_targets = broken_scoped
     await router.route_from_client(scoped, json.dumps({
         "id": 11, "method": "Target.getTargets",
     }))
     assert last_error(cap, scoped)["code"] == -32603
 
-    async def raw_tabs(session_id: str):
-        return [{"targetId": "raw-page", "type": "page"}]
-
-    router.upstream.list_tabs = raw_tabs
-    state.backend_name = "rdp"
-    await router.route_from_client(sessionless, json.dumps({
-        "id": 12, "method": "Target.getTargets",
-    }))
-    assert cap.per_client[sessionless.client_id][-1]["result"] == {
-        "targetInfos": [{"targetId": "raw-page", "type": "page"}],
-    }
-    assert cap.upstream == []
-
 
 @pytest.mark.asyncio
 async def test_get_targets_delegates_to_adapter_regardless_of_backend_name():
-    """Session isolation is an adapter capability, not a backend-name branch."""
+    """Only the extension synthesizes scope; raw CDP preserves native data."""
     _state, router, cap, (client,) = setup_router(
         "wrapped", backend="wrapped-extension")
-    seen: list[str] = []
+    seen: list[tuple[dict, str]] = []
 
-    async def list_tabs(session_id: str):
-        seen.append(session_id)
-        return [{
-            "targetId": "only-this-session",
-            "type": "page",
-            "url": "https://example.test/",
-            "title": "Example",
-            "attached": True,
-        }]
+    async def get_targets(params: dict, session_id: str):
+        seen.append((params, session_id))
+        return {"result": {"targetInfos": [{
+                "targetId": "only-this-session",
+                "type": "page",
+                "url": "https://example.test/",
+                "title": "Example",
+                "attached": True,
+            }]}}
 
-    router.upstream.list_tabs = list_tabs
+    router.upstream.get_targets = get_targets
     await router.route_from_client(client, json.dumps({
-        "id": 13, "method": "Target.getTargets",
+        "id": 13, "method": "Target.getTargets", "params": {"filter": []},
     }))
 
-    assert seen == ["s-wrapped"]
+    assert seen == [({"filter": []}, "s-wrapped")]
     assert cap.upstream == []
     assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == [
         {
@@ -246,34 +236,60 @@ async def test_get_targets_delegates_to_adapter_regardless_of_backend_name():
         }
     ]
 
+    raw_params = {"filter": [{"type": "service_worker", "exclude": False}]}
+    native_infos = [
+        {"targetId": "browser", "type": "browser", "url": ""},
+        {
+            "targetId": "worker", "type": "service_worker",
+            "url": "chrome-extension://worker.js", "title": "worker",
+            "attached": True,
+        },
+        {
+            "targetId": "raw-page",
+            "type": "page",
+            "url": "https://raw.test/",
+            "title": "Raw",
+            "attached": False,
+            "browserContextId": "context-1",
+            "canAccessOpener": False,
+        },
+    ]
+
     async def raw_command(method, params=None, session_id=None, timeout=10.0):
         assert method == "Target.getTargets"
-        return {"result": {"targetInfos": [
-            {"targetId": "browser", "type": "browser", "url": ""},
-            {
-                "targetId": "raw-page",
-                "type": "page",
-                "url": "https://raw.test/",
-                "title": "Raw",
-                "attached": False,
-                "browserContextId": "context-1",
-                "canAccessOpener": False,
-            },
-        ]}}
+        assert params == raw_params
+        return {"result": {"targetInfos": native_infos}}
 
     attach_cdp(router, cap, raw_command)
     await router.route_from_client(client, json.dumps({
-        "id": 14, "method": "Target.getTargets",
+        "id": 14, "method": "Target.getTargets", "params": raw_params,
     }))
-    assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == [{
-        "targetId": "raw-page",
-        "type": "page",
-        "url": "https://raw.test/",
-        "title": "Raw",
-        "attached": False,
-        "browserContextId": "context-1",
-        "canAccessOpener": False,
-    }]
+    assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == native_infos
+
+    native_error = {
+        "error": {
+            "code": -32602,
+            "message": "invalid filter",
+            "data": {"field": "filter"},
+        },
+        "nativeExtra": "preserved",
+    }
+
+    async def raw_error(method, params=None, session_id=None, timeout=10.0):
+        assert method == "Target.getTargets"
+        assert params == {"filter": "bad"}
+        return native_error
+
+    attach_cdp(router, cap, raw_error)
+    await router.route_from_client(client, json.dumps({
+        "id": 15,
+        "method": "Target.getTargets",
+        "params": {"filter": "bad"},
+    }))
+    assert cap.per_client[client.client_id][-1] == {
+        **native_error,
+        "id": 15,
+    }
 
 
 @pytest.mark.asyncio
@@ -500,8 +516,8 @@ async def test_open_recover_close_and_end_error_translation_branches():
         "params": {"sessionId": local_sid},
     }))
     assert last_error(cap, client)["code"] == -32603
-    assert local_sid not in client.sessions
-    assert "T" not in state.attachers
+    assert local_sid in client.sessions
+    assert "T" in state.attachers
 
     state.note_target_info({"targetId": "ghost", "type": "page"})
 
@@ -515,7 +531,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
         "params": {"targetId": "ghost"},
     }))
     assert last_error(cap, client)["code"] == -32603
-    assert "ghost" not in state.targets
+    assert "ghost" in state.targets
 
     async def malformed_recover(*args, **kwargs):
         return {"sessionId": "UP"}
@@ -649,8 +665,8 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
     }))
     assert calls[-1][0] == "Target.closeTarget"
     assert last_error(cap, client)["code"] == -32603
-    assert local_sid not in client.sessions
-    assert "T" not in state.targets
+    assert local_sid in client.sessions
+    assert "T" in state.targets
 
     await router.route_from_client(client, json.dumps({
         "id": 6,

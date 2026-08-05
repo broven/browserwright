@@ -43,6 +43,7 @@ class _MockExtension:
         # method/type → callable(msg) -> result dict (None error). For
         # 'createTab' / 'attach' / 'command' we provide sane defaults.
         self.tabs_meta: dict[int, dict] = {}
+        self.group_titles: dict[int, str] = {}
         self._next_created_tab = 100
         self.create_tab_messages: list[dict] = []
         # Every chrome.debugger.sendCommand the relay forwarded, as
@@ -89,6 +90,8 @@ class _MockExtension:
             group_id = msg.get("groupId")
             if not isinstance(group_id, int) or group_id < 0:
                 group_id = 700 if msg.get("groupName") else -1
+            if group_id >= 0 and msg.get("groupName"):
+                self.group_titles[group_id] = str(msg["groupName"])
             self.tabs_meta[tab] = {
                 "url": url, "title": "new", "groupId": group_id}
             # The extension announces the attach (the relay turns it into a
@@ -115,6 +118,7 @@ class _MockExtension:
                 ]
             await self._respond(cmd_id, {
                 "groupId": gid if isinstance(gid, int) else -1,
+                "groupTitle": self.group_titles.get(gid, ""),
                 "tabs": tabs,
             })
             return
@@ -149,11 +153,14 @@ class _MockExtension:
         }))
 
     async def announce_attached(self, *, tab_id: int, url: str = "https://t/",
-                                title: str = "t", group_id: int | None = None) -> None:
+                                title: str = "t", group_id: int | None = None,
+                                group_title: str | None = None) -> None:
         assert self.ws is not None
         self.tabs_meta[tab_id] = {"url": url, "title": title}
         if group_id is not None:
             self.tabs_meta[tab_id]["groupId"] = group_id
+            if group_title is not None:
+                self.group_titles[group_id] = group_title
         await self.ws.send(json.dumps({
             "type": "attached", "tabId": tab_id,
             "targetInfo": {"url": url, "title": title},
@@ -307,13 +314,18 @@ async def test_set_discover_targets_acks_and_replays():
 
 async def test_session_bound_replay_only_announces_session_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={"group_id": 44})
+    reg.update(sid, runtime={
+        "group_id": 44,
+        "current_target_id": "ext-tab-10",
+    })
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
-    await ext.announce_attached(tab_id=10, url="https://mine/", group_id=44)
+    await ext.announce_attached(
+        tab_id=10, url="https://mine/", group_id=44,
+        group_title="Research")
     await ext.announce_attached(tab_id=11, url="https://other/", group_id=55)
     await asyncio.sleep(0.05)
     client = _FakeClient()
@@ -362,12 +374,18 @@ async def test_create_target_opens_background_tab():
 
 async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={"group_id": 44})
+    reg.update(sid, runtime={
+        "group_id": 44,
+        "current_target_id": "ext-tab-10",
+    })
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
+    await ext.announce_attached(
+        tab_id=10, url="https://existing/", group_id=44,
+        group_title="Research")
     client = _FakeClient()
     async def _noop_frame(_text):
         return None
@@ -502,7 +520,7 @@ async def test_session_scoped_create_target_persists_group_id(monkeypatch):
     assert isinstance(fields["runtime"]["updated_at"], float)
 
 
-async def test_session_scoped_create_target_reuses_persisted_group_id():
+async def test_session_scoped_create_target_does_not_trust_bare_group_id():
     async with _wired() as (relay, ext, client, bridge):
         bridge = ExtensionFacadeBridge(
             client=client, relay=relay,
@@ -513,8 +531,8 @@ async def test_session_scoped_create_target_reuses_persisted_group_id():
         assert ext.create_tab_messages
         created = ext.create_tab_messages[-1]
         assert created["groupName"] == "Scoped Session"
-        assert created["groupId"] == 42
-        assert bridge._ext._groups["bw-s"] == 42  # noqa: SLF001
+        assert "groupId" not in created
+        assert bridge._ext._groups["bw-s"] == 700  # noqa: SLF001
 
 
 # ---- A4: Runtime.enable barrier --------------------------------------------

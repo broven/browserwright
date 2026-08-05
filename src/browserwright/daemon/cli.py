@@ -887,6 +887,14 @@ def _require_reaped(result: dict) -> None:
             f"death: {result!r}")
 
 
+def _require_complete_end_session(result: dict) -> None:
+    """A partial extension close is not a successful workspace teardown."""
+    if result.get("ok") is not True:
+        raise DaemonError(
+            "BrowserwrightDaemon.endSession left tabs open: "
+            f"{result!r}")
+
+
 #: Every forwarding subcommand. All emit the sorted-JSON RPC result verbatim
 #: (spec §5.1 single-line discipline) — these responses are structured, so a
 #: tab-separated form would lose fields. Each passes `browser_session`, so the
@@ -904,7 +912,7 @@ _FORWARDS: dict[str, _Forward] = {
     # argparse-required here, hence no precheck.
     "end-session": _Forward(
         "BrowserwrightDaemon.endSession", "cli-end-session", 10.0,
-        _end_session_params),
+        _end_session_params, validate=_require_complete_end_session),
     # Phase B: reap a session's resident executor, no browser teardown.
     "kill-executor": _Forward(
         "BrowserwrightDaemon.killExecutor", "cli-kill-executor", 10.0,

@@ -65,12 +65,142 @@ def _service_worker_marker_sources() -> dict[str, str]:
     detach_end = source.index("\n\nasync function doAttach(", detach_start)
     handler_start = source.index("async function handleDaemonMessage(")
     handler_end = source.index("// Shared attach sequence", handler_start)
+    close_start = source.index("async function doCloseTab(")
+    close_end = source.index("\n\nasync function doDetach(", close_start)
     return {
         **_marker_sources(),
         "workerMarkerRegion": source[marker_start:marker_end],
         "detachTab": source[detach_start:detach_end],
         "handleDaemonMessage": source[handler_start:handler_end],
+        "doCloseTab": source[close_start:close_end],
     }
+
+
+def _run_marker_detach_budget_probe(
+    payload: dict[str, str], hang_stage: str,
+) -> dict[str, object]:
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const calls = [];
+const chrome = {
+  debugger: {
+    async sendCommand(target, method, params) {
+      calls.push({ kind: "command", method, params });
+      const stage = method === "Runtime.evaluate"
+        ? (params.expression === input.installScript ? "installEvaluate" : "removeEvaluate")
+        : method;
+      if (stage === input.hangStage) return await new Promise(() => {});
+      if (method === "Page.addScriptToEvaluateOnNewDocument") {
+        return { identifier: "marker-script" };
+      }
+      return {};
+    },
+    async detach(target) {
+      calls.push({ kind: "detach", tabId: target.tabId });
+    },
+  },
+};
+const realm = vm.createContext({
+  chrome,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  setTimeout,
+  clearTimeout,
+  console: { info() {}, warn() {}, error: console.error },
+});
+const markerRegion = input.workerMarkerRegion
+  .replace("const MARKER_INSTALL_TIMEOUT_MS = 1500;",
+           "const MARKER_INSTALL_TIMEOUT_MS = 10;")
+  .replace("const MARKER_REMOVE_TIMEOUT_MS = 1000;",
+           "const MARKER_REMOVE_TIMEOUT_MS = 10;");
+vm.runInContext(`
+  const TITLE_PREFIX = "\\u{1F440} ";
+  const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
+  const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+  const attachedTabs = new Set([17]);
+  function safeSend() {}
+  ${markerRegion}
+  ${input.detachTab}
+`, realm);
+
+(async () => {
+  if (["Page.enable", "Page.addScriptToEvaluateOnNewDocument", "installEvaluate"]
+      .includes(input.hangStage)) {
+    vm.runInContext("markTabAttached(17)", realm);
+    while (calls.length === 0 ||
+           (input.hangStage === "Page.addScriptToEvaluateOnNewDocument" && calls.length < 2) ||
+           (input.hangStage === "installEvaluate" && calls.length < 3)) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  } else {
+    vm.runInContext('markedTabs.set(17, "marker-script")', realm);
+  }
+  const completed = await Promise.race([
+    vm.runInContext("detachTab(17)", realm).then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 100)),
+  ]);
+  process.stdout.write(JSON.stringify({
+    completed,
+    attached: vm.runInContext("attachedTabs.has(17)", realm),
+    calls,
+  }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", probe],
+        input=json.dumps({**payload, "hangStage": hang_stage}),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+        cwd=ROOT,
+    )
+    return json.loads(proc.stdout)
+
+
+def _run_failed_close_marker_probe(payload: dict[str, str]) -> dict[str, object]:
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const calls = [];
+const attachedTabs = new Set([17]);
+const markedTabs = new Map([[17, "marker-script"]]);
+const chrome = {
+  debugger: {
+    async detach() { calls.push({ kind: "detach" }); },
+  },
+  tabs: {
+    async remove() { calls.push({ kind: "remove" }); throw new Error("close denied"); },
+  },
+};
+function errMessage(error) { return String(error.message || error); }
+function safeSend(message) { calls.push({ kind: "response", message }); }
+vm.runInThisContext(input.doCloseTab);
+(async () => {
+  await doCloseTab(9, 17);
+  process.stdout.write(JSON.stringify({
+    attached: attachedTabs.has(17),
+    marked: markedTabs.has(17),
+    calls,
+  }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", probe],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+        cwd=ROOT,
+    )
+    return json.loads(proc.stdout)
 
 
 def _run_service_worker_realm_rebuild_probe(payload: dict[str, str]) -> dict:
@@ -131,7 +261,9 @@ const chrome = {
 };
 
 function newWorkerRealm(attached) {
-  const realm = vm.createContext({ chrome, console, sleep: async () => {} });
+  const realm = vm.createContext({
+    chrome, console, setTimeout, clearTimeout, sleep: async () => {},
+  });
   vm.runInContext(`
     const TITLE_PREFIX = "\\u{1F440} ";
     const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
@@ -210,6 +342,8 @@ const chrome = {
 const realm = vm.createContext({
   chrome,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  setTimeout,
+  clearTimeout,
   console: { info() {}, warn() {}, error: console.error },
 });
 vm.runInContext(`
@@ -754,3 +888,28 @@ def test_marker_cleanup_is_ordered_and_reload_remains_best_effort() -> None:
     ]
     assert mark_in_flight[2]["params"]["expression"] == sources["installScript"]
     assert mark_in_flight[4]["params"]["expression"] == sources["removeScript"]
+
+
+def test_marker_commands_cannot_block_debugger_detach() -> None:
+    sources = _service_worker_marker_sources()
+    stages = [
+        "Page.enable",
+        "Page.addScriptToEvaluateOnNewDocument",
+        "installEvaluate",
+        "Page.removeScriptToEvaluateOnNewDocument",
+        "removeEvaluate",
+    ]
+    for stage in stages:
+        result = _run_marker_detach_budget_probe(sources, stage)
+        assert result["completed"] is True, stage
+        assert result["attached"] is False, stage
+        assert result["calls"][-1] == {"kind": "detach", "tabId": 17}, stage
+
+
+def test_failed_tab_close_preserves_marker_and_attachment_state() -> None:
+    result = _run_failed_close_marker_probe(_service_worker_marker_sources())
+
+    assert result["attached"] is True
+    assert result["marked"] is True
+    assert [call["kind"] for call in result["calls"]] == ["remove", "response"]
+    assert result["calls"][-1]["message"]["error"]["message"] == "close denied"

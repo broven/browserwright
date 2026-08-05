@@ -730,6 +730,7 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
     def _end_extension(rec):
         assert reg.get(rec["id"]) is not None
         ext_closed.append(rec["id"])
+        return True
 
     monkeypatch.setattr(session_create, "_close_browser", _close_browser)
     monkeypatch.setattr(session_create, "_reap_executor", _reap_executor)
@@ -829,6 +830,24 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
     ]
     assert "still running" in message
     assert reg.get(sid) is None
+
+
+def test_cmd_session_end_reports_partial_extension_teardown(
+    tmp_bs_home, monkeypatch, capsys,
+):
+    from browserwright import cli, session_create, session_registry as reg
+    from browserwright.errors import DaemonUnavailable
+
+    sid = reg.allocate(backend="extension", owner="attach", name="shared")
+
+    def fail_end(_record):
+        raise DaemonUnavailable("extension tabs remain open")
+
+    monkeypatch.setattr(session_create, "end", fail_end)
+
+    assert cli._cmd_session(["end"], session_id=sid) == DaemonUnavailable.exit_code
+    assert "extension tabs remain open" in capsys.readouterr().err
+    assert reg.get(sid) is not None
 
 
 def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):

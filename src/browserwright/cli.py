@@ -610,14 +610,15 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
         return 0
 
     if sub == "end":
-        from .errors import NoSession
+        from .errors import BrowserwrightError
         from .session_ctx import resolve_session_or_env
         try:
             rec = resolve_session_or_env(session_id)
-        except NoSession as e:
+            message = session_create.end(rec)
+        except BrowserwrightError as e:
             print(str(e), file=sys.stderr)
             return e.exit_code
-        print(session_create.end(rec))
+        print(message)
         return 0
 
     if sub == "reset":

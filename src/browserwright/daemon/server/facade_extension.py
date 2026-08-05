@@ -134,7 +134,7 @@ class ExtensionFacadeBridge:
         self._client = client
         self._relay = relay
         self._session_id = session_id
-        loaded_name, loaded_group_id = self._load_session_scope(session_id)
+        loaded_name, _loaded_group_id = self._load_session_scope(session_id)
         self._session_name = session_name or loaded_name or session_id
         # A dedicated ExtensionUpstream over the SAME relay. on_frame routes
         # synthesized/forwarded frames back to THIS Playwright client. on_close
@@ -146,14 +146,10 @@ class ExtensionFacadeBridge:
             group_owner=binding_owner,
         )
         self._binding_owner = binding_owner or self._ext
-        initial_group_id = (
-            session_group_id
-            if isinstance(session_group_id, int) and session_group_id >= 0
-            else loaded_group_id
-        )
-        if self._session_id is not None and initial_group_id is not None:
-            self._binding_owner._bind_group(  # noqa: SLF001
-                self._session_id, initial_group_id)
+        # Ledger group ids are recovery candidates, not proof of live
+        # ownership: Chrome can recycle them after restart. The shared
+        # ExtensionUpstream validates title + known-tab membership before it
+        # promotes one into the live binding map.
         # tab_id → synthetic flat sessionId we've handed Playwright for it. One
         # entry per tab we've announced via attachedToTarget, so a later
         # `targetDestroyed`/`detachedFromTarget` references the same session and
@@ -481,19 +477,6 @@ class ExtensionFacadeBridge:
         self._creating += 1
         try:
             group_name = self._session_name or "Agent"
-            group_id = self._binding_owner.group_for_session(self._session_id)
-            if group_id is None and self._session_id is not None:
-                _name, group_id = self._load_session_scope(self._session_id)
-                if group_id is not None:
-                    self._binding_owner._bind_group(  # noqa: SLF001
-                        self._session_id, group_id)
-            # Same session-group discipline as the agent `open_background`
-            # verb: when the Playwright facade is session-scoped, tabs created
-            # by context.new_page() must belong to that session so session end
-            # can close them.
-            if self._session_id is not None and group_id is not None:
-                self._binding_owner._bind_group(  # noqa: SLF001
-                    self._session_id, group_id)
             gt = await self._ext.open_background_tab(
                 url, group_name=group_name,
                 session_id=self._session_id,
@@ -544,7 +527,9 @@ class ExtensionFacadeBridge:
             # the upstream's fabricated sessions for the tab + relay close.
             await self._ext.close_tab_by_target_id(f"ext-tab-{tab_id}")
         except Exception as e:  # noqa: BLE001
-            logger.debug("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
+            logger.warning("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
+            await self._respond(req_id, {"success": False})
+            return
         # Evict the facade-local per-tab state too.
         self._evict_tab(tab_id)
         await self._respond(req_id, {"success": True})

@@ -24,9 +24,11 @@ from the session-id naming convention (`ext-sid-<tabId>-<random>`).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
+import time
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from ... import session_registry
@@ -164,6 +166,14 @@ class ExtensionUpstream:
         # human-visible title used when creating a new group.
         self._groups: dict[str, int] = (
             group_owner._groups if group_owner is not None else {})
+        # All adapters over the same relay/binding owner (agent path + each
+        # Playwright facade bridge) must serialize first-bind operations for a
+        # session together. Separate lock maps would still permit one group per
+        # adapter under a concurrent first open.
+        self._group_locks: dict[str, asyncio.Lock] = (
+            group_owner._group_locks if group_owner is not None else {})
+        self._group_generations: dict[str, int] = (
+            group_owner._group_generations if group_owner is not None else {})
 
     def reset_session_announce(self, session_id: str | None) -> None:
         self._relay.reset_session_announce(session_id)
@@ -195,7 +205,28 @@ class ExtensionUpstream:
         A negative/invalid id is ignored — the group may have been auto-deleted
         (empty) and will be recreated on the next open."""
         if isinstance(group_id, int) and group_id >= 0:
+            conflict = next(
+                (owner for owner, bound in self._groups.items()
+                 if owner != session_id and bound == group_id),
+                None,
+            )
+            if conflict is not None:
+                raise RuntimeError(
+                    f"group ownership conflict: group {group_id} is already "
+                    f"bound to session {conflict!r}")
             self._groups[session_id] = group_id
+            self._group_generations[session_id] = self._relay_generation()
+
+    def _relay_generation(self) -> int:
+        generation = getattr(self._relay, "connection_generation", 0)
+        return generation if isinstance(generation, int) else 0
+
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        lock = self._group_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._group_locks[session_id] = lock
+        return lock
 
     def group_for_session(self, session_id: str | None) -> int | None:
         """Return the adapter-owned live group binding for ``session_id``."""
@@ -221,7 +252,9 @@ class ExtensionUpstream:
         """
         if session_id:
             live = self._groups.get(session_id)
-            if isinstance(live, int) and live >= 0:
+            live_generation = self._group_generations.get(session_id)
+            if (isinstance(live, int) and live >= 0
+                    and live_generation == self._relay_generation()):
                 return live, None
 
         candidates: list[int] = []
@@ -237,7 +270,11 @@ class ExtensionUpstream:
             candidates.append(explicit_group_id)
 
         for candidate in candidates:
+            validation_generation = self._relay_generation()
             info = await self._relay.query_group_tabs(group_id=candidate)
+            if validation_generation != self._relay_generation():
+                raise RuntimeError(
+                    f"extension reconnected while validating group id {candidate}")
             if not isinstance(info, dict):
                 raise RuntimeError(
                     f"could not validate group id {candidate}: "
@@ -254,9 +291,69 @@ class ExtensionUpstream:
                     f"group validation mismatch: asked for {candidate}, "
                     f"relay returned {resolved}")
             if session_id:
+                self._validate_recovered_group_ownership(
+                    session_id, resolved, info)
                 self._bind_group(session_id, resolved)
             return resolved, info
         return None, None
+
+    @staticmethod
+    def _runtime_tab_id(record: dict) -> int | None:
+        runtime = record.get("runtime")
+        target_id = (
+            runtime.get("current_target_id")
+            if isinstance(runtime, dict) else None)
+        return (
+            _tab_id_from_target_id(target_id)
+            if isinstance(target_id, str) else None)
+
+    def _validate_recovered_group_ownership(
+        self, session_id: str, group_id: int, info: dict,
+    ) -> None:
+        """Fail closed before upgrading a durable id into a live binding.
+
+        Chrome may recycle both group and tab ids after a browser restart. A
+        numeric id merely proves existence. Recovery therefore requires two
+        independent anchors already persisted for this session: the human
+        group title and the session's last-known tab membership. The title is
+        necessary but deliberately insufficient because names are editable and
+        need not be unique.
+        """
+        record = session_registry.get(session_id)
+        name = record.get("name") if isinstance(record, dict) else None
+        group_title = info.get("groupTitle")
+        member_ids = {
+            tab.get("tabId") for tab in (info.get("tabs") or [])
+            if isinstance(tab, dict) and isinstance(tab.get("tabId"), int)
+        }
+        known_tab_id = (
+            self._runtime_tab_id(record) if isinstance(record, dict) else None)
+        if not isinstance(name, str) or not name:
+            raise RuntimeError(
+                f"group ownership could not be proven for session {session_id!r}: "
+                "ledger has no session name")
+        if group_title != name:
+            raise RuntimeError(
+                f"group ownership mismatch for session {session_id!r}: "
+                f"expected title {name!r}, found {group_title!r}")
+        if known_tab_id is None or known_tab_id not in member_ids:
+            raise RuntimeError(
+                f"group ownership could not be proven for session {session_id!r}: "
+                "its last-known tab is not a member")
+
+        for other in session_registry.list_all():
+            other_id = other.get("id") if isinstance(other, dict) else None
+            if other_id == session_id:
+                continue
+            runtime = other.get("runtime") if isinstance(other, dict) else None
+            other_gid = runtime.get("group_id") if isinstance(runtime, dict) else None
+            other_tab_id = (
+                self._runtime_tab_id(other) if isinstance(other, dict) else None)
+            if other_gid == group_id or (
+                    other_tab_id is not None and other_tab_id in member_ids):
+                raise RuntimeError(
+                    f"group ownership conflict: session {other_id!r} also "
+                    f"claims group {group_id} or one of its tabs")
 
     @staticmethod
     def _group_required(*, group_name: str | None,
@@ -337,23 +434,53 @@ class ExtensionUpstream:
         every member tab — then the group disappears. Membership is resolved
         from the live group by numeric groupId (bound id first, else the
         persisted id passed in), NOT from any owned/borrowed set or title.
-        Returns ``{closed: [...], kept: []}`` (``kept`` is always empty now —
-        there is no borrowed distinction; drag a tab out of the group to spare
-        it)."""
+        Returns an honest ``{ok, closed, failed, kept}`` result (``kept`` is
+        always empty now — there is no borrowed distinction; drag a tab out of
+        the group to spare it)."""
+        async with self._lock_for(session_id):
+            return await self._end_session_locked(session_id, group_id)
+
+    async def _end_session_locked(self, session_id: str,
+                                  group_id: int | None = None) -> dict:
         group_id, members = await self._group_member_tabs(session_id, group_id)
-        self._groups.pop(session_id, None)
         closed: list[int] = []
+        failed: list[int] = []
         for tab_id in members:
             try:
                 await self._relay.close_tab(tab_id)
                 closed.append(tab_id)
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
-            # Evict any fabricated CDP sessions bound to a closed tab.
-            self.evict_tab_sessions(tab_id)
+                # Evict only after Chrome confirmed the tab is gone.
+                self.evict_tab_sessions(tab_id)
+            except Exception as e:  # noqa: BLE001 — report every failed tab
+                failed.append(tab_id)
+                logger.warning(
+                    "end_session(%s) could not close tab %d: %r",
+                    session_id, tab_id, e)
+        if not failed:
+            self._groups.pop(session_id, None)
+            self._group_generations.pop(session_id, None)
+        else:
+            # A partial close must leave a usable durable ownership anchor for
+            # the next retry. The old current target may be one we just closed;
+            # point it at a tab Chrome explicitly refused to close instead.
+            try:
+                record = session_registry.get(session_id)
+                if isinstance(record, dict):
+                    runtime = dict(record.get("runtime") or {})
+                    runtime.update({
+                        "group_id": group_id,
+                        "current_target_id": f"ext-tab-{failed[0]}",
+                        "updated_at": time.time(),
+                    })
+                    session_registry.update(session_id, runtime=runtime)
+            except Exception as e:  # noqa: BLE001 - retain live binding anyway
+                logger.warning(
+                    "end_session(%s) could not persist retry anchor: %r",
+                    session_id, e)
         return {
-            "ok": True,
+            "ok": not failed,
             "closed": closed,
+            "failed": failed,
             "kept": [],
             "backend": "extension",
         }
@@ -556,6 +683,16 @@ class ExtensionUpstream:
         REFUSES (raises) if the focused tab already belongs to another
         session's group; that error propagates to the caller.
         """
+        if session_id is not None:
+            async with self._lock_for(session_id):
+                return await self._attach_active_tab_locked(
+                    session_id=session_id, group_name=group_name)
+        return await self._attach_active_tab_locked(
+            session_id=session_id, group_name=group_name)
+
+    async def _attach_active_tab_locked(
+        self, *, session_id: str | None, group_name: str | None,
+    ) -> dict:
         gid, _info = await self._resolve_session_group(session_id)
         ghost = await self._relay.attach_active_tab(
             group_name=group_name, group_id=gid, timeout=10.0)
@@ -593,6 +730,26 @@ class ExtensionUpstream:
         name is only the human-visible title used when a new group must be
         created. The returned groupId is (re)bound to the session — that's the
         only per-session state we keep; membership comes from the live group."""
+        if session_id is not None:
+            async with self._lock_for(session_id):
+                return await self._open_background_tab_locked(
+                    url, group_name=group_name, session_id=session_id,
+                    background=background,
+                    skip_post_attach_commands=skip_post_attach_commands)
+        return await self._open_background_tab_locked(
+            url, group_name=group_name, session_id=session_id,
+            background=background,
+            skip_post_attach_commands=skip_post_attach_commands)
+
+    async def _open_background_tab_locked(
+        self,
+        url: str,
+        *,
+        group_name: str | None,
+        session_id: str | None,
+        background: bool,
+        skip_post_attach_commands: bool,
+    ) -> dict:
         gid, _info = await self._resolve_session_group(session_id)
         self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
@@ -639,6 +796,13 @@ class ExtensionUpstream:
     async def list_tabs(self, session_id: str | None = None) -> list[dict]:
         return await self.scoped_target_infos(session_id)
 
+    async def get_targets(self, params: dict,
+                          session_id: str | None = None) -> dict:
+        """Synthesize the session's tab-group-scoped browser enumeration."""
+        return {"result": {
+            "targetInfos": await self.scoped_target_infos(session_id),
+        }}
+
     async def current_page(self, session_id: str | None = None) -> dict:
         infos = await self.scoped_target_infos(session_id)
         if not infos:
@@ -683,12 +847,21 @@ class ExtensionUpstream:
 
         Raises (proxy maps to a CDP error) when no group matches or it has no
         tabs."""
-        info = await self._relay.query_group_tabs(group_id=group_id)
+        if not session_id:
+            raise ValueError("extension recovery requires a session id")
+        async with self._lock_for(session_id):
+            return await self._recover_session_locked(
+                session_id, group_id=group_id)
+
+    async def _recover_session_locked(self, session_id: str, *,
+                                      group_id: int) -> dict:
+        resolved_group_id, info = await self._resolve_session_group(
+            session_id, group_id)
         if not info or not info.get("tabs"):
             raise RuntimeError(
                 f"no recoverable tabs for group id {group_id} "
                 "(group missing or empty)")
-        group_id = int(info.get("groupId", -1))
+        group_id = int(resolved_group_id if resolved_group_id is not None else -1)
         tabs = info["tabs"]
         recovered: list[int] = []
         # tab_id → (sid, url, title, lastAccessed) for picking a representative.
@@ -704,8 +877,6 @@ class ExtensionUpstream:
             await self._relay.attach_tab(tab_id)
             sid = self.register_session(tab_id)
             url = str(tab.get("url", ""))
-            if session_id:
-                self._bind_group(session_id, group_id)
             recovered.append(tab_id)
             meta[tab_id] = {
                 "sid": sid,
@@ -716,6 +887,7 @@ class ExtensionUpstream:
         if not recovered:
             raise RuntimeError(
                 f"group id {group_id} had tabs but none had a usable tabId")
+        self._bind_group(session_id, group_id)
         # Representative tab: most-recently-accessed, else first.
         rep_id = max(recovered, key=lambda t: meta[t]["lastAccessed"])
         rep = meta[rep_id]
@@ -742,15 +914,15 @@ class ExtensionUpstream:
         the targetId fallback used after the original downstream opener has
         disconnected and its per-client binding was reaped.
         """
-        tab_id = self._sessions.pop(target, None)
+        tab_id = self._sessions.get(target)
         if tab_id is None:
             tab_id = _tab_id_from_session_id(target)
         if tab_id is None:
             tab_id = _tab_id_from_target_id(target)
         if tab_id is None:
             raise ValueError(f"unknown sessionId/targetId {target!r}")
-        self.evict_tab_sessions(tab_id)
         await self._relay.close_tab(tab_id)
+        self.evict_tab_sessions(tab_id)
         return {"ok": True, "tabId": tab_id}
 
     async def close_tab_by_target_id(self, target_id: str) -> dict:
@@ -762,10 +934,9 @@ class ExtensionUpstream:
         tab_id = _tab_id_from_target_id(target_id)
         if tab_id is None:
             raise ValueError(f"unknown targetId {target_id!r}")
-        # Drop any sessions that still reference this tab so the upstream
-        # doesn't hold stale entries.
-        self.evict_tab_sessions(tab_id)
         await self._relay.close_tab(tab_id)
+        # Drop sessions only after the relay confirmed Chrome closed the tab.
+        self.evict_tab_sessions(tab_id)
         return {"ok": True, "tabId": tab_id}
 
     async def send_command(self, method: str, params: dict | None = None,

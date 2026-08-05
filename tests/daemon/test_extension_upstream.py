@@ -538,6 +538,40 @@ async def test_close_tab_unknown_session_raises_value_error():
             await upstream.close_tab("not-a-real-session-id")
 
 
+@pytest.mark.asyncio
+async def test_relay_close_failure_propagates_and_preserves_ghost(monkeypatch):
+    async with _ext_upstream() as (relay, _upstream, _captured, ext):
+        await ext.announce_attached(tab_id=22, url="https://still-open/")
+        await asyncio.sleep(0.05)
+
+        async def fail_request(*args, **kwargs):
+            raise RuntimeError("chrome.tabs.remove failed")
+
+        monkeypatch.setattr(relay, "_request", fail_request)
+        with pytest.raises(RuntimeError, match="chrome.tabs.remove failed"):
+            await relay.close_tab(22)
+        assert any(g.tab_id == 22 for g in relay.list_ghost_targets())
+
+
+@pytest.mark.asyncio
+async def test_upstream_close_failure_preserves_session_binding():
+    class _FailingRelay:
+        port = 19989
+
+        async def close_tab(self, tab_id):
+            raise RuntimeError(f"close failed for {tab_id}")
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_FailingRelay(), _noop, _noop)
+    upstream.register_session(23, "ext-sid-23-known")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await upstream.close_tab("ext-sid-23-known")
+    assert upstream.resolve_tab_id("ext-sid-23-known") == 23
+
+
 # ---- tab-group = browser: groupId binding + close-whole-group -------------
 
 
@@ -610,6 +644,7 @@ async def test_open_background_restores_live_group_from_ledger_after_restart(
             calls.append(("query", group_id))
             return {
                 "groupId": 100,
+                "groupTitle": "Agent",
                 "tabs": [{"tabId": 10, "url": "https://old/", "title": "old"}],
             }
 
@@ -625,7 +660,11 @@ async def test_open_background_restores_live_group_from_ledger_after_restart(
         "browserwright.session_registry.get",
         lambda session_id: {
             "id": session_id,
-            "runtime": {"group_id": 100},
+            "name": "Agent",
+            "runtime": {
+                "group_id": 100,
+                "current_target_id": "ext-tab-10",
+            },
         },
     )
     async def _noop(_value):
@@ -728,6 +767,7 @@ async def test_other_group_sensitive_operations_restore_ledger_binding(
             calls.append(("query", group_id))
             return {
                 "groupId": 100,
+                "groupTitle": "Agent",
                 "tabs": [{"tabId": 10, "url": "https://old/", "title": "old"}],
             }
 
@@ -744,7 +784,14 @@ async def test_other_group_sensitive_operations_restore_ledger_binding(
 
     monkeypatch.setattr(
         "browserwright.session_registry.get",
-        lambda session_id: {"runtime": {"group_id": 100}},
+        lambda session_id: {
+            "id": session_id,
+            "name": "Agent",
+            "runtime": {
+                "group_id": 100,
+                "current_target_id": "ext-tab-10",
+            },
+        },
     )
 
     async def _noop(_value):
@@ -836,11 +883,227 @@ async def test_end_session_closes_whole_group():
         assert "A" not in upstream._groups
 
 
+@pytest.mark.asyncio
+async def test_cold_group_recovery_requires_title_and_known_tab(monkeypatch):
+    class _RecycledGroupRelay:
+        port = 19989
+
+        def reset_session_announce(self, _session_id):
+            return None
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "groupTitle": "Someone Else",
+                "tabs": [{"tabId": 10, "url": "https://other/", "title": "Other"}],
+            }
+
+        async def create_background_tab(self, *args, **kwargs):
+            raise AssertionError("ownership failure must not create a new group")
+
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda session_id: {
+            "id": session_id,
+            "name": "Agent",
+            "runtime": {
+                "group_id": 100,
+                "current_target_id": "ext-tab-10",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "browserwright.session_registry.list_all",
+        lambda: [],
+    )
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_RecycledGroupRelay(), _noop, _noop)
+    with pytest.raises(RuntimeError, match="ownership"):
+        await upstream.open_background_tab(
+            "https://new/", group_name="Agent", session_id="A")
+    assert upstream.group_for_session("A") is None
+
+
+@pytest.mark.asyncio
+async def test_matching_group_title_without_known_tab_is_not_ownership(monkeypatch):
+    class _SameTitleRelay:
+        port = 19989
+
+        def reset_session_announce(self, _session_id):
+            return None
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "groupTitle": "Agent",
+                "tabs": [{"tabId": 99, "url": "https://other/", "title": "Other"}],
+            }
+
+        async def create_background_tab(self, *args, **kwargs):
+            raise AssertionError("same title alone must not authorize reuse")
+
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda session_id: {
+            "id": session_id,
+            "name": "Agent",
+            "runtime": {
+                "group_id": 100,
+                "current_target_id": "ext-tab-10",
+            },
+        },
+    )
+    monkeypatch.setattr("browserwright.session_registry.list_all", lambda: [])
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_SameTitleRelay(), _noop, _noop)
+    with pytest.raises(RuntimeError, match="ownership"):
+        await upstream.open_background_tab(
+            "https://new/", group_name="Agent", session_id="A")
+
+
+@pytest.mark.asyncio
+async def test_reconnect_invalidates_live_group_fast_path(monkeypatch):
+    class _ReconnectedRelay:
+        port = 19989
+        connection_generation = 1
+
+        def reset_session_announce(self, _session_id):
+            return None
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "groupTitle": "Someone Else",
+                "tabs": [{"tabId": 99}],
+            }
+
+        async def create_background_tab(self, *args, **kwargs):
+            raise AssertionError("a recycled live binding must not be reused")
+
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 100, "current_target_id": "ext-tab-10"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+    monkeypatch.setattr("browserwright.session_registry.list_all", lambda: [])
+
+    async def _noop(_value):
+        return None
+
+    relay = _ReconnectedRelay()
+    upstream = ExtensionUpstream(relay, _noop, _noop)
+    upstream._bind_group("A", 100)
+    relay.connection_generation = 2
+
+    with pytest.raises(RuntimeError, match="ownership"):
+        await upstream.open_background_tab(
+            "https://new/", group_name="Agent", session_id="A")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_opens_share_one_group_across_adapters(monkeypatch):
+    calls: list[int | None] = []
+
+    class _ConcurrentRelay:
+        port = 19989
+
+        def reset_session_announce(self, _session_id):
+            return None
+
+        async def create_background_tab(self, url, *, group_name, group_id,
+                                        background,
+                                        skip_post_attach_commands):
+            calls.append(group_id)
+            await asyncio.sleep(0)
+            final_group = group_id if group_id is not None else 100 + len(calls)
+            tab_id = 40 + len(calls)
+            return SimpleNamespace(
+                tab_id=tab_id, target_id=f"ext-tab-{tab_id}", url=url,
+                title="new", group_id=final_group)
+
+    monkeypatch.setattr("browserwright.session_registry.get", lambda _sid: None)
+
+    async def _noop(_value):
+        return None
+
+    owner = ExtensionUpstream(_ConcurrentRelay(), _noop, _noop)
+    facade_adapter = ExtensionUpstream(
+        _ConcurrentRelay(), _noop, _noop, group_owner=owner)
+    first, second = await asyncio.gather(
+        owner.open_background_tab(
+            "https://one/", group_name="Agent", session_id="A"),
+        facade_adapter.open_background_tab(
+            "https://two/", group_name="Agent", session_id="A"),
+    )
+
+    assert calls == [None, first["groupId"]]
+    assert first["groupId"] == second["groupId"]
+
+
+@pytest.mark.asyncio
+async def test_end_session_reports_failed_tabs_and_retains_their_binding(
+    monkeypatch,
+):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _PartlyFailingRelay:
+        port = 19989
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "tabs": [{"tabId": 1}, {"tabId": 2}],
+            }
+
+        async def close_tab(self, tab_id):
+            if tab_id == 2:
+                raise RuntimeError("tab 2 refused to close")
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_PartlyFailingRelay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+    upstream.register_session(1, "ext-sid-1-known")
+    upstream.register_session(2, "ext-sid-2-known")
+
+    result = await upstream.end_session("A")
+
+    assert result["ok"] is False
+    assert result["closed"] == [1]
+    assert result["failed"] == [2]
+    assert upstream.group_for_session("A") == 300
+    assert upstream.session_for_tab(1) is None
+    assert upstream.resolve_tab_id("ext-sid-2-known") == 2
+    assert record["runtime"]["current_target_id"] == "ext-tab-2"
+
+
 # ---- session-reconnect-recovery ------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_recover_session_reattaches_tabs_and_rebuilds_state():
+async def test_recover_session_reattaches_tabs_and_rebuilds_state(monkeypatch):
     """recover_session queries the group, re-attaches each tab, rebuilds
     _sessions/_owned/_groups, and returns the representative target."""
     async with _ext_upstream() as (relay, upstream, captured, ext):
@@ -851,6 +1114,7 @@ async def test_recover_session_reattaches_tabs_and_rebuilds_state():
             assert q["groupId"] == 9  # recover by the persisted groupId, not the title
             await ext.respond(q["id"], result={
                 "groupId": 9,
+                "groupTitle": "Recovery",
                 "tabs": [
                     {"tabId": 50, "url": "https://a/", "title": "A",
                      "active": False, "lastAccessed": 100},
@@ -865,6 +1129,19 @@ async def test_recover_session_reattaches_tabs_and_rebuilds_state():
                 await ext.respond(a["id"], result={
                     "targetInfo": {"url": "", "title": ""}})
 
+        monkeypatch.setattr(
+            "browserwright.session_registry.get",
+            lambda session_id: {
+                "id": session_id,
+                "name": "Recovery",
+                "runtime": {
+                    "group_id": 9,
+                    "current_target_id": "ext-tab-50",
+                },
+            },
+        )
+        monkeypatch.setattr(
+            "browserwright.session_registry.list_all", lambda: [])
         r = asyncio.create_task(responder())
         result = await upstream.recover_session("bs-session-1", group_id=9)
         await r
@@ -895,32 +1172,52 @@ async def test_recover_session_empty_group_raises():
 
 
 @pytest.mark.asyncio
-async def test_end_session_resolves_group_by_passed_id_when_unbound():
+async def test_end_session_resolves_group_by_passed_id_when_unbound(monkeypatch):
     """end_session always resolves membership from the live group; when the
     session has no bound groupId in memory (e.g. after a daemon restart), the
     persisted numeric groupId passed in is the key used to find + close the tabs
     — never the title (names aren't unique)."""
-    async with _ext_upstream() as (relay, upstream, captured, ext):
-        async def responder():
-            q = await ext.next_command()
-            assert q["type"] == "queryGroup"
-            assert q["groupId"] == 3  # the passed persisted id, not a title
-            await ext.respond(q["id"], result={
+    calls: list[tuple[str, int]] = []
+
+    class _LedgerRelay:
+        port = 19989
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            calls.append(("query", group_id))
+            return {
                 "groupId": 3,
+                "groupTitle": "Agent",
                 "tabs": [
                     {"tabId": 60, "url": "https://x/", "title": "x",
                      "active": True, "lastAccessed": 1},
                 ],
-            })
-            c = await ext.next_command()
-            assert c["type"] == "closeTab"
-            assert c["tabId"] == 60
-            await ext.respond(c["id"], result={"ok": True, "tabId": 60})
+            }
 
-        r = asyncio.create_task(responder())
-        result = await upstream.end_session("never-tracked", group_id=3)
-        await r
-        assert result["closed"] == [60]
+        async def close_tab(self, tab_id):
+            calls.append(("close", tab_id))
+
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda session_id: {
+            "id": session_id,
+            "name": "Agent",
+            "runtime": {
+                "group_id": 3,
+                "current_target_id": "ext-tab-60",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "browserwright.session_registry.list_all", lambda: [])
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_LedgerRelay(), _noop, _noop)
+    result = await upstream.end_session("ledger-session", group_id=3)
+
+    assert calls == [("query", 3), ("close", 60)]
+    assert result["closed"] == [60]
 
 
 @pytest.mark.asyncio

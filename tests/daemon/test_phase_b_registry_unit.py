@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 
 import pytest
@@ -150,6 +151,50 @@ async def test_kill_and_wait_confirms_matching_process_death(monkeypatch):
     }
     assert current.is_alive() is False
     assert reg.get("sess-reap") is None
+
+
+@pytest.mark.asyncio
+async def test_kill_blocks_replacement_until_exact_instance_is_dead(monkeypatch):
+    reg = ExecutorRegistry()
+    old = _handle("sess-race", "/tmp/old.sock", executor_id="executor-old")
+    reg._handles["sess-race"] = old
+    reap_started = threading.Event()
+    allow_death = threading.Event()
+    spawned: list[str] = []
+
+    def blocked_reap(handle):
+        assert handle is old
+        reap_started.set()
+        assert allow_death.wait(timeout=2)
+        handle.proc.terminate()
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(
+            session_id, "/tmp/new.sock", executor_id="executor-new")
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        blocked_reap,
+    )
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    kill_task = asyncio.create_task(reg.kill("sess-race"))
+    assert await asyncio.to_thread(reap_started.wait, 1)
+    ensure_task = asyncio.create_task(reg.ensure("sess-race"))
+    await asyncio.sleep(0.02)
+    assert spawned == []
+    assert ensure_task.done() is False
+
+    allow_death.set()
+    assert await kill_task is True
+    assert await ensure_task == "/tmp/new.sock"
+    assert spawned == ["sess-race"]
+    assert reg.get("sess-race").executor_id == "executor-new"
 
 
 # ---- stale discovery-file robustness (Fork 4 / daemon restart) -------------
@@ -568,9 +613,13 @@ async def test_kill_executor_verb_reaps_and_acks():
 
     class _Daemon:
         class _Reg:
-            def kill(self, session_id):
+            async def kill_and_wait(self, session_id, *, executor_id=None):
                 killed.append(session_id)
-                return True
+                return {
+                    "killed": True,
+                    "reaped": True,
+                    "matched": True,
+                }
 
         executors = _Reg()
 

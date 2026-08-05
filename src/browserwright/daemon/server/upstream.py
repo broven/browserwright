@@ -58,6 +58,9 @@ class Upstream(Protocol):
 
     async def list_tabs(self, session_id: str | None = None) -> list[dict]: ...
 
+    async def get_targets(self, params: dict,
+                          session_id: str | None = None) -> dict: ...
+
     async def current_page(self, session_id: str | None = None) -> dict: ...
 
     async def attach_active(self, *, session_id: str | None = None,
@@ -296,6 +299,18 @@ class CdpUpstream:
             self._target_info[target_id] = tabs[-1]
         return tabs
 
+    async def get_targets(self, params: dict,
+                          session_id: str | None = None) -> dict:
+        """Return Chrome's native ``Target.getTargets`` response envelope.
+
+        Raw-CDP is a compatibility boundary: unlike the high-level
+        ``list_tabs`` helper, this path must preserve request filters, every
+        target type, and every response field exactly as Chrome returned it.
+        ``session_id`` is intentionally unused because rdp/env already scope
+        the workspace at the browser connection.
+        """
+        return await self.send_command("Target.getTargets", params)
+
     async def current_page(self, session_id: str | None = None) -> dict:
         if self._state is not None:
             for target_id, attacher in self._state.attachers.items():
@@ -384,7 +399,7 @@ class CdpUpstream:
         """End an rdp workspace; env/attach ownership remains external."""
         if self._on_end_session is not None:
             await self._on_end_session(session_id)
-        return {"ok": True, "closed": [], "kept": [],
+        return {"ok": True, "closed": [], "failed": [], "kept": [],
                 "backend": self.backend_name}
 
     async def recover(self, session_id: str | None = None, *,
