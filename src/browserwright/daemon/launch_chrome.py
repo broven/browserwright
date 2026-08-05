@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -28,6 +29,45 @@ from .platforms import cache_dir, discover_chrome_binary, profile_paths, runtime
 
 DEFAULT_PORT = 0  # let the OS pick when --port not given (spec §5.5 step 3)
 DEFAULT_TIMEOUT = 30.0
+
+#: Append arbitrary flags to every Chrome this module launches. Unset (the
+#: default) changes nothing.
+#:
+#: Why an *env* var when `extra_args=` already exists: the caller that spawns
+#: most of the Chromes is not a caller you can pass arguments to. For an rdp
+#: session the daemon owns the browser and calls `launch_chrome()` itself
+#: (`server/listener.py::_launch_rdp_chrome`), out of process from whoever
+#: started the daemon — so an in-process argument can't reach it, while an env
+#: var inherited by the daemon can. The E2E harness uses exactly that to run the
+#: rdp Chromes with `--headless=new` (see `tests/daemon/e2e/conftest.py`).
+#:
+#: Deliberately a generic "append this argv", not a `headless` boolean: the flag
+#: this needs today is `--headless=new`, but the mechanism is the same one you
+#: would want for `--window-position`, `--proxy-server`, `--lang`, or the next
+#: thing, and a boolean would have to be re-litigated each time.
+#:
+#: Value is parsed with `shlex.split`, so
+#: `BD_CHROME_EXTRA_ARGS='--headless=new --window-size=1280,800'` is two flags.
+#: It is appended BEFORE an explicit `extra_args=`, so a caller that passes the
+#: same flag still wins (Chrome takes the last occurrence).
+#:
+#: This does NOT weaken the §11 default-profile guard: `_check_not_default_profile`
+#: runs against `--user-data-dir`, which this can never set (it is appended after
+#: the framework's own flags, and Chrome ignores a second `--user-data-dir`).
+CHROME_EXTRA_ARGS_ENV = "BD_CHROME_EXTRA_ARGS"
+
+
+def _env_extra_args() -> list[str]:
+    """Parse `BD_CHROME_EXTRA_ARGS` into an argv list. Never raises: an
+    unbalanced quote falls back to whitespace splitting rather than taking a
+    browser launch down over a malformed env var."""
+    raw = os.environ.get(CHROME_EXTRA_ARGS_ENV, "").strip()
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError:
+        return raw.split()
 
 
 async def launch_chrome(
@@ -52,6 +92,10 @@ async def launch_chrome(
     `extra_args` (optional list) is appended to the Chrome argv verbatim, after
     the framework's own flags. Used by the E2E harness to inject
     `--load-extension=...`. Caller is responsible for shell-escaping.
+
+    The `BD_CHROME_EXTRA_ARGS` env var appends argv the same way for callers we
+    can't pass arguments to (notably the daemon launching an rdp session's own
+    Chrome) — see `CHROME_EXTRA_ARGS_ENV`.
     """
     check_name(profile)
 
@@ -111,6 +155,9 @@ async def launch_chrome(
         "--password-store=basic",
         "--use-mock-keychain",
     ]
+    # Env-level append first, explicit argument second — a caller that passes
+    # the same flag overrides the env (Chrome honours the last occurrence).
+    args.extend(_env_extra_args())
     if extra_args:
         args.extend(extra_args)
     proc = subprocess.Popen(

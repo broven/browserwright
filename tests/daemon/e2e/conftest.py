@@ -561,10 +561,89 @@ def ext_ready(e2e_daemon, e2e_chrome):
     )
 
 
+def rdp_headless() -> bool:
+    """Whether the rdp-backend Chromes run headless. Default **ON**.
+
+    Opposite default from `e2e_headless()` (the extension Chrome), and the
+    asymmetry is the point:
+
+    - The extension Chrome stays headful because tests in this suite assert
+      things only a real foreground window has (tab visibility, focus,
+      unthrottled rAF — `test_l2_background_render.py`).
+    - Nothing on the rdp side asserts any of that. The rdp tests cover executor
+      lifecycle, state persistence, page binding, tab reuse and timeout
+      reclamation, all of which are headless-clean. Their windows were pure
+      collateral damage: a full run popped ~18 rdp Chrome windows, each one
+      stealing the active window of whoever was working on the machine.
+
+    Escape hatch for debugging an rdp test visually: `BW_E2E_RDP_HEADFUL=1`.
+    """
+    return os.environ.get("BW_E2E_RDP_HEADFUL", "") != "1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _rdp_chrome_headless_env():
+    """Put `--headless=new` on every rdp Chrome launched during this session.
+
+    Two different launchers need it and only one is reachable from test code:
+
+    1. `e2e_chrome_rdp` calls `launch_chrome()` in-process (could take
+       `extra_args=`), and
+    2. the **daemon** calls `launch_chrome()` itself for every create-owned rdp
+       session (`server/listener.py::_launch_rdp_chrome`). That one runs in a
+       subprocess we only hand an environment to — no argument we pass here can
+       reach it.
+
+    So both go through the env hook (`launch_chrome.CHROME_EXTRA_ARGS_ENV`),
+    set on *this* process so every daemon spawned from `os.environ.copy()`
+    inherits it. Autouse + session-scoped so it is in place before any fixture
+    or in-test daemon spawn.
+
+    Deliberately does NOT touch the extension Chrome: that one is launched by
+    `_launch_cft_with_extension`, which never calls `launch_chrome()`.
+    """
+    key = _lc_mod.CHROME_EXTRA_ARGS_ENV
+    previous = os.environ.get(key)
+    if rdp_headless():
+        extra = "--headless=new"
+        os.environ[key] = f"{previous} {extra}" if previous else extra
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 @pytest.fixture
-def e2e_chrome_rdp(tmp_path_factory):
+def e2e_chrome_rdp(tmp_path_factory, _rdp_chrome_headless_env):
     """Chrome with --remote-debugging-port for RDP-backend tests.
     No extension — RDP backend doesn't need one. Uses regular Chrome.
+
+    Headless by default (`rdp_headless()`); `BW_E2E_RDP_HEADFUL=1` to watch it.
+
+    FUNCTION-scoped, and it must stay that way. It looks like an obvious
+    `scope="session"` win — it already serialises on the fixed `TEST_RDP_PORT`,
+    and 15 rdp tests each pay a Chrome launch for it. It was tried (2026-08,
+    headless, otherwise-identical tree) and it is NOT safe:
+
+        tests/daemon/e2e/test_l2_heredoc_playwright_page.py
+            ::test_cross_heredoc_tab_reuse_rdp
+        FAILED — PageBindTimeout: timed out binding Playwright to session
+        target '…' after 2s; no replacement page was created
+
+    …on the *first* run, in the *default* collection order — no shuffling
+    needed. That test passes on every function-scoped run. `CONTEXT.md` says why
+    this is structural rather than a bug to paper over: for an rdp session the
+    **workspace IS the browser instance**, so one shared Chrome means one shared
+    workspace, and a neighbour's leftover targets are visible to the session
+    that binds next. Function scope is the isolation the rdp tests are written
+    against.
+
+    The window-count problem it was going to solve is solved by
+    `_rdp_chrome_headless_env` instead: these Chromes cost 0 windows now, so
+    sharing them would buy nothing but flakiness.
     """
     cfg = _load_config(env={})
     profile_name = f"bd-e2e-rdp-{uuid.uuid4().hex[:8]}"
