@@ -1119,12 +1119,31 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
                     if isinstance(group_id, int) and group_id >= 0
                     else None
                 )
+                clean = {"ok": True, "backend": "extension", "closed": [],
+                         "failed": [], "kept": []}
+                if group_id is None:
+                    # Nothing was ever bound in Chrome, so there is nothing to
+                    # tear down and the record is already clean. Saying so is
+                    # what lets it be pruned at all — this path runs from the
+                    # idle watchdog, which fires when nobody has touched the
+                    # session, i.e. exactly when the lazily-opened adapter is
+                    # cold.
+                    return clean
                 holder = daemon.shared_context.holder
+                if holder.upstream is None:
+                    relay = holder.relay
+                    if relay is None or not relay.is_ready:
+                        # No extension is connected, so we cannot prove the
+                        # group is gone. Leave the record for a later sweep
+                        # rather than deleting state we cannot verify or
+                        # blocking the watchdog on a 60s cold open.
+                        raise RuntimeError(
+                            "extension not connected; deferring prune")
+                    await holder.ensure_open()
                 upstream = holder.upstream
-                if hasattr(upstream, "end_session"):
-                    return await upstream.end_session(  # type: ignore[attr-defined]
-                        sid, group_id)
-                raise RuntimeError("extension upstream has no end_session")
+                if upstream is None:
+                    raise RuntimeError("extension upstream unavailable")
+                return await upstream.end_session(sid, group_id)
             return {"ok": True, "backend": str(rec.get("backend") or "unknown"),
                     "closed": [], "failed": [], "kept": []}
 

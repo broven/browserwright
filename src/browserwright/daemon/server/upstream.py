@@ -285,6 +285,7 @@ class CdpUpstream:
         if not isinstance(upstream_sid, str):
             raise RuntimeError(f"Target.attachToTarget returned {attached!r}")
         self._target_sessions[target_id] = upstream_sid
+        await self._apply_userscripts_to_session(upstream_sid)
         state_meta = (
             self._state.targets.get(target_id)
             if self._state is not None else None
@@ -403,6 +404,7 @@ class CdpUpstream:
             if not isinstance(upstream_sid, str):
                 raise RuntimeError(f"Target.attachToTarget returned {attached!r}")
             self._target_sessions[target_id] = upstream_sid
+            await self._apply_userscripts_to_session(upstream_sid)
         self._current_target_id = target_id
         return {
             "sessionId": upstream_sid,
@@ -548,8 +550,30 @@ class CdpUpstream:
         entry["ids"] = remaining
         return failed
 
+    async def _apply_userscripts_to_session(self, upstream_sid: str) -> None:
+        """Install every stored, enabled script into a freshly attached page.
+
+        ``Page.addScriptToEvaluateOnNewDocument`` is per-session, so a script
+        installed before a tab existed would otherwise never run in it — the
+        caller was told the install succeeded, and it silently applied to
+        nothing. Best-effort: a failure here costs one page its scripts, never
+        the attach that triggered it.
+        """
+        for entry in list(self._userscripts.values()):
+            if not entry.get("enabled", True):
+                continue
+            if any(sid == upstream_sid for sid, _ in entry.get("ids", [])):
+                continue
+            try:
+                await self._register_userscript(entry, [upstream_sid],
+                                                replace_ids=False)
+            except Exception as e:  # noqa: BLE001 - never break the attach
+                logger.warning(
+                    "could not apply userscript %r to session %s: %r",
+                    entry.get("id"), upstream_sid, e)
+
     async def _register_userscript(
-        self, entry: dict, sessions: list[str],
+        self, entry: dict, sessions: list[str], *, replace_ids: bool = True,
     ) -> list[dict]:
         """Register one stored script in each live page session."""
         source = (entry.get("source") or entry.get("body")
@@ -572,10 +596,22 @@ class CdpUpstream:
                     "sessionId": sid,
                     "error": repr(e),
                 })
-        entry["ids"] = identifiers
+        # replace_ids=False is the incremental path (a new page attaching to an
+        # already-installed script): keep what is registered elsewhere instead
+        # of forgetting it.
+        entry["ids"] = identifiers if replace_ids else [
+            *entry.get("ids", []), *identifiers]
         return failed
 
     def _userscript_sync(self, failed: list[dict] | None = None) -> dict:
+        """Honest sync state: stored is not the same as active.
+
+        ``ok`` means nothing failed. It does NOT mean the script is running —
+        with no live page target there is nothing to register against, and
+        reporting a bare success there tells the caller the script is active
+        when it is not. ``pending`` marks exactly that case, so "stored, will
+        apply to the next tab" is distinguishable from "running now".
+        """
         failures = failed or []
         registered = sum(
             len(script.get("ids", []))
@@ -583,6 +619,8 @@ class CdpUpstream:
         return {
             "ok": not failures,
             "registered": registered,
+            "pending": bool(self._userscripts) and registered == 0
+            and not failures,
             "failed": failures,
         }
 
@@ -591,6 +629,14 @@ class CdpUpstream:
         """Raw-CDP userscript shim using new-document page scripts."""
         sessions = [sid for sid in kwargs.get("session_ids", [])
                     if isinstance(sid, str)]
+        if not sessions:
+            # The caller's bindings are not the source of truth here. A one-shot
+            # CLI websocket has no bindings at all, and passing its empty list
+            # through would register the script against nothing and still report
+            # success. For raw-CDP the workspace *is* the browser instance, so
+            # this adapter's own attached page targets are exactly the session's
+            # targets — ask ourselves rather than the transient client.
+            sessions = list(dict.fromkeys(self._target_sessions.values()))
         if verb == "install":
             script = payload.get("script") if isinstance(payload.get("script"), dict) else {}
             source = (script.get("source") or script.get("body")

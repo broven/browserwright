@@ -222,6 +222,15 @@ def end(record: dict) -> str:
     and ownership-aware workspace teardown all completed.
     """
     sid = record["id"]
+    # Terminal teardown needs the daemon, and after a crash, reboot or a
+    # foreground `serve` exiting there may not be one. Without this the RPC
+    # fails, the ledger entry is kept "for retry", and the retry takes this
+    # exact path and fails identically — a record that can never be cleared by
+    # any `session end`. For env that is worse than cosmetic: the stale record
+    # occupies the daemon's single env slot, so no new env session can be
+    # allocated either. `_ensure_daemon_running` pings first and a redundant
+    # spawn is a no-op, so this neither restarts a healthy daemon nor races one.
+    _ensure_daemon_running()
     if not _end_daemon_session(record):
         from .errors import DaemonUnavailable
 
