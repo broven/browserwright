@@ -21,6 +21,7 @@ import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import pytest
 import websockets
 
 from browserwright import session_registry as reg
@@ -817,3 +818,69 @@ async def test_main_frame_id_rewrite_round_trip_and_agent_path_isolation():
         await client.wait_for(lambda f: f.get("id") == 61 and "result" in f)
         assert captured and captured[0]["frameId"] == real_frame_id, (
             f"inbound command frameId not rewritten back; got {captured}")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="KNOWN BUG (unfixed): the session's first tab is never announced to "
+           "a session-bound facade bridge. See the docstring for the exact "
+           "ordering. This is a real, deterministic defect found while "
+           "diagnosing PageBindTimeout; it is NOT the whole cause of the "
+           "extension e2e PageBindTimeout failures (fixing it alone leaves "
+           "context.pages empty because Playwright's CRPage init still never "
+           "completes), so it is recorded here rather than papered over.",
+)
+async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
+    """Cold-bind regression: the session's FIRST tab must reach Playwright.
+
+    When the AGENT path opens the first tab of a session that has no tab group
+    yet, the extension emits ``attached`` BEFORE the createTab response, so the
+    relay fan-out reaches this bridge while the session→group binding (written
+    from that response) still does not exist. The visibility check then reports
+    "not in my group" and the announce is skipped -- permanently, because no
+    later event ever re-announces a tab. Playwright's ``context.pages`` stays
+    empty and ``bind_current_page`` raises ``PageBindTimeout`` no matter how
+    long it waits.
+    """
+    from browserwright.daemon.server.extension_upstream import ExtensionUpstream
+
+    sid = reg.allocate(backend="extension", owner="create", name="Cold")
+    # NOTE: deliberately NO runtime={"group_id": ...} -- this is a cold session.
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        # Playwright completes its discovery handshake FIRST: the executor
+        # cold-start connects the facade before it resolves the session target.
+        client.feed({"id": 1, "method": "Target.setDiscoverTargets",
+                     "params": {"discover": True}})
+        assert await client.wait_for(lambda f: f.get("id") == 1
+                                     and "result" in f)
+
+        # Now the AGENT path opens the session's first tab.
+        async def _noop(_):
+            return None
+
+        agent = ExtensionUpstream(relay, _noop, _noop)
+        opened = await agent.open_background_tab(
+            "about:blank", group_name="Cold", session_id=sid,
+            skip_post_attach_commands=True)
+        target_id = opened["targetId"]
+
+        # The authoritative target MUST be announced to Playwright.
+        await client.wait_for(
+            lambda f: f.get("method") == "Target.attachedToTarget"
+            and f["params"]["targetInfo"]["targetId"] == target_id,
+            timeout=3.0)
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
