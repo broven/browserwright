@@ -104,37 +104,28 @@ fi
 #    worktree's *running* e2e — whose Chrome still has a live pytest parent —
 #    is left alone. Orphans are exactly the leak this is meant to reap.
 #
-#    Two profile markers, because two different launchers leak:
-#      - `bd-e2e-chrome-`   the extension Chrome for Testing (tmpdir profile);
-#      - `/profiles/bs-s<id>` the Chrome the *daemon* launches for a
-#        create-owned rdp session. That one lands in the shared
-#        ~/.cache/browserwright-daemon/profiles/ tree, so ppid==1 is NOT enough
-#        to call it ours: the documented macOS launcher exits and leaves its
-#        Chrome grandchild reparented to init, so a sibling worktree's *live*
-#        rdp Chrome legitimately has ppid 1 too. Matching the shared tree by
-#        prefix alone would kill it — exactly what the guarantee above forbids.
-#        So we match only session ids this worktree's own e2e ledger recorded;
-#        with no ledger there is no proof of ownership and we skip the sweep
-#        (the daemon's startup orphan sweep reaps real leaks anyway).
-own_rdp=$(python3 - "$ROOT" <<'PYEOF' 2>/dev/null
-import glob, json, os, sys
-ids = set()
-for p in glob.glob(os.path.join(
-        sys.argv[1], "tests/daemon/e2e/_bs_home/*/sessions/ledger.json")):
-    try:
-        data = json.load(open(p))
-    except Exception:
-        continue
-    ids.update(str(k) for k in (data.get("sessions") or {}))
-print("|".join("/profiles/bs-s%s" % i for i in sorted(ids) if i))
-PYEOF
-)
-pattern="bd-e2e-chrome-"
-[ -n "${own_rdp:-}" ] && pattern="$pattern|$own_rdp"
+#    Only the extension Chrome for Testing (`bd-e2e-chrome-`, a tmpdir profile)
+#    is killed here. The daemon-launched rdp Chrome
+#    (`~/.cache/browserwright-daemon/profiles/bs-s<id>`) is deliberately NOT:
+#    that tree is shared across worktrees, isolated e2e ledgers routinely mint
+#    the same local session id, and after the documented macOS launcher handoff
+#    a sibling's *live* Chrome also has ppid 1 — so nothing observable on the
+#    process tells its browser apart from our leak. Killing the wrong one
+#    corrupts a run nobody is watching; leaving a leak costs disk. Report the
+#    candidates and let the daemon's own startup sweep, which is scoped to its
+#    runtime dir, reclaim them.
 orphans=$(ps -eo pid=,ppid=,command= 2>/dev/null \
   | grep -F -- "--user-data-dir=" \
-  | grep -E -- "$pattern" \
+  | grep -F -- "bd-e2e-chrome-" \
   | awk '$2 == 1 {print $1}')
+shared=$(ps -eo pid=,ppid=,command= 2>/dev/null \
+  | grep -F -- "--user-data-dir=" \
+  | grep -F -- "/profiles/bs-se2e-" \
+  | awk '$2 == 1 {print $1}')
+if [ -n "${shared:-}" ]; then
+  echo "teardown: NOT killing shared-profile rdp Chrome (cannot prove it is"
+  echo "  this worktree's): $(echo "$shared" | tr '\n' ' ')"
+fi
 if [ -n "${orphans:-}" ]; then
   echo "teardown: killing orphaned e2e Chrome: $(echo "$orphans" | tr '\n' ' ')"
   echo "$orphans" | xargs kill 2>/dev/null

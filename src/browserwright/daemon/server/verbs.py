@@ -8,6 +8,7 @@ belongs to ``CdpUpstream``, not to this dispatcher.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -523,11 +524,23 @@ class SessionVerbsMixin:
                     await asyncio.wait_for(
                         self._ensure_upstream(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    # ensure_open may have entered CONNECTING before it was
-                    # cancelled. No workspace mutation follows this result;
-                    # restore a retryable daemon phase when no adapter was
-                    # published.
-                    if self.upstream is None:
+                    # ensure_open may have been cancelled *after* publishing an
+                    # adapter — assigned and attached — but before
+                    # set_connected. Keying the reset on `upstream is None`
+                    # left exactly that case in CONNECTING permanently, where
+                    # _gate_upstream_ready neither forwards frames nor starts
+                    # another open, so client traffic piles up unanswered in
+                    # the pre-open buffer. Reset whenever the open did not
+                    # finish, and take the half-published adapter down with it.
+                    # No workspace mutation follows this result.
+                    if self.state.upstream_phase != UpstreamPhase.CONNECTED:
+                        partial = self.upstream
+                        self.upstream = None
+                        if partial is not None:
+                            with contextlib.suppress(Exception):
+                                partial.detach(self)
+                            with contextlib.suppress(Exception):
+                                await partial.close(reason="open_timeout")
                         await self.state.set_disconnected()
                     return _teardown_budget_result(self.state.backend_name)
             upstream = self.upstream

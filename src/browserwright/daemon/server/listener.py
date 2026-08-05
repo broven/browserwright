@@ -1047,6 +1047,15 @@ class _UpstreamHolder:
         await self.state.set_disconnected()
         if up is not None:
             up.detach(self.router)
+            # Detaching only unhooks it from the Router; the websocket, its
+            # reader task and the heartbeat keep running. For an attach-owned
+            # session _kill_rdp_chrome is deliberately a no-op, so nothing else
+            # ends them — and a retry would open a second adapter while frames
+            # from this abandoned one still arrive at the Router. Best-effort:
+            # this path exists because teardown already ran out of budget, so a
+            # failing close must not stop the context becoming retryable.
+            with contextlib.suppress(Exception):
+                await up.close(reason="teardown_aborted")
 
     async def _on_upstream_closed(self, reason: str) -> None:
         """Called by CdpUpstream's reader when upstream drops on its
