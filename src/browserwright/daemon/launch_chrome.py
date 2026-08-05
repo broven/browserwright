@@ -49,12 +49,18 @@ DEFAULT_TIMEOUT = 30.0
 #: Value is parsed with `shlex.split`, so
 #: `BD_CHROME_EXTRA_ARGS='--headless=new --window-size=1280,800'` is two flags.
 #: It is appended BEFORE an explicit `extra_args=`, so a caller that passes the
-#: same flag still wins (Chrome takes the last occurrence).
+#: same non-protected flag still wins (Chrome takes the last occurrence).
 #:
-#: This does NOT weaken the §11 default-profile guard: `_check_not_default_profile`
-#: runs against `--user-data-dir`, which this can never set (it is appended after
-#: the framework's own flags, and Chrome ignores a second `--user-data-dir`).
+#: Profile and remote-debugging switches are rejected at both append entrypoints;
+#: browserwright must remain the sole owner of that security boundary.
 CHROME_EXTRA_ARGS_ENV = "BD_CHROME_EXTRA_ARGS"
+
+_PROTECTED_CHROME_SWITCHES = frozenset({
+    "user-data-dir",
+    "remote-debugging-address",
+    "remote-debugging-port",
+    "remote-debugging-pipe",
+})
 
 
 def _env_extra_args() -> list[str]:
@@ -68,6 +74,27 @@ def _env_extra_args() -> list[str]:
         return shlex.split(raw)
     except ValueError:
         return raw.split()
+
+
+def _reject_protected_extra_args(args: list[str], *, source: str) -> None:
+    """Refuse appended switches that could replace our profile/CDP boundary."""
+    for arg in args:
+        # Chromium trims each argv token before deciding whether it is a switch.
+        arg = arg.strip()
+        if arg.startswith("--"):
+            switch = arg[2:].partition("=")[0]
+        elif arg.startswith("-"):
+            switch = arg[1:].partition("=")[0]
+        else:
+            continue
+        if switch in _PROTECTED_CHROME_SWITCHES:
+            displayed_switch = arg.partition("=")[0]
+            raise UserError(
+                f"{source} contains protected Chrome switch "
+                f"{displayed_switch!r}; "
+                "browserwright owns the user-data directory and remote-debugging "
+                "transport"
+            )
 
 
 async def launch_chrome(
@@ -89,15 +116,20 @@ async def launch_chrome(
     `allow_default_profile=True` (or env `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE=1`)
     is the expert escape hatch for the §11 guard — see `_check_not_default_profile`.
 
-    `extra_args` (optional list) is appended to the Chrome argv verbatim, after
-    the framework's own flags. Used by the E2E harness to inject
-    `--load-extension=...`. Caller is responsible for shell-escaping.
+    `extra_args` (optional list) is appended to the Chrome argv after the
+    framework's own flags. Used by the E2E harness to inject
+    `--load-extension=...`. Profile and remote-debugging switches are rejected.
 
     The `BD_CHROME_EXTRA_ARGS` env var appends argv the same way for callers we
     can't pass arguments to (notably the daemon launching an rdp session's own
     Chrome) — see `CHROME_EXTRA_ARGS_ENV`.
     """
     check_name(profile)
+    env_extra_args = _env_extra_args()
+    explicit_extra_args = list(extra_args or ())
+    _reject_protected_extra_args(
+        env_extra_args, source=CHROME_EXTRA_ARGS_ENV)
+    _reject_protected_extra_args(explicit_extra_args, source="extra_args")
 
     # 1) Chrome binary.
     binary = discover_chrome_binary(chrome_binary or cfg.chrome_binary)
@@ -157,9 +189,8 @@ async def launch_chrome(
     ]
     # Env-level append first, explicit argument second — a caller that passes
     # the same flag overrides the env (Chrome honours the last occurrence).
-    args.extend(_env_extra_args())
-    if extra_args:
-        args.extend(extra_args)
+    args.extend(env_extra_args)
+    args.extend(explicit_extra_args)
     proc = subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,

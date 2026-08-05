@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import time
 
 import pytest
@@ -224,8 +226,8 @@ async def test_executor_inflight_sidecar_is_surfaced_with_its_age(
     wedged worker cannot answer an RPC. `status` reads it back."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     _ipc.write_executor_inflight("bs-abc", {
-        "session": "bs-abc", "what": "code", "code_sha": "abc123def456",
-        "code_chars": 91, "timeout_ms": 30000,
+        "session": "bs-abc", "what": "code", "request_id": "abc123def456",
+        "timeout_ms": 30000,
         "started_wall": time.time() - 47.0, "connected": True,
     })
     state = fresh_state()
@@ -235,7 +237,7 @@ async def test_executor_inflight_sidecar_is_surfaced_with_its_age(
     reply = await ask_status(state, daemon=daemon)
     fl = reply["result"]["executors"][0]["inflight"]
     assert fl["what"] == "code"
-    assert fl["code_sha"] == "abc123def456"
+    assert fl["request_id"] == "abc123def456"
     assert fl["elapsed_s"] >= 46.0
 
     _ipc.write_executor_inflight("bs-abc", None)
@@ -244,8 +246,7 @@ async def test_executor_inflight_sidecar_is_surfaced_with_its_age(
 
 
 def test_the_inflight_sidecar_never_carries_code(tmp_path, monkeypatch):
-    """Heredocs routinely carry credentials and the runtime dir is shared. The
-    sidecar records a digest of the code, never the code."""
+    """Heredoc contents must not determine any published correlation token."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     from browserwright._executor.process import _Worker
     from browserwright._executor.protocol import ExecuteRequest
@@ -258,8 +259,9 @@ def test_the_inflight_sidecar_never_carries_code(tmp_path, monkeypatch):
         assert "hunter2" not in raw
         assert "super-secret" not in raw
         published = json.loads(raw)
-        assert published["code_chars"] == len(secret)
-        assert len(published["code_sha"]) == 12
+        assert len(published["request_id"]) == 32
+        assert "code_sha" not in published
+        assert "code_chars" not in published
         # The monotonic clock is meaningless across processes; only its
         # wall-clock twin is published.
         assert "started_at" not in published
@@ -274,6 +276,104 @@ def test_the_inflight_sidecar_never_carries_code(tmp_path, monkeypatch):
     assert worker.inflight_snapshot() is None
 
 
+def test_inflight_request_id_is_random_for_identical_code(tmp_path, monkeypatch):
+    """A local observer cannot validate code guesses against a stable digest."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    from browserwright._executor.process import _Worker
+    from browserwright._executor.protocol import ExecuteRequest
+
+    worker = _Worker("bs-secret", executor_id="e1")
+    request = ExecuteRequest(code="page.fill('#pw', 'candidate')")
+    worker._begin_inflight(request)
+    first = json.loads(_ipc.executor_inflight_path("bs-secret").read_text())
+    worker._end_inflight()
+    worker._begin_inflight(request)
+    try:
+        second = json.loads(_ipc.executor_inflight_path("bs-secret").read_text())
+        assert first["request_id"] != second["request_id"]
+    finally:
+        worker._end_inflight()
+
+
+def test_inflight_sidecar_is_private_even_with_permissive_umask(
+        tmp_path, monkeypatch):
+    """Executor observability artifacts stay under 0700 with a 0600 file."""
+    runtime = tmp_path / "shared-runtime"
+    runtime.mkdir(mode=0o777)
+    runtime.chmod(0o777)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    old_umask = os.umask(0o022)
+    try:
+        _ipc.write_executor_inflight("bs-private", {"what": "code"})
+    finally:
+        os.umask(old_umask)
+
+    path = _ipc.executor_inflight_path("bs-private")
+    assert path.parent != runtime
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_inflight_write_does_not_follow_predictable_tmp_symlink(
+        tmp_path, monkeypatch):
+    """A pre-planted legacy ``.tmp`` symlink cannot redirect a hot-path write."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    path = _ipc.executor_inflight_path("bs-link")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    victim = tmp_path / "victim"
+    victim.write_text("keep me")
+    legacy_tmp = path.with_name(path.name + ".tmp")
+    legacy_tmp.symlink_to(victim)
+
+    _ipc.write_executor_inflight("bs-link", {"what": "code"})
+
+    assert victim.read_text() == "keep me"
+    assert json.loads(path.read_text()) == {"what": "code"}
+
+
+def test_inflight_write_remains_best_effort(tmp_path, monkeypatch):
+    """An unusable runtime path costs observability, never execution."""
+    not_a_directory = tmp_path / "not-a-directory"
+    not_a_directory.write_text("occupied")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(not_a_directory))
+
+    _ipc.write_executor_inflight("bs-best-effort", {"what": "code"})
+    _ipc.write_executor_inflight("bs-best-effort", None)
+
+
+def test_inflight_write_refuses_a_symlinked_private_directory(
+        tmp_path, monkeypatch):
+    """A pre-planted per-user directory symlink is not a writable escape."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    private_dir = tmp_path / f"browserwright-{os.geteuid()}"
+    private_dir.symlink_to(redirected, target_is_directory=True)
+
+    _ipc.write_executor_inflight("bs-dir-link", {"what": "code"})
+
+    assert list(redirected.iterdir()) == []
+    assert not _ipc.executor_inflight_path("bs-dir-link").exists()
+
+
+def test_executor_cleanup_does_not_follow_private_directory_symlink(
+        tmp_path, monkeypatch):
+    """Cleanup cannot unlink a same-named file through an attacker redirect."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    private_dir = tmp_path / f"browserwright-{os.geteuid()}"
+    private_dir.symlink_to(redirected, target_is_directory=True)
+    sidecar_name = _ipc.executor_inflight_path("bs-cleanup-link").name
+    victim = redirected / sidecar_name
+    victim.write_text("keep me")
+
+    _ipc.cleanup_executor("bs-cleanup-link")
+
+    assert victim.read_text() == "keep me"
+
+
 def test_cleanup_executor_removes_the_inflight_sidecar(tmp_path, monkeypatch):
     """A sidecar outliving its executor would make `ps` report a call that ended
     when the process died."""
@@ -282,6 +382,21 @@ def test_cleanup_executor_removes_the_inflight_sidecar(tmp_path, monkeypatch):
     assert _ipc.executor_inflight_path("bs-gone").exists()
     _ipc.cleanup_executor("bs-gone")
     assert not _ipc.executor_inflight_path("bs-gone").exists()
+
+
+def test_orphan_cleanup_removes_private_inflight_sidecars(tmp_path, monkeypatch):
+    """Daemon startup sweeps stale sidecars from their new private directory."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    _ipc.write_executor_inflight("bs-orphan", {"what": "code"})
+    sidecar = _ipc.executor_inflight_path("bs-orphan")
+    assert sidecar.exists()
+
+    from browserwright.daemon.server.executor_registry import (
+        cleanup_orphan_executors,
+    )
+    cleanup_orphan_executors()
+
+    assert not sidecar.exists()
 
 
 def test_the_sidecar_is_not_mistaken_for_a_discovery_file(tmp_path, monkeypatch):
