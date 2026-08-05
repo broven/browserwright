@@ -197,6 +197,53 @@ async def test_kill_blocks_replacement_until_exact_instance_is_dead(monkeypatch)
     assert reg.get("sess-race").executor_id == "executor-new"
 
 
+@pytest.mark.asyncio
+async def test_terminal_teardown_blocks_and_then_rejects_ensure(monkeypatch):
+    reg = ExecutorRegistry()
+    teardown_started = asyncio.Event()
+    allow_teardown = asyncio.Event()
+    spawned: list[str] = []
+
+    async def teardown():
+        teardown_started.set()
+        await allow_teardown.wait()
+        return {"ok": True, "closed": [], "failed": []}
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(session_id, "/tmp/replacement.sock")
+
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._discovery_alive",
+        lambda _session_id: False,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    end_task = asyncio.create_task(reg.terminate_session("sess-end", teardown))
+    await asyncio.wait_for(teardown_started.wait(), timeout=1.0)
+    preflight_calls: list[str] = []
+
+    async def preflight():
+        preflight_calls.append("opened workspace")
+
+    ensure_task = asyncio.create_task(
+        reg.ensure_with_preflight("sess-end", preflight))
+    await asyncio.sleep(0.02)
+    assert spawned == []
+    assert ensure_task.done() is False
+
+    allow_teardown.set()
+    assert (await end_task)[1]["ok"] is True
+    with pytest.raises(RuntimeError, match="has ended"):
+        await ensure_task
+    assert spawned == []
+    assert preflight_calls == []
+
+
 # ---- stale discovery-file robustness (Fork 4 / daemon restart) -------------
 
 

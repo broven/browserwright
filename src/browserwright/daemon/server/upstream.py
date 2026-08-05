@@ -61,6 +61,10 @@ class Upstream(Protocol):
     async def get_targets(self, params: dict,
                           session_id: str | None = None) -> dict: ...
 
+    async def target_belongs_to_session(
+        self, session_id: str, target_id: str,
+    ) -> bool: ...
+
     async def current_page(self, session_id: str | None = None) -> dict: ...
 
     async def attach_active(self, *, session_id: str | None = None,
@@ -310,6 +314,12 @@ class CdpUpstream:
         the workspace at the browser connection.
         """
         return await self.send_command("Target.getTargets", params)
+
+    async def target_belongs_to_session(
+        self, session_id: str, target_id: str,
+    ) -> bool:
+        """Raw-CDP workspaces are already isolated by browser/context."""
+        return True
 
     async def current_page(self, session_id: str | None = None) -> dict:
         if self._state is not None:

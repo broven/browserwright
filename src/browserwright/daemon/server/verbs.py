@@ -453,15 +453,28 @@ class SessionVerbsMixin:
         ) is None:
             return
 
-        # Phase B (PR2): kill this session's persistent executor FIRST, symmetric
-        # for rdp + extension (each session has its own executor keyed on the
-        # daemon registry, even though extension sessions share one
-        # UpstreamContext). Idempotent — a no-op when no executor was spawned.
         daemon = self.daemon
         registry = getattr(daemon, "executors", None) if daemon is not None else None
-        if registry is not None:
+
+        group_id = params.get("groupId")
+        group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
+
+        async def teardown_workspace() -> dict:
+            # This readiness + teardown runs under ExecutorRegistry's lifecycle
+            # gate in production. A queued ensure therefore cannot reopen the
+            # workspace between executor reap and terminal teardown.
+            if (self.upstream is None and self._ensure_upstream is not None
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                await self._ensure_upstream()
+            upstream = self.upstream
+            if upstream is None:
+                raise RuntimeError("upstream not attached")
+            return await upstream.end_session(session, group_id)
+
+        terminate = getattr(registry, "terminate_session", None)
+        if callable(terminate):
             try:
-                reap = await registry.kill_current_and_wait(session)
+                reap, result = await terminate(session, teardown_workspace)
                 if reap.get("reaped") is not True:
                     await self._send_to_client(
                         client.client_id,
@@ -474,16 +487,33 @@ class SessionVerbsMixin:
             except Exception as e:  # noqa: BLE001 - executor kill is best-effort
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
-                    f"endSession executor reap failed: {e!r}"))
+                    f"endSession failed: {e!r}"))
                 return
-
-        group_id = params.get("groupId")
-        group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
-        result = await self._invoke_upstream(
-            client, req_id, "endSession failed",
-            lambda upstream: upstream.end_session(session, group_id))
-        if result is None:
-            return
+        else:
+            # Lightweight test doubles and old embedders retain the prior
+            # sequence; the real daemon registry always takes the atomic path.
+            if registry is not None:
+                try:
+                    reap = await registry.kill_current_and_wait(session)
+                    if reap.get("reaped") is not True:
+                        await self._send_to_client(
+                            client.client_id,
+                            _error_response(
+                                req_id, -32603,
+                                "endSession could not confirm executor death: "
+                                f"{reap!r}"),
+                        )
+                        return
+                except Exception as e:  # noqa: BLE001
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"endSession executor reap failed: {e!r}"))
+                    return
+            result = await self._invoke_upstream(
+                client, req_id, "endSession failed",
+                lambda upstream: upstream.end_session(session, group_id))
+            if result is None:
+                return
         await self._send_to_client(client.client_id, _result_response(req_id, result))
 
     async def _handle_ensure_executor(
@@ -508,18 +538,6 @@ class SessionVerbsMixin:
                 req_id, -32603,
                 "ensureExecutor unavailable: daemon has no executor registry"))
             return
-        # Backend-specific cold readiness belongs to the holder. In particular,
-        # the extension holder fast-fails within the CDP reply deadline when no
-        # service worker is connected; raw-CDP holders use a no-op preflight.
-        if (self._prepare_executor is not None
-                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-            try:
-                await self._prepare_executor(session)
-            except Exception as e:  # noqa: BLE001 - surface adapter diagnosis
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"ensureExecutor failed (upstream readiness): {e}"))
-                return
         # Failure #4 fix: ensure the session's UPSTREAM (rdp Chrome) is launched
         # + ready BEFORE we spawn the executor. The executor's cold-start
         # `connect_over_cdp(facade)` resolves the rdp Chrome's DYNAMIC port,
@@ -530,17 +548,28 @@ class SessionVerbsMixin:
         # and the executor exits during cold-start. Mirror the other verbs'
         # lazy-open (openBackgroundTab / closeTab). Best-effort + bounded: a
         # launch failure surfaces as a proper error envelope, never a crash.
-        if (self._ensure_upstream is not None
-                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-            try:
-                await self._ensure_upstream()
-            except Exception as e:  # noqa: BLE001
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"ensureExecutor failed (upstream open): {e!r}"))
-                return
+        async def preflight() -> None:
+            if (self._prepare_executor is not None
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                try:
+                    await self._prepare_executor(session)
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"upstream readiness: {e}") from e
+            if (self._ensure_upstream is not None
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"upstream open: {e!r}") from e
         try:
-            sock_path = await registry.ensure(session)
+            ensure_with_preflight = getattr(
+                registry, "ensure_with_preflight", None)
+            if callable(ensure_with_preflight):
+                sock_path = await ensure_with_preflight(session, preflight)
+            else:
+                await preflight()
+                sock_path = await registry.ensure(session)
         except Exception as e:  # noqa: BLE001
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"ensureExecutor failed: {e!r}"))
@@ -617,13 +646,30 @@ class SessionVerbsMixin:
                 req_id, -32602,
                 "BrowserwrightDaemon.closeTab requires params.sessionId or params.targetId"))
             return
-        if await self._require_browser_session(
+        browser_session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.closeTab", params,
-        ) is None:
+        )
+        if browser_session is None:
             return
         upstream = await self._ready_upstream(client, req_id, "closeTab failed")
         if upstream is None:
             return
+        if has_tid:
+            authorize = getattr(upstream, "target_belongs_to_session", None)
+            if callable(authorize):
+                try:
+                    allowed = await authorize(browser_session, target_id_param)
+                except Exception as e:  # noqa: BLE001 - unknown must fail closed
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"closeTab ownership check failed: {e!r}"))
+                    return
+                if not allowed:
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32602,
+                        f"target {target_id_param} does not belong to session "
+                        f"{browser_session!r}"))
+                    return
         # Resolve to (target_id, upstream_sid, owner_client_id, owner_local_sid).
         # sessionId path = per-client lookup; targetId path = state.attachers
         # global lookup, valid even across different ws clients.

@@ -415,6 +415,22 @@ class Router(SessionVerbsMixin):
                 req_id, -32602, "Target.attachToTarget requires params.targetId"))
             return
 
+        authorize = getattr(self.upstream, "target_belongs_to_session", None)
+        if callable(authorize) and client.session_id is not None:
+            try:
+                allowed = await authorize(client.session_id, target_id)
+            except Exception as e:  # noqa: BLE001 - fail closed on unknown scope
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"target ownership check failed: {e!r}"))
+                return
+            if not allowed:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32602,
+                    f"target {target_id} does not belong to session "
+                    f"{client.session_id!r}"))
+                return
+
         existing = self.state.attachers.get(target_id)
         if existing is None:
             # No prior owner — forward upstream + intercept response.

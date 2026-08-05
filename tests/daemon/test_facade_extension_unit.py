@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import AsyncIterator
 
 import pytest
@@ -352,6 +353,160 @@ async def test_session_bound_replay_only_announces_session_group(tmp_home):
             await asyncio.wait_for(run_task, timeout=2.0)
         await ext.close()
         await relay.stop()
+
+
+async def test_session_bound_browser_methods_reject_foreign_targets(tmp_home):
+    sid = reg.allocate(backend="extension", owner="create", name="Research")
+    reg.update(sid, runtime={
+        "group_id": 44,
+        "current_target_id": "ext-tab-10",
+    })
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    await ext.announce_attached(
+        tab_id=10, url="https://mine/", group_id=44,
+        group_title="Research")
+    await ext.announce_attached(
+        tab_id=11, url="https://secret/", group_id=55,
+        group_title="Other")
+    await asyncio.sleep(0.05)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        client.feed({"id": 1, "method": "Target.getTargets", "params": {
+            "filter": [{"type": "page", "exclude": False}],
+        }})
+        listed = await client.wait_for(lambda f: f.get("id") == 1)
+        assert {
+            info["targetId"] for info in listed["result"]["targetInfos"]
+        } == {"ext-tab-10"}
+
+        client.feed({"id": 2, "method": "Target.attachToTarget",
+                     "params": {"targetId": "ext-tab-11"}})
+        attached = await client.wait_for(lambda f: f.get("id") == 2)
+        assert attached["error"]["code"] == -32602
+
+        client.feed({"id": 3, "method": "Target.getTargetInfo",
+                     "params": {"targetId": "ext-tab-11"}})
+        info = await client.wait_for(lambda f: f.get("id") == 3)
+        assert info["error"]["code"] == -32602
+
+        client.feed({"id": 4, "method": "Target.closeTarget",
+                     "params": {"targetId": "ext-tab-11"}})
+        closed = await client.wait_for(lambda f: f.get("id") == 4)
+        assert closed["result"]["success"] is False
+        assert 11 in ext.tabs_meta
+
+        before = list(ext.commands_seen)
+        client.feed({
+            "id": 5,
+            "sessionId": "ext-sid-11-FORGED",
+            "method": "Runtime.evaluate",
+            "params": {"expression": "document.cookie"},
+        })
+        forged = await client.wait_for(lambda f: f.get("id") == 5)
+        assert forged["error"]["code"] == -32602
+        assert ext.commands_seen == before
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
+
+
+async def test_session_scope_is_enforced_without_transport():
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.closed: list[int] = []
+            self.commands: list[tuple[int, str]] = []
+
+        def list_ghost_targets(self):
+            return [
+                SimpleNamespace(
+                    target_id="ext-tab-10", type="page",
+                    url="https://mine/", title="Mine"),
+                SimpleNamespace(
+                    target_id="ext-tab-11", type="page",
+                    url="https://secret/", title="Secret"),
+            ]
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            members = {44: [10], 55: [11]}.get(group_id, [])
+            return {"groupId": group_id, "tabs": [
+                {"tabId": tab_id} for tab_id in members
+            ]}
+
+        async def close_tab(self, tab_id):
+            self.closed.append(tab_id)
+
+        async def attach_tab(self, tab_id, *, timeout=10.0):
+            return None
+
+        async def send_cdp(self, tab_id, method, params):
+            self.commands.append((tab_id, method))
+            return {}
+
+        def set_session_announce(self, _session_id):
+            return None
+
+        def reset_session_announce(self, _session_id):
+            return None
+
+    async def _noop(_value):
+        return None
+
+    relay = _Relay()
+    owner = ExtensionUpstream(relay, _noop, _noop)
+    owner._bind_group("session-A", 44)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(
+        client=client,
+        relay=relay,
+        session_id="session-A",
+        session_name="A",
+        binding_owner=owner,
+    )
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 1, "method": "Target.getTargets", "params": {},
+    }))
+    assert {
+        info["targetId"] for info in client.result_for(1)["targetInfos"]
+    } == {"ext-tab-10"}
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 2, "method": "Target.attachToTarget",
+        "params": {"targetId": "ext-tab-11"},
+    }))
+    assert next(f for f in client.sent if f.get("id") == 2)["error"]["code"] == -32602
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 3, "method": "Target.getTargetInfo",
+        "params": {"targetId": "ext-tab-11"},
+    }))
+    assert next(f for f in client.sent if f.get("id") == 3)["error"]["code"] == -32602
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 4, "method": "Target.closeTarget",
+        "params": {"targetId": "ext-tab-11"},
+    }))
+    assert client.result_for(4)["success"] is False
+    assert relay.closed == []
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 5, "sessionId": "ext-sid-11-FORGED",
+        "method": "Runtime.evaluate", "params": {"expression": "secret"},
+    }))
+    assert next(f for f in client.sent if f.get("id") == 5)["error"]["code"] == -32602
+    assert relay.commands == []
 
 
 # ---- A3: createTarget maps to a background tab -----------------------------

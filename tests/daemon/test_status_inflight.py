@@ -399,6 +399,24 @@ def test_orphan_cleanup_removes_private_inflight_sidecars(tmp_path, monkeypatch)
     assert not sidecar.exists()
 
 
+def test_orphan_cleanup_keeps_fixed_paths_until_process_death_confirmed(
+        tmp_path, monkeypatch):
+    from browserwright.daemon.server import executor_registry as er
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    _ipc.write_executor_file(
+        "bs-live-orphan", str(_ipc.executor_sock_path("bs-live-orphan")), 4242)
+    discovery = _ipc.executor_file_path("bs-live-orphan")
+    socket_path = _ipc.executor_sock_path("bs-live-orphan")
+    socket_path.write_text("old socket placeholder")
+    monkeypatch.setattr(er, "_terminate_orphan_and_wait", lambda _pid: False)
+
+    er.cleanup_orphan_executors()
+
+    assert discovery.exists()
+    assert socket_path.exists()
+
+
 def test_the_sidecar_is_not_mistaken_for_a_discovery_file(tmp_path, monkeypatch):
     """`cleanup_orphan_executors` globs `bw-exec-*.json` and SIGTERMs whatever
     `pid` it finds inside. The sidecar must not match that glob."""

@@ -161,6 +161,104 @@ vm.runInContext(`
     return json.loads(proc.stdout)
 
 
+def _run_marker_late_completion_probe(
+    payload: dict[str, str], late_stage: str,
+) -> dict[str, object]:
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const calls = [];
+let releaseLate;
+const lateGate = new Promise((resolve) => { releaseLate = resolve; });
+let commandQueue = Promise.resolve();
+let pageMarked = false;
+
+function stageFor(method, params) {
+  if (method !== "Runtime.evaluate") return method;
+  return params.expression === input.installScript
+    ? "installEvaluate" : "removeEvaluate";
+}
+
+const chrome = {
+  debugger: {
+    sendCommand(target, method, params) {
+      const stage = stageFor(method, params);
+      calls.push({ kind: "command", stage, method });
+      const run = async () => {
+        if (stage === input.lateStage) await lateGate;
+        if (stage === "installEvaluate") pageMarked = true;
+        if (stage === "removeEvaluate") pageMarked = false;
+        if (method === "Page.addScriptToEvaluateOnNewDocument") {
+          return { identifier: "marker-script" };
+        }
+        return {};
+      };
+      const result = commandQueue.then(run);
+      commandQueue = result.catch(() => {});
+      return result;
+    },
+    async detach(target) {
+      calls.push({ kind: "detach", tabId: target.tabId });
+    },
+  },
+};
+const realm = vm.createContext({
+  chrome,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  setTimeout,
+  clearTimeout,
+  console: { info() {}, warn() {}, error: console.error },
+});
+const markerRegion = input.workerMarkerRegion
+  .replace("const MARKER_INSTALL_TIMEOUT_MS = 1500;",
+           "const MARKER_INSTALL_TIMEOUT_MS = 100;")
+  .replace("const MARKER_REMOVE_TIMEOUT_MS = 1000;",
+           "const MARKER_REMOVE_TIMEOUT_MS = 10;");
+vm.runInContext(`
+  const TITLE_PREFIX = "\\u{1F440} ";
+  const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
+  const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+  const attachedTabs = new Set([17]);
+  function safeSend() {}
+  ${markerRegion}
+  ${input.detachTab}
+`, realm);
+
+(async () => {
+  const marking = vm.runInContext("markTabAttached(17)", realm);
+  while (!calls.some((call) => call.stage === input.lateStage)) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const detached = await vm.runInContext("detachTab(17)", realm);
+  const detachIndex = calls.findIndex((call) => call.kind === "detach");
+  releaseLate();
+  await Promise.allSettled([marking, commandQueue]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await commandQueue;
+  process.stdout.write(JSON.stringify({
+    calls,
+    detachIndex,
+    pageMarked,
+    marked: vm.runInContext("markedTabs.has(17)", realm),
+    marking: vm.runInContext("markingTabs.has(17)", realm),
+  }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", probe],
+        input=json.dumps({**payload, "lateStage": late_stage}),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+        cwd=ROOT,
+    )
+    return json.loads(proc.stdout)
+
+
 def _run_failed_close_marker_probe(payload: dict[str, str]) -> dict[str, object]:
     probe = r"""
 const vm = require("node:vm");
@@ -878,16 +976,18 @@ def test_marker_cleanup_is_ordered_and_reload_remains_best_effort() -> None:
         **sources,
         "markInFlight": True,
     })
+    # Cleanup now invalidates the in-flight generation immediately. Waiting
+    # for the full install before sending removal was the bug: the removal
+    # deadline could expire, reload/detach would proceed, and the old install
+    # continuation could then restore the marker. Page.enable may finish, but
+    # no addScript/install-evaluate is allowed after invalidation; current-page
+    # removal is queued immediately.
     assert [call.get("method") or call["kind"] for call in mark_in_flight] == [
         "Page.enable",
-        "Page.addScriptToEvaluateOnNewDocument",
-        "Runtime.evaluate",
-        "Page.removeScriptToEvaluateOnNewDocument",
         "Runtime.evaluate",
         "reload",
     ]
-    assert mark_in_flight[2]["params"]["expression"] == sources["installScript"]
-    assert mark_in_flight[4]["params"]["expression"] == sources["removeScript"]
+    assert mark_in_flight[1]["params"]["expression"] == sources["removeScript"]
 
 
 def test_marker_commands_cannot_block_debugger_detach() -> None:
@@ -904,6 +1004,28 @@ def test_marker_commands_cannot_block_debugger_detach() -> None:
         assert result["completed"] is True, stage
         assert result["attached"] is False, stage
         assert result["calls"][-1] == {"kind": "detach", "tabId": 17}, stage
+
+
+def test_late_marker_install_cannot_resume_after_debugger_detach() -> None:
+    sources = _service_worker_marker_sources()
+    for stage in (
+        "Page.enable",
+        "Page.addScriptToEvaluateOnNewDocument",
+        "installEvaluate",
+    ):
+        result = _run_marker_late_completion_probe(sources, stage)
+        calls = result["calls"]
+        detach_index = result["detachIndex"]
+        assert detach_index >= 0, stage
+        assert not any(
+            call.get("stage") in {
+                "Page.addScriptToEvaluateOnNewDocument", "installEvaluate"
+            }
+            for call in calls[detach_index + 1:]
+        ), stage
+        assert result["pageMarked"] is False, stage
+        assert result["marked"] is False, stage
+        assert result["marking"] is False, stage
 
 
 def test_failed_tab_close_preserves_marker_and_attachment_state() -> None:
