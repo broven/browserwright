@@ -731,18 +731,35 @@ class SessionVerbsMixin:
         # `if callable(getattr(...))` fails OPEN — an adapter missing the
         # method skips the check silently. Every adapter declares it.
         try:
-            allowed = await upstream.target_belongs_to_session(
+            ownership = await upstream.target_belongs_to_session(
                 browser_session, target_id)
         except Exception as e:  # noqa: BLE001 - unknown must fail closed
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603,
                 f"closeTab ownership check failed: {e!r}"))
             return
-        if not allowed:
+        if ownership is None:
+            if not self._raw_cdp_backend:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    "closeTab target ownership is unavailable for the shared "
+                    "extension workspace"))
+                return
+            # Raw-CDP authorization is the browser-instance routing boundary.
+            # The operation below can still fail if a forwarding-only adapter
+            # does not implement close_session_tab; that is a capability error,
+            # not an ownership denial.
+        elif ownership is False:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
                 f"target {target_id} does not belong to session "
                 f"{browser_session!r}"))
+            return
+        elif ownership is not True:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"closeTab ownership check returned invalid value "
+                f"{ownership!r}"))
             return
         try:
             # Every adapter declares close_session_tab, so this is one call and

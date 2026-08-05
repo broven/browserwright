@@ -660,7 +660,7 @@ class ExtensionFacadeBridge:
         if self._session_id is None:
             return True
         try:
-            allowed = await self._binding_owner.target_belongs_to_session(
+            ownership = await self._binding_owner.target_belongs_to_session(
                 self._session_id, target_id)
         except Exception as e:  # noqa: BLE001 - unknown ownership fails closed
             if close_response:
@@ -669,8 +669,26 @@ class ExtensionFacadeBridge:
                 await self._error(
                     req_id, -32603, f"target ownership check failed: {e!r}")
             return False
-        if allowed:
+        if ownership is True:
             return True
+        if ownership is None:
+            if close_response:
+                await self._respond(req_id, {"success": False})
+            else:
+                await self._error(
+                    req_id, -32603,
+                    "target ownership is unavailable for the shared extension "
+                    "workspace")
+            return False
+        if ownership is not False:
+            if close_response:
+                await self._respond(req_id, {"success": False})
+            else:
+                await self._error(
+                    req_id, -32603,
+                    f"target ownership check returned invalid value "
+                    f"{ownership!r}")
+            return False
         if close_response:
             await self._respond(req_id, {"success": False})
         else:

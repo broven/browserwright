@@ -42,7 +42,7 @@ from .verbs import (  # noqa: F401 - re-exports are part of proxy's surface
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from .upstream import Upstream
+    from .upstream import TargetOwnership, Upstream
 
 
 class _SendOnlyUpstream:
@@ -89,10 +89,11 @@ class _SendOnlyUpstream:
 
     async def target_belongs_to_session(
         self, session_id: str, target_id: str,
-    ) -> bool:
-        # This adapter has a wire sender but no session binding owner. Unknown
-        # ownership is a denial, never permission to forward an attach/close.
-        return False
+    ) -> "TargetOwnership":
+        # A wire sender is not a session-binding authority. Raw-CDP callers may
+        # rely on their browser-instance workspace boundary; shared extension
+        # callers must fail closed when this answer is unavailable.
+        return None
 
     async def end_session_before(
         self, session_id: str, group_id: int | None = None, *, deadline: float,
@@ -180,6 +181,11 @@ class Router(SessionVerbsMixin):
                 self.upstream = None
             return
         _SendOnlyUpstream(fn).attach(self)
+
+    @property
+    def _raw_cdp_backend(self) -> bool:
+        """Whether the browser connection itself is the workspace boundary."""
+        return self.state.backend_name != "extension"
 
     async def release_client(self, client_id: int) -> ClientState | None:
         """Release a downstream client and close its primary upstream sessions.
@@ -437,21 +443,42 @@ class Router(SessionVerbsMixin):
         if client.session_id is not None:
             try:
                 # Ownership is part of the declared Upstream contract. A
-                # capability-limited adapter must deny explicitly; probing for
-                # the member here would turn an incomplete adapter into a
-                # silent authorization bypass.
-                allowed = await self.upstream.target_belongs_to_session(
+                # capability-limited adapter must report ``None`` explicitly;
+                # probing for the member here would turn an incomplete adapter
+                # into a silent authorization bypass.
+                ownership = await self.upstream.target_belongs_to_session(
                     client.session_id, target_id)
             except Exception as e:  # noqa: BLE001 - fail closed on unknown scope
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
                     f"target ownership check failed: {e!r}"))
                 return
-            if not allowed:
+            if ownership is None:
+                if not self._raw_cdp_backend:
+                    await self._send_to_client(
+                        client.client_id,
+                        _error_response(
+                            req_id, -32603,
+                            "target ownership is unavailable for the shared "
+                            "extension workspace",
+                        ),
+                    )
+                    return
+                # The compatibility adapter cannot inspect membership. For a
+                # raw-CDP workspace, authorization already happened when the
+                # session was routed to its browser instance (and env admits
+                # only one session per daemon), so attach may proceed here.
+            elif ownership is False:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32602,
                     f"target {target_id} does not belong to session "
                     f"{client.session_id!r}"))
+                return
+            elif ownership is not True:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"target ownership check returned invalid value "
+                    f"{ownership!r}"))
                 return
 
         existing = self.state.attachers.get(target_id)

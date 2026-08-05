@@ -30,6 +30,12 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
+# Target-membership answers are deliberately three-valued. ``True`` and
+# ``False`` are authoritative answers; ``None`` means this adapter does not
+# own the session binding and therefore cannot answer. Callers must handle
+# ``None`` explicitly rather than treating it as either permission or denial.
+TargetOwnership = bool | None
+
 if TYPE_CHECKING:
     from .proxy import Router
 
@@ -73,7 +79,7 @@ class Upstream(Protocol):
 
     async def target_belongs_to_session(
         self, session_id: str, target_id: str,
-    ) -> bool: ...
+    ) -> TargetOwnership: ...
 
     async def current_page(self, session_id: str | None = None) -> dict: ...
 
@@ -327,15 +333,22 @@ class CdpUpstream:
         Raw-CDP is a compatibility boundary: unlike the high-level
         ``list_tabs`` helper, this path must preserve request filters, every
         target type, and every response field exactly as Chrome returned it.
-        ``session_id`` is intentionally unused because rdp/env already scope
-        the workspace at the browser connection.
+        ``session_id`` is intentionally unused. RDP scopes each session at its
+        per-session browser connection. Env uses the daemon's shared browser
+        connection, but session creation admits only one env session per
+        daemon, so that connection is still the sole env session's workspace.
         """
         return await self.send_command("Target.getTargets", params)
 
     async def target_belongs_to_session(
         self, session_id: str, target_id: str,
     ) -> bool:
-        """Raw-CDP workspaces are already isolated by browser/context."""
+        """Authorize at the raw-CDP browser-instance boundary.
+
+        RDP has a per-session connection. Env relies on the atomic
+        one-env-session-per-daemon creation invariant before using its shared
+        connection as the same boundary.
+        """
         return True
 
     async def current_page(self, session_id: str | None = None) -> dict:

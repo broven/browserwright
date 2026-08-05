@@ -63,19 +63,8 @@ def setup_router(*labels: str, backend: str = "rdp",
     return state, router, cap, clients
 
 
-def allow_target_ownership(router: Router) -> None:
-    """Give forwarding-only routing tests explicit ownership evidence."""
-    assert router.upstream is not None
-
-    async def belongs(_session_id: str, _target_id: str) -> bool:
-        return True
-
-    router.upstream.target_belongs_to_session = belongs
-
-
 async def attach_primary(router: Router, cap: Capture, client, target_id: str = "T",
                          upstream_sid: str = "U"):
-    allow_target_ownership(router)
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "Target.attachToTarget",
@@ -148,7 +137,7 @@ async def test_target_attach_and_close_are_authorized_by_browser_session():
 
 
 @pytest.mark.asyncio
-async def test_send_only_adapter_fails_closed_before_target_attach_forwarding():
+async def test_send_only_adapter_without_extension_authority_fails_closed():
     _state, router, cap, (client,) = setup_router(
         backend="extension", wire_upstream=True)
     client.session_id = "session-A"
@@ -160,9 +149,26 @@ async def test_send_only_adapter_fails_closed_before_target_attach_forwarding():
         "params": {"targetId": "ext-tab-1"},
     }))
 
-    assert last_error(cap, client)["code"] == -32602
-    assert "does not belong to session" in last_error(cap, client)["message"]
+    assert last_error(cap, client)["code"] == -32603
+    assert "ownership is unavailable" in last_error(cap, client)["message"]
     assert cap.upstream == []
+
+
+@pytest.mark.asyncio
+async def test_send_only_adapter_forwards_rdp_attach_at_browser_boundary():
+    _state, router, cap, (client,) = setup_router(
+        backend="rdp", wire_upstream=True)
+
+    await router.route_from_client(client, json.dumps({
+        "id": 32,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "rdp-tab-1"},
+    }))
+
+    assert [frame["method"] for frame in cap.upstream] == [
+        "Target.attachToTarget",
+    ]
+    assert cap.upstream[0]["params"]["targetId"] == "rdp-tab-1"
 
 
 @pytest.mark.asyncio
@@ -470,7 +476,6 @@ async def test_get_targets_delegates_to_adapter_regardless_of_backend_name():
 @pytest.mark.asyncio
 async def test_attach_response_race_variants_and_validation():
     state, router, cap, (alice, bob, carol) = setup_router("alice", "bob", "carol")
-    allow_target_ownership(router)
 
     await router.route_from_client(alice, json.dumps({
         "id": 10, "method": "Target.attachToTarget", "params": {},
@@ -564,7 +569,6 @@ async def test_detach_paths_and_session_scoped_event_unbinds():
 @pytest.mark.asyncio
 async def test_upstream_event_table_orphan_and_pending_auto_attach_edges():
     state, router, cap, (client,) = setup_router()
-    allow_target_ownership(router)
     await router.route_from_client(client, json.dumps({
         "id": 20,
         "method": "Target.attachToTarget",
