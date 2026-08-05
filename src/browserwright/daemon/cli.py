@@ -142,6 +142,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
     p_status.add_argument("--json", action="store_true")
 
+    # ps — in-flight introspection. Sibling of `status`, NOT a flag on it:
+    # `status` answers "is a daemon there" (liveness, used by the skill layer as
+    # a health ping) and must stay cheap and stable. `ps` answers "what is it
+    # doing right now", which is a different question with a different failure
+    # mode — you run it precisely when `status` already said "alive".
+    p_ps = sub.add_parser(
+        "ps",
+        help="list what the running daemon is waiting on (clients, in-flight "
+             "requests, executors)")
+    p_ps.add_argument("--json", action="store_true",
+                      help="emit the raw status payload instead of tables")
+    p_ps.add_argument("--timeout", type=float, default=5.0,
+                      help="seconds to wait for the daemon to answer")
+
     # logs (v0.2)
     p_logs = sub.add_parser("logs", help="print the daemon log file path or tail it")
     p_logs.add_argument("--follow", "-f", action="store_true", help="tail -f the log")
@@ -512,6 +526,26 @@ def _cmd_status(args, cfg: Config, *, probe=None) -> int:
     else:
         print("daemon not running")
     return 0 if st.alive else 2
+
+
+def _cmd_ps(args, cfg: Config) -> int:
+    """Print what the daemon is currently waiting on.
+
+    Three tables side by side — router hop, relay hop, executor hop — because
+    each hop keeps its own request ids in its own id space. Correlating them is
+    left to the reader's eyes (method name + elapsed), which is enough for a
+    local daemon where concurrent in-flight requests are a single-digit number,
+    and avoids threading a synthetic request id through five id spaces and the
+    executor wire format to get it.
+    """
+    def _emit(payload: dict) -> None:
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            _pretty_ps(payload)
+
+    return _rpc_cmd(cfg, "BrowserwrightDaemon.status", {},
+                    client_label="cli-ps", timeout=args.timeout, emit=_emit)
 
 
 def _cmd_attach_active(args, cfg: Config) -> int:
@@ -987,6 +1021,7 @@ _DISPATCH = {
     "stop": _cmd_stop,
     "restart": _cmd_restart,
     "status": _cmd_status,
+    "ps": _cmd_ps,
     "logs": _cmd_logs,
     # v0.5
     "backend-info": _cmd_backend_info,
@@ -1003,6 +1038,85 @@ _DISPATCH = {
 
 
 # ---- pretty print ----------------------------------------------------------
+
+
+def _secs(v) -> str:
+    """Render a duration. `-` when the source had no timestamp to offer — an
+    absent clock must not be printed as `0.0s`, which is a different claim."""
+    if not isinstance(v, (int, float)):
+        return "-"
+    if v < 60:
+        return f"{v:.1f}s"
+    if v < 3600:
+        return f"{int(v // 60)}m{int(v % 60):02d}s"
+    return f"{int(v // 3600)}h{int((v % 3600) // 60):02d}m"
+
+
+def _pretty_ps(p: dict) -> None:
+    d = p.get("daemon") or {}
+    print(f"daemon pid {d.get('pid')} version {d.get('version')} "
+          f"schema {p.get('schema_version')}")
+
+    empty = True
+    for ctx in p.get("contexts") or []:
+        label = ctx.get("session_id") or "(shared)"
+        print(f"\ncontext {label}  backend={ctx.get('backend')} "
+              f"upstream={ctx.get('upstream_phase')} "
+              f"idle={_secs(ctx.get('idle_s'))} "
+              f"targets={ctx.get('targets')} attachers={ctx.get('attachers')}")
+        clients = ctx.get("clients") or []
+        if clients:
+            print(f"  {'CLIENT':<8} {'LABEL':<22} {'SESSION':<20} "
+                  f"{'SESS':<5} {'BUF':<4} {'CONNECTED':<10} {'LAST CMD':<10}")
+            for c in clients:
+                print(f"  {str(c.get('client_id')):<8} "
+                      f"{str(c.get('label') or '')[:22]:<22} "
+                      f"{str(c.get('session_id') or '-')[:20]:<20} "
+                      f"{c.get('sessions', 0):<5} "
+                      f"{c.get('pre_open_buffered', 0):<4} "
+                      f"{_secs(c.get('connected_age_s')):<10} "
+                      f"{_secs(c.get('last_command_age_s')):<10}")
+        for r in ctx.get("pending_requests") or []:
+            empty = False
+            print(f"  IN-FLIGHT  hop=router  method={r.get('method')}  "
+                  f"elapsed={_secs(r.get('elapsed_s'))}  "
+                  f"client={r.get('client_id')}  upstream_id={r.get('upstream_id')}")
+
+    relay = p.get("relay") or {}
+    if relay.get("running"):
+        exts = relay.get("extensions") or []
+        print(f"\nrelay  extensions={len(exts)}")
+        for e in exts:
+            print(f"  {e.get('install_id') or '?'}  "
+                  f"version={e.get('browserwright_version') or '?'}  "
+                  f"pending={e.get('pending', 0)}  "
+                  f"oldest={_secs(e.get('oldest_pending_s'))}")
+        for r in relay.get("inflight") or []:
+            empty = False
+            name = r.get("method") or r.get("kind")
+            print(f"  IN-FLIGHT  hop=relay  method={name}  "
+                  f"elapsed={_secs(r.get('elapsed_s'))}  "
+                  f"tab={r.get('tab_id')}  id={r.get('id')}")
+
+    executors = p.get("executors") or []
+    print(f"\nexecutors  {len(executors)}")
+    if executors:
+        print(f"  {'SESSION':<22} {'PID':<8} {'ALIVE':<6} {'AGE':<10} {'IDLE':<10}")
+    for e in executors:
+        print(f"  {str(e.get('session_id'))[:22]:<22} "
+              f"{str(e.get('pid')):<8} "
+              f"{('yes' if e.get('alive') else 'no'):<6} "
+              f"{_secs(e.get('age_s')):<10} {_secs(e.get('idle_s')):<10}")
+        fl = e.get("inflight")
+        if fl:
+            empty = False
+            print(f"    IN-FLIGHT  hop=executor  what={fl.get('what')}  "
+                  f"elapsed={_secs(fl.get('elapsed_s'))}  "
+                  f"code={fl.get('code_sha')}  "
+                  f"budget={fl.get('timeout_ms')}ms")
+
+    if empty:
+        print("\nnothing in flight")
 
 
 def _pretty_doctor(out: dict) -> None:

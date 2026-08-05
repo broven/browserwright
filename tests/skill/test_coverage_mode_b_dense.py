@@ -341,6 +341,7 @@ def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():
     cdp._inflight_cv = threading.Condition(cdp._lock)
     cdp._next_id = 1
     cdp._inflight = {}
+    cdp._inflight_meta = {}
     cdp._closed = False
     cdp._closed_reason = None
     sent = []

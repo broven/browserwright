@@ -77,6 +77,17 @@ class PendingRequest:
     # For Target.attachToTarget we need to remember which targetId the client
     # asked for so we can fill the attachers table when the response arrives.
     attach_target_id: str | None = None
+    # When the daemon put this request on the upstream wire. `time.monotonic`,
+    # not `time.time`: this exists to answer "how long has this been waiting",
+    # and a wall clock that steps backwards would answer it wrong. Without it a
+    # 50ms request and a 5-minute one are the same row in `pending_requests`,
+    # which is exactly what made a hung daemon indistinguishable from an idle
+    # one. Read by `status.snapshot` / `browserwright-daemon ps`.
+    started_at: float = field(default_factory=time.monotonic)
+
+    def elapsed_s(self, *, now: float | None = None) -> float:
+        now = time.monotonic() if now is None else now
+        return max(0.0, now - self.started_at)
     # Sessionless-vs-sessioned: if the original request carried a sessionId,
     # the response must carry the *local* sessionId back. CDP responses on
     # session-scoped requests echo the session-id in some daemon-mediated
@@ -101,6 +112,11 @@ class ClientState:
     session_name: str | None = None
     sessions: dict[str, SessionBinding] = field(default_factory=dict)
     """local_session_id → SessionBinding owned by this client."""
+    # Wall-clock, deliberately: these two are rendered as "connected 4m ago" /
+    # "last command 12s ago" by `browserwright-daemon ps`, which is a human
+    # question about a human clock. Both are written on every decoded client
+    # frame (`Router.route_from_client`) and read by `status.snapshot` — until
+    # that reader existed, `last_command_at` was write-only.
     connected_at: float = field(default_factory=time.time)
     last_command_at: float = field(default_factory=time.time)
     # Spec §10 open question: when a client sends a frame while upstream is
