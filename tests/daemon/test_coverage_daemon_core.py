@@ -425,6 +425,92 @@ async def test_daemon_teardown_missing_rdp_context_returns_false():
     assert await daemon.teardown_rdp_context("missing") is False
 
 
+@pytest.mark.asyncio
+async def test_daemon_teardown_failure_retains_rdp_context_for_retry():
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    class Holder:
+        def __init__(self):
+            self.killed = False
+
+        def _kill_rdp_chrome(self):
+            self.killed = True
+            return True
+
+        async def trigger_close(self, _reason):
+            assert self.killed is True
+            raise RuntimeError("Chrome refused to terminate")
+
+        async def abort_rdp_teardown(self):
+            return None
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    ctx = UpstreamContext(
+        backend="rdp", state=DaemonState("rdp"),
+        router=Router(), holder=Holder())
+    daemon.contexts["sess"] = ctx
+
+    with pytest.raises(RuntimeError, match="refused to terminate"):
+        await daemon.teardown_rdp_context("sess")
+    assert daemon.contexts["sess"] is ctx
+
+
+@pytest.mark.asyncio
+async def test_daemon_teardown_budget_restores_retryable_rdp_context():
+    import time
+
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+
+    class Router:
+        daemon = None
+
+    state = DaemonState("rdp")
+
+    class Holder:
+        def __init__(self):
+            self.killed = False
+
+        def _kill_rdp_chrome(self):
+            self.killed = True
+            return True
+
+        async def trigger_close(self, _reason):
+            await state.begin_closing("skill_disconnect")
+            await asyncio.Event().wait()
+
+        async def abort_rdp_teardown(self):
+            await state.set_disconnected()
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    holder = Holder()
+    ctx = UpstreamContext(
+        backend="rdp", state=state, router=Router(), holder=holder)
+    daemon.contexts["sess"] = ctx
+
+    ended = await daemon.teardown_rdp_context(
+        "sess", deadline=time.monotonic() + 0.01)
+
+    assert ended is False
+    assert holder.killed is True
+    assert daemon.contexts["sess"] is ctx
+    assert state.upstream_phase is UpstreamPhase.DISCONNECTED
+
+
 def test_proxy_json_helpers_and_cdp_result_unwrap():
     from browserwright.daemon.server import proxy
 

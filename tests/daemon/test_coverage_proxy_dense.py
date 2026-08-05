@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -129,6 +131,90 @@ async def test_target_attach_and_close_are_authorized_by_browser_session():
     }))
     assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
     assert upstream.closed == ["ext-tab-1"]
+
+
+@pytest.mark.asyncio
+async def test_close_tab_session_id_rechecks_live_ownership():
+    state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    client.session_id = "session-A"
+    state.bind_session(client.client_id, "local-1", "upstream-1", "ext-tab-1")
+    state.claim_attacher(
+        "ext-tab-1", client.client_id, "local-1", "upstream-1")
+
+    class _MovedTabUpstream:
+        is_open = True
+
+        def __init__(self):
+            self.closed: list[str] = []
+
+        async def target_belongs_to_session(self, session_id, target_id):
+            assert (session_id, target_id) == ("session-A", "ext-tab-1")
+            return False
+
+        async def close_tab(self, target):
+            self.closed.append(target)
+            return {"ok": True, "tabId": 1}
+
+    upstream = _MovedTabUpstream()
+    router.upstream = upstream
+
+    await router.route_from_client(client, json.dumps({
+        "id": 4,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"sessionId": "local-1"},
+    }))
+
+    assert last_error(cap, client)["code"] == -32602
+    assert upstream.closed == []
+
+
+@pytest.mark.asyncio
+async def test_close_tab_rejects_mismatched_session_and_target_ids():
+    state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    client.session_id = "session-A"
+    state.bind_session(client.client_id, "local-1", "upstream-1", "ext-tab-1")
+
+    class _Upstream:
+        is_open = True
+
+        async def close_tab(self, _target):
+            raise AssertionError("mismatched addresses must not close a tab")
+
+    router.upstream = _Upstream()
+    await router.route_from_client(client, json.dumps({
+        "id": 5,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"sessionId": "local-1", "targetId": "ext-tab-2"},
+    }))
+
+    assert last_error(cap, client)["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_extension_detached_event_invalidates_router_binding():
+    from types import SimpleNamespace
+
+    from browserwright.daemon.server.extension_upstream import ExtensionUpstream
+
+    state, router, _cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    state.bind_session(client.client_id, "local-7", "ext-sid-7-known", "ext-tab-7")
+    state.claim_attacher(
+        "ext-tab-7", client.client_id, "local-7", "ext-sid-7-known")
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(
+        SimpleNamespace(port=19989), router.forward_from_upstream, _noop)
+    upstream.register_session(7, "ext-sid-7-known")
+
+    await upstream._handle_extension_event({"type": "detached", "tabId": 7})
+
+    assert "local-7" not in client.sessions
+    assert "ext-tab-7" not in state.attachers
 
 
 def attach_cdp(router: Router, cap: Capture, command, *, on_end_session=None):
@@ -649,6 +735,93 @@ async def test_end_session_daemon_edge_cases():
         "params": {"session": "sess"},
     }))
     assert last_error(cap, client)["code"] == -32603
+
+
+@pytest.mark.asyncio
+async def test_rdp_end_session_does_not_turn_false_teardown_into_success():
+    state, router, cap, (client,) = setup_router()
+    client.session_id = "sess"
+
+    async def refused(_session: str) -> bool:
+        return False
+
+    attach_cdp(router, cap, lambda *_args, **_kwargs: None,
+               on_end_session=refused)
+    await router.route_from_client(client, json.dumps({
+        "id": 4,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["ok"] is False
+    assert result["failed"] == ["workspace"]
+
+
+@pytest.mark.asyncio
+async def test_raw_external_workspace_noop_end_remains_successful():
+    state, router, cap, (client,) = setup_router()
+    client.session_id = "sess"
+
+    async def not_owned(_session: str) -> None:
+        return None
+
+    attach_cdp(router, cap, lambda *_args, **_kwargs: None,
+               on_end_session=not_owned)
+    await router.route_from_client(client, json.dumps({
+        "id": 5,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_session_cold_open_respects_budget_and_restores_phase(
+    monkeypatch,
+):
+    from browserwright.daemon.server import verbs as verbs_mod
+
+    state, router, cap, (client,) = setup_router()
+    client.session_id = "sess"
+    router.upstream = None
+    state.upstream_phase = UpstreamPhase.DISCONNECTED
+    ensure_cancelled = False
+
+    async def slow_ensure():
+        nonlocal ensure_cancelled
+        await state.begin_connecting("extension")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            ensure_cancelled = True
+            raise
+
+    class Registry:
+        async def terminate_session(self, session, teardown, *, budget=None):
+            return ({"reaped": True}, await teardown())
+
+    async def disconnect(_reason):
+        return None
+
+    router.daemon = SimpleNamespace(executors=Registry())
+    router.bind_lifecycle(
+        ensure_upstream=slow_ensure, trigger_disconnect=disconnect)
+    monkeypatch.setattr(verbs_mod, "_END_SESSION_BUDGET_S", 0.55)
+
+    await router.route_from_client(client, json.dumps({
+        "id": 6,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert result["timedOut"] is True
+    assert ensure_cancelled is True
+    assert state.upstream_phase is UpstreamPhase.DISCONNECTED
 
 
 @pytest.mark.asyncio

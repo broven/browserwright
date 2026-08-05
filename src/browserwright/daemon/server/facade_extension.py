@@ -545,11 +545,14 @@ class ExtensionFacadeBridge:
         if not await self._authorize_target(
                 req_id, f"ext-tab-{tab_id}", close_response=True):
             return
+        validated_generation = self._relay.connection_generation
         sid = self._tab_sessions.get(tab_id)
         try:
             # Same core as the agent path's closeTab-by-targetId verb: evicts
             # the upstream's fabricated sessions for the tab + relay close.
-            await self._ext.close_tab_by_target_id(f"ext-tab-{tab_id}")
+            await self._ext.close_tab_by_target_id(
+                f"ext-tab-{tab_id}",
+                expected_generation=validated_generation)
         except Exception as e:  # noqa: BLE001
             logger.warning("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
             await self._respond(req_id, {"success": False})

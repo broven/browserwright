@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import signal
 import subprocess
 import tempfile
 import time
@@ -209,9 +210,17 @@ async def launch_chrome(
     # `/json/version` on the requested port but never writes
     # DevToolsActivePort (Skill team field report May 2026). When --port 0
     # we have no fallback because we don't know what port Chrome picked.
-    actual_port, ws_path = await _wait_for_chrome_ready(
-        proc, user_data_dir, requested_port=port, timeout=timeout,
-    )
+    try:
+        actual_port, ws_path = await _wait_for_chrome_ready(
+            proc, user_data_dir, requested_port=port, timeout=timeout,
+        )
+    except BaseException:
+        # Ownership transfers to the caller only after readiness returns and
+        # the pid can be published in ``extras``. Until then every exit path —
+        # including asyncio cancellation from a caller's budget — must reap
+        # the detached process or it becomes an untracked daemon-owned Chrome.
+        _terminate_unpublished_chrome(proc)
+        raise
 
     # 6) Build ws URL.
     ws_url = f"ws://127.0.0.1:{actual_port}{ws_path}"
@@ -414,6 +423,20 @@ def _spawn_kwargs() -> dict:
     `_ipc.py:68-76` `spawn_kwargs()`.
     """
     return {"start_new_session": True}
+
+
+def _terminate_unpublished_chrome(proc: subprocess.Popen) -> None:
+    """Best-effort TERM for a Chrome whose pid wasn't returned to its owner."""
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if proc.poll() is None:
+        with _silent():
+            proc.terminate()
 
 
 class _silent:

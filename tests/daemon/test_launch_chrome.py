@@ -2,6 +2,7 @@
 that writes DevToolsActivePort and then sleeps."""
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import browserwright.daemon.launch_chrome as lc_mod
-from browserwright.daemon.config import load
+from browserwright.daemon.config import Config, load
 from browserwright.daemon.errors import (
     ChromeBinaryNotFound,
     Unavailable,
@@ -86,6 +87,47 @@ async def test_launch_chrome_end_to_end(monkeypatch, tmp_path, fake_chrome):
         os.kill(pid, 15)
     except ProcessLookupError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_cancellation_terminates_unpublished_process(
+    monkeypatch, tmp_path,
+):
+    """A caller budget may cancel readiness after Popen but before pid return."""
+    ready_started = asyncio.Event()
+
+    class Proc:
+        pid = 99_999_999
+
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    proc = Proc()
+    monkeypatch.setattr(lc_mod, "discover_chrome_binary", lambda _value: Path("/chrome"))
+    monkeypatch.setattr(lc_mod, "_allocate_data_dir", lambda *_a, **_kw: tmp_path / "profile")
+    monkeypatch.setattr(lc_mod, "_check_not_default_profile", lambda *_a, **_kw: None)
+    monkeypatch.setattr(lc_mod.subprocess, "Popen", lambda *_a, **_kw: proc)
+
+    async def never_ready(*_args, **_kwargs):
+        ready_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(lc_mod, "_wait_for_chrome_ready", never_ready)
+
+    task = asyncio.create_task(lc_mod.launch_chrome(
+        Config(), profile="cancelled", port=9222, timeout=30.0))
+    await ready_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.terminated is True
 
 
 @pytest.mark.asyncio

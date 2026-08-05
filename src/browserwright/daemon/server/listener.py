@@ -854,24 +854,30 @@ class _UpstreamHolder:
         self.rdp_profile_dir = extras.get("profile_path")
         self.rdp_port = port
 
-    def _kill_rdp_chrome(self) -> None:
+    def _kill_rdp_chrome(self) -> bool:
         """Phase 3 teardown: SIGTERM the daemon-owned Chrome for this rdp
         session (best-effort; the process may already be gone). Clears the pid
         so a later relaunch starts fresh. Leaves the profile dir on disk — it's
         a persistent `bs-s{id}` dir that orphan-cleanup sweeps on next startup;
         removing it inline races Chrome's shutdown writeback."""
         pid = self.rdp_pid
-        self.rdp_pid = None
         if pid is None:
-            return
+            return True
         import os as _os
         import signal as _signal
         try:
             _os.kill(pid, _signal.SIGTERM)
+            self.rdp_pid = None
             logger.info("killed rdp Chrome pid %d for session %s",
                         pid, self.session_id)
-        except (ProcessLookupError, PermissionError, OSError) as e:
+            return True
+        except ProcessLookupError as e:
+            self.rdp_pid = None
             logger.debug("rdp Chrome pid %s already gone: %r", pid, e)
+            return True
+        except (PermissionError, OSError) as e:
+            logger.warning("could not terminate rdp Chrome pid %s: %r", pid, e)
+            return False
 
     async def _open_extension_upstream(self, cfg: Config) -> None:
         """v0.4 extension backend: the daemon IS the upstream.
@@ -923,17 +929,19 @@ class _UpstreamHolder:
         # fallback for an adapter that reports nothing.
         await self.state.set_connected(ext.ws_url or "ext://relay")
 
-    async def _end_raw_session(self, session_id: str) -> bool:
+    async def _end_raw_session(
+        self, session_id: str, *, deadline: float | None = None,
+    ) -> bool | None:
         """Apply the raw adapter's ownership policy through its daemon context."""
         daemon = getattr(self.router, "daemon", None)
         contexts = getattr(daemon, "contexts", None)
         teardown = getattr(daemon, "teardown_rdp_context", None)
         if (isinstance(contexts, dict) and session_id in contexts
                 and callable(teardown)):
-            return bool(await teardown(session_id))
+            return bool(await teardown(session_id, deadline=deadline))
         # env and attach-owned raw browsers are external: ending a browserwright
         # session must not fabricate ownership or kill them.
-        return False
+        return None
 
     async def trigger_close(self, reason: CloseReason) -> None:
         """Run the spec §6.5 close etiquette + tear down upstream.
@@ -1003,6 +1011,15 @@ class _UpstreamHolder:
         # Inverse of open: publish DISCONNECTED before removing the one adapter
         # reference, so concurrent verbs lazy-open instead of seeing a connected
         # router with an absent implementation.
+        if up is not None:
+            up.detach(self.router)
+
+    async def abort_rdp_teardown(self) -> None:
+        """Restore a retryable, non-CLOSING context after bounded teardown."""
+        self._kill_rdp_chrome()
+        up = self.upstream
+        self.upstream = None
+        await self.state.set_disconnected()
         if up is not None:
             up.detach(self.router)
 

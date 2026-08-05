@@ -198,6 +198,96 @@ async def test_kill_blocks_replacement_until_exact_instance_is_dead(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_cancelled_kill_keeps_replacement_blocked_until_reap(monkeypatch):
+    reg = ExecutorRegistry()
+    old = _handle("sess-cancel", "/tmp/old.sock", executor_id="executor-old")
+    reg._handles["sess-cancel"] = old
+    reap_started = threading.Event()
+    allow_death = threading.Event()
+    spawned: list[str] = []
+
+    def blocked_reap(handle):
+        assert handle is old
+        reap_started.set()
+        assert allow_death.wait(timeout=2)
+        handle.proc.terminate()
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(
+            session_id, "/tmp/new.sock", executor_id="executor-new")
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        blocked_reap,
+    )
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    kill_task = asyncio.create_task(reg.kill_current_and_wait("sess-cancel"))
+    assert await asyncio.to_thread(reap_started.wait, 1)
+    kill_task.cancel()
+    ensure_task = asyncio.create_task(reg.ensure("sess-cancel"))
+    await asyncio.sleep(0.02)
+
+    assert spawned == []
+    assert ensure_task.done() is False
+
+    allow_death.set()
+    with pytest.raises(asyncio.CancelledError):
+        await kill_task
+    assert await ensure_task == "/tmp/new.sock"
+    assert spawned == ["sess-cancel"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_teardown_accepts_cooperative_retryable_partial(monkeypatch):
+    reg = ExecutorRegistry()
+    teardown_started = asyncio.Event()
+    teardown_cancelled = False
+    spawned: list[str] = []
+
+    async def teardown():
+        nonlocal teardown_cancelled
+        teardown_started.set()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            teardown_cancelled = True
+            raise
+        return {"ok": False, "partial": True, "timedOut": True}
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(session_id, "/tmp/retry.sock")
+
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._discovery_alive",
+        lambda _session_id: False,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    reap, result = await reg.terminate_session(
+        "sess-budget", teardown, budget=0.05)
+
+    assert reap["reaped"] is True
+    assert teardown_started.is_set()
+    assert teardown_cancelled is False
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert result["timedOut"] is True
+    assert await reg.ensure("sess-budget") == "/tmp/retry.sock"
+    assert spawned == ["sess-budget"]
+
+
+@pytest.mark.asyncio
 async def test_terminal_teardown_blocks_and_then_rejects_ensure(monkeypatch):
     reg = ExecutorRegistry()
     teardown_started = asyncio.Event()
