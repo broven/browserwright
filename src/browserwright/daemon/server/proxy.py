@@ -231,6 +231,11 @@ class Router(SessionVerbsMixin):
     async def route_from_client(self, client: ClientState, text: str) -> None:
         msg = _json_safe(text)
         if msg is None:
+            restricted = getattr(self.daemon, "session_is_restricted", None)
+            if (callable(restricted) and restricted(client.session_id)):
+                await self._send_to_client(client.client_id, _error_response(
+                    None, -32603, "browserwright session has ended"))
+                return
             # Garbage frame — best-effort forward, upstream will error if it
             # cares. We still gate on upstream readiness so the frame doesn't
             # vanish during the lazy-open window.
@@ -250,6 +255,13 @@ class Router(SessionVerbsMixin):
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") or {}
         local_sid = msg.get("sessionId") if isinstance(msg.get("sessionId"), str) else None
+
+        restricted = getattr(self.daemon, "session_is_restricted", None)
+        if (callable(restricted) and restricted(client.session_id)
+                and method != "BrowserwrightDaemon.endSession"):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "browserwright session has ended"))
+            return
 
         # --- BrowserwrightDaemon.* namespace ---
         # Self-answered: doesn't need upstream, so no gate.

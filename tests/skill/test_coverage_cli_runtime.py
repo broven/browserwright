@@ -715,33 +715,20 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
     reg._with_entry(create_sid, lambda e: e.update(last_seen=0.0))
     reg._with_entry(attach_sid, lambda e: e.update(last_seen=0.0))
     reg._with_entry(ext_sid, lambda e: e.update(last_seen=0.0))
-    closed = []
-    reaped = []
-    ext_closed = []
+    ended = []
 
-    def _close_browser(rec):
-        assert reg.get(rec["id"]) is not None
-        closed.append(rec["id"])
+    def _run(cmd):
+        sid = cmd[cmd.index("--session") + 1]
+        assert reg.get(sid) is not None
+        ended.append(sid)
+        return 0
 
-    def _reap_executor(rec):
-        assert reg.get(rec["id"]) is not None
-        reaped.append(rec["id"])
-
-    def _end_extension(rec):
-        assert reg.get(rec["id"]) is not None
-        ext_closed.append(rec["id"])
-        return True
-
-    monkeypatch.setattr(session_create, "_close_browser", _close_browser)
-    monkeypatch.setattr(session_create, "_reap_executor", _reap_executor)
-    monkeypatch.setattr(session_create, "_end_extension_workspace", _end_extension)
+    monkeypatch.setattr(session_create, "_run", _run)
 
     pruned = session_create.reap(idle_seconds=1)
 
     assert {rec["id"] for rec in pruned} == {create_sid, attach_sid, ext_sid}
-    assert reaped == [create_sid, attach_sid, ext_sid]
-    assert closed == [create_sid]
-    assert ext_closed == [ext_sid]
+    assert ended == [create_sid, attach_sid, ext_sid]
     assert reg.get(create_sid) is None
     assert reg.get(attach_sid) is None
     assert reg.get(ext_sid) is None
@@ -823,10 +810,8 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
 
     message = session_create.end(reg.get(sid))
 
-    # Extension is attach-owned: end() closes the session's owned tabs
-    # (end-session, threading the durable group-id) AND best-effort reaps the
-    # session's resident Phase B executor (kill-executor) so it doesn't leak —
-    # the browser itself stays running.
+    # The daemon's one terminal lifecycle closes the extension group, reaps the
+    # executor, and revokes clients while leaving the browser itself running.
     assert calls == [
         [
             "browserwright-daemon",
@@ -835,12 +820,6 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
             sid,
             "--group-id",
             "12",
-        ],
-        [
-            "browserwright-daemon",
-            "kill-executor",
-            "--session",
-            sid,
         ],
     ]
     assert "still running" in message
@@ -866,22 +845,15 @@ def test_cmd_session_end_reports_partial_extension_teardown(
 
 
 def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):
-    """Failure #3 hardening: an attach-owned rdp session's `end()` leaves the
-    browser running (semantics unchanged) but still best-effort reaps the
-    session's resident executor (`kill-executor`) so it doesn't leak — the full
-    `endSession` path is create-only and never otherwise contacts the daemon."""
+    """Attach rdp uses daemon termination but keeps its external browser."""
     from browserwright import session_create, session_registry as reg
 
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
-    # The browser must NOT be closed for an attach session.
-    monkeypatch.setattr(session_create, "_close_browser",
-                        lambda rec: calls.append(["CLOSE_BROWSER", rec["id"]]))
-
     message = session_create.end(reg.get(sid))
 
-    assert calls == [["browserwright-daemon", "kill-executor", "--session", sid]]
+    assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
     assert "still running" in message  # browser untouched (semantics preserved)
     assert reg.get(sid) is None
 
@@ -905,10 +877,12 @@ def test_session_create_end_create_rdp_does_not_double_reap(tmp_bs_home, monkeyp
     assert reg.get(sid) is None
 
 
-def test_session_create_end_reap_tolerates_dead_daemon(tmp_bs_home, monkeypatch):
-    """The executor reap is best-effort: a dead daemon (subprocess error) must
-    NOT fail `session end` — `_reap_executor` swallows it via `_run`."""
+def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
+    tmp_bs_home, monkeypatch,
+):
+    """An unreachable daemon cannot prove that attach clients were revoked."""
     from browserwright import session_create, session_registry as reg
+    from browserwright.errors import DaemonUnavailable
 
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
 
@@ -917,10 +891,9 @@ def test_session_create_end_reap_tolerates_dead_daemon(tmp_bs_home, monkeypatch)
 
     monkeypatch.setattr(session_create.subprocess, "run", boom)
 
-    # Must not raise even though the daemon is unreachable.
-    message = session_create.end(reg.get(sid))
-    assert "still running" in message
-    assert reg.get(sid) is None
+    with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
+        session_create.end(reg.get(sid))
+    assert reg.get(sid) is not None
 
 
 def test_session_create_new_env_is_attach_shared_context(tmp_bs_home, monkeypatch):
@@ -986,21 +959,15 @@ def test_session_create_treats_legacy_unscoped_env_as_conflict(
 
 
 def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch):
-    """An env session is attach-owned: end() reaps only the resident executor
-    (kill-executor) and leaves the externally-owned browser running (issue
-    #20) — never _close_browser."""
+    """Env termination revokes clients but leaves the external browser."""
     from browserwright import session_create, session_registry as reg
 
     sid = reg.allocate(backend="env", owner="attach", name="cloak")
     calls = []
     monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
-    # The external browser must NOT be closed for an env (attach) session.
-    monkeypatch.setattr(session_create, "_close_browser",
-                        lambda rec: calls.append(["CLOSE_BROWSER", rec["id"]]))
-
     message = session_create.end(reg.get(sid))
 
-    assert calls == [["browserwright-daemon", "kill-executor", "--session", sid]]
+    assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
     assert "still running" in message
     assert reg.get(sid) is None
 

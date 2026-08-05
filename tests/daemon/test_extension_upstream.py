@@ -1726,6 +1726,37 @@ async def test_validated_generation_refuses_write_before_send():
 
 
 @pytest.mark.asyncio
+async def test_attach_target_carries_validation_generation_to_relay():
+    class ReconnectingRelay:
+        port = 19989
+
+        def __init__(self):
+            self.connection_generation = 7
+            self.expected_generation = None
+
+        async def attach_tab(
+            self, tab_id, *, expected_generation, timeout=5.0,
+        ):
+            assert tab_id == 42
+            self.expected_generation = expected_generation
+            self.connection_generation += 1
+            if expected_generation != self.connection_generation:
+                raise ConnectionError("generation changed before attach")
+
+    async def noop(_value):
+        return None
+
+    relay = ReconnectingRelay()
+    upstream = ExtensionUpstream(relay, noop, noop)
+
+    with pytest.raises(ConnectionError, match="generation changed"):
+        await upstream.attach_target(42)
+
+    assert relay.expected_generation == 7
+    assert upstream.session_for_tab(42) is None
+
+
+@pytest.mark.asyncio
 async def test_group_query_timeout_is_end_to_end_across_stale_preflight(
     monkeypatch,
 ):

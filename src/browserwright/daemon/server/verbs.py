@@ -508,11 +508,21 @@ class SessionVerbsMixin:
             return await upstream.end_session_before(
                 session, group_id, deadline=teardown_deadline)
 
-        terminate = getattr(registry, "terminate_session", None)
+        daemon_terminate = getattr(daemon, "terminate_session", None)
+        terminate = (
+            daemon_terminate if callable(daemon_terminate)
+            else getattr(registry, "terminate_session", None))
         if callable(terminate):
             try:
-                reap, result = await terminate(
-                    session, teardown_workspace, budget=_END_SESSION_BUDGET_S)
+                if callable(daemon_terminate):
+                    reap, result = await terminate(
+                        session, teardown_workspace,
+                        caller_token=client.connection_token,
+                        budget=_END_SESSION_BUDGET_S)
+                else:
+                    reap, result = await terminate(
+                        session, teardown_workspace,
+                        budget=_END_SESSION_BUDGET_S)
                 if reap.get("reaped") is not True:
                     await self._send_to_client(
                         client.client_id,
@@ -555,6 +565,12 @@ class SessionVerbsMixin:
             if result is None:
                 return
         await self._send_to_client(client.client_id, _result_response(req_id, result))
+        if (isinstance(result, dict) and result.get("ok") is True
+                and client.connection_token is not None
+                and daemon is not None):
+            revoke = getattr(daemon, "revoke_session_lease", None)
+            if callable(revoke):
+                await revoke(client.connection_token)
 
     async def _handle_ensure_executor(
         self, client: ClientState, params: dict, req_id: int | None,

@@ -447,7 +447,9 @@ async def test_session_scope_is_enforced_without_transport():
         async def close_tab(self, tab_id):
             self.closed.append(tab_id)
 
-        async def attach_tab(self, tab_id, *, timeout=10.0):
+        async def attach_tab(
+            self, tab_id, *, expected_generation=None, timeout=10.0,
+        ):
             return None
 
         async def send_cdp(self, tab_id, method, params):

@@ -426,6 +426,7 @@ class RelayServer:
             "attach active failed (no error captured)")
 
     async def attach_tab(self, tab_id: int, *,
+                         expected_generation: int | None = None,
                          timeout: float = 5.0) -> GhostTarget:
         """Tell the extension to `chrome.debugger.attach({tabId})`. Retries
         up to ATTACH_RETRY_LIMIT on "already attached" errors.
@@ -436,6 +437,7 @@ class RelayServer:
         if ext is None:
             raise RuntimeError("no extension connected")
         ext = await self._ensure_extension_fresh_or_raise(ext, timeout=timeout)
+        self._require_generation(expected_generation)
         # Idempotency: extension may already hold chrome.debugger.attach on
         # this tab (popup click, prior daemon lifecycle — the SW survives
         # daemon restarts and re-announces attached tabs on reconnect, so
