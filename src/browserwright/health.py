@@ -167,8 +167,8 @@ def doctor_checks() -> dict:
     #    primitive surface agents actually call? A broken install / syntax
     #    error here would otherwise only show up mid-task.
     try:
-        from . import api as _api  # noqa: F401
-        n = len(getattr(_api, "EXPORTS", []) or [])
+        import browserwright as _bw  # noqa: F401
+        n = len(getattr(_bw, "EXPORTS", []) or [])
         add("helpers", "pass", f"helper surface imports ({n} exports)", "")
     except Exception as e:  # noqa: BLE001
         add(

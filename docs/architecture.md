@@ -356,7 +356,7 @@ The install wizard codifies this same decision tree —
 ```
 src/browserwright/
 ├── cli.py                ← argv dispatch — start here when wiring a new subcommand
-├── api.py                ← `from browserwright import *` surface
+├── __init__.py           ← `EXPORTS` = the `from browserwright import *` surface
 ├── install.py            ← the wizard (doctor-driven option detection)
 ├── mode_b_client.py      ← Mode B socket client + client_for_session() resolver
 ├── session_create.py / session_registry.py / session_runtime.py

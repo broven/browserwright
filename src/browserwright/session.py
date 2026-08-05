@@ -108,10 +108,11 @@ class Session:
 
 # ---- singleton + context-var override ---------------------------------
 
-# Module-level default. Lazily created on first ``current_session()`` call
-# from a context that hasn't pushed an override. Lives for the process.
+# Module-level default, bound explicitly by ``set_session()``. There is no
+# lazy default: ``Session()`` with neither ``daemon=`` nor ``record=`` always
+# raises ``NoSession``, so an unbound ``current_session()`` raises rather than
+# manufacturing a session with a guessed backend.
 _singleton: Optional[Session] = None
-_singleton_lock = threading.Lock()
 
 # ContextVar holds the currently-active Session for this thread / task.
 # ``None`` means "no override → use the default singleton".
@@ -135,11 +136,13 @@ def current_session() -> Session:
     override = _active.get()
     if override is not None:
         return override
-    global _singleton
     if _singleton is None:
-        with _singleton_lock:
-            if _singleton is None:
-                _singleton = Session()
+        from .errors import NoSession
+        raise NoSession(
+            "no session bound: a Session needs an explicit ledger "
+            "record (its backend/daemon comes from `session new`). "
+            "Pass record=/daemon= explicitly."
+        )
     return _singleton
 
 
