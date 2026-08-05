@@ -384,10 +384,14 @@ class CdpUpstream:
                 "title": meta.get("title", ""),
                 "groupId": -1,
             }
-        try:
-            tabs = await self.list_tabs(session_id)
-        except Exception:
-            tabs = []
+        # Deliberately unguarded. Swallowing an enumeration failure here turns
+        # "I could not ask Chrome" into "the browser has no tabs", and the
+        # fallback below then creates an about:blank — duplicating a tab the
+        # user can see and splitting the persisted target from the selected
+        # page. session-workspaces.md requires failing retryably under
+        # uncertainty rather than inventing a page, so let it propagate and
+        # reserve open_tab for a *confirmed* empty browser.
+        tabs = await self.list_tabs(session_id)
         current = next((tab for tab in tabs
                         if tab["targetId"] == self._current_target_id), None)
         if current is None:
@@ -549,6 +553,27 @@ class CdpUpstream:
                 })
         entry["ids"] = remaining
         return failed
+
+    def _forget_target(self, target_id: str) -> None:
+        """Evict every adapter cache keyed on one destroyed target.
+
+        Also drops the userscript handles registered in that page's session:
+        the registration died with the session, so keeping the
+        ``(sessionId, identifier)`` pair would make a later remove or toggle
+        fail against a session that no longer exists — permanently, since
+        nothing else prunes them.
+        """
+        upstream_sid = self._target_sessions.pop(target_id, None)
+        self._target_info.pop(target_id, None)
+        if self._current_target_id == target_id:
+            self._current_target_id = None
+        if upstream_sid is None:
+            return
+        for entry in self._userscripts.values():
+            ids = entry.get("ids")
+            if ids:
+                entry["ids"] = [(sid, ident) for sid, ident in ids
+                                if sid != upstream_sid]
 
     async def _apply_userscripts_to_session(self, upstream_sid: str) -> None:
         """Install every stored, enabled script into a freshly attached page.
@@ -782,6 +807,15 @@ class CdpUpstream:
                         if not fut.done():
                             fut.set_result(parsed)
                         continue
+                    # Chrome is the authority on which targets exist. A tab can
+                    # go away without passing through close_tab — the user
+                    # closes it, or Playwright calls page.close() — and these
+                    # caches would otherwise keep answering with a target that
+                    # is gone.
+                    if parsed.get("method") == "Target.targetDestroyed":
+                        tid = (parsed.get("params") or {}).get("targetId")
+                        if isinstance(tid, str):
+                            self._forget_target(tid)
                 # Forward to downstream.
                 try:
                     await self._on_frame(text)

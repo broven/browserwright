@@ -1048,7 +1048,7 @@ async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
 
 
 @pytest.mark.asyncio
-async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targets():
+async def test_rdp_attach_active_reuses_local_page_then_surfaces_enumeration_errors():
     state, router, cap, (client,) = setup_router(backend="rdp")
     state.bind_session(client.client_id, "local", "UP", "T")
     state.claim_attacher("T", client.client_id, "local", "UP")
@@ -1071,22 +1071,25 @@ async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targ
 
     state.unbind_session_by_local(client.client_id, "local")
 
-    async def fallback_cmd(method: str, params=None, session_id=None):
+    # This used to assert the opposite: that a failed Target.getTargets fell
+    # through to createTarget. That is not a fallback, it is a fabrication —
+    # a CDP error means we could not ask which tabs exist, not that there are
+    # none, and creating one then duplicates a tab the user can see and splits
+    # the persisted target from the selected page. docs/session-workspaces.md
+    # requires failing retryably under uncertainty; open_tab is reserved for a
+    # *confirmed* empty browser.
+    async def failing_enumeration(method: str, params=None, session_id=None):
         calls.append(method)
         if method == "Target.getTargets":
             return {"id": -1, "error": {"message": "bad"}}
-        if method == "Target.createTarget":
-            return {"id": -1, "result": {"targetId": "NEW"}}
-        if method == "Target.attachToTarget":
-            return {"id": -1, "result": {"sessionId": "UP-NEW"}}
-        raise AssertionError(method)
+        raise AssertionError(f"must not reach {method} on an unknown target set")
 
-    attach_cdp(router, cap, fallback_cmd)
+    attach_cdp(router, cap, failing_enumeration)
     await router.route_from_client(client, json.dumps({
         "id": 2, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
-    assert calls[-3:] == ["Target.getTargets", "Target.createTarget", "Target.attachToTarget"]
-    assert cap.per_client[client.client_id][-1]["result"]["targetId"] == "NEW"
+    assert calls[-1] == "Target.getTargets"
+    assert "error" in cap.per_client[client.client_id][-1]
 
 
 @pytest.mark.asyncio
