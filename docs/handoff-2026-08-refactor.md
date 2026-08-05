@@ -98,8 +98,18 @@ exactly this reason.)
 
 ## 4. What the review rounds actually taught
 
-Eleven rounds: seven `adversarial-review`, four `review-loop`. Findings per
-round: **11 → 8 → 7 → 7 → 3 → 2 → 3 → 3 → 3 → 1 → 0**.
+Fourteen rounds in two series, against the same branch:
+
+| series | findings per round |
+|---|---|
+| `adversarial-review` (directed — I supplied a focus list each time) | 11 · 8 · 7 · 7 · 3 · 2 · 3 |
+| `review-loop` (undirected native reviewer) | 3 · 3 · 1 · 5 · 3 · 3 · 2 |
+
+**It never reached zero.** The last round was blocked by a Codex usage limit,
+not by a clean result, and the series was not converging monotonically — each
+hardening pass established a new invariant, and the next round found the paths
+that did not uphold it. Anyone continuing this should expect the same and
+budget for it rather than treating a low round as done.
 
 **Eight of the findings were introduced by earlier fixes.** Remote debugging
 pointable at the user's daily profile, a permanently blocking `detach`,
@@ -115,11 +125,26 @@ aimed at, including one that **every existing env user would hit on upgrade**
 deleted, and they permanently occupied the single env slot). Seven rounds of
 "is the new mechanism correct?" never asked "what about the old data?".
 
-**One defect shape dominates**: *a state the system can enter but not leave, or
-a success that is not one.* False success on close, on teardown, on userscript
-install; ledger rows nothing can prune; a `session end` that tells you to retry
-along the path that just failed. When reviewing this codebase, look for that
-shape first.
+**Two defect shapes dominate.** When reviewing this codebase, look for these
+first — between them they account for most of the 40-odd findings:
+
+1. *A state the system can enter but not leave, or a success that is not one.*
+   False success on close, on teardown, on userscript install; ledger rows
+   nothing can prune; a `session end` that tells you to retry along the path
+   that just failed.
+2. *New strictness that forgot about state which already exists.* Legacy env
+   records with no `daemon_scope`, an extension one version behind that omits
+   `groupTitle`, an already-running daemon on the wrong backend, Chrome's own
+   auto-deletion of an empty group. Four separate findings, all the same
+   omission: every round asked "is the new mechanism right?" and none asked
+   "what does it do to what is already out there?"
+
+**And check the fixes, not just the feature.** Eight findings were introduced
+by earlier fixes in this same series, including two of mine written while the
+reviewer was rate-limited: an unconditional `_ensure_daemon_running()` that
+made env teardown strictly worse, and an orphan-sweep ownership check that
+swapped one unsound test for another and added a prefix-matching bug on the
+way.
 
 ## 5. Open work
 
@@ -165,7 +190,25 @@ Not filed, but worth knowing:
   unchanged" gate on this suite needs a control run or multiple samples; a
   single before/after pair will mislead you. The stable core is 11–12.
 
-## 6. Working notes for the next session
+## 6. Where the review stopped
+
+Not clean. The last `review-loop` round could not run — Codex hit a usage limit
+that resets 2026-08-12 — so this branch ships with the review series open
+rather than closed. Everything the reviewer *did* report has been fixed or
+filed; nothing was dismissed as noise.
+
+If you pick this up after the limit resets, the next step is literally:
+
+```bash
+CODEX_COMPANION=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs | sort -V | tail -1)
+node "$CODEX_COMPANION" review --base main
+```
+
+Given the trend, expect it to find something. Two areas were never reviewed at
+all because they are unreachable from a static diff: the real-Chrome e2e paths
+(see #30) and anything requiring an actual extension upgrade in a live browser.
+
+## 7. Working notes for the next session
 
 - `mise run test` is the gate: **633 daemon + 1 xfailed, 44 skipped · 133 skill ·
   12 evals**, ~25 s. `mise run lint` must be clean.
