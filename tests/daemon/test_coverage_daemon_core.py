@@ -64,27 +64,42 @@ def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
     assert payload["probe_state"] == "not_running"
 
 
-def test_cmd_status_json_marks_transient_probe_failure(monkeypatch, tmp_path, capsys):
-    from browserwright.daemon import _ipc, _stale
+def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):
+    """A daemon whose socket file survives but that never answers, with its
+    ports free: `transient_probe_failed`, and the retry loop really ran."""
+    from browserwright.daemon.probe import DaemonProbe
 
     sock = tmp_path / "daemon.sock"
     sock.write_text("", encoding="utf-8")
     calls = []
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: calls.append(timeout) or (None, None))
-    monkeypatch.setattr(_ipc, "sock_path", lambda: sock)
-    monkeypatch.setattr(
-        _ipc,
-        "endpoint_describe",
-        lambda: {"transport": "unix", "path": str(sock), "host": None, "port": None, "token": None},
-    )
-    monkeypatch.setattr(cli_mod.time, "sleep", lambda _seconds: None)
-    # Hermetic: without this the probe reaches out to the real default ports
-    # (19989/19990) and reports `port_held_by_unresponsive_process` whenever the
-    # developer's own daemon relay happens to be listening. Same stub the
-    # sibling wiring tests use.
-    monkeypatch.setattr(_stale, "port_is_listening", lambda host, port: False)
 
-    assert cli_mod._cmd_status(SimpleNamespace(json=True), Config()) == 2
+    class _Silent(DaemonProbe):
+        retry_window = 0.05
+
+        def ping(self, timeout):
+            calls.append(timeout)
+            return (None, None)
+
+        def socket_present(self):
+            return True
+
+        # Hermetic: the real probe would reach the developer's own daemon on the
+        # default ports (19989/19990) and report a port-held zombie instead.
+        def listening_ports(self, ports):
+            return []
+
+        def endpoint(self):
+            return {"transport": "unix", "path": str(sock),
+                    "host": None, "port": None, "token": None}
+
+        def facade(self):
+            return (None, None)
+
+        def sleep(self, seconds):
+            pass
+
+    assert cli_mod._cmd_status(SimpleNamespace(json=True), Config(),
+                               probe=_Silent(Config())) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["probe_state"] == "transient_probe_failed"
     assert len(calls) > 1

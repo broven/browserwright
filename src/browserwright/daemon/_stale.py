@@ -18,10 +18,10 @@ never auto-kill — we surface the pid-file pid for the user to handle.
 from __future__ import annotations
 
 import os
-import signal
 import socket
 import subprocess
-import time
+
+from .supervise import Outcome, pid_alive as _pid_alive, terminate
 
 
 def daemon_tcp_ports(cfg) -> list[int]:
@@ -106,19 +106,9 @@ def pid_is_browserwright_daemon(pid: int) -> bool:
     return "browserwright-daemon" in cmd or "browserwright.daemon" in cmd
 
 
-def pid_alive(pid: int) -> bool:
-    """True if ``pid`` exists (signal 0 probe)."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by someone else
-    except OSError:
-        return False
-    return True
+#: Re-exported from `supervise` so this module keeps its self-contained
+#: "detect + reclaim" vocabulary while there is only one implementation.
+pid_alive = _pid_alive
 
 
 def confirmed_stale_holder(ports: list[int]) -> int | None:
@@ -142,30 +132,19 @@ def reclaim_ports(pid: int, ports: list[int], *, timeout: float = 5.0) -> bool:
     SIGKILL as a last resort. Returns True once the ports are free.
 
     The caller MUST have confirmed ``pid`` via :func:`confirmed_stale_holder`
-    (or an equivalent lsof+cmdline check) — this function does not re-verify."""
+    (or an equivalent lsof+cmdline check) — this function does not re-verify, so
+    no ``guard`` is passed to :func:`supervise.terminate`.
+
+    Note the death observable: *ports free*, not *process gone*. Reclaiming is
+    about being able to bind, and a daemon that has released its listeners has
+    already given us what we need.
+    """
     def _all_free() -> bool:
         return all(not port_is_listening("127.0.0.1", p) for p in ports)
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    outcome = terminate(pid, is_dead=_all_free, grace=timeout, kill_grace=2.0)
+    if outcome is Outcome.ALREADY_GONE:
         return _all_free()
-    except OSError:
+    if outcome is Outcome.SIGNAL_FAILED:
         return False
-    if _wait(_all_free, timeout):
-        return True
-    # Escalate — a wedged daemon may never handle SIGTERM.
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
-    return _wait(_all_free, 2.0)
-
-
-def _wait(pred, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pred():
-            return True
-        time.sleep(0.15)
-    return pred()
+    return outcome in (Outcome.EXITED, Outcome.KILLED)

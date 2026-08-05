@@ -54,16 +54,9 @@ class ExtensionBackend(Backend):
              / loaded the extension → available=false + needs_user_action
           3. running with extensions → available=true
         """
-        url = f"http://127.0.0.1:{self._port}/__status__"
-        # `trust_env=False` + explicit `mounts={}` makes httpx ignore the
-        # user's HTTPS_PROXY / SOCKS_PROXY / ALL_PROXY env vars. Loopback
-        # traffic must never go through a proxy — same trick the other
-        # backends use for their `/json/version` probes.
+        from ..relay_status import fetch as fetch_relay_status
         try:
-            async with httpx.AsyncClient(
-                timeout=2.0, trust_env=False, mounts={},
-            ) as client:
-                resp = await client.get(url)
+            resp = await fetch_relay_status("127.0.0.1", self._port)
         except (httpx.ConnectError, httpx.ConnectTimeout):
             return DoctorResult(
                 name=self.name,

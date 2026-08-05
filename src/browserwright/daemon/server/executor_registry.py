@@ -26,6 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from .. import _ipc
+from ..supervise import pid_alive as _pid_alive, wait_until
 
 logger = logging.getLogger(__name__)
 
@@ -341,19 +342,6 @@ class ExecutorRegistry:
         return reaped
 
 
-def _pid_alive(pid: int) -> bool:
-    """POSIX liveness probe: ``kill(pid, 0)`` raises if the process is gone."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but not ours to signal — still alive
-    except OSError:
-        return False
-    return True
-
-
 def _discovery_alive(session_id: str) -> bool:
     """Whether the session's on-disk discovery file names a STILL-LIVE executor.
 
@@ -430,20 +418,21 @@ def _wait_or_kill(proc: subprocess.Popen, escalate) -> None:
     After escalating (SIGKILL) we poll a few more times to REAP the zombie — the
     handle is dropped from the registry by the caller, so nothing else will
     `poll()`/`wait()` this pid; without a final reap a SIGKILLed child lingers as
-    a zombie until the daemon exits."""
-    deadline = time.monotonic() + _KILL_GRACE_S
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return
-        time.sleep(0.05)
+    a zombie until the daemon exits.
+
+    The waiting is `supervise.wait_until`; the signalling is NOT
+    `supervise.terminate`, because this path must signal the process *group*
+    (the executor is a session leader by design) and the SIGTERM was already
+    sent by the caller before it offloaded to this thread."""
+    def exited() -> bool:
+        return proc.poll() is not None
+
+    if wait_until(exited, _KILL_GRACE_S, interval=0.05):
+        return
     with _quiet():
         escalate()
     # Reap the zombie now that it has been SIGKILLed (bounded short wait).
-    reap_deadline = time.monotonic() + 1.0
-    while time.monotonic() < reap_deadline:
-        if proc.poll() is not None:
-            return
-        time.sleep(0.02)
+    wait_until(exited, 1.0, interval=0.02)
 
 
 def _killpg_or_kill(proc: subprocess.Popen, sig: int) -> None:

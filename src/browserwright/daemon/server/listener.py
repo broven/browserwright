@@ -75,16 +75,25 @@ def make_context(*, backend: str, cfg: Config,
 # ---- top-level entry -------------------------------------------------------
 
 
-def _reclaim_stale_daemon_ports(cfg: Config) -> None:
+def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
     """Reclaim the relay/facade ports from a *confirmed* stale browserwright
     daemon (issue #15, 2.2). No-op when the ports are free or held by an
-    unconfirmed process (we never SIGTERM a stranger)."""
+    unconfirmed process (we never SIGTERM a stranger).
+
+    The write-side twin of `cli status`: both read the world through the same
+    `probe.DaemonProbe` so they can never disagree about which ports matter or
+    who counts as a confirmed holder. Only the reclaim itself is local, because
+    only this side mutates. `probe` is injectable for tests; production passes
+    nothing.
+    """
     from .. import _stale
-    ports = _stale.daemon_tcp_ports(cfg)
-    held = [p for p in ports if _stale.port_is_listening("127.0.0.1", p)]
+    from ..probe import DaemonProbe
+
+    p = probe if probe is not None else DaemonProbe(cfg)
+    held = p.listening_ports(p.daemon_ports())
     if not held:
         return
-    pid = _stale.confirmed_stale_holder(held)
+    pid = p.confirmed_stale_holder(held)
     if pid is None:
         logger.warning(
             "ports %s are in use but no confirmed browserwright daemon holds "
