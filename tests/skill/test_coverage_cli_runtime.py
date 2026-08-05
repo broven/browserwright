@@ -940,6 +940,51 @@ def test_session_create_new_env_is_attach_shared_context(tmp_bs_home, monkeypatc
     assert rec["name"] == "cloak"
 
 
+def test_session_create_rejects_second_env_on_same_daemon(
+    tmp_bs_home, monkeypatch,
+):
+    from browserwright import session_create, session_registry as reg
+
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+
+    first = session_create.new(backend="env", name="profile-a")
+    with pytest.raises(ValueError, match="N isolated daemons"):
+        session_create.new(backend="env", name="profile-b")
+
+    assert [row["id"] for row in reg.list_all()] == [first]
+    rdp = reg.allocate(backend="rdp", owner="attach", name="rdp-still-allowed")
+    assert rdp == "2"
+
+
+def test_session_create_allows_one_env_per_isolated_daemon(
+    tmp_bs_home, monkeypatch, tmp_path,
+):
+    from browserwright import session_create, session_registry as reg
+
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "daemon-a"))
+    first = session_create.new(backend="env", name="profile-a")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "daemon-b"))
+    second = session_create.new(backend="env", name="profile-b")
+
+    assert [row["id"] for row in reg.list_all()] == [first, second]
+
+
+def test_session_create_treats_legacy_unscoped_env_as_conflict(
+    tmp_bs_home, monkeypatch,
+):
+    from browserwright import session_create, session_registry as reg
+
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    legacy = reg.allocate(backend="env", owner="attach", name="legacy")
+
+    with pytest.raises(ValueError, match=legacy):
+        session_create.new(backend="env", name="new")
+
+    assert [row["id"] for row in reg.list_all()] == [legacy]
+
+
 def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch):
     """An env session is attach-owned: end() reaps only the resident executor
     (kill-executor) and leaves the externally-owned browser running (issue

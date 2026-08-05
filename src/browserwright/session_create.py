@@ -198,7 +198,17 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         # (docs/session-workspaces.md §"Routing And Facade"), not a per-session
         # UpstreamContext. Driving N external profiles → one env-backed daemon
         # (isolated XDG_RUNTIME_DIR + --facade-port + BD_CDP_WS) per profile.
-        sid = reg.allocate(backend="env", owner="attach", name=name)
+        from .daemon import _ipc
+
+        # The guard and allocation share the ledger's file lock, so concurrent
+        # creators cannot both observe an empty slot. Scope by the fixed daemon
+        # socket (XDG_RUNTIME_DIR) rather than by the global BS_HOME ledger;
+        # this preserves the documented N-isolated-daemon fleet pattern.
+        daemon_scope = str(_ipc.sock_path().resolve())
+        sid = reg.allocate(
+            backend="env", owner="attach", name=name,
+            env_daemon_scope=daemon_scope,
+        )
         _ensure_daemon_running()
         return sid
     if backend == "rdp":
