@@ -1107,7 +1107,19 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
                 continue
 
         async def teardown_workspace() -> dict:
-            if rec.get("backend") == "rdp" and rec.get("owner") == "create":
+            if rec.get("backend") == "rdp":
+                # Every rdp context, not just create-owned. The scope check
+                # above goes through context_for_required, which for rdp
+                # *creates* the per-session context as a side effect of
+                # validating it — so skipping teardown here would strand that
+                # context, and any upstream socket it opened, for the rest of
+                # the daemon's life once the ledger row is gone.
+                #
+                # Safe for attach: the holder only SIGTERMs a pid it launched
+                # itself, and an attach-owned holder has none, so this closes
+                # our websocket and drops the context without touching the
+                # external browser — the ownership rule in
+                # docs/session-workspaces.md is preserved.
                 await daemon.teardown_rdp_context(sid)
                 return {"ok": True, "backend": "rdp", "closed": [],
                         "failed": [], "kept": []}
