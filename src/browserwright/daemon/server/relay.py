@@ -192,6 +192,11 @@ class RelayServer:
         self._host = host
         self._server: Any = None
         self._extensions: dict[str, _ExtensionConn] = {}
+        # Monotonic connection epoch. A fresh extension hello may represent a
+        # Chrome restart, where numeric tab/group ids can be recycled. Session
+        # adapters use this to demote in-memory group bindings back to
+        # ownership-checked recovery candidates after every reconnect.
+        self._connection_generation: int = 0
         self._next_cmd_id: int = 1
         self._first_ready = asyncio.Event()
         # Hook: every event-frame from any extension gets called back here so
@@ -261,6 +266,10 @@ class RelayServer:
     @property
     def is_ready(self) -> bool:
         return any(e.hello_received.is_set() for e in self._extensions.values())
+
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
 
     def set_event_handler(
         self, handler: Callable[[dict], Awaitable[None]] | None,
@@ -528,8 +537,8 @@ class RelayServer:
     async def close_tab(self, tab_id: int, *,
                         timeout: float = 5.0) -> None:
         """Spec Phase B Feature 2: close a tab via chrome.tabs.remove (not a
-        debugger detach). Clears the ghost-target entry whether or not the
-        extension confirmed.
+        debugger detach). Clears the ghost-target entry only after the
+        extension confirms Chrome removed the tab.
 
         Raises if no extension is connected at all — silently returning
         success here would lie to callers about a close that never went
@@ -542,11 +551,8 @@ class RelayServer:
         if ext is None:
             raise RuntimeError(f"no extension knows tab {tab_id}")
         ext = await self._ensure_extension_fresh_or_raise(ext)
-        try:
-            await self._request(
-                ext, {"type": "closeTab", "tabId": tab_id}, timeout=timeout)
-        except Exception as e:
-            logger.warning("close_tab(tab=%d) failed: %r", tab_id, e)
+        await self._request(
+            ext, {"type": "closeTab", "tabId": tab_id}, timeout=timeout)
         ext.tabs.pop(tab_id, None)
 
     async def send_cdp(self, tab_id: int, method: str, params: dict,
@@ -976,6 +982,7 @@ class RelayServer:
         kind = msg.get("type")
 
         if kind == "hello":
+            self._connection_generation += 1
             ext.install_id = str(msg.get("installId") or "")
             ext.browser = str(msg.get("browser") or "")
             ext.version = str(msg.get("version") or "")

@@ -298,7 +298,7 @@ def test_tab_rpc_handlers_cover_success_and_failures(monkeypatch, capsys):
         Unavailable("socket down"),
         {"closed": [1]},
         DaemonError("close boom"),
-        {"closed": [], "kept": ["T"]},
+        {"ok": True, "closed": [], "failed": [], "kept": ["T"]},
         DaemonError("end boom"),
     ]
 

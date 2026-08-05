@@ -750,22 +750,21 @@ async function _ensureTabInGroup(tabId, groupName, resolvedGroupId, windowId) {
 }
 
 async function doCloseTab(id, tabId) {
-  // Best-effort detach first so chrome.debugger doesn't try to talk to the
-  // doomed tab as we tear it down. Failures here are silent.
-  markedTabs.delete(tabId);  // skip strip-prefix — tab is dying anyway
-  try {
-    await chrome.debugger.detach({ tabId });
-  } catch (_e) {
-    // not attached, or mid-close — ignore.
-  }
-  attachedTabs.delete(tabId);
   try {
     await chrome.tabs.remove(tabId);
+    // Chrome removed the tab and tears down its debugger session as part of
+    // that operation. Commit our bookkeeping only after that confirmation;
+    // otherwise a failed remove would leave a visible marker on a tab we had
+    // already forgotten and detached.
+    markedTabs.delete(tabId);
+    attachedTabs.delete(tabId);
     safeSend({ type: "response", id, result: { ok: true, tabId } });
   } catch (e) {
     const msg = String(e?.message || e || "").toLowerCase();
     if (msg.includes("no tab with id")) {
       // Already gone — caller wanted it closed, success-equivalent.
+      markedTabs.delete(tabId);
+      attachedTabs.delete(tabId);
       safeSend({ type: "response", id, result: { ok: true, tabId } });
       return;
     }
@@ -853,6 +852,7 @@ async function doQueryGroup(id, groupName, sessionGroupId) {
       safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
       return;
     }
+    const group = await chrome.tabGroups.get(groupId);
     const tabs = await chrome.tabs.query({ groupId });
     const out = (Array.isArray(tabs) ? tabs : []).map((tab) => ({
       tabId: tab.id,
@@ -863,7 +863,11 @@ async function doQueryGroup(id, groupName, sessionGroupId) {
     }));
     // Most-recently-accessed first so the daemon can pick a representative tab.
     out.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-    safeSend({ type: "response", id, result: { groupId, tabs: out } });
+    safeSend({
+      type: "response",
+      id,
+      result: { groupId, groupTitle: group?.title || "", tabs: out },
+    });
   } catch (e) {
     safeSend({
       type: "response",
@@ -1164,6 +1168,30 @@ const markedTabs = new Map();
 // duplicate installs and stores the Chrome registration id.
 const markingTabs = new Map();
 const MARKER_RELOAD_CLEANUP_TIMEOUT_MS = 1500;
+// Marker CDP is cosmetic and must never hold debugger detach hostage. Each
+// phase gets one absolute budget shared by all of its sendCommand calls, so a
+// sequence of hung calls cannot multiply the delay.
+const MARKER_INSTALL_TIMEOUT_MS = 1500;
+const MARKER_REMOVE_TIMEOUT_MS = 1000;
+
+async function markerCommandBefore(deadline, tabId, method, params) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new Error("marker " + method + " exceeded its deadline");
+  }
+  let timer = null;
+  try {
+    return await Promise.race([
+      chrome.debugger.sendCommand({ tabId }, method, params),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(
+          "marker " + method + " timed out")), remaining);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
 
 // SW-side twin of the injected stripPrefix — see MARKER_STRIP_PREFIX_SRC
 // above. Can't be generated from that fragment (MV3 CSP bans eval); if you
@@ -1220,22 +1248,25 @@ async function markTabAttached(tabId) {
   }
   if (markedTabs.has(tabId)) return;
   const install = (async () => {
+    const deadline = Date.now() + MARKER_INSTALL_TIMEOUT_MS;
     // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
     // (e.g. popup-attach racing daemon attach-active) coalesce.
     markedTabs.set(tabId, "");
     try {
       // Page domain may not be enabled yet on a fresh chrome.debugger session;
       // enabling is idempotent so this is safe to call repeatedly.
-      await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
-      const reg = await chrome.debugger.sendCommand(
-        { tabId },
+      await markerCommandBefore(deadline, tabId, "Page.enable", {});
+      const reg = await markerCommandBefore(
+        deadline,
+        tabId,
         "Page.addScriptToEvaluateOnNewDocument",
         { source: MARKER_INSTALL_SCRIPT },
       );
       markedTabs.set(tabId, reg?.identifier || "");
       // The above fires only on new documents; inject into the current one too.
-      await chrome.debugger.sendCommand(
-        { tabId },
+      await markerCommandBefore(
+        deadline,
+        tabId,
         "Runtime.evaluate",
         { expression: MARKER_INSTALL_SCRIPT },
       );
@@ -1255,16 +1286,28 @@ async function markTabAttached(tabId) {
 }
 
 async function unmarkTabBeforeDetach(tabId) {
+  const deadline = Date.now() + MARKER_REMOVE_TIMEOUT_MS;
   const pending = markingTabs.get(tabId);
   if (pending) {
-    try { await pending; } catch (e) {}
+    // Bounded on purpose. The install task awaits Page.enable, a script
+    // registration and a Runtime.evaluate; a wedged renderer leaves it
+    // unsettled forever (the OOPIF freeze still does this), and detach must
+    // not be held hostage to it — an unbounded await here never reaches
+    // chrome.debugger.detach, leaving Chrome attached with stale session
+    // state. Losing the wait only risks racing a marker we are about to
+    // remove anyway.
+    await Promise.race([
+      pending.catch(() => {}),
+      sleep(Math.max(0, deadline - Date.now())),
+    ]);
   }
   const identifier = markedTabs.get(tabId);
   markedTabs.delete(tabId);
   if (identifier) {
     try {
-      await chrome.debugger.sendCommand(
-        { tabId },
+      await markerCommandBefore(
+        deadline,
+        tabId,
         "Page.removeScriptToEvaluateOnNewDocument",
         { identifier },
       );
@@ -1274,8 +1317,9 @@ async function unmarkTabBeforeDetach(tabId) {
     }
   }
   try {
-    await chrome.debugger.sendCommand(
-      { tabId },
+    await markerCommandBefore(
+      deadline,
+      tabId,
       "Runtime.evaluate",
       { expression: MARKER_REMOVE_SCRIPT },
     );

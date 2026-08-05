@@ -461,10 +461,21 @@ class SessionVerbsMixin:
         registry = getattr(daemon, "executors", None) if daemon is not None else None
         if registry is not None:
             try:
-                registry.kill(session)
+                reap = await registry.kill_current_and_wait(session)
+                if reap.get("reaped") is not True:
+                    await self._send_to_client(
+                        client.client_id,
+                        _error_response(
+                            req_id, -32603,
+                            "endSession could not confirm executor death: "
+                            f"{reap!r}"),
+                    )
+                    return
             except Exception as e:  # noqa: BLE001 - executor kill is best-effort
-                logger.warning("endSession: executor kill for %s failed: %r",
-                               session, e)
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"endSession executor reap failed: {e!r}"))
+                return
 
         group_id = params.get("groupId")
         group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
@@ -569,17 +580,11 @@ class SessionVerbsMixin:
         wait = params.get("wait") is True
         if registry is not None:
             try:
-                if wait:
-                    result = await registry.kill_and_wait(
-                        session, executor_id=executor_id)
-                    killed = bool(result.get("killed"))
-                    reaped = bool(result.get("reaped"))
-                    matched = bool(result.get("matched", True))
-                else:
-                    killed = bool(registry.kill(session))
-                    # The legacy fire-and-forget path has acknowledged only the
-                    # signal, not process death.
-                    reaped = not killed
+                result = await registry.kill_and_wait(
+                    session, executor_id=executor_id)
+                killed = bool(result.get("killed"))
+                reaped = bool(result.get("reaped"))
+                matched = bool(result.get("matched", True))
             except Exception as e:  # noqa: BLE001 - executor kill is best-effort
                 logger.warning("killExecutor: kill for %s failed: %r", session, e)
         response = {"ok": True, "killed": killed}
@@ -595,8 +600,8 @@ class SessionVerbsMixin:
 
         Maps the client-facing LOCAL sessionId to the upstream sessionId
         (mirroring _handle_detach's translation), invokes upstream.close_tab,
-        and tears down the local state bindings whether the close succeeded
-        or not — the tab is gone either way.
+        and tears down local state bindings only after upstream confirms the
+        close. On failure the binding remains available for retry.
         """
         # Param validation runs FIRST (same rationale as openBackgroundTab:
         # empty params must answer -32602, never -32601).
@@ -651,8 +656,7 @@ class SessionVerbsMixin:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603, f"closeTab failed: {e!r}"))
                 return
-            finally:
-                self._forget_tab_binding(target_id)
+            self._forget_tab_binding(target_id)
             await self._send_to_client(client.client_id, _result_response(req_id, {
                 "ok": True,
                 "tabId": result.get("tabId"),
@@ -669,9 +673,8 @@ class SessionVerbsMixin:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"closeTab failed: {e!r}"))
             return
-        finally:
-            self._forget_tab_binding(
-                target_id, owner_client_id, owner_local_sid)
+        self._forget_tab_binding(
+            target_id, owner_client_id, owner_local_sid)
         await self._send_to_client(client.client_id, _result_response(req_id, {
             "ok": True,
             "tabId": result.get("tabId"),

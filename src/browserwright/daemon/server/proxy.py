@@ -78,7 +78,7 @@ class _SendOnlyUpstream:
     async def _unavailable(self, *args, **kwargs):
         raise RuntimeError("upstream adapter is unavailable in cold-router harness")
 
-    open_tab = close_tab = list_tabs = current_page = attach_active = _unavailable
+    open_tab = close_tab = list_tabs = get_targets = current_page = attach_active = _unavailable
     end_session = _unavailable
 
     async def recover(self, *args, **kwargs) -> dict:
@@ -246,22 +246,32 @@ class Router(SessionVerbsMixin):
         if not await self._gate_upstream_ready(client, text, msg=msg):
             return
 
-        # --- session-aware Target.getTargets enumeration -------------------
-        # Every adapter owns its workspace boundary. In particular, extension
-        # filters the relay's global ghost table to this session's tab group;
-        # raw-CDP adapters enumerate their private browser. Router must not
-        # infer either behavior from a backend name.
+        # --- adapter-owned Target.getTargets enumeration -------------------
+        # Extension synthesizes a session-scoped browser view. Raw-CDP returns
+        # Chrome's native envelope verbatim (including request filters,
+        # non-page targets, extra fields, and native errors). This seam is
+        # deliberately separate from high-level list_tabs(), which is allowed
+        # to expose only page targets.
         if (method == "Target.getTargets"
                 and self.upstream is not None
                 and client.session_id):
             try:
-                infos = await self.upstream.list_tabs(client.session_id)
+                envelope = await self.upstream.get_targets(
+                    params, client.session_id)
             except Exception as e:  # noqa: BLE001
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603, f"getTargets scoping failed: {e!r}"))
                 return
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {"targetInfos": infos}))
+            if not isinstance(envelope, dict) or not (
+                    isinstance(envelope.get("result"), dict)
+                    or isinstance(envelope.get("error"), dict)):
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"getTargets adapter returned malformed envelope: {envelope!r}"))
+                return
+            response = dict(envelope)
+            response["id"] = req_id
+            await self._send_to_client(client.client_id, json.dumps(response))
             return
 
         # --- Target.attachToTarget interceptor ---

@@ -1054,17 +1054,25 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
         sid = str(rec.get("id") or "")
         if not sid:
             continue
+        teardown_ok = True
         try:
-            daemon.executors.kill(sid)
+            reap = await daemon.executors.kill_current_and_wait(sid)
+            if reap.get("reaped") is not True:
+                teardown_ok = False
+                logger.warning(
+                    "auto session-prune could not confirm executor death "
+                    "(session=%s): %r", sid, reap)
         except Exception as e:  # noqa: BLE001
             logger.warning("auto session-prune executor kill failed "
                            "(session=%s): %r", sid, e)
+            teardown_ok = False
         if rec.get("backend") == "rdp" and rec.get("owner") == "create":
             try:
                 await daemon.teardown_rdp_context(sid)
             except Exception as e:  # noqa: BLE001
                 logger.warning("auto session-prune rdp teardown failed "
                                "(session=%s): %r", sid, e)
+                teardown_ok = False
         elif rec.get("backend") == "extension":
             try:
                 runtime = rec.get("runtime") or {}
@@ -1077,10 +1085,19 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
                 holder = daemon.shared_context.holder
                 upstream = holder.upstream
                 if hasattr(upstream, "end_session"):
-                    await upstream.end_session(sid, group_id)  # type: ignore[attr-defined]
+                    result = await upstream.end_session(  # type: ignore[attr-defined]
+                        sid, group_id)
+                    if not isinstance(result, dict) or result.get("ok") is not True:
+                        teardown_ok = False
+                        logger.warning(
+                            "auto session-prune extension teardown incomplete "
+                            "(session=%s): %r", sid, result)
             except Exception as e:  # noqa: BLE001
                 logger.warning("auto session-prune extension teardown failed "
                                "(session=%s): %r", sid, e)
+                teardown_ok = False
+        if not teardown_ok:
+            continue
         try:
             removed = session_registry.remove(sid)
         except Exception as e:  # noqa: BLE001
@@ -1136,7 +1153,7 @@ async def _idle_watchdog(
             try:
                 daemon.executors.reap_dead()
                 if idle_after:
-                    daemon.executors.reap_idle(idle_after)
+                    await daemon.executors.reap_idle(idle_after)
             except Exception as e:  # noqa: BLE001 - never let reap break the loop
                 logger.warning("executor reap failed: %r", e)
             # --- upstream idle-close (gated) ---
@@ -1180,7 +1197,7 @@ async def _graceful_shutdown(daemon: "Daemon") -> None:
     # Phase B (PR2): SIGTERM every registered executor — they are daemon
     # children and must die with us (mirrors the per-context close above).
     try:
-        daemon.executors.kill_all()
+        await daemon.executors.kill_all()
     except Exception as e:  # noqa: BLE001
         logger.warning("executor shutdown kill failed: %r", e)
 

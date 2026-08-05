@@ -144,8 +144,9 @@ def reap(*, idle_seconds: float) -> list[dict]:
     pruned: list[dict] = []
     for rec in stale:
         _reap_executor(rec)
-        if rec.get("backend") == "extension":
-            _end_extension_workspace(rec)
+        if (rec.get("backend") == "extension"
+                and not _end_extension_workspace(rec)):
+            continue
         if rec.get("owner") == "create":
             _close_browser(rec)
         removed = reg.remove(str(rec.get("id")))
@@ -213,12 +214,13 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     raise ValueError(f"unknown backend {backend!r} (use extension|rdp|env)")
 
 
-def _end_extension_workspace(record: dict) -> None:
+def _end_extension_workspace(record: dict) -> bool:
     """Close the session's agent-owned extension tabs via the single daemon.
 
-    Best-effort: the shared browser itself stays open (extension sessions are
-    attach-owned); only the tabs this session opened are closed. The
-    ``end-session`` CLI no longer takes ``--name`` — there is one daemon."""
+    The shared browser itself stays open (extension sessions are attach-owned);
+    only the session group is closed. A non-zero result is significant: the
+    caller retains the ledger so teardown can be retried. The ``end-session``
+    CLI no longer takes ``--name`` — there is one daemon."""
     cmd = ["browserwright-daemon", "end-session", "--session", record["id"]]
     # Thread the durable numeric groupId (persisted in ledger.runtime on every
     # open) so the daemon can close the whole group even when its in-memory
@@ -227,7 +229,7 @@ def _end_extension_workspace(record: dict) -> None:
     gid = runtime.get("group_id")
     if isinstance(gid, int) and gid >= 0:
         cmd += ["--group-id", str(gid)]
-    _run(cmd)
+    return _run(cmd) == 0
 
 
 def end(record: dict) -> str:
@@ -236,11 +238,16 @@ def end(record: dict) -> str:
     create-owned → the daemon closes the browser it launched (endSession).
     attach       → leave the browser running, remind the user.
     extension    → also close the session's agent-owned tabs (browser stays).
-    Always removes the ledger entry.
+    Removes the ledger entry only after extension teardown is confirmed.
     """
     sid = record["id"]
     if record.get("backend") == "extension":
-        _end_extension_workspace(record)
+        if not _end_extension_workspace(record):
+            from .errors import DaemonUnavailable
+
+            raise DaemonUnavailable(
+                f"session {sid} still has extension tabs that could not be "
+                "closed; its ledger entry was kept for retry")
     if record.get("owner") == "create":
         # `_close_browser` → daemon `endSession`, which ALSO kills the executor
         # (symmetric in `_handle_end_session`), so no separate reap needed here.
