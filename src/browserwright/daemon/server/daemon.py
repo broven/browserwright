@@ -3,7 +3,7 @@
 `docs/refactor-single-daemon.md` §"Key insight: the engine already exists":
 `Router` + `DaemonState` + `_UpstreamHolder` are already a complete
 single-upstream / multi-client engine — they only touch `self.state.*` and one
-`self._upstream_send`. So this module does NOT rewrite any routing/translation
+one attached ``Upstream``. So this module does NOT rewrite routing/translation
 logic. It:
 
   - bundles one `(state, router, holder)` triple per upstream into an

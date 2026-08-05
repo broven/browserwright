@@ -254,6 +254,9 @@ def _router_with_client(backend: str):
         return None
 
     router.bind_lifecycle(_ensure, _disc)
+    async def _upstream_send(_text):
+        return None
+    router.update_upstream_send(_upstream_send)
     client = state.allocate_client("c")
     client.session_id = "sess"
     captured[client.client_id] = []
@@ -287,7 +290,7 @@ async def test_end_session_kills_executor_extension():
         return {"ok": True, "closed": [], "kept": []}
 
     router.daemon = _Daemon()
-    router._end_session = _end_session
+    router.upstream.end_session = _end_session
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.endSession",
@@ -310,6 +313,10 @@ async def test_end_session_kills_executor_rdp():
             return True
 
     router.daemon = _Daemon()
+    async def _end_session(session, *args):
+        await router.daemon.teardown_rdp_context(session)
+        return {"ok": True, "closed": [], "kept": [], "backend": "rdp"}
+    router.upstream.end_session = _end_session
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.endSession",

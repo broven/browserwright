@@ -3,12 +3,12 @@
 This module wires together:
   - `_ipc` (socket file / ping)
   - `state` (DaemonState)
-  - `upstream` (UpstreamConnection)
+  - `upstream` (the Upstream protocol and its adapters)
   - `proxy` (Router)
 
 Spec §8.5: the listener task accepts clients, the upstream-lifecycle task
 opens/closes the upstream ws lazily, and the keepalive task is built into
-UpstreamConnection (heartbeat) + websockets server (ws-level pings).
+CdpUpstream (heartbeat) + websockets server (ws-level pings).
 
 v0.2 single-client model: the second ws upgrade is rejected with HTTP 503
 + a clear body. spec §9.2.
@@ -42,7 +42,7 @@ from ..observability import (
 from .state import CloseReason, DaemonState, UpstreamPhase
 from .proxy import Router
 from .daemon import Daemon, UnknownSessionError, UpstreamContext
-from .upstream import UpstreamConnection
+from .upstream import CdpUpstream, Upstream
 from .relay import RelayServer
 from .extension_upstream import ExtensionUpstream
 from .facade import PlaywrightFacade
@@ -568,12 +568,6 @@ class _ClientHandler:
             trigger_disconnect=holder.trigger_close,
         )
 
-        # If upstream is already open (warm from another client), make sure the
-        # router has the send fn wired. (The first ensure_open call wires it
-        # internally; subsequent client sessions inherit it.)
-        if holder.is_open:
-            router.update_upstream_send(holder.send_text)
-
         logger.info("client %d connected (label=%s, session=%s, backend=%s, total=%d)",
                     client.client_id, label, session_id or "-", ctx.backend,
                     len(state.clients))
@@ -598,7 +592,7 @@ class _ClientHandler:
 
 
 class _UpstreamHolder:
-    """Owns the single UpstreamConnection. Provides lazy-open + graceful-close
+    """Owns the single Upstream adapter. Provides lazy-open + graceful-close
     primitives the Router can call.
 
     v0.4: when `cfg.backend == "extension"` we replace the conventional ws
@@ -612,7 +606,10 @@ class _UpstreamHolder:
                  *, session_id: str | None = None):
         self.state = state
         self.router = router
-        self.upstream: UpstreamConnection | ExtensionUpstream | None = None
+        self.upstream: Upstream | None = None
+        # Keep the extension adapter (and its live session→group bindings)
+        # across idle detach/reattach. The relay is transport only.
+        self._extension_adapter: ExtensionUpstream | None = None
         self._open_lock = asyncio.Lock()
         self._cfg: Config = cfg
         # v0.4: only populated when backend=extension. Owned by the holder
@@ -636,17 +633,15 @@ class _UpstreamHolder:
         return self.upstream is not None and self.upstream.is_open
 
     async def send_text(self, frame: str) -> None:
-        """Proxy to the live UpstreamConnection.send_text.
+        """Proxy to the live Upstream.send_cdp.
 
-        Exposed on the holder so callers in this module can pass
-        `holder.send_text` as the router's `upstream_send` callable without
-        needing to drill through `holder.upstream.send_text` (which races
-        with close: holder.upstream may become None mid-call).
+        Exposed for lifecycle callers that should not drill through
+        ``holder.upstream`` while it may be replaced or cleared on reconnect.
         """
         conn = self.upstream
         if conn is None:
             raise RuntimeError("upstream not open")
-        await conn.send_text(frame)
+        await conn.send_cdp(frame)
 
     async def _broadcast_event(self, method: str, params: dict) -> None:
         """Fan a `{method, params}` envelope to every connected client.
@@ -668,7 +663,7 @@ class _UpstreamHolder:
           - extension → wait for the relay's first extension to send hello,
             wrap in ExtensionUpstream, mark CONNECTED
           - everything else → resolve a CDP ws URL and connect a real
-            UpstreamConnection
+            CdpUpstream
 
         v0.5.3 F-3: emits two lifecycle events to subscribed clients:
           - `BrowserwrightDaemon.upstreamConnecting {backend}` at the start of
@@ -721,7 +716,7 @@ class _UpstreamHolder:
 
             # Task #76: any client frame that arrived during the lazy-open
             # window was buffered per-client. Replay them now that the
-            # upstream is live and `_upstream_send` is wired.
+            # upstream is live and atomically attached to the router.
             try:
                 await self.router.drain_pre_open_buffers()
             except Exception as e:
@@ -737,9 +732,11 @@ class _UpstreamHolder:
             raise
 
         try:
-            conn = UpstreamConnection(
+            conn = CdpUpstream(
                 on_frame=self.router.forward_from_upstream,
                 on_close=self._on_upstream_closed,
+                state=self.state,
+                on_end_session=self._end_raw_session,
             )
             await conn.open(rr.ws_url, timeout=cfg.timeout)
         except Exception as e:
@@ -748,14 +745,8 @@ class _UpstreamHolder:
             await self.state.set_disconnected()
             raise
         self.upstream = conn
-        self.router.update_upstream_send(conn.send_text)
-        # Phase 3: expose the upstream's daemon-internal command channel to the
-        # Router so the unified session verbs (openBackgroundTab / closeTab /
-        # userscript) have an rdp implementation via raw CDP — Target.create/
-        # closeTarget, Page.addScriptToEvaluateOnNewDocument. Distinct id space
-        # from client traffic (UpstreamConnection.send_command). Cleared on
-        # close (symmetric with the extension callbacks).
-        self.router._upstream_command = conn.send_command
+        # Publish the complete adapter before CONNECTED becomes visible.
+        conn.attach(self.router)
         # Tell Chrome to gossip about all targets so we can maintain the
         # last_activated table without needing the client to enable it.
         # `waitForDebuggerOnStart=False` keeps target creation immediate.
@@ -856,11 +847,14 @@ class _UpstreamHolder:
                 "extension backend selected but relay was never started — "
                 "internal bug, please report")
         try:
-            ext = ExtensionUpstream(
-                relay=self.relay,
-                on_frame=self.router.forward_from_upstream,
-                on_close=self._on_upstream_closed,
-            )
+            ext = self._extension_adapter
+            if ext is None or ext._relay is not self.relay:  # noqa: SLF001
+                ext = ExtensionUpstream(
+                    relay=self.relay,
+                    on_frame=self.router.forward_from_upstream,
+                    on_close=self._on_upstream_closed,
+                )
+                self._extension_adapter = ext
             # Use the daemon's open timeout (default 5s in tests) but allow
             # the user a generous window (60s) to load the extension. Spec
             # §8.4 'extension-permission' ux_cost — user has to click the
@@ -879,33 +873,24 @@ class _UpstreamHolder:
             await self.state.set_disconnected()
             raise
         self.upstream = ext
-        self.router.update_upstream_send(ext.send_text)
-        # IMPORTANT: wire all extension-only verb callbacks BEFORE
-        # state.set_connected — concurrent BrowserwrightDaemon.* handlers in the
-        # proxy gate on state.upstream_phase == CONNECTED to skip the lazy-
-        # open call, so if we flip the phase first they'd see callback=None
-        # and respond -32601 incorrectly. Tear-down in trigger_close runs
-        # the opposite order (clear callbacks AFTER set_disconnected) for
-        # the symmetric reason.
-        # v0.5.4: wire the daemon-driven attach-active path. Only the
-        # extension backend has an out-of-band attach verb; other backends
-        # leave the callback as None so the proxy errors -32601.
-        self.router._attach_active_tab = ext.attach_active_tab
-        # Phase B: open_background + close_tab — same extension-only contract.
-        self.router._open_background_tab = ext.open_background_tab
-        self.router._close_tab = ext.close_tab
-        self.router._close_tab_by_target_id = ext.close_tab_by_target_id
-        self.router._end_session = ext.end_session  # P5 per-session teardown
-        # Session-reconnect-recovery: rebuild a session's tab bindings from the
-        # persisted numeric tab-group id.
-        self.router._recover_session = ext.recover_session
-        self.router._wait_session_announce = ext.wait_session_announce
-        self.router._userscript_request = ext.userscript_request
-        self.router._reload_extensions = ext.reload_extensions
-        # Scope Target.getTargets to the requesting session's tab group so
-        # extension sessions sharing one Chrome are mutually invisible.
-        self.router._scoped_targets = ext.scoped_target_infos
+        # Atomic publication replaces the old twelve-field callback wiring.
+        ext.attach(self.router)
+        # Prefer the adapter's own pseudo-URL: it carries the relay port, which
+        # is what `daemon ps` shows per context. "ext://relay" is only the
+        # fallback for an adapter that reports nothing.
         await self.state.set_connected(ext.ws_url or "ext://relay")
+
+    async def _end_raw_session(self, session_id: str) -> bool:
+        """Apply the raw adapter's ownership policy through its daemon context."""
+        daemon = getattr(self.router, "daemon", None)
+        contexts = getattr(daemon, "contexts", None)
+        teardown = getattr(daemon, "teardown_rdp_context", None)
+        if (isinstance(contexts, dict) and session_id in contexts
+                and callable(teardown)):
+            return bool(await teardown(session_id))
+        # env and attach-owned raw browsers are external: ending a browserwright
+        # session must not fabricate ownership or kill them.
+        return False
 
     async def trigger_close(self, reason: CloseReason) -> None:
         """Run the spec §6.5 close etiquette + tear down upstream.
@@ -954,23 +939,6 @@ class _UpstreamHolder:
         # Tear down upstream ws.
         up = self.upstream
         self.upstream = None
-        self.router.update_upstream_send(None)
-        # v0.5.4: drop the extension-backend attach-active callback so
-        # post-close BrowserwrightDaemon.attachActiveTab returns -32601 instead
-        # of racing against a torn-down upstream.
-        self.router._attach_active_tab = None
-        self.router._open_background_tab = None
-        self.router._close_tab = None
-        self.router._close_tab_by_target_id = None
-        self.router._end_session = None
-        self.router._recover_session = None
-        self.router._wait_session_announce = None
-        self.router._userscript_request = None
-        self.router._reload_extensions = None
-        # Phase 3: drop the rdp raw-CDP command channel (symmetric with the
-        # extension callbacks above) so a post-close verb returns a clean error
-        # instead of racing a torn-down upstream.
-        self.router._upstream_command = None
         if up is not None:
             try:
                 await up.close(code=1000, reason=reason)
@@ -989,9 +957,14 @@ class _UpstreamHolder:
         # for prompt teardown we'd need to plumb each ServerConnection in
         # — left as a follow-up since the natural-exit path is reliable.
         await self.state.set_disconnected()
+        # Inverse of open: publish DISCONNECTED before removing the one adapter
+        # reference, so concurrent verbs lazy-open instead of seeing a connected
+        # router with an absent implementation.
+        if up is not None:
+            up.detach(self.router)
 
     async def _on_upstream_closed(self, reason: str) -> None:
-        """Called by UpstreamConnection's reader when upstream drops on its
+        """Called by CdpUpstream's reader when upstream drops on its
         own (Chrome exited, etc.). We translate to a CloseReason and run
         the close-etiquette path.
 
