@@ -470,11 +470,26 @@ def test_daemon_context_for_env_requires_matching_daemon_scope(
         records.get,
     )
 
+    def claim_legacy(session_id, daemon_scope):
+        record = records.get(session_id)
+        if not isinstance(record, dict) or record.get("backend") != "env":
+            return False
+        existing_scope = record.get("daemon_scope")
+        if existing_scope is None:
+            record["daemon_scope"] = daemon_scope
+            return True
+        return existing_scope == daemon_scope
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.claim_legacy_env_scope",
+        claim_legacy,
+    )
+
     assert daemon.context_for_required("matching") is shared
     with pytest.raises(UnknownSessionError):
         daemon.context_for_required("foreign")
-    with pytest.raises(UnknownSessionError):
-        daemon.context_for_required("legacy")
+    assert daemon.context_for_required("legacy") is shared
+    assert records["legacy"]["daemon_scope"] == scope
 
 
 @pytest.mark.parametrize("shared_backend,record_backend", [
@@ -595,6 +610,64 @@ async def test_daemon_termination_revokes_only_the_ended_session_and_gates_races
     calls.append(("ack", "caller"))
     await daemon.revoke_session_lease(caller)
     assert calls[-2:] == [("ack", "caller"), ("revoke", "caller")]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_session_terminators_do_not_deadlock_each_other(
+    monkeypatch,
+):
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    class Registry:
+        async def terminate_session(self, session_id, teardown, *, budget=None):
+            return {"reaped": True}, await teardown()
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    daemon.executors = Registry()
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension"},
+    )
+
+    first_token = object()
+    second_token = object()
+    first_task = None
+    second_task = None
+
+    async def revoke_first():
+        assert first_task is not None
+        await first_task
+
+    async def revoke_second():
+        assert second_task is not None
+        await second_task
+
+    daemon.acquire_session_lease(
+        "session-a", first_token, revoke_first, kind="control")
+    daemon.acquire_session_lease(
+        "session-a", second_token, revoke_second, kind="control")
+
+    async def teardown():
+        return {"ok": True, "backend": "extension"}
+
+    first_task = asyncio.create_task(daemon.terminate_session(
+        "session-a", teardown, caller_token=first_token))
+    second_task = asyncio.create_task(daemon.terminate_session(
+        "session-a", teardown, caller_token=second_token))
+
+    first, second = await asyncio.wait_for(
+        asyncio.gather(first_task, second_task), timeout=0.5)
+    assert first[1]["ok"] is True
+    assert second[1]["ok"] is True
 
 
 @pytest.mark.asyncio
