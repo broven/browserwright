@@ -11,7 +11,14 @@ from __future__ import annotations
 
 import json
 
+from .conftest import requires_headful
 from .helpers import run_skill
+
+#: Both tests below compare a *backgrounded* tab against what a foreground tab
+#: would do. Headless has no foreground, reports every tab as visible, and does
+#: not throttle rAF — so they would pass without exercising `keepTabRendered()`
+#: at all. A vacuous pass is worse than no test, hence the skip.
+_HEADFUL_REASON = "asserts off-screen visibility/rAF against a real window"
 
 
 def _last_json(stdout: str) -> dict:
@@ -23,6 +30,7 @@ def _last_json(stdout: str) -> dict:
 
 def test_background_tab_reports_visible_and_focused(ext_ready, e2e_daemon):
     """A backgrounded tab we never switch to should still look focused+visible."""
+    requires_headful(_HEADFUL_REASON)
     # Background-tab open is a daemon/extension feature (chrome.debugger
     # attaches a never-focused tab); it has no agent-surface Playwright
     # equivalent. Drive it via the internal session_runtime helpers to keep
@@ -60,6 +68,7 @@ def test_background_tab_raf_keeps_advancing(ext_ready, e2e_daemon):
     requestAnimationFrame frame and writes it to the DOM; a backgrounded tab
     with throttled rAF would barely move (hidden tabs get ~1fps or 0). We read
     the counter, wait, read again, and require real progress."""
+    requires_headful(_HEADFUL_REASON)
     # rAF loop writing frame count into #n. data: URL keeps the test hermetic.
     html = (
         "<body><span id=n>0</span>"

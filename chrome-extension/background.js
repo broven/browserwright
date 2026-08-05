@@ -901,6 +901,22 @@ function errMessage(e) {
 // prefix and disconnect the observer; on unexpected detach (DevTools steals
 // the session) the prefix persists until the user reloads — acceptable.
 
+// The marker written in front of a real title: eye + separating space.
+//
+// There are TWO marker forms on purpose, and the injected side (PREFIX /
+// PREFIX_BARE in MARKER_STRIP_PREFIX_SRC) is what decides between them. An
+// empty title gets the *bare* eye, because HTML's `document.title` getter
+// strips trailing ASCII whitespace: `"👀 "` can never be read back as `"👀 "`.
+// The injected observer re-asserts the marker on every <head> mutation, so a
+// value that never reads back as what was written is rewritten forever — a
+// microtask loop that pins the renderer's main thread. `chrome.debugger`
+// commands then never resolve and the daemon reports
+// `relay send failed: TimeoutError()`. Only empty-titled pages (about:blank,
+// data: URLs, pages caught before their title is set) could reach it, which is
+// what made the freeze look random.
+//
+// This constant is the read side: `stripMarker()` below must keep accepting
+// both forms. There is no bare twin here because the SW never writes titles.
 const TITLE_PREFIX = "\u{1F440} ";  // 👀 + space
 
 // ---- shared injected-source fragments --------------------------------------
@@ -910,10 +926,18 @@ const TITLE_PREFIX = "\u{1F440} ";  // 👀 + space
 // can't drift between the two. The SW-side stripMarker() below mirrors
 // MARKER_STRIP_PREFIX_SRC but can't be generated from it (MV3 extension CSP
 // forbids eval/new Function) — keep them in sync by hand.
+//
+// Footgun: everything below lives inside template literals, so a backtick
+// anywhere in them — including in a // comment — ends the string early and
+// turns background.js into a syntax error. Quote identifiers in these comments
+// with plain words, not backticks.
 
-// Defines PREFIX + stripPrefix(value) in the injected scope.
+// Defines PREFIX / PREFIX_BARE + stripPrefix(value) + markedTitle(value) in the
+// injected scope. Mirrors TITLE_PREFIX / TITLE_PREFIX_BARE / stripMarker() on
+// the SW side.
 const MARKER_STRIP_PREFIX_SRC = `
   const PREFIX = '\u{1F440} ';
+  const PREFIX_BARE = '\u{1F440}';
 
   function stripPrefix(value) {
     let title = String(value ?? '');
@@ -927,6 +951,20 @@ const MARKER_STRIP_PREFIX_SRC = `
       }
     }
     return title;
+  }
+
+  // The one place that decides what a marked title looks like. Used by BOTH
+  // writers (the observer's re-assert and the document.title setter) so they
+  // cannot disagree about the empty case — the case that used to loop.
+  //
+  // Invariant: markedTitle(x) must survive a DOM round-trip unchanged, i.e.
+  // reading back what it wrote yields the same string. With a trailing space
+  // and an empty clean title it does not, and the observer never settles.
+  // stripPrefix() accepts both the spaced and the bare form, so titles marked
+  // by an older build are still cleaned up correctly on detach.
+  function markedTitle(value) {
+    const clean = stripPrefix(value);
+    return clean ? PREFIX + clean : PREFIX_BARE;
   }
 `;
 
@@ -990,16 +1028,30 @@ const MARKER_INSTALL_SCRIPT = `
   }
 
   let normalizing = false;
+  // The value we last asked the DOM to store, cleared once it sticks.
+  //
+  // The normalizing flag is not a guard against self-feeding writes:
+  // ensurePrefix runs from a MutationObserver, whose callbacks are delivered
+  // asynchronously, so the finally below has always released the flag before
+  // the next one arrives. markedTitle() is a fixpoint, so this latch never
+  // fires in practice — but if a write ever fails to round-trip again (a future
+  // DOM normalization rule, another script fighting us for the title) it caps
+  // the argument at one wasted write instead of an unbounded microtask loop
+  // that freezes the tab.
+  let lastWritten = null;
   function ensurePrefix() {
     if (normalizing) return;
     normalizing = true;
     try {
       const current = rawTitle();
-      const clean = stripPrefix(current);
-      const marked = PREFIX + clean;
-      if (stripPrefix(current) !== clean || current !== marked) {
-        writeRawTitle(document, marked);
+      const marked = markedTitle(current);
+      if (current === marked) {
+        lastWritten = null;  // settled; a later title change may re-mark
+        return;
       }
+      if (marked === lastWritten) return;  // already written, it didn't stick
+      lastWritten = marked;
+      writeRawTitle(document, marked);
     } finally {
       normalizing = false;
     }
@@ -1014,7 +1066,9 @@ const MARKER_INSTALL_SCRIPT = `
         return stripPrefix(rawTitle(this));
       },
       set: function(value) {
-        writeRawTitle(this, PREFIX + stripPrefix(value));
+        // Same fixpoint rule as ensurePrefix — a page clearing its own title
+        // must not store a value the getter will normalize into a mismatch.
+        writeRawTitle(this, markedTitle(value));
       },
     });
   }
@@ -1107,6 +1161,15 @@ const markedTabs = new Map();
 // SW-side twin of the injected stripPrefix — see MARKER_STRIP_PREFIX_SRC
 // above. Can't be generated from that fragment (MV3 CSP bans eval); if you
 // change one, change both.
+//
+// Handles BOTH marker forms, and must keep doing so: the first loop eats
+// TITLE_PREFIX (`"👀 Foo"`), the second eats a bare TITLE_PREFIX_BARE plus one
+// optional following whitespace char (`"👀"`, `"👀Foo"`). That is not just
+// tidiness — tabs marked by an older build carry the spaced form, and a user's
+// long-lived Chrome still has those tabs open across an extension update, so a
+// stripper that only knew the new form would leave 👀 stuck in their tab strip.
+// There is deliberately no markedTitle() twin here: the SW only ever *reads*
+// titles (to report them upstream), it never writes one.
 function stripMarker(title) {
   let clean = String(title ?? "");
   while (clean.startsWith(TITLE_PREFIX)) {
