@@ -150,7 +150,7 @@ async def test_self_answer_backend_info_and_target_table():
 
 
 @pytest.mark.asyncio
-async def test_wait_session_announce_is_extension_only_noop_for_rdp():
+async def test_wait_session_announce_uses_upstream_shim_for_rdp():
     state, router, cap, (client,) = setup_router("rdp-session", backend="rdp")
     called = False
 
@@ -166,8 +166,8 @@ async def test_wait_session_announce_is_extension_only_noop_for_rdp():
         "params": {"timeout": 0.01},
     }))
 
-    assert cap.per_client[client.client_id][-1]["result"] == {"announced": True}
-    assert called is False
+    assert cap.per_client[client.client_id][-1]["result"] == {"announced": False}
+    assert called is True
 
 
 @pytest.mark.asyncio
@@ -672,6 +672,28 @@ async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targ
 
 
 @pytest.mark.asyncio
+async def test_rdp_recover_reuses_existing_local_binding():
+    state, router, cap, (client,) = setup_router(backend="rdp")
+    state.bind_session(client.client_id, "local", "UP", "T")
+    state.claim_attacher("T", client.client_id, "local", "UP")
+    state.note_target_info({
+        "targetId": "T", "type": "page", "url": "https://front/", "title": "Front",
+    })
+
+    async def should_not_call(method: str, params=None, session_id=None):
+        raise AssertionError(method)
+
+    attach_cdp(router, cap, should_not_call)
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserwrightDaemon.recoverSession",
+    }))
+
+    assert cap.per_client[client.client_id][-1]["result"]["sessionId"] == "local"
+    assert list(client.sessions) == ["local"]
+    assert state.attachers["T"].primary_local_session == "local"
+
+
+@pytest.mark.asyncio
 async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
     state, router, cap, (client,) = setup_router(backend="rdp")
     await router.route_from_client(client, json.dumps({
@@ -690,16 +712,18 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
         if method == "Page.addScriptToEvaluateOnNewDocument":
             return {"id": -1, "result": {"identifier": f"id-{session_id}"}}
         if method == "Page.removeScriptToEvaluateOnNewDocument":
-            raise RuntimeError("ignored")
+            return {"id": -1, "result": {}}
         raise AssertionError(method)
 
     attach_cdp(router, cap, us_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.userscript.install",
-        "params": {"script": {"identity": "u", "source": "console.log(1)"}},
+        "params": {"script": {
+            "id": "hash-u", "identity": "u", "source": "console.log(1)"}},
     }))
     assert cap.per_client[client.client_id][-1]["result"]["identity"] == "u"
+    assert cap.per_client[client.client_id][-1]["result"]["id"] == "hash-u"
     add_calls = [c for c in calls if c[0] == "Page.addScriptToEvaluateOnNewDocument"]
     assert [c[2] for c in add_calls] == ["UP1"]
 
@@ -713,7 +737,7 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
         "method": "BrowserwrightDaemon.userscript.toggle",
         "params": {"key": "missing"},
     }))
-    assert cap.per_client[client.client_id][-1]["result"]["ok"] is False
+    assert last_error(cap, client)["code"] == -32000
 
     await router.route_from_client(client, json.dumps({
         "id": 5,
@@ -723,18 +747,48 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
     assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
 
     await router.route_from_client(client, json.dumps({
+        "id": 55,
+        "method": "BrowserwrightDaemon.userscript.toggle",
+        "params": {"key": "u", "enabled": True},
+    }))
+    assert cap.per_client[client.client_id][-1]["result"]["enabled"] is True
+    assert calls[-1][0] == "Page.addScriptToEvaluateOnNewDocument"
+
+    async def failing_remove(method: str, params=None, session_id=None):
+        if method == "Page.removeScriptToEvaluateOnNewDocument":
+            raise RuntimeError("still registered")
+        raise AssertionError(method)
+
+    router.upstream.send_command = failing_remove
+    await router.route_from_client(client, json.dumps({
+        "id": 56,
+        "method": "BrowserwrightDaemon.userscript.toggle",
+        "params": {"key": "u", "enabled": False},
+    }))
+    failed_sync = cap.per_client[client.client_id][-1]["result"]
+    assert failed_sync["ok"] is False
+    assert failed_sync["sync"]["ok"] is False
+    assert failed_sync["sync"]["failed"]
+
+    await router.route_from_client(client, json.dumps({
+        "id": 57,
+        "method": "BrowserwrightDaemon.userscript.install",
+        "params": {"script": {
+            "id": "hash-u", "identity": "u", "source": "console.log(2)"}},
+    }))
+    assert last_error(cap, client)["code"] == -32000
+
+    await router.route_from_client(client, json.dumps({
         "id": 6,
         "method": "BrowserwrightDaemon.userscript.logs",
     }))
-    assert cap.per_client[client.client_id][-1]["result"] == {
-        "logs": [], "backend": "rdp",
-    }
+    assert cap.per_client[client.client_id][-1]["result"] == {"logs": []}
 
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.userscript.mystery",
     }))
-    assert cap.per_client[client.client_id][-1]["result"]["ok"] is False
+    assert last_error(cap, client)["code"] == -32601
 
     assert _cmd_result({"id": -1, "result": {"ok": True}}) == {"ok": True}
     with pytest.raises(RuntimeError):

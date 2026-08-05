@@ -92,8 +92,13 @@ class _SendOnlyUpstream:
         raise RuntimeError("userscript upstream unavailable")
 
     async def reload_extensions(self, **kwargs) -> dict:
-        return {"ok": False, "reloaded": False,
-                "reason": "upstream adapter unavailable"}
+        return {
+            "ok": False,
+            "sent": 0,
+            "extensions": [],
+            "applicable": False,
+            "reason": "upstream adapter unavailable",
+        }
 
 
 # ---- helpers --------------------------------------------------------------
