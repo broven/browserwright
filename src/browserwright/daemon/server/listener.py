@@ -52,6 +52,26 @@ logger = logging.getLogger(__name__)
 _SESSION_PRUNE_INTERVAL_S = 3600.0
 
 
+def _executor_ready_budget_s() -> float:
+    """Bound extension reconnect grace below the control-plane deadline."""
+    try:
+        return float(os.environ.get("BW_EXT_READY_BUDGET_S", "") or 10.0)
+    except (TypeError, ValueError):
+        return 10.0
+
+
+_EXECUTOR_READY_BUDGET_S = _executor_ready_budget_s()
+
+_NO_EXTENSION_CONNECTED_MSG = (
+    "no browserwright extension is connected to the daemon (session {sid}). "
+    "Open the browser where the extension is installed and ensure it is "
+    "enabled; if you just installed or upgraded browserwright, reload the "
+    "extension at chrome://extensions so its service worker reconnects to the "
+    "daemon relay. Then retry. (Use --backend=rdp --create for an isolated "
+    "Chrome that needs no extension.)"
+)
+
+
 # ---- per-upstream context factory ------------------------------------------
 
 
@@ -566,6 +586,7 @@ class _ClientHandler:
         router.bind_lifecycle(
             ensure_upstream=holder.ensure_open,
             trigger_disconnect=holder.trigger_close,
+            prepare_executor=holder.prepare_executor,
         )
 
         logger.info("client %d connected (label=%s, session=%s, backend=%s, total=%d)",
@@ -642,6 +663,28 @@ class _UpstreamHolder:
         if conn is None:
             raise RuntimeError("upstream not open")
         await conn.send_cdp(frame)
+
+    async def prepare_executor(self, session_id: str) -> None:
+        """Backend-owned cold-start preflight for ``ensureExecutor``.
+
+        Raw-CDP holders need no separate readiness check: ``ensure_open`` below
+        launches/resolves their browser. The extension holder gives its
+        service worker a short reconnect grace and then fails with the useful
+        diagnosis before the normal 60-second interactive open can outlive the
+        control-plane response deadline. This probe never mutates the upstream
+        state machine, so a later extension reconnect remains recoverable.
+        """
+        if self.relay is None:
+            return
+        if self.relay.is_ready:
+            return
+        try:
+            await self.relay.wait_ready(timeout=_EXECUTOR_READY_BUDGET_S)
+        except Exception:  # noqa: BLE001 - timeout + relay reconnect hiccups
+            pass
+        if not self.relay.is_ready:
+            raise Unavailable(
+                _NO_EXTENSION_CONNECTED_MSG.format(sid=session_id))
 
     async def _broadcast_event(self, method: str, params: dict) -> None:
         """Fan a `{method, params}` envelope to every connected client.

@@ -474,6 +474,7 @@ async function handleDaemonMessage(msg) {
         msg.reason || "manual",
         msg.expectedVersion || daemonVersion || "",
       );
+      await cleanupMarkersBeforeReload();
       chrome.runtime.reload();
       return;
     case "attach":
@@ -1157,6 +1158,12 @@ const MARKER_REMOVE_SCRIPT = `
 // tabId → scriptIdentifier returned by Page.addScriptToEvaluateOnNewDocument
 // (needed to remove the per-document hook on detach).
 const markedTabs = new Map();
+// tabId → the full in-flight marker installation. Cleanup waits for it so its
+// last action cannot re-install the marker after detach/reload already removed
+// it. This map is intentionally separate from markedTabs: the latter reserves
+// duplicate installs and stores the Chrome registration id.
+const markingTabs = new Map();
+const MARKER_RELOAD_CLEANUP_TIMEOUT_MS = 1500;
 
 // SW-side twin of the injected stripPrefix — see MARKER_STRIP_PREFIX_SRC
 // above. Can't be generated from that fragment (MV3 CSP bans eval); if you
@@ -1206,46 +1213,67 @@ async function keepTabRendered(tabId) {
 }
 
 async function markTabAttached(tabId) {
+  const pending = markingTabs.get(tabId);
+  if (pending) {
+    await pending;
+    return;
+  }
   if (markedTabs.has(tabId)) return;
-  // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
-  // (e.g. popup-attach racing daemon attach-active) coalesce.
-  markedTabs.set(tabId, "");
+  const install = (async () => {
+    // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
+    // (e.g. popup-attach racing daemon attach-active) coalesce.
+    markedTabs.set(tabId, "");
+    try {
+      // Page domain may not be enabled yet on a fresh chrome.debugger session;
+      // enabling is idempotent so this is safe to call repeatedly.
+      await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+      const reg = await chrome.debugger.sendCommand(
+        { tabId },
+        "Page.addScriptToEvaluateOnNewDocument",
+        { source: MARKER_INSTALL_SCRIPT },
+      );
+      markedTabs.set(tabId, reg?.identifier || "");
+      // The above fires only on new documents; inject into the current one too.
+      await chrome.debugger.sendCommand(
+        { tabId },
+        "Runtime.evaluate",
+        { expression: MARKER_INSTALL_SCRIPT },
+      );
+    } catch (e) {
+      // Tab might have closed mid-attach, or chrome.debugger session is gone —
+      // not worth failing the whole attach over a cosmetic marker.
+      console.warn("[bd-relay] markTabAttached(" + tabId + ") failed:", e);
+      markedTabs.delete(tabId);
+    }
+  })();
+  markingTabs.set(tabId, install);
   try {
-    // Page domain may not be enabled yet on a fresh chrome.debugger session;
-    // enabling is idempotent so this is safe to call repeatedly.
-    await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
-    const reg = await chrome.debugger.sendCommand(
-      { tabId },
-      "Page.addScriptToEvaluateOnNewDocument",
-      { source: MARKER_INSTALL_SCRIPT },
-    );
-    markedTabs.set(tabId, reg?.identifier || "");
-    // The above fires only on *new* documents; inject into the current one too.
-    await chrome.debugger.sendCommand(
-      { tabId },
-      "Runtime.evaluate",
-      { expression: MARKER_INSTALL_SCRIPT },
-    );
-  } catch (e) {
-    // Tab might have closed mid-attach, or chrome.debugger session is gone —
-    // not worth failing the whole attach over a cosmetic marker.
-    console.warn("[bd-relay] markTabAttached(" + tabId + ") failed:", e);
-    markedTabs.delete(tabId);
+    await install;
+  } finally {
+    if (markingTabs.get(tabId) === install) markingTabs.delete(tabId);
   }
 }
 
 async function unmarkTabBeforeDetach(tabId) {
+  const pending = markingTabs.get(tabId);
+  if (pending) {
+    try { await pending; } catch (e) {}
+  }
   const identifier = markedTabs.get(tabId);
   markedTabs.delete(tabId);
-  if (identifier === undefined) return;
-  try {
-    if (identifier) {
+  if (identifier) {
+    try {
       await chrome.debugger.sendCommand(
         { tabId },
         "Page.removeScriptToEvaluateOnNewDocument",
         { identifier },
       );
+    } catch (e) {
+      // The old registration may already be gone. Current-page cleanup below
+      // is independent and must still run.
     }
+  }
+  try {
     await chrome.debugger.sendCommand(
       { tabId },
       "Runtime.evaluate",
@@ -1253,6 +1281,24 @@ async function unmarkTabBeforeDetach(tabId) {
     );
   } catch (e) {
     // Tab closing or session already torn down — safe to ignore.
+  }
+}
+
+async function cleanupMarkersBeforeReload() {
+  // A controlled extension reload destroys this service-worker realm and both
+  // in-memory sets. Strip markers while chrome.debugger is still usable. The
+  // union also covers a mark still in flight (attached, but no identifier yet)
+  // and any bookkeeping drift between the two collections.
+  const knownTabs = new Set([...attachedTabs, ...markedTabs.keys()]);
+  const cleanup = Promise.allSettled(
+    [...knownTabs].map((tabId) => unmarkTabBeforeDetach(tabId)),
+  );
+  const completed = await Promise.race([
+    cleanup.then(() => true),
+    sleep(MARKER_RELOAD_CLEANUP_TIMEOUT_MS).then(() => false),
+  ]);
+  if (!completed) {
+    console.warn("[bd-relay] marker cleanup timed out; reloading anyway");
   }
 }
 

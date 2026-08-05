@@ -33,7 +33,7 @@ class _Router:
         self.unregistered: list[int] = []
         self.released: list[int] = []
         self.upstream_senders: list[object] = []
-        self.lifecycle: tuple[object, object] | None = None
+        self.lifecycle: tuple[object, object, object] | None = None
         self.drained = 0
         self.daemon = None
         self.upstream = None
@@ -50,8 +50,10 @@ class _Router:
     def unregister_client(self, cid: int) -> None:
         self.unregistered.append(cid)
 
-    def bind_lifecycle(self, ensure_upstream, trigger_disconnect) -> None:
-        self.lifecycle = (ensure_upstream, trigger_disconnect)
+    def bind_lifecycle(
+        self, ensure_upstream, trigger_disconnect, prepare_executor=None,
+    ) -> None:
+        self.lifecycle = (ensure_upstream, trigger_disconnect, prepare_executor)
 
     async def route_from_client(self, client, text: str) -> None:
         self.routes.append((client.client_id, text))
@@ -184,6 +186,9 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
         async def trigger_close(self, reason: str) -> None:
             return None
 
+        async def prepare_executor(self, session_id: str) -> None:
+            return None
+
     class Conn:
         request = SimpleNamespace(path="/ws?client=alice&session=s-1")
 
@@ -211,7 +216,8 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
     assert router.registered == [77]
     assert router.unregistered == [77]
     assert router.released == [77]
-    assert router.lifecycle == (holder.ensure_open, holder.trigger_close)
+    assert router.lifecycle == (
+        holder.ensure_open, holder.trigger_close, holder.prepare_executor)
     assert router.upstream is holder.upstream
     assert [(cid, json.loads(text)) for cid, text in router.routes] == [
         (77, {"id": 1}),

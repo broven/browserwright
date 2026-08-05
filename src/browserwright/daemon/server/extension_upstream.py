@@ -29,6 +29,7 @@ import logging
 import secrets
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
+from ... import session_registry
 from .. import __version__
 from .relay import RelayServer, GhostTarget, _CommandError
 
@@ -200,6 +201,63 @@ class ExtensionUpstream:
         """Return the adapter-owned live group binding for ``session_id``."""
         return self._groups.get(session_id) if session_id else None
 
+    async def _resolve_session_group(
+        self,
+        session_id: str | None,
+        explicit_group_id: int | None = None,
+    ) -> tuple[int | None, dict | None]:
+        """Resolve one session's group before any group-sensitive operation.
+
+        Adapter memory is the steady-state fast path.  After daemon restart it
+        is empty, so the ledger's ``runtime.group_id`` is the durable fallback;
+        that id is validated against Chrome before reuse because empty groups
+        are auto-deleted.  An explicit id retained by legacy recover/teardown
+        callers is the final compatibility fallback.  Names are never queried.
+
+        The returned group query is reusable by membership callers, avoiding a
+        second relay round trip on the cold ledger-recovery path.  Transport
+        errors deliberately propagate: a transient validation failure must not
+        be mistaken for permission to create a second group.
+        """
+        if session_id:
+            live = self._groups.get(session_id)
+            if isinstance(live, int) and live >= 0:
+                return live, None
+
+        candidates: list[int] = []
+        if session_id:
+            record = session_registry.get(session_id)
+            runtime = record.get("runtime") if isinstance(record, dict) else None
+            ledger_group = (
+                runtime.get("group_id") if isinstance(runtime, dict) else None)
+            if isinstance(ledger_group, int) and ledger_group >= 0:
+                candidates.append(ledger_group)
+        if (isinstance(explicit_group_id, int) and explicit_group_id >= 0
+                and explicit_group_id not in candidates):
+            candidates.append(explicit_group_id)
+
+        for candidate in candidates:
+            info = await self._relay.query_group_tabs(group_id=candidate)
+            if not isinstance(info, dict):
+                raise RuntimeError(
+                    f"could not validate group id {candidate}: "
+                    f"malformed relay response {info!r}")
+            resolved = info.get("groupId")
+            if not isinstance(resolved, int):
+                raise RuntimeError(
+                    f"could not validate group id {candidate}: "
+                    f"malformed groupId {resolved!r}")
+            if resolved < 0:
+                continue
+            if resolved != candidate:
+                raise RuntimeError(
+                    f"group validation mismatch: asked for {candidate}, "
+                    f"relay returned {resolved}")
+            if session_id:
+                self._bind_group(session_id, resolved)
+            return resolved, info
+        return None, None
+
     @staticmethod
     def _group_required(*, group_name: str | None,
                         group_id: int | None,
@@ -219,14 +277,14 @@ class ExtensionUpstream:
                                  group_id: int | None = None) -> tuple[int, list[int]]:
         """Resolve the session's live group membership = the source of truth.
         Returns ``(group_id, [tab_id, ...])``. Keyed ONLY on the numeric Chrome
-        groupId — the session's in-memory bound id first, else the persisted id
-        passed in. The title is never a lookup key (names aren't unique;
-        decision 6). Empty list when the session has no live group (never opened
-        a tab, or its last tab closed and Chrome auto-deleted the group)."""
-        gid = self._groups.get(session_id) if session_id else None
-        if gid is None:
-            gid = group_id
-        info = await self._relay.query_group_tabs(group_id=gid)
+        groupId — adapter memory first, then the ledger's durable id, then the
+        explicit compatibility id passed in. The title is never a lookup key
+        (names aren't unique; decision 6). Empty list when the session has no
+        live group (never opened a tab, or its last tab closed and Chrome
+        auto-deleted the group)."""
+        gid, info = await self._resolve_session_group(session_id, group_id)
+        if info is None:
+            info = await self._relay.query_group_tabs(group_id=gid)
         if not info:
             return (-1, [])
         live_gid = int(info.get("groupId", -1))
@@ -498,7 +556,7 @@ class ExtensionUpstream:
         REFUSES (raises) if the focused tab already belongs to another
         session's group; that error propagates to the caller.
         """
-        gid = self._groups.get(session_id) if session_id else None
+        gid, _info = await self._resolve_session_group(session_id)
         ghost = await self._relay.attach_active_tab(
             group_name=group_name, group_id=gid, timeout=10.0)
         group_id = getattr(ghost, "group_id", -1)
@@ -535,7 +593,7 @@ class ExtensionUpstream:
         name is only the human-visible title used when a new group must be
         created. The returned groupId is (re)bound to the session — that's the
         only per-session state we keep; membership comes from the live group."""
-        gid = self._groups.get(session_id) if session_id else None
+        gid, _info = await self._resolve_session_group(session_id)
         self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
             url,
