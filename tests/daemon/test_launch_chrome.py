@@ -10,7 +10,11 @@ import pytest
 
 import browserwright.daemon.launch_chrome as lc_mod
 from browserwright.daemon.config import load
-from browserwright.daemon.errors import ChromeBinaryNotFound, Unavailable
+from browserwright.daemon.errors import (
+    ChromeBinaryNotFound,
+    Unavailable,
+    UserError,
+)
 
 
 @pytest.fixture
@@ -532,6 +536,107 @@ async def test_launch_chrome_passes_extra_args(monkeypatch, tmp_path, fake_chrom
         os.kill(out["extras"]["pid"], 15)
     except ProcessLookupError:
         pass
+
+
+# ---- E2E harness: BD_CHROME_EXTRA_ARGS env hook ---------------------------
+#
+# The env twin of `extra_args`. It exists for the launcher you cannot pass an
+# argument to: for a create-owned rdp session the *daemon* calls launch_chrome()
+# itself, in its own process, so only an inherited env var reaches it. The E2E
+# harness uses this to make those Chromes `--headless=new`.
+
+
+async def _capture_argv(monkeypatch, tmp_path, fake_chrome, **kwargs) -> list[str]:
+    """Run launch_chrome against the fake binary; return the Chrome argv."""
+    captured: list[list[str]] = []
+    real_popen = lc_mod.subprocess.Popen
+
+    def fake_popen(args, **kw):
+        args_list = list(args)
+        if "--version" not in args_list:
+            captured.append(args_list)
+        return real_popen(args, **kw)
+
+    monkeypatch.setattr(lc_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    cfg = load(env={"XDG_CACHE_HOME": str(tmp_path / "cache"),
+                    "XDG_RUNTIME_DIR": str(tmp_path / "run")})
+    out = await lc_mod.launch_chrome(
+        cfg, profile="isolated", chrome_binary=str(fake_chrome), port=51235,
+        **kwargs,
+    )
+    try:
+        os.kill(out["extras"]["pid"], 15)
+    except ProcessLookupError:
+        pass
+    assert captured, "Popen never called"
+    return captured[0]
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_appends_env_extra_args(
+    monkeypatch, tmp_path, fake_chrome,
+):
+    """BD_CHROME_EXTRA_ARGS is shlex-split and appended after our own flags."""
+    monkeypatch.setenv(lc_mod.CHROME_EXTRA_ARGS_ENV,
+                       "--headless=new --window-size=1280,800")
+    argv = await _capture_argv(monkeypatch, tmp_path, fake_chrome)
+    assert "--headless=new" in argv
+    assert "--window-size=1280,800" in argv
+    assert argv.index("--remote-allow-origins=*") < argv.index("--headless=new")
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_env_extra_args_unset_changes_nothing(
+    monkeypatch, tmp_path, fake_chrome,
+):
+    """Default off: an unset (or blank) env var adds no argv at all."""
+    monkeypatch.delenv(lc_mod.CHROME_EXTRA_ARGS_ENV, raising=False)
+    baseline = await _capture_argv(monkeypatch, tmp_path, fake_chrome)
+    monkeypatch.setenv(lc_mod.CHROME_EXTRA_ARGS_ENV, "   ")
+    blank = await _capture_argv(monkeypatch, tmp_path, fake_chrome)
+    assert baseline == blank
+    assert not any(a.startswith("--headless") for a in baseline)
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_explicit_extra_args_win_over_env(
+    monkeypatch, tmp_path, fake_chrome,
+):
+    """Env args come first so an explicit `extra_args=` occurrence is LAST —
+    Chrome honours the last occurrence of a repeated flag."""
+    monkeypatch.setenv(lc_mod.CHROME_EXTRA_ARGS_ENV, "--lang=de")
+    argv = await _capture_argv(monkeypatch, tmp_path, fake_chrome,
+                               extra_args=["--lang=en-US"])
+    assert argv.index("--lang=de") < argv.index("--lang=en-US")
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_env_extra_args_malformed_quotes_dont_raise(
+    monkeypatch, tmp_path, fake_chrome,
+):
+    """An unbalanced quote must not take the browser launch down."""
+    monkeypatch.setenv(lc_mod.CHROME_EXTRA_ARGS_ENV, "--proxy-server='oops")
+    argv = await _capture_argv(monkeypatch, tmp_path, fake_chrome)
+    assert "--proxy-server='oops" in argv
+
+
+@pytest.mark.asyncio
+async def test_launch_chrome_env_extra_args_cannot_defeat_default_profile_guard(
+    monkeypatch, tmp_path,
+):
+    """The §11 guard reads `user_data_dir`, which the env hook never sets — so
+    pointing it at the default profile still refuses."""
+    default = tmp_path / "DefaultChromeProfile"
+    default.mkdir()
+    monkeypatch.setattr(lc_mod, "profile_paths", lambda: [default])
+    monkeypatch.setattr(lc_mod, "_allocate_data_dir", lambda *a, **kw: default)
+    monkeypatch.setenv(lc_mod.CHROME_EXTRA_ARGS_ENV,
+                       f"--user-data-dir={tmp_path / 'elsewhere'}")
+    cfg = load(env={})
+    with pytest.raises(UserError):
+        await lc_mod.launch_chrome(cfg, profile="isolated")
 
 
 # ---- v0.5 Task #12: discover_chrome_binary validates --version -----------

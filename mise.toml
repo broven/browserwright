@@ -103,9 +103,18 @@ fi
 #    global daemon never do), and we additionally require ppid==1 so a sibling
 #    worktree's *running* e2e — whose Chrome still has a live pytest parent —
 #    is left alone. Orphans are exactly the leak this is meant to reap.
+#
+#    Two profile markers, because two different launchers leak:
+#      - `bd-e2e-chrome-`   the extension Chrome for Testing (tmpdir profile);
+#      - `/profiles/bs-se2e-` the Chrome the *daemon* launches for a
+#        create-owned rdp session. That one lands in the shared
+#        ~/.cache/browserwright-daemon/profiles/ tree, which this task otherwise
+#        stays out of — but `bs-se2e-` is unambiguous (the profile is
+#        `bs-s<session_id>` and only e2e mints `e2e-*` session ids), and a
+#        real leak of one was observed surviving a full run.
 orphans=$(ps -eo pid=,ppid=,command= 2>/dev/null \
   | grep -F -- "--user-data-dir=" \
-  | grep -F "bd-e2e-chrome-" \
+  | grep -E -- "bd-e2e-chrome-|/profiles/bs-se2e-" \
   | awk '$2 == 1 {print $1}')
 if [ -n "${orphans:-}" ]; then
   echo "teardown: killing orphaned e2e Chrome: $(echo "$orphans" | tr '\n' ' ')"
