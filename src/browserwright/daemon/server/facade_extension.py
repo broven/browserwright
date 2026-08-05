@@ -314,6 +314,8 @@ class ExtensionFacadeBridge:
             tab_id = (_tab_id_from_target_id(tid)
                       if isinstance(tid, str) else None)
             if tab_id is not None:
+                if not await self._authorize_target(req_id, tid):
+                    return
                 await self._respond(req_id, {"targetInfo": self._target_info(tab_id)})
             else:
                 await self._respond(req_id, {"targetInfo": self._browser_target_info()})
@@ -353,6 +355,22 @@ class ExtensionFacadeBridge:
         # Browser.getVersion). Its responses carry no sessionId, which is
         # correct for these browser-level methods. ---
         if session_id is None:
+            if method == "Target.getTargets" and self._session_id is not None:
+                try:
+                    envelope = await self._ext.get_targets(
+                        params, self._session_id)
+                except Exception as e:  # noqa: BLE001
+                    await self._error(
+                        req_id, -32603, f"getTargets scoping failed: {e!r}")
+                    return
+                if isinstance(envelope.get("error"), dict):
+                    error = envelope["error"]
+                    await self._error(
+                        req_id, int(error.get("code", -32603)),
+                        str(error.get("message", "getTargets failed")))
+                else:
+                    await self._respond(req_id, envelope.get("result") or {})
+                return
             if method == "Target.attachToTarget":
                 await self._handle_attach_to_target(req_id, params)
                 return
@@ -374,7 +392,7 @@ class ExtensionFacadeBridge:
                                        params: dict) -> None:
         """Forward a session-scoped command to the tab's chrome.debugger and
         echo `{id, sessionId, result|error}`."""
-        tab_id = self._ext.resolve_tab_id(session_id)
+        tab_id = self._tab_id_for_session(session_id)
         if tab_id is None:
             await self._error(req_id, -32602,
                               f"unknown sessionId {session_id!r}",
@@ -427,6 +445,9 @@ class ExtensionFacadeBridge:
         target_id = params.get("targetId")
         tab_id = (_tab_id_from_target_id(target_id)
                   if isinstance(target_id, str) else None)
+        if (isinstance(target_id, str)
+                and not await self._authorize_target(req_id, target_id)):
+            return
         # Reuse an already-announced session for this tab if we have one, so
         # auto-attach replay + an explicit attachToTarget agree on one session.
         if tab_id is not None and tab_id in self._tab_sessions:
@@ -521,6 +542,9 @@ class ExtensionFacadeBridge:
             # CDP returns success:false for an unknown target rather than erroring.
             await self._respond(req_id, {"success": False})
             return
+        if not await self._authorize_target(
+                req_id, f"ext-tab-{tab_id}", close_response=True):
+            return
         sid = self._tab_sessions.get(tab_id)
         try:
             # Same core as the agent path's closeTab-by-targetId verb: evicts
@@ -572,7 +596,7 @@ class ExtensionFacadeBridge:
         AND already observes the extension event fan-out via `_on_relay_event` —
         so it is the one place that can both drive the re-subscribe and watch
         for the resulting event without a second transport hop."""
-        tab_id = self._ext.resolve_tab_id(session_id)
+        tab_id = self._tab_id_for_session(session_id)
         if tab_id is None:
             await self._error(req_id, -32602,
                               f"unknown sessionId {session_id!r}",
@@ -612,6 +636,46 @@ class ExtensionFacadeBridge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._ctx_waiters.setdefault(tab_id, []).append(fut)
         return fut
+
+    def _tab_id_for_session(self, session_id: str) -> int | None:
+        """Resolve only sids this facade connection actually handed out.
+
+        ``ExtensionUpstream.resolve_tab_id`` intentionally understands the
+        synthetic sid's text format for daemon-internal recovery. It is not an
+        authorization boundary: a facade client could otherwise invent
+        ``ext-sid-<foreign-tab>-anything`` and bypass attachToTarget entirely.
+        """
+        return next(
+            (tab_id for tab_id, sid in self._tab_sessions.items()
+             if sid == session_id),
+            None,
+        )
+
+    async def _authorize_target(
+        self, req_id: int | None, target_id: str, *, close_response: bool = False,
+    ) -> bool:
+        if self._session_id is None:
+            return True
+        try:
+            allowed = await self._binding_owner.target_belongs_to_session(
+                self._session_id, target_id)
+        except Exception as e:  # noqa: BLE001 - unknown ownership fails closed
+            if close_response:
+                await self._respond(req_id, {"success": False})
+            else:
+                await self._error(
+                    req_id, -32603, f"target ownership check failed: {e!r}")
+            return False
+        if allowed:
+            return True
+        if close_response:
+            await self._respond(req_id, {"success": False})
+        else:
+            await self._error(
+                req_id, -32602,
+                f"target {target_id} does not belong to session "
+                f"{self._session_id!r}")
+        return False
 
     def _disarm_context_waiter(self, tab_id: int,
                                fut: asyncio.Future) -> None:

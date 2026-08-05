@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from .. import _ipc
 from ..supervise import pid_alive as _pid_alive, wait_until
@@ -91,6 +92,10 @@ class ExecutorRegistry:
         # One lock per session id guards its spawn (the rdp `_open_lock`
         # equivalent — prevents the double-spawn race, Fork 1 risk).
         self._locks: dict[str, asyncio.Lock] = {}
+        # Successful workspace teardown is terminal for this daemon lifetime.
+        # Session ids are durable/unique, so retaining the result is both the
+        # tombstone that rejects a queued ensure and an idempotent end result.
+        self._terminal_results: dict[str, dict] = {}
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         lock = self._locks.get(session_id)
@@ -111,21 +116,75 @@ class ExecutorRegistry:
         — `_spawn` unconditionally `cleanup_executor`s it before launching a
         fresh executor, so a dead pid's stale path can never be handed back."""
         async with self._lock_for(session_id):
-            handle = self._handles.get(session_id)
-            if handle is not None and handle.is_alive():
-                return handle.sock_path
-            # Dead handle (crashed) → drop it and cold-spawn a fresh one.
-            if handle is not None:
-                self._handles.pop(session_id, None)
-            # No in-memory handle (e.g. just-restarted daemon): a leftover
-            # discovery file whose process is dead is worthless. Validate +
-            # purge it so neither this spawn nor the thin client latches onto a
-            # dead socket (Fork 4 stale-file robustness).
-            if not _discovery_alive(session_id):
-                _ipc.cleanup_executor(session_id)
-            handle = await self._spawn(session_id)
-            self._handles[session_id] = handle
+            return await self._ensure_locked(session_id)
+
+    async def ensure_with_preflight(
+        self,
+        session_id: str,
+        preflight: Callable[[], Awaitable[None]],
+    ) -> str:
+        """Serialize upstream readiness and spawn with terminal teardown.
+
+        Running readiness outside this lock is unsafe: an authorized ensure
+        can reopen the browser after endSession closes it but before spawn wins
+        the registry lock. The shared lifecycle gate covers both phases.
+        """
+        async with self._lock_for(session_id):
+            self._raise_if_terminal(session_id)
+            await preflight()
+            return await self._ensure_locked(session_id)
+
+    def _raise_if_terminal(self, session_id: str) -> None:
+        if session_id in self._terminal_results:
+            raise RuntimeError(f"session {session_id!r} has ended")
+
+    async def _ensure_locked(self, session_id: str) -> str:
+        self._raise_if_terminal(session_id)
+        handle = self._handles.get(session_id)
+        if handle is not None and handle.is_alive():
             return handle.sock_path
+        # Dead handle (crashed) → drop it and cold-spawn a fresh one.
+        if handle is not None:
+            self._handles.pop(session_id, None)
+        # No in-memory handle (e.g. just-restarted daemon): a leftover
+        # discovery file whose process is dead is worthless. Validate + purge.
+        if not _discovery_alive(session_id):
+            _ipc.cleanup_executor(session_id)
+        handle = await self._spawn(session_id)
+        self._handles[session_id] = handle
+        return handle.sock_path
+
+    async def terminate_session(
+        self,
+        session_id: str,
+        teardown: Callable[[], Awaitable[dict]],
+    ) -> tuple[dict[str, object], dict]:
+        """Atomically reap the executor and tear down its browser workspace.
+
+        A successful result installs a terminal tombstone before releasing the
+        per-session lock, so an ensure that was already authorized and queued
+        cannot create a replacement. Failed/partial teardown is retryable and
+        deliberately does not install the tombstone.
+        """
+        async with self._lock_for(session_id):
+            cached = self._terminal_results.get(session_id)
+            if cached is not None:
+                return ({
+                    "killed": False,
+                    "reaped": True,
+                    "matched": True,
+                    "executor_id": None,
+                }, dict(cached))
+            handle = self._handles.get(session_id)
+            executor_id = handle.executor_id if handle is not None else None
+            reap = await self._kill_and_wait_locked(
+                session_id, executor_id=executor_id)
+            if reap.get("reaped") is not True:
+                return reap, {}
+            result = await teardown()
+            if isinstance(result, dict) and result.get("ok") is True:
+                self._terminal_results[session_id] = dict(result)
+            return reap, result
 
     async def _spawn(self, session_id: str) -> ExecutorHandle:
         """Spawn ``python -m browserwright._executor --session <id>`` detached
@@ -520,17 +579,13 @@ def cleanup_orphan_executors() -> None:
             sock = d.get("sock")
         except (OSError, ValueError, TypeError):
             sock = None
-        if pid is not None:
-            try:
-                # SIGTERM the orphan's process group; it's a session leader.
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    os.kill(pid, signal.SIGTERM)
-                logger.info("orphan-cleanup: SIGTERM stray executor pid %d "
-                            "(%s)", pid, entry.name)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+        if pid is not None and not _terminate_orphan_and_wait(pid):
+            # Fixed per-session paths cannot be reused while the old process
+            # may still run its unconditional SIGTERM cleanup handler.
+            logger.warning(
+                "orphan-cleanup: executor pid %d did not exit; retaining %s",
+                pid, entry.name)
+            continue
         # Remove the stale discovery file + its socket.
         for p in (entry, entry.with_suffix(".sock"),
                   *( [_to_path(sock)] if isinstance(sock, str) else [] )):
@@ -540,6 +595,30 @@ def cleanup_orphan_executors() -> None:
                 p.unlink()
             except (FileNotFoundError, IsADirectoryError, OSError):
                 pass
+
+
+def _terminate_orphan_and_wait(pid: int) -> bool:
+    """Bounded TERM→KILL reap for a process without a ``Popen`` handle."""
+    if not _pid_alive(pid):
+        return True
+    try:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGTERM)
+        logger.info("orphan-cleanup: SIGTERM stray executor pid %d", pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return not _pid_alive(pid)
+    if wait_until(lambda: not _pid_alive(pid), _KILL_GRACE_S, interval=0.05):
+        return True
+    try:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    return wait_until(lambda: not _pid_alive(pid), 1.0, interval=0.02)
 
 
 def _to_path(s: str):

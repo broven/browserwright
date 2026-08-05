@@ -159,6 +159,14 @@ The link from a session to its live browser handle: the numeric `group_id` on
 `extension`, the attached target on `rdp` / `env`. Live binding lives in
 process; the ledger holds the durable copy used to recover after a restart.
 
+**Extension boundary:** Chrome tab groups expose no application-owned,
+persistent identity. Recovery therefore uses only best-effort evidence: the
+ledger's numeric group id, the user-editable/non-unique title, and last-known
+tab membership. Renaming a group can make recovery reject the original group;
+after Chrome restarts and recycles group/tab ids, a same-titled group can be
+misidentified. This is a known backend tradeoff, not something another daemon
+cache can turn into a stronger ownership proof.
+
 ### ghost target
 A synthesized CDP `targetInfo` for an extension tab. The extension backend has
 no real CDP targets, so the relay fabricates them (`make_target_info`) for both

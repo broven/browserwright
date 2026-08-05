@@ -756,6 +756,7 @@ async function doCloseTab(id, tabId) {
     // that operation. Commit our bookkeeping only after that confirmation;
     // otherwise a failed remove would leave a visible marker on a tab we had
     // already forgotten and detached.
+    invalidateMarkerInstall(tabId);
     markedTabs.delete(tabId);
     attachedTabs.delete(tabId);
     safeSend({ type: "response", id, result: { ok: true, tabId } });
@@ -763,6 +764,7 @@ async function doCloseTab(id, tabId) {
     const msg = String(e?.message || e || "").toLowerCase();
     if (msg.includes("no tab with id")) {
       // Already gone — caller wanted it closed, success-equivalent.
+      invalidateMarkerInstall(tabId);
       markedTabs.delete(tabId);
       attachedTabs.delete(tabId);
       safeSend({ type: "response", id, result: { ok: true, tabId } });
@@ -1162,17 +1164,26 @@ const MARKER_REMOVE_SCRIPT = `
 // tabId → scriptIdentifier returned by Page.addScriptToEvaluateOnNewDocument
 // (needed to remove the per-document hook on detach).
 const markedTabs = new Map();
-// tabId → the full in-flight marker installation. Cleanup waits for it so its
-// last action cannot re-install the marker after detach/reload already removed
-// it. This map is intentionally separate from markedTabs: the latter reserves
-// duplicate installs and stores the Chrome registration id.
+// tabId → {token, promise} for the in-flight installation. The unique token is
+// the cancellation/ABA guard: detach invalidates it, and a later re-attach gets
+// a different token that an old catch/finally cannot erase.
 const markingTabs = new Map();
+// tabId → current opaque generation token. Object identity (not a resettable
+// integer) stays safe if Chrome later recycles a numeric tab id.
+const markerTokens = new Map();
 const MARKER_RELOAD_CLEANUP_TIMEOUT_MS = 1500;
 // Marker CDP is cosmetic and must never hold debugger detach hostage. Each
 // phase gets one absolute budget shared by all of its sendCommand calls, so a
 // sequence of hung calls cannot multiply the delay.
 const MARKER_INSTALL_TIMEOUT_MS = 1500;
 const MARKER_REMOVE_TIMEOUT_MS = 1000;
+
+function invalidateMarkerInstall(tabId) {
+  const pending = markingTabs.get(tabId)?.promise;
+  markerTokens.set(tabId, {});
+  markingTabs.delete(tabId);
+  return pending;
+}
 
 async function markerCommandBefore(deadline, tabId, method, params) {
   const remaining = deadline - Date.now();
@@ -1242,11 +1253,14 @@ async function keepTabRendered(tabId) {
 
 async function markTabAttached(tabId) {
   const pending = markingTabs.get(tabId);
-  if (pending) {
-    await pending;
+  if (pending && markerTokens.get(tabId) === pending.token) {
+    await pending.promise;
     return;
   }
   if (markedTabs.has(tabId)) return;
+  const token = {};
+  markerTokens.set(tabId, token);
+  const isCurrent = () => markerTokens.get(tabId) === token;
   const install = (async () => {
     const deadline = Date.now() + MARKER_INSTALL_TIMEOUT_MS;
     // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
@@ -1256,12 +1270,26 @@ async function markTabAttached(tabId) {
       // Page domain may not be enabled yet on a fresh chrome.debugger session;
       // enabling is idempotent so this is safe to call repeatedly.
       await markerCommandBefore(deadline, tabId, "Page.enable", {});
+      if (!isCurrent()) return;
       const reg = await markerCommandBefore(
         deadline,
         tabId,
         "Page.addScriptToEvaluateOnNewDocument",
         { source: MARKER_INSTALL_SCRIPT },
       );
+      if (!isCurrent()) {
+        // Best effort for a registration that completed as detach invalidated
+        // us. Detach itself clears debugger-session registrations; this covers
+        // implementations where the completion won that race.
+        if (reg?.identifier) {
+          chrome.debugger.sendCommand(
+            { tabId },
+            "Page.removeScriptToEvaluateOnNewDocument",
+            { identifier: reg.identifier },
+          ).catch(() => {});
+        }
+        return;
+      }
       markedTabs.set(tabId, reg?.identifier || "");
       // The above fires only on new documents; inject into the current one too.
       await markerCommandBefore(
@@ -1270,61 +1298,57 @@ async function markTabAttached(tabId) {
         "Runtime.evaluate",
         { expression: MARKER_INSTALL_SCRIPT },
       );
+      if (!isCurrent()) return;
     } catch (e) {
       // Tab might have closed mid-attach, or chrome.debugger session is gone —
       // not worth failing the whole attach over a cosmetic marker.
       console.warn("[bd-relay] markTabAttached(" + tabId + ") failed:", e);
-      markedTabs.delete(tabId);
+      if (isCurrent()) markedTabs.delete(tabId);
     }
   })();
-  markingTabs.set(tabId, install);
+  const record = { token, promise: install };
+  markingTabs.set(tabId, record);
   try {
     await install;
   } finally {
-    if (markingTabs.get(tabId) === install) markingTabs.delete(tabId);
+    if (markingTabs.get(tabId) === record) markingTabs.delete(tabId);
   }
 }
 
 async function unmarkTabBeforeDetach(tabId) {
   const deadline = Date.now() + MARKER_REMOVE_TIMEOUT_MS;
-  const pending = markingTabs.get(tabId);
-  if (pending) {
-    // Bounded on purpose. The install task awaits Page.enable, a script
-    // registration and a Runtime.evaluate; a wedged renderer leaves it
-    // unsettled forever (the OOPIF freeze still does this), and detach must
-    // not be held hostage to it — an unbounded await here never reaches
-    // chrome.debugger.detach, leaving Chrome attached with stale session
-    // state. Losing the wait only risks racing a marker we are about to
-    // remove anyway.
-    await Promise.race([
-      pending.catch(() => {}),
-      sleep(Math.max(0, deadline - Date.now())),
-    ]);
-  }
+  const pending = invalidateMarkerInstall(tabId);
+  // Invalidate before any wait. Every continuation of the old installation
+  // checks its opaque token before issuing the next marker command.
   const identifier = markedTabs.get(tabId);
   markedTabs.delete(tabId);
+  // Dispatch both cleanup commands immediately. They queue behind any marker
+  // command Chrome is already processing; notably, current-page removal then
+  // runs after a late install Runtime.evaluate instead of detach racing ahead
+  // and leaving the visible marker behind. Awaiting one cleanup before sending
+  // the other would let it consume the whole shared deadline.
+  const removals = [];
   if (identifier) {
-    try {
-      await markerCommandBefore(
+    removals.push(markerCommandBefore(
         deadline,
         tabId,
         "Page.removeScriptToEvaluateOnNewDocument",
         { identifier },
-      );
-    } catch (e) {
-      // The old registration may already be gone. Current-page cleanup below
-      // is independent and must still run.
-    }
+      ).catch(() => {}));
   }
-  try {
-    await markerCommandBefore(
+  removals.push(markerCommandBefore(
       deadline,
       tabId,
       "Runtime.evaluate",
       { expression: MARKER_REMOVE_SCRIPT },
-    );
-  } catch (e) {
-    // Tab closing or session already torn down — safe to ignore.
+    ).catch(() => {}));
+  await Promise.allSettled(removals);
+  if (pending) {
+    // Still bounded: a wedged renderer must never hold debugger detach hostage.
+    await Promise.race([
+      pending.catch(() => {}),
+      sleep(Math.max(0, deadline - Date.now())),
+    ]);
   }
 }
 
@@ -1386,6 +1410,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source && typeof source.tabId === "number") {
+    invalidateMarkerInstall(source.tabId);
     attachedTabs.delete(source.tabId);
     // Unexpected detach (DevTools steals the session, tab crashes, etc.) —
     // we can no longer run CDP commands, so the page-side observer keeps the
@@ -1441,6 +1466,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // onDetach didn't fire first (rare close-ordering races).
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (!attachedTabs.has(tabId)) return;
+  invalidateMarkerInstall(tabId);
   attachedTabs.delete(tabId);
   markedTabs.delete(tabId);
   safeSend({ type: "detached", tabId, reason: "tab_closed" });

@@ -1247,3 +1247,123 @@ async def test_scoped_target_infos_filters_ghosts_to_session_group():
         infos = await upstream.scoped_target_infos(session_id="A")
         await r
         assert {ti["targetId"] for ti in infos} == {"ext-tab-1"}
+
+
+@pytest.mark.asyncio
+async def test_end_session_refuses_to_treat_unknown_membership_as_empty():
+    class _DisconnectedRelay:
+        port = 19989
+        connection_generation = 1
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return None
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_DisconnectedRelay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    with pytest.raises(RuntimeError, match="membership.*unknown"):
+        await upstream.end_session("A")
+
+    assert upstream.group_for_session("A") == 300
+
+
+@pytest.mark.asyncio
+async def test_end_session_reconciles_lost_close_responses_before_anchor(
+    monkeypatch,
+):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _LostResponseRelay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.members = {1, 2}
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {
+                "groupId": group_id,
+                "tabs": [{"tabId": tab_id} for tab_id in sorted(self.members)],
+            }
+
+        async def close_tab(self, tab_id):
+            if tab_id == 1:
+                self.members.remove(1)
+                raise RuntimeError("response lost after remove")
+            raise RuntimeError("tab refused close")
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_LostResponseRelay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    result = await upstream.end_session("A")
+
+    assert result["ok"] is False
+    assert result["closed"] == [1]
+    assert result["failed"] == [2]
+    assert record["runtime"]["current_target_id"] == "ext-tab-2"
+
+
+@pytest.mark.asyncio
+async def test_unbound_tab_event_is_dropped_instead_of_browser_broadcast():
+    captured: list[dict] = []
+
+    async def _capture(text):
+        captured.append(json.loads(text))
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(SimpleNamespace(port=19989), _capture, _noop)
+    await upstream._handle_extension_event({
+        "type": "event",
+        "tabId": 77,
+        "method": "Runtime.consoleAPICalled",
+        "params": {"args": [{"value": "tenant secret"}]},
+    })
+
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_extension_get_targets_honors_target_filter():
+    async def _noop(_value):
+        return None
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {"groupId": group_id, "tabs": [{"tabId": 1}]}
+
+        def list_ghost_targets(self):
+            return [SimpleNamespace(
+                target_id="ext-tab-1", type="page", url="https://mine/",
+                title="Mine")]
+
+    upstream = ExtensionUpstream(_Relay(), _noop, _noop)
+    upstream._bind_group("A", 100)
+
+    envelope = await upstream.get_targets({
+        "filter": [{"type": "page", "exclude": True}, {}],
+    }, "A")
+
+    assert envelope == {"result": {"targetInfos": []}}

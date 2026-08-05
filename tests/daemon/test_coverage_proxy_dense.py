@@ -80,6 +80,57 @@ def last_error(cap: Capture, client) -> dict:
     return cap.per_client[client.client_id][-1]["error"]
 
 
+@pytest.mark.asyncio
+async def test_target_attach_and_close_are_authorized_by_browser_session():
+    state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    client.session_id = "session-A"
+
+    class _ScopedUpstream:
+        is_open = True
+
+        def __init__(self):
+            self.closed: list[str] = []
+            self.forwarded: list[dict] = []
+
+        async def target_belongs_to_session(self, session_id, target_id):
+            return session_id == "session-A" and target_id == "ext-tab-1"
+
+        async def send_cdp(self, text):
+            self.forwarded.append(json.loads(text))
+
+        async def close_tab(self, target):
+            self.closed.append(target)
+            return {"ok": True, "tabId": int(target.rsplit("-", 1)[1])}
+
+    upstream = _ScopedUpstream()
+    router.upstream = upstream
+
+    await router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "ext-tab-2"},
+    }))
+    assert last_error(cap, client)["code"] == -32602
+    assert upstream.forwarded == []
+
+    await router.route_from_client(client, json.dumps({
+        "id": 2,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"targetId": "ext-tab-2"},
+    }))
+    assert last_error(cap, client)["code"] == -32602
+    assert upstream.closed == []
+
+    await router.route_from_client(client, json.dumps({
+        "id": 3,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"targetId": "ext-tab-1"},
+    }))
+    assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
+    assert upstream.closed == ["ext-tab-1"]
+
+
 def attach_cdp(router: Router, cap: Capture, command, *, on_end_session=None):
     async def on_close(_reason: str) -> None:
         return None
