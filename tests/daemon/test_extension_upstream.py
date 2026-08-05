@@ -851,9 +851,22 @@ async def test_attach_active_passes_bound_group():
 
 
 @pytest.mark.asyncio
-async def test_end_session_closes_whole_group():
+async def test_end_session_closes_whole_group(monkeypatch):
     """DECIDED: end_session closes the WHOLE group — every member tab resolved
     from live membership — and `kept` is always empty (no borrowed)."""
+    record = {
+        "id": "A", "name": "Agent",
+        "runtime": {},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
     async with _ext_upstream() as (relay, upstream, captured, ext):
         await _open_in_group(upstream, ext, "https://a/", 30, 300, "A")
 
@@ -1200,17 +1213,22 @@ async def test_end_session_resolves_group_by_passed_id_when_unbound(monkeypatch)
         async def close_tab(self, tab_id, **_kwargs):
             calls.append(("close", tab_id))
 
-    monkeypatch.setattr(
-        "browserwright.session_registry.get",
-        lambda session_id: {
-            "id": session_id,
-            "name": "Agent",
-            "runtime": {
-                "group_id": 3,
-                "current_target_id": "ext-tab-60",
-            },
+    record = {
+        "id": "ledger-session",
+        "name": "Agent",
+        "runtime": {
+            "group_id": 3,
+            "current_target_id": "ext-tab-60",
         },
-    )
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
     monkeypatch.setattr(
         "browserwright.session_registry.list_all", lambda: [])
 
@@ -1469,6 +1487,155 @@ async def test_budgeted_end_session_stops_and_persists_unfinished_candidates(
     assert result["failed"] == [2, 3]
     assert record["runtime"]["retry_target_ids"] == [
         "ext-tab-2", "ext-tab-3"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checkpoint_failure", ["update_error", "missing_record", "vanished"])
+async def test_end_session_refuses_first_close_when_initial_checkpoint_fails(
+    monkeypatch, checkpoint_failure,
+):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda _session_id: (
+            None if checkpoint_failure == "missing_record" else record),
+    )
+
+    def fail_update(_session_id, **_fields):
+        if checkpoint_failure == "update_error":
+            raise OSError("ledger unavailable")
+        return None
+
+    monkeypatch.setattr(
+        "browserwright.session_registry.update", fail_update)
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.closed: list[int] = []
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {"groupId": group_id, "groupTitle": "Agent",
+                    "tabs": [{"tabId": 1}, {"tabId": 2}]}
+
+        async def close_tab(self, tab_id, **_kwargs):
+            self.closed.append(tab_id)
+
+    async def _noop(_value):
+        return None
+
+    relay = _Relay()
+    upstream = ExtensionUpstream(relay, _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    with pytest.raises(RuntimeError, match="checkpoint.*before closing"):
+        await upstream.end_session("A")
+
+    assert relay.closed == []
+
+
+@pytest.mark.asyncio
+async def test_end_session_cancellation_keeps_preclose_retry_checkpoint(
+    monkeypatch,
+):
+    record = {
+        "id": "A", "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {"groupId": group_id, "groupTitle": "Agent",
+                    "tabs": [{"tabId": 1}, {"tabId": 2}]}
+
+        async def close_tab(self, _tab_id, **_kwargs):
+            raise asyncio.CancelledError
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_Relay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    with pytest.raises(asyncio.CancelledError):
+        await upstream.end_session("A")
+
+    assert record["runtime"]["current_target_id"] is None
+    assert record["runtime"]["retry_target_ids"] == [
+        "ext-tab-1", "ext-tab-2"]
+
+
+@pytest.mark.asyncio
+async def test_end_session_distinguishes_survivor_checkpoint_from_close_failure(
+    monkeypatch, caplog,
+):
+    record = {
+        "id": "A",
+        "name": "Agent",
+        "runtime": {"group_id": 300, "current_target_id": "ext-tab-1"},
+    }
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        "browserwright.session_registry.get", lambda _session_id: record)
+
+    def update(_session_id, **fields):
+        retry_ids = list(fields["runtime"]["retry_target_ids"])
+        events.append(("checkpoint", retry_ids))
+        if len([event for event in events if event[0] == "checkpoint"]) == 2:
+            raise OSError("ledger unavailable after close")
+        record.update(fields)
+        return record
+
+    monkeypatch.setattr("browserwright.session_registry.update", update)
+
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            return {"groupId": group_id, "groupTitle": "Agent",
+                    "tabs": [{"tabId": 1}, {"tabId": 2}]}
+
+        async def close_tab(self, tab_id, **_kwargs):
+            events.append(("close", tab_id))
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(_Relay(), _noop, _noop)
+    upstream._bind_group("A", 300)
+
+    with pytest.raises(
+        RuntimeError, match="tab 1 closed.*survivor checkpoint failed"
+    ):
+        await upstream.end_session("A")
+
+    assert events == [
+        ("checkpoint", ["ext-tab-1", "ext-tab-2"]),
+        ("close", 1),
+        ("checkpoint", ["ext-tab-2"]),
+    ]
+    assert record["runtime"]["retry_target_ids"] == [
+        "ext-tab-1", "ext-tab-2"]
+    assert "could not close tab 1" not in caplog.text
 
 
 @pytest.mark.asyncio

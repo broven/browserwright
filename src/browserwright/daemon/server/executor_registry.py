@@ -54,6 +54,11 @@ class ExecutorHandle:
     proc: subprocess.Popen
     sock_path: str
     executor_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # A spawned process owns the fixed session paths before it publishes its
+    # discovery record. Keeping that provisional instance in the registry
+    # makes every startup failure use the same exact-instance reaper as kill,
+    # sweep, and cancellation paths; it must never be handed to a caller.
+    ready: bool = True
     spawned_at: float = field(default_factory=time.monotonic)
     # Wall-clock spawn time, used to floor the discovery-file-mtime idle clock
     # (mtime is wall-clock; spawned_at above is a monotonic clock for races).
@@ -142,7 +147,15 @@ class ExecutorRegistry:
         self._raise_if_terminal(session_id)
         handle = self._handles.get(session_id)
         if handle is not None and handle.is_alive():
-            return handle.sock_path
+            if handle.ready:
+                return handle.sock_path
+            reap = await self._kill_and_wait_locked(
+                session_id, executor_id=handle.executor_id)
+            if reap.get("reaped") is not True:
+                raise RuntimeError(
+                    f"executor for session {session_id!r} failed startup and "
+                    "could not be reaped")
+            handle = None
         # Dead handle (crashed) → drop it and cold-spawn a fresh one.
         if handle is not None:
             self._handles.pop(session_id, None)
@@ -218,14 +231,32 @@ class ExecutorRegistry:
             stdin=subprocess.DEVNULL,
             **_spawn_kwargs(),
         )
-        sock_path = await self._await_ready(session_id, proc, executor_id=executor_id)
-        logger.info("spawned executor for session %s (pid=%s)", session_id, proc.pid)
-        return ExecutorHandle(
+        handle = ExecutorHandle(
             session_id=session_id,
             proc=proc,
-            sock_path=sock_path,
+            sock_path=str(_ipc.executor_sock_path(session_id)),
             executor_id=executor_id,
+            ready=False,
         )
+        # Publish the provisional exact instance before the first await. The
+        # caller holds the session lock, so nobody can reuse the fixed paths;
+        # status/cleanup code can still identify the process if startup fails.
+        self._handles[session_id] = handle
+        try:
+            sock_path = await self._await_ready(
+                session_id, proc, executor_id=executor_id)
+        except BaseException:
+            # Cancellation is delayed until the same cancellation-resistant
+            # exact-instance reaper used by kill/teardown confirms death. A
+            # replacement therefore cannot publish at these fixed paths while
+            # the old process can still unlink them during exit.
+            await self._kill_and_wait_locked(
+                session_id, executor_id=executor_id)
+            raise
+        handle.sock_path = sock_path
+        handle.ready = True
+        logger.info("spawned executor for session %s (pid=%s)", session_id, proc.pid)
+        return handle
 
     async def _await_ready(
         self, session_id: str, proc: subprocess.Popen, executor_id: str | None = None
@@ -253,11 +284,6 @@ class ExecutorRegistry:
             ):
                 return str(record["sock"])
             await asyncio.sleep(0.05)
-        # Timed out — kill the stuck child so it doesn't leak.
-        try:
-            proc.terminate()
-        except OSError:
-            pass
         raise RuntimeError(
             f"executor for session {session_id!r} never became ready")
 

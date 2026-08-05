@@ -81,6 +81,25 @@ class _SendOnlyUpstream:
     open_tab = close_tab = list_tabs = get_targets = current_page = attach_active = _unavailable
     end_session = _unavailable
 
+    async def close_session_tab(
+        self, session_id: str, target_id: str,
+    ) -> dict:
+        raise RuntimeError(
+            "forwarding-only upstream cannot close a session tab")
+
+    async def target_belongs_to_session(
+        self, session_id: str, target_id: str,
+    ) -> bool:
+        # This adapter has a wire sender but no session binding owner. Unknown
+        # ownership is a denial, never permission to forward an attach/close.
+        return False
+
+    async def end_session_before(
+        self, session_id: str, group_id: int | None = None, *, deadline: float,
+    ) -> dict:
+        raise RuntimeError(
+            "forwarding-only upstream cannot end a session")
+
     async def recover(self, *args, **kwargs) -> dict:
         return {"recovered": [], "groupId": -1, "tabs": []}
 
@@ -415,10 +434,14 @@ class Router(SessionVerbsMixin):
                 req_id, -32602, "Target.attachToTarget requires params.targetId"))
             return
 
-        authorize = getattr(self.upstream, "target_belongs_to_session", None)
-        if callable(authorize) and client.session_id is not None:
+        if client.session_id is not None:
             try:
-                allowed = await authorize(client.session_id, target_id)
+                # Ownership is part of the declared Upstream contract. A
+                # capability-limited adapter must deny explicitly; probing for
+                # the member here would turn an incomplete adapter into a
+                # silent authorization bypass.
+                allowed = await self.upstream.target_belongs_to_session(
+                    client.session_id, target_id)
             except Exception as e:  # noqa: BLE001 - fail closed on unknown scope
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,

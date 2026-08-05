@@ -9,7 +9,7 @@ import pytest
 
 from browserwright.daemon.server.proxy import Router, _cmd_result
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
-from browserwright.daemon.server.upstream import CdpUpstream
+from browserwright.daemon.server.upstream import CdpUpstream, Upstream
 
 
 class Capture:
@@ -63,8 +63,19 @@ def setup_router(*labels: str, backend: str = "rdp",
     return state, router, cap, clients
 
 
+def allow_target_ownership(router: Router) -> None:
+    """Give forwarding-only routing tests explicit ownership evidence."""
+    assert router.upstream is not None
+
+    async def belongs(_session_id: str, _target_id: str) -> bool:
+        return True
+
+    router.upstream.target_belongs_to_session = belongs
+
+
 async def attach_primary(router: Router, cap: Capture, client, target_id: str = "T",
                          upstream_sid: str = "U"):
+    allow_target_ownership(router)
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "Target.attachToTarget",
@@ -134,6 +145,24 @@ async def test_target_attach_and_close_are_authorized_by_browser_session():
     }))
     assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
     assert upstream.closed == ["ext-tab-1"]
+
+
+@pytest.mark.asyncio
+async def test_send_only_adapter_fails_closed_before_target_attach_forwarding():
+    _state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=True)
+    client.session_id = "session-A"
+    assert isinstance(router.upstream, Upstream)
+
+    await router.route_from_client(client, json.dumps({
+        "id": 31,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "ext-tab-1"},
+    }))
+
+    assert last_error(cap, client)["code"] == -32602
+    assert "does not belong to session" in last_error(cap, client)["message"]
+    assert cap.upstream == []
 
 
 @pytest.mark.asyncio
@@ -441,6 +470,7 @@ async def test_get_targets_delegates_to_adapter_regardless_of_backend_name():
 @pytest.mark.asyncio
 async def test_attach_response_race_variants_and_validation():
     state, router, cap, (alice, bob, carol) = setup_router("alice", "bob", "carol")
+    allow_target_ownership(router)
 
     await router.route_from_client(alice, json.dumps({
         "id": 10, "method": "Target.attachToTarget", "params": {},
@@ -534,6 +564,7 @@ async def test_detach_paths_and_session_scoped_event_unbinds():
 @pytest.mark.asyncio
 async def test_upstream_event_table_orphan_and_pending_auto_attach_edges():
     state, router, cap, (client,) = setup_router()
+    allow_target_ownership(router)
     await router.route_from_client(client, json.dumps({
         "id": 20,
         "method": "Target.attachToTarget",
@@ -652,31 +683,47 @@ async def test_open_recover_close_and_end_error_translation_branches():
     }))
     local_sid = cap.per_client[client.client_id][-1]["result"]["sessionId"]
 
-    async def failing_close(upstream_sid: str):
-        raise RuntimeError(f"nope {upstream_sid}")
+    ownership_checks: list[tuple[str, str]] = []
 
-    router.upstream.close_tab = failing_close
+    async def owns_target(session_id: str, target_id: str) -> bool:
+        ownership_checks.append((session_id, target_id))
+        return True
+
+    close_attempts: list[tuple[str, str]] = []
+
+    async def failing_close(session_id: str, target_id: str):
+        close_attempts.append((session_id, target_id))
+        raise RuntimeError(f"business close failed for {target_id}")
+
+    router.upstream.target_belongs_to_session = owns_target
+    router.upstream.close_session_tab = failing_close
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.closeTab",
         "params": {"sessionId": local_sid},
     }))
     assert last_error(cap, client)["code"] == -32603
+    assert "business close failed" in last_error(cap, client)["message"]
+    assert ownership_checks == [("s-client", "T")]
+    assert close_attempts == [("s-client", "T")]
     assert local_sid in client.sessions
     assert "T" in state.attachers
 
     state.note_target_info({"targetId": "ghost", "type": "page"})
 
-    async def failing_close_by_target(target_id: str):
-        raise RuntimeError(target_id)
+    async def failing_close_by_target(session_id: str, target_id: str):
+        close_attempts.append((session_id, target_id))
+        raise RuntimeError(f"business close failed for {target_id}")
 
-    router.upstream.close_tab = failing_close_by_target
+    router.upstream.close_session_tab = failing_close_by_target
     await router.route_from_client(client, json.dumps({
         "id": 5,
         "method": "BrowserwrightDaemon.closeTab",
         "params": {"targetId": "ghost"},
     }))
     assert last_error(cap, client)["code"] == -32603
+    assert "business close failed" in last_error(cap, client)["message"]
+    assert close_attempts[-1] == ("s-client", "ghost")
     assert "ghost" in state.targets
 
     async def malformed_recover(*args, **kwargs):
