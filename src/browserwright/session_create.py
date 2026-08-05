@@ -57,6 +57,20 @@ def _run(cmd: list[str]) -> int:
         return 1
 
 
+def _daemon_is_running() -> bool:
+    """True iff a daemon answers on this XDG_RUNTIME_DIR's socket right now.
+
+    Deliberately does not care about version match — callers use it to decide
+    whether teardown has anything to talk to, not whether to upgrade.
+    """
+    from .daemon import _ipc
+    try:
+        pid, _version = _ipc.ping_status_sync(timeout=1.0)
+        return pid is not None
+    except Exception:
+        return False
+
+
 def _ensure_daemon_running() -> None:
     """Make sure the ONE global daemon is up; spawn ``serve`` detached if not.
 
@@ -223,20 +237,47 @@ def end(record: dict) -> str:
     """
     sid = record["id"]
     # Terminal teardown needs the daemon, and after a crash, reboot or a
-    # foreground `serve` exiting there may not be one. Without this the RPC
-    # fails, the ledger entry is kept "for retry", and the retry takes this
-    # exact path and fails identically — a record that can never be cleared by
-    # any `session end`. For env that is worse than cosmetic: the stale record
-    # occupies the daemon's single env slot, so no new env session can be
-    # allocated either. `_ensure_daemon_running` pings first and a redundant
-    # spawn is a no-op, so this neither restarts a healthy daemon nor races one.
-    _ensure_daemon_running()
+    # foreground `serve` exiting there may not be one — in which case the RPC
+    # fails, the entry is kept "for retry", and the retry takes this same path
+    # to the same failure. A record that `session end` cannot clear.
+    #
+    # Only `extension` may be recovered by starting one, because a bare
+    # `serve` IS the extension daemon. An env fleet's daemon carries per-profile
+    # configuration (its own XDG_RUNTIME_DIR, BD_CDP_WS, facade port — see
+    # docs/session-workspaces.md §"Scaling env to N profiles"); spawning a bare
+    # one would come up on the wrong backend and get the end-session rejected
+    # for a mismatch, leaving the record AND still holding the single env slot.
+    if record.get("backend") == "extension" and not _daemon_is_running():
+        # A bare `serve` IS the extension daemon, so starting one recovers this
+        # case. Never do this for env: that fleet's daemon carries per-profile
+        # configuration (its own XDG_RUNTIME_DIR, BD_CDP_WS, facade port — see
+        # docs/session-workspaces.md §"Scaling env to N profiles"), and a bare
+        # one would come up on the wrong backend and have end-session rejected
+        # for a mismatch — leaving the record AND still holding the env slot.
+        _ensure_daemon_running()
     if not _end_daemon_session(record):
         from .errors import DaemonUnavailable
 
+        # The row stays. An unreachable daemon cannot prove clients were
+        # revoked, and dropping the row for a session whose external browser
+        # may still have live clients driving it is worse than leaving one that
+        # needs another attempt.
+        #
+        # env cannot be auto-recovered the way extension can: its daemon
+        # carries per-profile configuration, so tell the user what to restart
+        # instead of guessing. Without this the failure is a dead end — the
+        # record also holds that daemon's single env slot.
+        hint = ""
+        if record.get("backend") == "env" and not _daemon_is_running():
+            hint = (
+                " No daemon is answering on this XDG_RUNTIME_DIR. Restart this "
+                "profile's daemon with the same XDG_RUNTIME_DIR and BD_CDP_WS "
+                "(see docs/session-workspaces.md, 'Scaling env to N profiles'), "
+                "then run `session end` again."
+            )
         raise DaemonUnavailable(
             f"session {sid} termination was incomplete; its ledger entry was "
-            "kept for retry")
+            f"kept for retry.{hint}")
     if record.get("owner") == "create":
         msg = f"session {sid} ended; the browser it launched was closed."
     else:

@@ -106,15 +106,34 @@ fi
 #
 #    Two profile markers, because two different launchers leak:
 #      - `bd-e2e-chrome-`   the extension Chrome for Testing (tmpdir profile);
-#      - `/profiles/bs-se2e-` the Chrome the *daemon* launches for a
+#      - `/profiles/bs-s<id>` the Chrome the *daemon* launches for a
 #        create-owned rdp session. That one lands in the shared
-#        ~/.cache/browserwright-daemon/profiles/ tree, which this task otherwise
-#        stays out of — but `bs-se2e-` is unambiguous (the profile is
-#        `bs-s<session_id>` and only e2e mints `e2e-*` session ids), and a
-#        real leak of one was observed surviving a full run.
+#        ~/.cache/browserwright-daemon/profiles/ tree, so ppid==1 is NOT enough
+#        to call it ours: the documented macOS launcher exits and leaves its
+#        Chrome grandchild reparented to init, so a sibling worktree's *live*
+#        rdp Chrome legitimately has ppid 1 too. Matching the shared tree by
+#        prefix alone would kill it — exactly what the guarantee above forbids.
+#        So we match only session ids this worktree's own e2e ledger recorded;
+#        with no ledger there is no proof of ownership and we skip the sweep
+#        (the daemon's startup orphan sweep reaps real leaks anyway).
+own_rdp=$(python3 - "$ROOT" <<'PYEOF' 2>/dev/null
+import glob, json, os, sys
+ids = set()
+for p in glob.glob(os.path.join(
+        sys.argv[1], "tests/daemon/e2e/_bs_home/*/sessions/ledger.json")):
+    try:
+        data = json.load(open(p))
+    except Exception:
+        continue
+    ids.update(str(k) for k in (data.get("sessions") or {}))
+print("|".join("/profiles/bs-s%s" % i for i in sorted(ids) if i))
+PYEOF
+)
+pattern="bd-e2e-chrome-"
+[ -n "${own_rdp:-}" ] && pattern="$pattern|$own_rdp"
 orphans=$(ps -eo pid=,ppid=,command= 2>/dev/null \
   | grep -F -- "--user-data-dir=" \
-  | grep -E -- "bd-e2e-chrome-|/profiles/bs-se2e-" \
+  | grep -E -- "$pattern" \
   | awk '$2 == 1 {print $1}')
 if [ -n "${orphans:-}" ]; then
   echo "teardown: killing orphaned e2e Chrome: $(echo "$orphans" | tr '\n' ' ')"
