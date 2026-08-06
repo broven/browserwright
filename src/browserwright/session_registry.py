@@ -100,6 +100,43 @@ def get(session_id: str) -> Optional[dict]:
     return json.loads(p.read_text())["sessions"].get(session_id)
 
 
+def migrate_legacy_backends() -> dict:
+    """Clear ledger rows naming a backend that no longer exists (#38).
+
+    Without this they are **immortal**: the daemon raises `UnknownSessionError`
+    for an unrecognised backend, so `session end` cannot confirm teardown and
+    keeps the row "for retry", and auto-prune skips it for the same reason. The
+    retry takes the same path to the same failure, forever.
+
+    Two different situations, two different answers:
+
+    - ``rdp`` → renamed to ``cdp``. Byte-identical semantics, same workspace,
+      same owner — a silent in-place migration is the honest thing.
+    - ``env`` → **evicted**. There is no equivalent row: an env session's
+      endpoint lived in its daemon's environment, not in the record, so there
+      is nothing to migrate it *to*. Returned to the caller so the eviction can
+      be logged rather than happening invisibly.
+
+    Goes through ``_locked`` directly, not ``update()`` — that guard rejects a
+    ``backend`` change by design, and rightly so for every caller but this one.
+
+    Returns ``{"migrated": [id, ...], "evicted": [record, ...]}``.
+    """
+    with _locked() as data:
+        migrated: list[str] = []
+        evicted: list[dict] = []
+        for sid, entry in list(data["sessions"].items()):
+            if not isinstance(entry, dict):
+                continue
+            backend = entry.get("backend")
+            if backend == "rdp":
+                entry["backend"] = "cdp"
+                migrated.append(sid)
+            elif backend == "env":
+                evicted.append(data["sessions"].pop(sid))
+        return {"migrated": migrated, "evicted": evicted}
+
+
 def _with_entry(session_id: str, fn: Callable[[dict], object]) -> Optional[dict]:
     """Apply ``fn`` to a session entry in-place under the lock; return the entry."""
     with _locked() as data:

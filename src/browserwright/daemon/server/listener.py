@@ -200,6 +200,26 @@ async def run_serve(cfg: Config) -> int:
     # ephemeral cdp sessions start clean (and so a relaunch on the same profile
     # isn't blocked by a stale SingletonLock).
     _cleanup_orphan_cdp_chrome()
+    # #38: clear ledger rows naming a retired backend. Left alone they are
+    # immortal — this daemon would refuse to route them (UnknownSessionError),
+    # which is also what stops `session end` and auto-prune from clearing them.
+    try:
+        from ... import session_registry
+
+        swept = session_registry.migrate_legacy_backends()
+        if swept["migrated"]:
+            logger.info("ledger: migrated %d session(s) from backend 'rdp' to "
+                        "'cdp': %s", len(swept["migrated"]),
+                        ", ".join(swept["migrated"]))
+        for rec in swept["evicted"]:
+            logger.warning(
+                "ledger: evicted session %s (%r) — backend 'env' no longer "
+                "exists and its endpoint lived in a daemon's environment, not "
+                "in the record, so there is nothing to migrate it to. Recreate "
+                "it with `session new --backend=cdp --attach=<url>`.",
+                rec.get("id"), rec.get("name"))
+    except Exception as e:  # noqa: BLE001 — never block startup on the ledger
+        logger.warning("ledger: legacy-backend sweep failed: %r", e)
     # Phase B (PR2): the executor is "cdp Chrome v2" — sweep orphan executor
     # subprocesses + their stale `bw-exec-*` sockets/discovery files left by a
     # prior daemon SIGKILL, same rationale as the cdp sweep above.

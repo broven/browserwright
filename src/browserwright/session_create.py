@@ -200,6 +200,10 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
             "tab group title; for CDP sessions it labels the isolated browser "
             "session. It need not be unique."
         )
+    # #38: a ledger carrying retired-backend rows would list them forever.
+    # Sweeping here means the first thing a user does after upgrading clears
+    # them, not only a daemon restart.
+    reg.migrate_legacy_backends()
     if backend == "extension":
         sid = reg.allocate(backend="extension",
                            owner="attach", name=name)
@@ -271,6 +275,19 @@ def end(record: dict) -> str:
     and ownership-aware workspace teardown all completed.
     """
     sid = record["id"]
+    # #38: a row naming a retired backend can never be ended through the
+    # daemon — it refuses to route one, so the RPC fails, the row is kept "for
+    # retry", and every retry repeats that. Clear it here instead of asking the
+    # daemon a question with no answer.
+    if record.get("backend") not in ("extension", "cdp"):
+        reg.remove(sid)
+        return (
+            f"session {sid} removed from the ledger. Its backend "
+            f"{record.get('backend')!r} no longer exists, so there was nothing "
+            "for the daemon to tear down. Any browser it used is untouched; if "
+            "it was a create-owned Chrome, the daemon sweeps its `bs-s"
+            f"{sid}` profile on next start."
+        )
     # Terminal teardown needs the daemon, and after a crash, reboot or a
     # foreground `serve` exiting there may not be one — in which case the RPC
     # fails, the entry is kept "for retry", and the retry takes this same path
