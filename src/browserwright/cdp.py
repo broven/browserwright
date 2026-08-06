@@ -98,6 +98,18 @@ def _rpc_error_fix(method: str, err: object) -> str:
     if isinstance(err, dict) and err.get("code") == -32601:
         from .mode_b_client import ModeBClient  # lazy: avoid import cycle
         return ModeBClient.explain_rpc_error(method, err)
+    if (isinstance(err, dict) and method == "Target.attachToTarget"
+            and "already attached" in str(err.get("message", "")).lower()):
+        # Issue #40: the "another client" here is very likely the session's
+        # own executor orphaned by a daemon crash/restart — it still holds
+        # the target while the ledger row + discovery record leak. Reaping it
+        # breaks the deadlock; the generic -32601 hint does not apply.
+        return (
+            "an executor orphaned by a daemon crash may still hold this "
+            "target: run `browserwright session reset <session-id>` (or "
+            "`browserwright session end --session=<session-id>`) to reap it, "
+            "then retry"
+        )
     return ""
 
 

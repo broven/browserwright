@@ -27,7 +27,11 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from .. import _ipc
-from ..supervise import pid_alive as _pid_alive, wait_until
+from ..supervise import (
+    pid_alive as _pid_alive,
+    terminate_orphan,
+    wait_until,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -449,8 +453,25 @@ class ExecutorRegistry:
                         "current_executor_id": recorded_id,
                     }
                 if _pid_alive(int(record["pid"])):
-                    # The daemon cannot honestly confirm death for a live
-                    # process it no longer owns with a Popen handle.
+                    # No Popen handle (daemon restarted and the startup
+                    # orphan sweep missed this executor), but the discovery
+                    # record carries a start-time fingerprint — reap it
+                    # exactly like the orphan sweep does, instead of leaving
+                    # the session stuck behind an executor nobody can kill
+                    # (issue #40). Runs off-loop (the reap polls with real
+                    # sleeps) and only claims success once death is confirmed.
+                    if await asyncio.to_thread(
+                        _terminate_orphan_and_wait,
+                        int(record["pid"]),
+                        record.get("start_time"),
+                    ):
+                        _ipc.cleanup_executor(session_id)
+                        return {
+                            "killed": True,
+                            "reaped": True,
+                            "matched": True,
+                            "executor_id": executor_id,
+                        }
                     return {
                         "killed": False,
                         "reaped": False,
@@ -729,54 +750,10 @@ def cleanup_orphan_executors() -> None:
 
 
 def _terminate_orphan_and_wait(pid: int, start_time: str | None = None) -> bool:
-    """Bounded TERM→KILL reap for a process without a ``Popen`` handle.
-
-    ``start_time`` is the fingerprint recorded when the discovery file was
-    written. A crash can leave that file behind while its executor exits, and
-    the OS is free to hand the pid to anything — so liveness alone does not
-    say the pid is still ours, and signalling its whole *group* on that basis
-    can take out an unrelated process tree. Three cases, deliberately graded:
-
-    - recorded and matching  → ours; full group escalation.
-    - recorded and differing → someone else's; do not signal at all, and
-      report the orphan as gone so its stale files are cleaned up.
-    - not recorded (a discovery file written before this field existed)
-      → unverifiable; signal only the exact pid, never the group.
-    """
-    if not _pid_alive(pid):
-        return True
-    verified = False
-    if start_time is not None:
-        from ..platforms import proc_start_time
-        current = proc_start_time(pid)
-        if current is not None and current != start_time:
-            logger.info(
-                "orphan-cleanup: pid %d was recycled (start-time mismatch); "
-                "not signalling", pid)
-            return True
-        verified = current is not None
-    try:
-        try:
-            if not verified:
-                raise PermissionError("unverified pid: exact-pid signal only")
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            os.kill(pid, signal.SIGTERM)
-        logger.info("orphan-cleanup: SIGTERM stray executor pid %d", pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        return not _pid_alive(pid)
-    if wait_until(lambda: not _pid_alive(pid), _KILL_GRACE_S, interval=0.05):
-        return True
-    try:
-        try:
-            if not verified:
-                raise PermissionError("unverified pid: exact-pid signal only")
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    return wait_until(lambda: not _pid_alive(pid), 1.0, interval=0.02)
+    """Thin wrapper over ``supervise.terminate_orphan`` kept for callers that
+    imported this name (the startup sweep, Layer 2's daemon-independent reap,
+    and tests). See ``supervise.terminate_orphan`` for the graded semantics."""
+    return terminate_orphan(pid, start_time, grace=_KILL_GRACE_S)
 
 
 def _to_path(s: str):

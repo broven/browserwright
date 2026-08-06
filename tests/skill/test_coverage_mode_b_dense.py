@@ -377,6 +377,24 @@ def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():
     assert "stale" in exc.value.fix
     assert "BrowserwrightDaemon.newerMethod" in exc.value.fix
 
+    # Issue #40: an attach conflict against the session's own orphaned
+    # executor must point at the reap recovery, not at the generic -32601
+    # stale-daemon hint (which does not apply).
+    cdp._ws = _FakeWS(
+        lambda frame: {
+            "id": frame["id"],
+            "error": {
+                "code": -32602,
+                "message": "target ext-tab-32688709 already attached by "
+                           "another client",
+            },
+        }
+    )
+    with pytest.raises(CDPError) as exc:
+        CDPSession.send(cdp, "Target.attachToTarget", targetId="ext-tab-1")
+    assert "orphaned" in exc.value.fix
+    assert "session reset" in exc.value.fix
+
     cdp._closed = True
     cdp._closed_reason = "bye"
     with pytest.raises(CDPError, match="ws closed: bye"):
