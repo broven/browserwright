@@ -37,17 +37,17 @@ from ._e2e_ports import e2e_ports
 
 _PORTS = e2e_ports()
 TEST_EXT_PORT = _PORTS["ext"]
-TEST_RDP_PORT = _PORTS["rdp"]
+TEST_CDP_PORT = _PORTS["cdp"]
 # Phase C: the Playwright facade is auto-enabled on a fixed default port
 # (DEFAULT_FACADE_PORT = 19990) — but every e2e daemon MUST override it: the
 # default is the machine-global daemon's facade port (issue #44 B), and the
-# extension + rdp session daemons run concurrently, so they also need distinct
+# extension + cdp session daemons run concurrently, so they also need distinct
 # ports from each other. Each daemon binds its own derived port; the L1
-# facade-test daemons and the rdp auto-facade daemon get theirs below.
+# facade-test daemons and the cdp auto-facade daemon get theirs below.
 TEST_EXT_FACADE_PORT = _PORTS["facade_ext"]
-TEST_RDP_FACADE_PORT = _PORTS["facade_rdp"]
-# The remaining facade ports: L1 rdp facade (test_l1_playwright_facade.py), L1
-# extension facade (test_l1_playwright_facade_extension.py), and the rdp
+TEST_CDP_FACADE_PORT = _PORTS["facade_cdp"]
+# The remaining facade ports: L1 cdp facade (test_l1_playwright_facade.py), L1
+# extension facade (test_l1_playwright_facade_extension.py), and the cdp
 # auto-facade daemon (test_l2_heredoc_playwright_page.py, via BD_FACADE_PORT).
 TEST_FACADE_L1_PORT = _PORTS["facade_l1"]
 TEST_FACADE_L1_EXT_PORT = _PORTS["facade_l1_ext"]
@@ -73,7 +73,7 @@ def scrubbed_env() -> dict[str, str]:
     """Return os.environ with BD_*/BS_*/BU_* vars stripped.
 
     Prevents the user's shell environment from leaking into test
-    subprocesses (e.g. BD_RDP_PORT, BD_BACKEND).
+    subprocesses (e.g. BD_CDP_PORT, BD_BACKEND).
     Callers re-add only the vars they need for isolation.
     """
     return {k: v for k, v in os.environ.items()
@@ -440,7 +440,7 @@ def requires_headful(reason: str) -> None:
 
 
 def _launch_cft_with_extension(
-    cft_binary: Path, ext_dir: Path, *, rdp_port: int = 0,
+    cft_binary: Path, ext_dir: Path, *, cdp_port: int = 0,
 ) -> ChromeHandle:
     """Launch Chrome for Testing with --load-extension, wait for CDP ready."""
     profile_dir = Path(tempfile.mkdtemp(prefix="bd-e2e-chrome-"))
@@ -448,7 +448,7 @@ def _launch_cft_with_extension(
         str(cft_binary),
         *(["--headless=new"] if e2e_headless() else []),
         f"--user-data-dir={profile_dir}",
-        f"--remote-debugging-port={rdp_port}",
+        f"--remote-debugging-port={cdp_port}",
         "--no-first-run",
         "--no-default-browser-check",
         "--remote-allow-origins=*",
@@ -613,8 +613,8 @@ def ext_ready(e2e_daemon, e2e_chrome):
     )
 
 
-def rdp_headless() -> bool:
-    """Whether the rdp-backend Chromes run headless. Default **ON**.
+def cdp_headless() -> bool:
+    """Whether the cdp-backend Chromes run headless. Default **ON**.
 
     Opposite default from `e2e_headless()` (the extension Chrome), and the
     asymmetry is the point:
@@ -622,27 +622,27 @@ def rdp_headless() -> bool:
     - The extension Chrome stays headful because tests in this suite assert
       things only a real foreground window has (tab visibility, focus,
       unthrottled rAF — `test_l2_background_render.py`).
-    - Nothing on the rdp side asserts any of that. The rdp tests cover executor
+    - Nothing on the cdp side asserts any of that. The cdp tests cover executor
       lifecycle, state persistence, page binding, tab reuse and timeout
       reclamation, all of which are headless-clean. Their windows were pure
-      collateral damage: a full run popped ~18 rdp Chrome windows, each one
+      collateral damage: a full run popped ~18 cdp Chrome windows, each one
       stealing the active window of whoever was working on the machine.
 
-    Escape hatch for debugging an rdp test visually: `BW_E2E_RDP_HEADFUL=1`.
+    Escape hatch for debugging an cdp test visually: `BW_E2E_CDP_HEADFUL=1`.
     """
-    return os.environ.get("BW_E2E_RDP_HEADFUL", "") != "1"
+    return os.environ.get("BW_E2E_CDP_HEADFUL", "") != "1"
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _rdp_chrome_headless_env():
-    """Put `--headless=new` on every rdp Chrome launched during this session.
+def _cdp_chrome_headless_env():
+    """Put `--headless=new` on every cdp Chrome launched during this session.
 
     Two different launchers need it and only one is reachable from test code:
 
-    1. `e2e_chrome_rdp` calls `launch_chrome()` in-process (could take
+    1. `e2e_chrome_cdp` calls `launch_chrome()` in-process (could take
        `extra_args=`), and
-    2. the **daemon** calls `launch_chrome()` itself for every create-owned rdp
-       session (`server/listener.py::_launch_rdp_chrome`). That one runs in a
+    2. the **daemon** calls `launch_chrome()` itself for every create-owned cdp
+       session (`server/listener.py::_launch_cdp_chrome`). That one runs in a
        subprocess we only hand an environment to — no argument we pass here can
        reach it.
 
@@ -656,7 +656,7 @@ def _rdp_chrome_headless_env():
     """
     key = _lc_mod.CHROME_EXTRA_ARGS_ENV
     previous = os.environ.get(key)
-    if rdp_headless():
+    if cdp_headless():
         extra = "--headless=new"
         os.environ[key] = f"{previous} {extra}" if previous else extra
     try:
@@ -669,47 +669,47 @@ def _rdp_chrome_headless_env():
 
 
 @pytest.fixture
-def e2e_chrome_rdp(tmp_path_factory, _rdp_chrome_headless_env):
-    """Chrome with --remote-debugging-port for RDP-backend tests.
-    No extension — RDP backend doesn't need one. Uses regular Chrome.
+def e2e_chrome_cdp(tmp_path_factory, _cdp_chrome_headless_env):
+    """Chrome with --remote-debugging-port for CDP-backend tests.
+    No extension — CDP backend doesn't need one. Uses regular Chrome.
 
-    Headless by default (`rdp_headless()`); `BW_E2E_RDP_HEADFUL=1` to watch it.
+    Headless by default (`cdp_headless()`); `BW_E2E_CDP_HEADFUL=1` to watch it.
 
     FUNCTION-scoped, and it must stay that way. It looks like an obvious
-    `scope="session"` win — it already serialises on the fixed `TEST_RDP_PORT`,
-    and 15 rdp tests each pay a Chrome launch for it. It was tried (2026-08,
+    `scope="session"` win — it already serialises on the fixed `TEST_CDP_PORT`,
+    and 15 cdp tests each pay a Chrome launch for it. It was tried (2026-08,
     headless, otherwise-identical tree) and it is NOT safe:
 
         tests/daemon/e2e/test_l2_heredoc_playwright_page.py
-            ::test_cross_heredoc_tab_reuse_rdp
+            ::test_cross_heredoc_tab_reuse_cdp
         FAILED — PageBindTimeout: timed out binding Playwright to session
         target '…' after 2s; no replacement page was created
 
     …on the *first* run, in the *default* collection order — no shuffling
     needed. That test passes on every function-scoped run. `CONTEXT.md` says why
-    this is structural rather than a bug to paper over: for an rdp session the
+    this is structural rather than a bug to paper over: for an cdp session the
     **workspace IS the browser instance**, so one shared Chrome means one shared
     workspace, and a neighbour's leftover targets are visible to the session
-    that binds next. Function scope is the isolation the rdp tests are written
+    that binds next. Function scope is the isolation the cdp tests are written
     against.
 
     The window-count problem it was going to solve is solved by
-    `_rdp_chrome_headless_env` instead: these Chromes cost 0 windows now, so
+    `_cdp_chrome_headless_env` instead: these Chromes cost 0 windows now, so
     sharing them would buy nothing but flakiness.
     """
     cfg = _load_config(env={})
-    profile_name = f"bd-e2e-rdp-{uuid.uuid4().hex[:8]}"
+    profile_name = f"bd-e2e-cdp-{uuid.uuid4().hex[:8]}"
     out = asyncio.run(_lc_mod.launch_chrome(
         cfg,
         profile=profile_name,
         persistent=False,
-        port=TEST_RDP_PORT,
+        port=TEST_CDP_PORT,
     ))
     handle = ChromeHandle(
         ws_url=out["ws_url"],
         profile_path=Path(out["extras"]["profile_path"]),
         pid=int(out["extras"]["pid"]),
-        port=TEST_RDP_PORT,
+        port=TEST_CDP_PORT,
     )
     yield handle
     _kill_chrome(handle.pid)
@@ -717,27 +717,27 @@ def e2e_chrome_rdp(tmp_path_factory, _rdp_chrome_headless_env):
 
 
 @pytest.fixture
-def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
-    """Spawn the single daemon with a test RDP port for the rdp scenario.
+def e2e_cdp_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
+    """Spawn the single daemon with a test CDP port for the cdp scenario.
 
     Single-global-daemon: no `--name`. Isolated from the developer's daemon (and
     from the extension `e2e_daemon`) via its own throwaway XDG_RUNTIME_DIR →
     distinct fixed socket. The skill drives the browser *through* this Mode B
-    daemon (no direct-ws / Mode A); the rdp upstream is resolved lazily on the
-    first client frame via `BD_RDP_PORT`. Yields the daemon's XDG_RUNTIME_DIR so
+    daemon (no direct-ws / Mode A); the cdp upstream is resolved lazily on the
+    first client frame via `BD_CDP_PORT`. Yields the daemon's XDG_RUNTIME_DIR so
     callers can point `status`/`stop`/clients at the right fixed socket.
     """
-    log_path = e2e_artifacts_dir / "daemon-rdp.log"
+    log_path = e2e_artifacts_dir / "daemon-cdp.log"
     log_fh = open(log_path, "wb")  # noqa: SIM115 — closed in teardown
 
     runtime_dir = _isolated_runtime_dir()
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
-    env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+    env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
     # Keep daemon-side session routing aligned with helpers.run_skill() for
-    # RDP attach/create parity tests.
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "rdp")
+    # CDP attach/create parity tests.
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "cdp")
     # Don't inherit the user's toml (relay_url / ports / default_backend).
     env["BD_CONFIG"] = ""
 
@@ -749,8 +749,8 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         [
             sys.executable, "-m", "browserwright.daemon.cli",
             "serve",
-            "--backend", "rdp",
-            "--facade-port", str(TEST_RDP_FACADE_PORT),
+            "--backend", "cdp",
+            "--facade-port", str(TEST_CDP_FACADE_PORT),
             "-v",
         ],
         stdout=log_fh,
@@ -780,7 +780,7 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             _fail(
-                f"rdp daemon exited early with code {proc.returncode}; "
+                f"cdp daemon exited early with code {proc.returncode}; "
                 f"see {log_path}"
             )
         status = subprocess.run(
@@ -797,11 +797,11 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         time.sleep(0.2)
     else:
         _fail(
-            f"rdp daemon never came up within 10s; last status={last!r}; "
+            f"cdp daemon never came up within 10s; last status={last!r}; "
             f"see {log_path}"
         )
 
-    _LIVE_DAEMON_LOGS["daemon-rdp"] = _daemon_log_file(runtime_dir)
+    _LIVE_DAEMON_LOGS["daemon-cdp"] = _daemon_log_file(runtime_dir)
 
     yield runtime_dir
 
@@ -815,6 +815,6 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
-    _LIVE_DAEMON_LOGS.pop("daemon-rdp", None)
-    _harvest_daemon_log(runtime_dir, log_path, "rdp daemon")
+    _LIVE_DAEMON_LOGS.pop("daemon-cdp", None)
+    _harvest_daemon_log(runtime_dir, log_path, "cdp daemon")
     shutil.rmtree(runtime_dir, ignore_errors=True)

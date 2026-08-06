@@ -19,24 +19,24 @@ def test_extension_connects_to_daemon(ext_ready):
     assert ext_ready["extensions"] >= 1
 
 
-def test_rdp_backend_resolves_via_daemon(e2e_chrome_rdp):
-    """L0 RDP backend: `browserwright-daemon doctor --json --backend rdp`
-    (with BD_RDP_PORT pointed at the fixture Chrome) reports the rdp backend
+def test_cdp_backend_resolves_via_daemon(e2e_chrome_cdp):
+    """L0 CDP backend: `browserwright-daemon doctor --json --backend cdp`
+    (with BD_CDP_PORT pointed at the fixture Chrome) reports the cdp backend
     available with a browser-level ws URL. (The one-shot `url` subcommand was
     removed; doctor is the remaining resolver probe surface.)"""
     import json
     import subprocess
     from .conftest import scrubbed_env
     env = scrubbed_env()
-    env["BD_RDP_PORT"] = str(e2e_chrome_rdp.port)
+    env["BD_CDP_PORT"] = str(e2e_chrome_cdp.port)
     proc = subprocess.run(
-        ["browserwright-daemon", "doctor", "--json", "--backend", "rdp"],
+        ["browserwright-daemon", "doctor", "--json", "--backend", "cdp"],
         capture_output=True, text=True, timeout=10, env=env,
     )
     assert proc.returncode == 0, f"stderr: {proc.stderr}"
     out = json.loads(proc.stdout)
-    rdp = next(b for b in out["backends"] if b["name"] == "rdp")
-    assert rdp["available"], f"rdp backend unavailable: {rdp}"
+    cdp = next(b for b in out["backends"] if b["name"] == "cdp")
+    assert cdp["available"], f"cdp backend unavailable: {cdp}"
     # doctor never opens a ws (zero-side-effect contract), so ws_url stays
     # None; `available` + detail prove the CDP endpoint answered discovery.
-    assert rdp["detail"]
+    assert cdp["detail"]

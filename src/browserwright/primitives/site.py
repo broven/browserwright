@@ -92,8 +92,8 @@ def remember_preference(key: str, value: Any, *, confirm: bool = True,
     writing a dotted key whose root segment already holds a scalar
     silently replaces the scalar with a dict. e.g. if
     ``frontmatter.daemon`` was previously a string and the agent calls
-    ``remember_preference("daemon.preferred_backend", "rdp")``, the
-    string is destroyed and replaced with ``{preferred_backend: "rdp"}``.
+    ``remember_preference("daemon.preferred_backend", "cdp")``, the
+    string is destroyed and replaced with ``{preferred_backend: "cdp"}``.
     No diagnostic is emitted. Avoid this by never mixing scalar and
     dotted writes under the same root key; v0.6 will surface a
     ``NeedsUserConfirm`` warning when the type would change.

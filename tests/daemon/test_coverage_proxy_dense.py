@@ -43,7 +43,7 @@ class Capture:
         self.disconnects.append(reason)
 
 
-def setup_router(*labels: str, backend: str = "rdp",
+def setup_router(*labels: str, backend: str = "cdp",
                  phase: UpstreamPhase = UpstreamPhase.CONNECTED,
                  wire_upstream: bool = True):
     state = DaemonState(backend_name=backend)
@@ -155,20 +155,20 @@ async def test_send_only_adapter_without_extension_authority_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_send_only_adapter_forwards_rdp_attach_at_browser_boundary():
+async def test_send_only_adapter_forwards_cdp_attach_at_browser_boundary():
     _state, router, cap, (client,) = setup_router(
-        backend="rdp", wire_upstream=True)
+        backend="cdp", wire_upstream=True)
 
     await router.route_from_client(client, json.dumps({
         "id": 32,
         "method": "Target.attachToTarget",
-        "params": {"targetId": "rdp-tab-1"},
+        "params": {"targetId": "cdp-tab-1"},
     }))
 
     assert [frame["method"] for frame in cap.upstream] == [
         "Target.attachToTarget",
     ]
-    assert cap.upstream[0]["params"]["targetId"] == "rdp-tab-1"
+    assert cap.upstream[0]["params"]["targetId"] == "cdp-tab-1"
 
 
 @pytest.mark.asyncio
@@ -331,8 +331,8 @@ async def test_self_answer_backend_info_and_target_table():
 
 
 @pytest.mark.asyncio
-async def test_wait_session_announce_uses_upstream_shim_for_rdp():
-    state, router, cap, (client,) = setup_router("rdp-session", backend="rdp")
+async def test_wait_session_announce_uses_upstream_shim_for_cdp():
+    state, router, cap, (client,) = setup_router("cdp-session", backend="cdp")
     called = False
 
     async def wait_session_announce(session_id: str, timeout: float) -> bool:
@@ -766,7 +766,7 @@ async def test_end_session_daemon_edge_cases():
             self.fail = fail
             self.calls: list[str] = []
 
-        async def teardown_rdp_context(self, session: str) -> None:
+        async def teardown_cdp_context(self, session: str) -> None:
             self.calls.append(session)
             if self.fail:
                 raise RuntimeError("teardown failed")
@@ -777,18 +777,18 @@ async def test_end_session_daemon_edge_cases():
         raise AssertionError("endSession must not send CDP")
     attach_cdp(
         router, cap, unused_command,
-        on_end_session=good.teardown_rdp_context)
+        on_end_session=good.teardown_cdp_context)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "sess"},
     }))
     assert good.calls == ["sess"]
-    assert cap.per_client[client.client_id][-1]["result"]["backend"] == "rdp"
+    assert cap.per_client[client.client_id][-1]["result"]["backend"] == "cdp"
 
     bad = TeardownDaemon(fail=True)
     router.daemon = bad
-    router.upstream._on_end_session = bad.teardown_rdp_context
+    router.upstream._on_end_session = bad.teardown_cdp_context
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.endSession",
@@ -798,7 +798,7 @@ async def test_end_session_daemon_edge_cases():
 
 
 @pytest.mark.asyncio
-async def test_rdp_end_session_does_not_turn_false_teardown_into_success():
+async def test_cdp_end_session_does_not_turn_false_teardown_into_success():
     state, router, cap, (client,) = setup_router()
     client.session_id = "sess"
 
@@ -884,11 +884,20 @@ async def test_end_session_cold_open_respects_budget_and_restores_phase(
     assert state.upstream_phase is UpstreamPhase.DISCONNECTED
 
 
-@pytest.mark.parametrize("backend", ["rdp", "env"])
 @pytest.mark.asyncio
 async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
-    monkeypatch, backend,
+    monkeypatch,
 ):
+    """Ending an attach-owned raw-CDP session must not start an upstream first.
+
+    The teardown assertion below **inverted** with #38. This used to be
+    parametrized over `["cdp", "env"]` and expect `0` teardown calls for `env`,
+    because an env session routed to the shared context and had no per-session
+    context of its own to drop. Every raw-CDP session has one now, so teardown
+    always runs — and it is still safe for attach, because the holder only
+    SIGTERMs a pid it launched itself and an attach-owned holder has none.
+    """
+    backend = "cdp"
     from browserwright import session_registry
 
     state, router, cap, (client,) = setup_router(
@@ -913,7 +922,7 @@ async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
         def __init__(self):
             self.teardown_calls = []
 
-        async def teardown_rdp_context(self, session, *, deadline=None):
+        async def teardown_cdp_context(self, session, *, deadline=None):
             self.teardown_calls.append((session, deadline))
             return True
 
@@ -929,12 +938,12 @@ async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
     result = cap.per_client[client.client_id][-1]["result"]
     assert result["ok"] is True
     assert result["backend"] == backend
-    assert len(daemon.teardown_calls) == (1 if backend == "rdp" else 0)
+    assert len(daemon.teardown_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_rdp_open_attach_close_error_translation_and_cleanup():
-    state, router, cap, (client,) = setup_router(backend="rdp")
+async def test_cdp_open_attach_close_error_translation_and_cleanup():
+    state, router, cap, (client,) = setup_router(backend="cdp")
 
     await router.route_from_client(client, json.dumps({
         "id": 1,
@@ -973,7 +982,7 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
 
     calls: list[tuple[str, Any, Any]] = []
 
-    async def rdp_cmd(method: str, params=None, session_id=None):
+    async def cdp_cmd(method: str, params=None, session_id=None):
         calls.append((method, params, session_id))
         if method == "Target.createTarget":
             return {"id": -1, "result": {"targetId": "T"}}
@@ -983,7 +992,7 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             raise RuntimeError("close boom")
         raise AssertionError(method)
 
-    attach_cdp(router, cap, rdp_cmd)
+    attach_cdp(router, cap, cdp_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -1010,10 +1019,10 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
 
 @pytest.mark.asyncio
 async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
-    """issue #20: an env session speaks real browser-level CDP (like rdp), so
+    """issue #20: an env session speaks real browser-level CDP (like cdp), so
     the unified tab verbs must dispatch to raw CDP via `_upstream_command` —
     NOT return -32601 "requires the extension backend". Locks in
-    `Router._raw_cdp_backend` covering env, not only rdp."""
+    `Router._raw_cdp_backend` covering env, not only cdp."""
     state, router, cap, (client,) = setup_router(backend="env")
 
     calls: list[str] = []
@@ -1048,8 +1057,8 @@ async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
 
 
 @pytest.mark.asyncio
-async def test_rdp_attach_active_reuses_local_page_then_surfaces_enumeration_errors():
-    state, router, cap, (client,) = setup_router(backend="rdp")
+async def test_cdp_attach_active_reuses_local_page_then_surfaces_enumeration_errors():
+    state, router, cap, (client,) = setup_router(backend="cdp")
     state.bind_session(client.client_id, "local", "UP", "T")
     state.claim_attacher("T", client.client_id, "local", "UP")
     state.note_target_info({
@@ -1093,8 +1102,8 @@ async def test_rdp_attach_active_reuses_local_page_then_surfaces_enumeration_err
 
 
 @pytest.mark.asyncio
-async def test_rdp_recover_reuses_existing_local_binding():
-    state, router, cap, (client,) = setup_router(backend="rdp")
+async def test_cdp_recover_reuses_existing_local_binding():
+    state, router, cap, (client,) = setup_router(backend="cdp")
     state.bind_session(client.client_id, "local", "UP", "T")
     state.claim_attacher("T", client.client_id, "local", "UP")
     state.note_target_info({
@@ -1115,8 +1124,8 @@ async def test_rdp_recover_reuses_existing_local_binding():
 
 
 @pytest.mark.asyncio
-async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
-    state, router, cap, (client,) = setup_router(backend="rdp")
+async def test_cdp_userscript_registry_success_error_and_unsupported_paths():
+    state, router, cap, (client,) = setup_router(backend="cdp")
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.userscript.install",

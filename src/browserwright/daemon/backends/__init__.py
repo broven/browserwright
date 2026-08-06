@@ -9,15 +9,18 @@ from __future__ import annotations
 from typing import Callable
 
 from .base import Backend
-from .cdp import EnvBackend, RdpBackend
+from .cdp import CdpBackend
 from .extension import ExtensionBackend
 
 
 # (name, factory) — factories take a Config and return a Backend instance.
 # Order is the documented fallback order: cheapest + most explicit first.
+#
+# `env` used to sit ahead of `cdp` here. It is gone (#38): it was the same
+# real-CDP backend differing only in where the ws URL came from, and that is
+# now a per-session field rather than a separate backend id.
 _REGISTRY: list[tuple[str, Callable[..., Backend]]] = [
-    ("env", EnvBackend),
-    ("rdp", RdpBackend),
+    ("cdp", CdpBackend),
     ("extension", ExtensionBackend),
 ]
 

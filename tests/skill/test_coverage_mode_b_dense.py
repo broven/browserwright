@@ -128,7 +128,7 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
 
     outputs = deque(
         [
-            _Proc(stdout=json.dumps({"backend": "rdp"})),
+            _Proc(stdout=json.dumps({"backend": "cdp"})),
             _Proc(stdout=json.dumps({"version": "1.2.3"})),
             _Proc(stdout="browserwright-daemon 9.8.7\n"),
         ]
@@ -143,7 +143,7 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     client = ModeBClient()
     client._session_id = "s-1"
 
-    assert client.get_backend_info() == {"backend": "rdp"}
+    assert client.get_backend_info() == {"backend": "cdp"}
     assert client.running_daemon_version() == "1.2.3"
     assert client.installed_daemon_version() == "9.8.7"
     assert commands[0][0] == [
@@ -275,7 +275,7 @@ def test_resolve_session_empty_explicit_arg_refuses_even_with_env(tmp_bs_home, m
     from browserwright import session_registry as reg
     from browserwright.errors import NoSession
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
 
     with pytest.raises(NoSession):
@@ -287,7 +287,7 @@ def test_resolve_session_requires_explicit_arg_even_with_env(tmp_bs_home, monkey
     from browserwright import session_registry as reg
     from browserwright.errors import NoSession
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
 
     with pytest.raises(NoSession):
@@ -376,6 +376,24 @@ def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():
         CDPSession.send(cdp, "BrowserwrightDaemon.newerMethod")
     assert "stale" in exc.value.fix
     assert "BrowserwrightDaemon.newerMethod" in exc.value.fix
+
+    # Issue #40: an attach conflict against the session's own orphaned
+    # executor must point at the reap recovery, not at the generic -32601
+    # stale-daemon hint (which does not apply).
+    cdp._ws = _FakeWS(
+        lambda frame: {
+            "id": frame["id"],
+            "error": {
+                "code": -32602,
+                "message": "target ext-tab-32688709 already attached by "
+                           "another client",
+            },
+        }
+    )
+    with pytest.raises(CDPError) as exc:
+        CDPSession.send(cdp, "Target.attachToTarget", targetId="ext-tab-1")
+    assert "orphaned" in exc.value.fix
+    assert "session reset" in exc.value.fix
 
     cdp._closed = True
     cdp._closed_reason = "bye"

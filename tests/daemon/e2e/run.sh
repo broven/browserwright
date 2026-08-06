@@ -46,8 +46,8 @@ eval "$(uv run python "$ROOT/tests/daemon/e2e/_e2e_ports.py")"
 # Anything else is somebody else's — we REFUSE and exit instead of killing.
 # Killing the wrong daemon is far more damaging than not killing at all: it
 # corrupts a run nobody is watching, whereas refusing fails loudly right here.
-E2E_PORTS="$TEST_EXT_PORT $TEST_RDP_PORT $TEST_FACADE_L1_PORT \
-$TEST_FACADE_L1_EXT_PORT $TEST_FACADE_EXT_PORT $TEST_FACADE_RDP_PORT \
+E2E_PORTS="$TEST_EXT_PORT $TEST_CDP_PORT $TEST_FACADE_L1_PORT \
+$TEST_FACADE_L1_EXT_PORT $TEST_FACADE_EXT_PORT $TEST_FACADE_CDP_PORT \
 $TEST_FACADE_AUTOFACADE_PORT"
 mine=""; theirs=""
 for port in $E2E_PORTS; do

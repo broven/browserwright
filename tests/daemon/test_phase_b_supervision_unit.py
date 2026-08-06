@@ -3,7 +3,7 @@
   - idle-reap: a stale executor (discovery-file mtime older than the threshold)
     is SIGTERMed + popped; a fresh one is left alone.
   - endSession kill: the endSession verb kills + pops the session's executor for
-    BOTH rdp and extension backends (symmetric).
+    BOTH cdp and extension backends (symmetric).
   - crash-reap: a dead child is dropped so the next `ensure()` cold-respawns.
   - shutdown kill-all: every registered executor is signalled + dropped.
   - orphan-sweep: stale `bw-exec-*` sockets/discovery files are unlinked on
@@ -308,29 +308,29 @@ async def test_end_session_kills_executor_extension():
 
 
 @pytest.mark.asyncio
-async def test_end_session_kills_executor_rdp():
-    router, client, captured = _router_with_client("rdp")
+async def test_end_session_kills_executor_cdp():
+    router, client, captured = _router_with_client("cdp")
     reg = _RecordingRegistry()
 
     class _Daemon:
         executors = reg
         contexts = {"sess": object()}
 
-        async def teardown_rdp_context(self, session):
+        async def teardown_cdp_context(self, session):
             return True
 
     router.daemon = _Daemon()
     async def _end_session(session, *args):
-        await router.daemon.teardown_rdp_context(session)
-        return {"ok": True, "closed": [], "kept": [], "backend": "rdp"}
+        await router.daemon.teardown_cdp_context(session)
+        return {"ok": True, "closed": [], "kept": [], "backend": "cdp"}
     router.upstream.end_session = _end_session
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "sess"},
     }))
-    assert reg.killed == ["sess"], "rdp endSession did not kill executor"
-    assert captured[client.client_id][-1]["result"]["backend"] == "rdp"
+    assert reg.killed == ["sess"], "cdp endSession did not kill executor"
+    assert captured[client.client_id][-1]["result"]["backend"] == "cdp"
 
 
 # ---- idle-watchdog drives executor supervision -----------------------------
@@ -421,7 +421,7 @@ async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypat
     from browserwright.daemon.server import listener
 
     monkeypatch.setenv("BS_HOME", str(tmp_path))
-    sid = reg.allocate(backend="rdp", owner="create", name="old")
+    sid = reg.allocate(backend="cdp", owner="create", name="old")
     reg._with_entry(sid, lambda e: e.update(last_seen=0.0))
 
     class _Executors:
@@ -440,7 +440,7 @@ async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypat
         def __init__(self):
             self.torn_down: list[str] = []
 
-        async def teardown_rdp_context(self, session_id):
+        async def teardown_cdp_context(self, session_id):
             assert reg.get(session_id) is not None
             self.torn_down.append(session_id)
             return True
@@ -450,7 +450,7 @@ async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypat
     pruned = await listener._auto_prune_sessions(daemon, reason="test")
     assert len(pruned) == 1
     assert pruned[0]["id"] == sid
-    assert pruned[0]["backend"] == "rdp"
+    assert pruned[0]["backend"] == "cdp"
     assert pruned[0]["owner"] == "create"
     assert daemon.executors.killed == [sid]
     assert daemon.torn_down == [sid]
@@ -510,50 +510,6 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
     assert daemon.executors.killed == [sid]
     assert upstream.ended == [(sid, 17)]
     assert reg.get(sid) is None
-
-
-@pytest.mark.asyncio
-async def test_auto_prune_env_respects_daemon_scope(tmp_path, monkeypatch):
-    from browserwright import session_registry as reg
-    from browserwright.daemon.config import Config
-    from browserwright.daemon.server import listener
-    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
-    from browserwright.daemon.server.state import DaemonState
-
-    runtime_dir = tmp_path / "runtime"
-    monkeypatch.setenv("BS_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
-    local_scope = str((runtime_dir / "browserwright-daemon.sock").resolve())
-    local = reg.allocate(
-        backend="env", owner="attach", name="local",
-        env_daemon_scope=local_scope)
-    foreign = reg.allocate(
-        backend="env", owner="attach", name="foreign",
-        env_daemon_scope="/tmp/foreign/browserwright-daemon.sock")
-    for sid in (local, foreign):
-        reg._with_entry(sid, lambda e: e.update(last_seen=0.0))
-
-    class _Router:
-        daemon = None
-
-    class _Registry:
-        async def terminate_session(self, session_id, teardown, *, budget=None):
-            return {"reaped": True}, await teardown()
-
-    shared = UpstreamContext(
-        backend="env", state=DaemonState("env"),
-        router=_Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(backend="env", session_idle_prune=1.0),
-        shared_context=shared,
-        make_context=lambda **_kw: pytest.fail("should not create"))
-    daemon.executors = _Registry()
-
-    pruned = await listener._auto_prune_sessions(daemon, reason="test")
-
-    assert [rec["id"] for rec in pruned] == [local]
-    assert reg.get(local) is None
-    assert reg.get(foreign) is not None
 
 
 @pytest.mark.asyncio

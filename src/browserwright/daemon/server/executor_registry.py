@@ -1,7 +1,7 @@
 """Phase B: daemon-side per-session executor registry + lazy spawn.
 
 The daemon is ALREADY a per-session child-process manager (it spawns + tracks +
-SIGTERMs per-session rdp Chrome). The executor is "rdp Chrome v2": same
+SIGTERMs per-session cdp Chrome). The executor is "cdp Chrome v2": same
 supervision contract, a different child binary. PR1 builds only what
 ``ensureExecutor`` needs — a registry keyed by ``session_id`` + a single-flight
 spawn guard so two concurrent first-heredocs can't double-spawn. FULL
@@ -27,7 +27,11 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from .. import _ipc
-from ..supervise import pid_alive as _pid_alive, wait_until
+from ..supervise import (
+    pid_alive as _pid_alive,
+    terminate_orphan,
+    wait_until,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ logger = logging.getLogger(__name__)
 _SPAWN_READY_TIMEOUT_S = 15.0
 
 # Grace window between SIGTERM and SIGKILL when reaping an executor (mirrors the
-# rdp-Chrome teardown discipline — terminate, then escalate if it won't die).
+# cdp-Chrome teardown discipline — terminate, then escalate if it won't die).
 _KILL_GRACE_S = 3.0
 
 
@@ -110,7 +114,7 @@ class ExecutorRegistry:
 
     def __init__(self) -> None:
         self._handles: dict[str, ExecutorHandle] = {}
-        # One lock per session id guards its spawn (the rdp `_open_lock`
+        # One lock per session id guards its spawn (the cdp `_open_lock`
         # equivalent — prevents the double-spawn race, Fork 1 risk).
         self._locks: dict[str, asyncio.Lock] = {}
         # Successful workspace teardown is terminal for this daemon lifetime.
@@ -449,8 +453,25 @@ class ExecutorRegistry:
                         "current_executor_id": recorded_id,
                     }
                 if _pid_alive(int(record["pid"])):
-                    # The daemon cannot honestly confirm death for a live
-                    # process it no longer owns with a Popen handle.
+                    # No Popen handle (daemon restarted and the startup
+                    # orphan sweep missed this executor), but the discovery
+                    # record carries a start-time fingerprint — reap it
+                    # exactly like the orphan sweep does, instead of leaving
+                    # the session stuck behind an executor nobody can kill
+                    # (issue #40). Runs off-loop (the reap polls with real
+                    # sleeps) and only claims success once death is confirmed.
+                    if await asyncio.to_thread(
+                        _terminate_orphan_and_wait,
+                        int(record["pid"]),
+                        record.get("start_time"),
+                    ):
+                        _ipc.cleanup_executor(session_id)
+                        return {
+                            "killed": True,
+                            "reaped": True,
+                            "matched": True,
+                            "executor_id": executor_id,
+                        }
                     return {
                         "killed": False,
                         "reaped": False,
@@ -521,7 +542,7 @@ class ExecutorRegistry:
         own — e.g. the Fork-4 facade-death self-exit, or a segfault). Returns
         the session ids dropped. The next `ensure()` for those sessions
         cold-starts a fresh executor — mirrors `_on_upstream_closed` →
-        `drop_rdp_context`."""
+        `drop_cdp_context`."""
         dead: list[str] = []
         for session_id, handle in list(self._handles.items()):
             if not handle.is_alive():
@@ -580,7 +601,7 @@ def _spawn_kwargs() -> dict:
 
 def _terminate(handle: ExecutorHandle) -> None:
     """SIGTERM the executor's whole process group, escalate to SIGKILL after a
-    grace window. Mirrors `listener._kill_rdp_chrome` but signals the GROUP
+    grace window. Mirrors `listener._kill_cdp_chrome` but signals the GROUP
     (the spawn used `start_new_session=True`, so the executor is a session
     leader — `killpg` reaps any grandchildren too). Best-effort + never raises.
 
@@ -588,7 +609,7 @@ def _terminate(handle: ExecutorHandle) -> None:
     zombie reap run on a short-lived BACKGROUND daemon thread so we NEVER block
     the daemon's asyncio event loop (this is called from `_handle_end_session`,
     `_idle_watchdog`, and `_graceful_shutdown`, all on the loop — unlike
-    `_kill_rdp_chrome` which only fire-and-forgets a SIGTERM, we additionally
+    `_kill_cdp_chrome` which only fire-and-forgets a SIGTERM, we additionally
     guarantee escalation without stalling the loop for the grace window)."""
     proc = handle.proc
     if proc.poll() is not None:
@@ -669,7 +690,7 @@ class _quiet:
 
 
 def cleanup_orphan_executors() -> None:
-    """Startup orphan-sweep (mirrors `listener._cleanup_orphan_rdp_chrome`).
+    """Startup orphan-sweep (mirrors `listener._cleanup_orphan_cdp_chrome`).
 
     A hard daemon crash / SIGKILL leaves executor subprocesses running + their
     `bw-exec-*.json` discovery files + `bw-exec-*.sock` sockets on disk. On the
@@ -729,54 +750,10 @@ def cleanup_orphan_executors() -> None:
 
 
 def _terminate_orphan_and_wait(pid: int, start_time: str | None = None) -> bool:
-    """Bounded TERM→KILL reap for a process without a ``Popen`` handle.
-
-    ``start_time`` is the fingerprint recorded when the discovery file was
-    written. A crash can leave that file behind while its executor exits, and
-    the OS is free to hand the pid to anything — so liveness alone does not
-    say the pid is still ours, and signalling its whole *group* on that basis
-    can take out an unrelated process tree. Three cases, deliberately graded:
-
-    - recorded and matching  → ours; full group escalation.
-    - recorded and differing → someone else's; do not signal at all, and
-      report the orphan as gone so its stale files are cleaned up.
-    - not recorded (a discovery file written before this field existed)
-      → unverifiable; signal only the exact pid, never the group.
-    """
-    if not _pid_alive(pid):
-        return True
-    verified = False
-    if start_time is not None:
-        from ..platforms import proc_start_time
-        current = proc_start_time(pid)
-        if current is not None and current != start_time:
-            logger.info(
-                "orphan-cleanup: pid %d was recycled (start-time mismatch); "
-                "not signalling", pid)
-            return True
-        verified = current is not None
-    try:
-        try:
-            if not verified:
-                raise PermissionError("unverified pid: exact-pid signal only")
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            os.kill(pid, signal.SIGTERM)
-        logger.info("orphan-cleanup: SIGTERM stray executor pid %d", pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        return not _pid_alive(pid)
-    if wait_until(lambda: not _pid_alive(pid), _KILL_GRACE_S, interval=0.05):
-        return True
-    try:
-        try:
-            if not verified:
-                raise PermissionError("unverified pid: exact-pid signal only")
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    return wait_until(lambda: not _pid_alive(pid), 1.0, interval=0.02)
+    """Thin wrapper over ``supervise.terminate_orphan`` kept for callers that
+    imported this name (the startup sweep, Layer 2's daemon-independent reap,
+    and tests). See ``supervise.terminate_orphan`` for the graded semantics."""
+    return terminate_orphan(pid, start_time, grace=_KILL_GRACE_S)
 
 
 def _to_path(s: str):

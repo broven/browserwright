@@ -33,12 +33,12 @@ from pathlib import Path
 #: the fixtures' constants aligned.
 PORT_SLOTS: tuple[tuple[str, str, int], ...] = (
     ("ext",               "TEST_EXT_PORT",               0),  # extension relay
-    ("rdp",               "TEST_RDP_PORT",               1),  # rdp Chrome debug
-    ("facade_l1",         "TEST_FACADE_L1_PORT",         2),  # l1 rdp facade daemon
+    ("cdp",               "TEST_CDP_PORT",               1),  # cdp Chrome debug
+    ("facade_l1",         "TEST_FACADE_L1_PORT",         2),  # l1 cdp facade daemon
     ("facade_l1_ext",     "TEST_FACADE_L1_EXT_PORT",     3),  # l1 ext facade daemon
     ("facade_ext",        "TEST_FACADE_EXT_PORT",        4),  # session ext daemon facade
-    ("facade_rdp",        "TEST_FACADE_RDP_PORT",        5),  # session rdp daemon facade
-    ("facade_autofacade", "TEST_FACADE_AUTOFACADE_PORT", 6),  # rdp auto-facade daemon
+    ("facade_cdp",        "TEST_FACADE_CDP_PORT",        5),  # session cdp daemon facade
+    ("facade_autofacade", "TEST_FACADE_AUTOFACADE_PORT", 6),  # cdp auto-facade daemon
 )
 
 RANGE_LO = 30000

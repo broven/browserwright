@@ -18,6 +18,7 @@ name = "browserwright"
 version = "0.0.0"
 description = "Browserwright — let AI/code agents drive a real or isolated browser and author userscripts. Single package: the agent-facing REPL/site-skills/memory layer plus the bundled browser-resolving daemon (CDP proxy + extension/cloud backends)."
 requires-python = ">=3.11"
+license = "AGPL-3.0-only"
 dependencies = [
     "websockets==15.0.1",
     "pillow==12.2.0",

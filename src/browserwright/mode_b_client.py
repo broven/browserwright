@@ -55,7 +55,7 @@ class ModeBClient:
         # session-bound clients override this with ``skill-s<id>``.
         self._client_label: str = "skill-repl"
         # The session id, emitted on the ws query as ``?session=<id>`` — this is
-        # the key the daemon's dispatcher routes on (rdp sessions reach their
+        # the key the daemon's dispatcher routes on (cdp sessions reach their
         # own UpstreamContext through it). None for the bare REPL client.
         self._session_id: Optional[str] = None
 
@@ -148,7 +148,7 @@ class ModeBClient:
             return self._cached_ws
         ep = self.discover()
         # Session-bound clients carry ``?session=<id>`` — the daemon dispatcher
-        # routes on this (not on the client label). Without it an rdp session
+        # routes on this (not on the client label). Without it an cdp session
         # resolves to None → the shared (extension) context.
         session_q = f"&session={self._session_id}" if self._session_id else ""
         # websockets.sync.client.connect doesn't support ws+unix:// natively;
@@ -260,7 +260,7 @@ class ModeBClient:
         how cold-start launches ``serve``.
 
         ``backend`` pins ``--backend`` on the respawn. The daemon refuses to
-        start under auto (it would silently fall back to rdp and leave the
+        start under auto (it would silently fall back to cdp and leave the
         extension relay un-bound), so a restart that drops the backend would
         kill the daemon. Callers that know the backend the old daemon was
         serving (see ``ensure_version_coherent``) pass it through so the

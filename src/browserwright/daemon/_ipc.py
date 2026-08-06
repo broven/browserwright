@@ -275,6 +275,7 @@ def read_executor_record(session_id: str) -> dict | None:
             "pid": pid,
             "session": recorded_session,
             "executor_id": executor_id,
+            "start_time": d.get("start_time"),
         }
     except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
         return None

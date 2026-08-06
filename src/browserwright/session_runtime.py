@@ -56,18 +56,30 @@ def _resolve_record(sess) -> Optional[dict]:
     return reg.get(sid)
 
 
-def persist_target(target_id: str, *, group_id: Optional[int] = None,
+def persist_target(target_id: Optional[str], *, group_id: Optional[int] = None,
                    sess=None) -> None:
     """Cache the current tab binding in the ledger record's ``runtime`` field.
 
     Called wherever a primitive sets ``current_target_id`` so a later process
-    can fast-path re-attach without querying the tab group."""
+    can fast-path re-attach without querying the tab group. ``target_id=None``
+    clears the cached binding (the current tab was closed).
+
+    ``group_id`` (the durable extension tab-group anchor) is preserved from the
+    existing record when the caller does not know it — a binding change must
+    never orphan the session from its tab group (CONTEXT.md: group_id is
+    load-bearing durable state)."""
     if sess is None:
         from .session import current_session
         sess = current_session()
     sid = _resolve_sid(sess)
     if not sid:
         return
+    if group_id is None:
+        rec = _resolve_record(sess)
+        if isinstance(rec, dict):
+            existing = (rec.get("runtime") or {}).get("group_id")
+            if isinstance(existing, int):
+                group_id = existing
     runtime = {
         "current_target_id": target_id,
         "group_id": group_id,
@@ -79,6 +91,34 @@ def persist_target(target_id: str, *, group_id: Optional[int] = None,
     except Exception:
         # Caching is best-effort; never let a ledger write break a primitive.
         pass
+
+
+#: Optional per-process callback fired when the session's current-target
+#: binding changes (``bind_target`` / ``register_recovered`` / close-of-current
+#: in ``close_session_tab``). The resident executor registers a hook here so
+#: its live Playwright ``page`` follows the session's current tab; plain CLI
+#: processes leave it unset (no live page to rebind).
+_target_changed_hook = None
+
+
+def set_target_changed_hook(fn) -> None:
+    """Register (or clear, with ``None``) the current-target-changed hook.
+
+    The hook receives the ``Session`` whose binding changed, and runs in the
+    process that changed it (the executor's worker thread for agent code)."""
+    global _target_changed_hook
+    _target_changed_hook = fn
+
+
+def _notify_target_changed(sess) -> None:
+    """Fire the registered hook, if any. Never raises: a rebind failure must
+    not break the tab-lifecycle operation that triggered it."""
+    hook = _target_changed_hook
+    if hook is not None:
+        try:
+            hook(sess)
+        except Exception:
+            pass
 
 
 def register_recovered(sess, payload: dict) -> Optional[str]:
@@ -93,6 +133,7 @@ def register_recovered(sess, payload: dict) -> Optional[str]:
     cdp = sess.cdp
     cdp._sessions[target_id] = session_id
     sess.current_target_id = target_id
+    _notify_target_changed(sess)
     return target_id
 
 
@@ -160,7 +201,7 @@ def session_tabs(sess, *, include_internal: bool = True) -> list[dict]:
     """The session's page targets ``[{targetId, url, title, attached}]``.
 
     Unified across backends: the daemon scopes ``Target.getTargets`` to the
-    session's browser (extension = the session's tab group; rdp/env = the
+    session's browser (extension = the session's tab group; cdp/env = the
     daemon-owned Chrome). ``[]`` when the session has no tabs — a legitimate
     state, not an error. ``include_internal=False`` filters chrome:// et al.
     """
@@ -185,7 +226,11 @@ def bind_target(sess, target_id: str) -> dict:
     """Attach ``target_id``, make it the session's current tab, persist it.
 
     Raises ``CDPError`` when the target no longer exists (tab closed, or the
-    daemon restarted since the id was issued)."""
+    daemon restarted since the id was issued).
+
+    This is the internal switch_tab: after it returns, the session's current
+    tab is ``target_id`` and the live ``page`` (executor) follows via the
+    target-changed hook."""
     sess.cdp.attach(target_id)
     sess.current_target_id = target_id
     persist_target(target_id, sess=sess)
@@ -193,6 +238,7 @@ def bind_target(sess, target_id: str) -> dict:
         sess.cdp.send("Target.activateTarget", targetId=target_id)
     except CDPError:
         pass
+    _notify_target_changed(sess)
     return {"targetId": target_id}
 
 
@@ -207,7 +253,7 @@ def open_session_tab(
 
     The daemon dispatches ``BrowserwrightDaemon.openBackgroundTab`` by the
     session's (immutable) backend: extension opens inside the session's tab
-    group honoring ``background=`` (don't steal the user's focus); rdp/env use
+    group honoring ``background=`` (don't steal the user's focus); cdp/env use
     ``Target.createTarget``. Returns ``{targetId, tabId, url, title, groupId}``
     (``groupId`` is -1 on non-extension backends)."""
     rec = getattr(sess, "session_record", None)
@@ -250,7 +296,7 @@ def open_session_tab(
         "url": payload.get("url", url),
         "title": payload.get("title", ""),
         # groupId is the session's tab-group id on extension (the durable
-        # reconnect anchor), -1 on rdp/env (tab groups are an extension concept).
+        # reconnect anchor), -1 on cdp/env (tab groups are an extension concept).
         "groupId": payload.get("groupId", -1),
     }
 
@@ -259,7 +305,7 @@ def close_session_tab(
     sess, *, target_id: Optional[str] = None, session_id: Optional[str] = None,
 ) -> dict:
     """Close a tab via the daemon (``chrome.tabs.remove`` on extension,
-    ``Target.closeTarget`` on rdp/env). Defaults to the session's current tab.
+    ``Target.closeTarget`` on cdp/env). Defaults to the session's current tab.
 
     Returns ``{"ok": True, "tabId": N}``; clears any cached CDP state for the
     closed target."""
@@ -294,10 +340,17 @@ def close_session_tab(
     cdp = sess.cdp
     stale_targets = [tid for tid, sid in cdp._sessions.items()
                      if sid == session_id]
+    cleared_current = False
     for tid in stale_targets:
         cdp._sessions.pop(tid, None)
         if sess.current_target_id == tid:
             sess.current_target_id = None
+            cleared_current = True
+    if cleared_current:
+        # Never leave the durable binding pointing at a closed tab: a later
+        # process fast-paths on the ledger and would re-attach a dead target.
+        persist_target(None, sess=sess)
+        _notify_target_changed(sess)
     return {"ok": bool(payload.get("ok", True)),
             "tabId": payload.get("tabId")}
 

@@ -30,7 +30,7 @@ Usage:
   browserwright -s <session-id> [--env NAME ...] -f script.py
   browserwright -s <session-id> [--env NAME ...] --code-stdin < script.py
 
-  browserwright session new --backend=<extension|rdp|env> --name=SESSION_LABEL [--create | --attach=PORT]
+  browserwright session new --backend=<extension|cdp|env> --name=SESSION_LABEL [--create | --attach=PORT]
   browserwright session reset <id>
   browserwright session end --session=ID
   browserwright session list [--json]
@@ -588,13 +588,21 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
 
     if sub == "new":
         backend = kw.get("backend")
-        if backend not in ("extension", "rdp", "env"):
-            print("usage: browserwright session new --backend=<extension|rdp|env> "
-                  "--name=SESSION_LABEL [--create | --attach=PORT]", file=sys.stderr)
+        if backend not in ("extension", "cdp"):
+            if backend in ("rdp", "env"):
+                # Name the replacement, not just the rejection (#38). Both are
+                # names people have in scripts today, and both map onto `cdp`.
+                print(session_create._unknown_backend_message(backend),
+                      file=sys.stderr)
+                return 1
+            print("usage: browserwright session new --backend=<extension|cdp> "
+                  "--name=SESSION_LABEL [--create | --attach=<port|url>]",
+                  file=sys.stderr)
             print("--name is a short task-specific session label. Extension sessions "
-                  "use it as the Chrome tab group title; RDP and env sessions use it "
-                  "only to label the browser session. env binds the agent surface to "
-                  "the daemon's externally-owned upstream (BD_CDP_WS + --backend env).",
+                  "use it as the Chrome tab group title; cdp sessions use it only to "
+                  "label the browser session. --create launches an isolated browser "
+                  "we own; --attach borrows one we don't — a local port (9222) or a "
+                  "CDP URL (ws://…, or https://… for a cloud/anti-detect browser).",
                   file=sys.stderr)
             return 1
         try:
@@ -637,7 +645,10 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     if sub == "list":
         rows = reg.list_all()
         if kw.get("json") or kw.get("output") == "json":
-            sys.stdout.write(json.dumps(rows, indent=2, default=str) + "\n")
+            # Redacted: this dumps whole records, and a session's endpoint can
+            # carry a bearer token now that it lives in the ledger (#38).
+            sys.stdout.write(json.dumps(
+                [reg.redacted(r) for r in rows], indent=2, default=str) + "\n")
             return 0
         if not rows:
             print("(no sessions)")
@@ -756,6 +767,9 @@ def _cmd_whoami(args: list[str], *, session_id: Optional[str] = None) -> int:
     except NoSession as e:
         print(str(e), file=sys.stderr)
         return e.exit_code
+    # An allowlist, not a convenience: `workspace` is omitted deliberately
+    # because it can hold a CDP endpoint with an embedded token (#38). If you
+    # add a field here, run it through `reg.redacted` first.
     view = {k: rec.get(k) for k in ("id", "backend", "owner", "name")}
     sys.stdout.write(json.dumps(view, default=str) + "\n")
     return 0

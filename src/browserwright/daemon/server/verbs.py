@@ -63,9 +63,9 @@ def _result_response(req_id: int | None, result: dict) -> str:
 def _cmd_result(envelope: object) -> dict:
     """Extract the CDP ``result`` dict from an ``UpstreamConnection.send_command``
     envelope. send_command resolves to the FULL frame
-    (``{"id": N, "result": {...}}`` or ``{"id": N, "error": {...}}``), so the rdp
+    (``{"id": N, "result": {...}}`` or ``{"id": N, "error": {...}}``), so the cdp
     verb impls must unwrap ``result`` rather than reading fields off the envelope.
-    Raises ``RuntimeError`` on a CDP error or a malformed frame (the rdp handlers
+    Raises ``RuntimeError`` on a CDP error or a malformed frame (the cdp handlers
     catch it and surface -32603)."""
     if not isinstance(envelope, dict):
         raise RuntimeError(f"malformed CDP response: {envelope!r}")
@@ -360,7 +360,7 @@ class SessionVerbsMixin:
         """Spec Phase B Feature 1.
 
         Extension calls the extension upstream's open_background_tab inside the
-        session tab group. RDP handles the same public verb with raw CDP against
+        session tab group. CDP handles the same public verb with raw CDP against
         the session's isolated browser. Both paths register the returned
         (target_id, upstream_session_id) as a regular client-side binding so
         subsequent CDP commands work through the same session-id translation
@@ -465,7 +465,7 @@ class SessionVerbsMixin:
 
         extension: close every tab in the session's adapter-owned tab group.
 
-        rdp: the per-session context owns a dedicated Chrome. Close that Chrome
+        cdp: the per-session context owns a dedicated Chrome. Close that Chrome
         (SIGTERM the launched pid), close the upstream, and drop the context —
         the uniform, non-`-32601` success shape (docs §RPCs)."""
         session = params.get("session")
@@ -499,17 +499,20 @@ class SessionVerbsMixin:
             attach_owned_raw = (
                 isinstance(record, dict)
                 and record.get("owner") == "attach"
-                and record_backend in ("rdp", "env")
+                and record_backend == "cdp"
             )
             if attach_owned_raw and self.upstream is None:
-                ended: bool | None = None
-                if record_backend == "rdp":
-                    ended = False
-                    teardown_rdp = getattr(
-                        daemon, "teardown_rdp_context", None)
-                    if callable(teardown_rdp):
-                        ended = await teardown_rdp(
-                            session, deadline=teardown_deadline)
+                # Every raw-CDP session has a per-session context now, so there
+                # is no longer a branch where teardown is skipped. `env` used to
+                # fall through here with `ended = None` — it routed to the
+                # shared context and had nothing of its own to drop — which also
+                # meant it could never report failure. It can now, and that is
+                # honest: a context that fails to close is a real partial.
+                ended: bool | None = False
+                teardown_cdp = getattr(daemon, "teardown_cdp_context", None)
+                if callable(teardown_cdp):
+                    ended = await teardown_cdp(
+                        session, deadline=teardown_deadline)
                 ok = ended is not False
                 return {
                     "ok": ok,
@@ -650,10 +653,10 @@ class SessionVerbsMixin:
                 req_id, -32603,
                 "ensureExecutor unavailable: daemon has no executor registry"))
             return
-        # Failure #4 fix: ensure the session's UPSTREAM (rdp Chrome) is launched
+        # Failure #4 fix: ensure the session's UPSTREAM (cdp Chrome) is launched
         # + ready BEFORE we spawn the executor. The executor's cold-start
-        # `connect_over_cdp(facade)` resolves the rdp Chrome's DYNAMIC port,
-        # which is only pinned once `_ensure_upstream` (→ `_launch_rdp_chrome`)
+        # `connect_over_cdp(facade)` resolves the cdp Chrome's DYNAMIC port,
+        # which is only pinned once `_ensure_upstream` (→ `_launch_cdp_chrome`)
         # has run. Pre-restart, ordinary client frames launched Chrome before
         # the executor connected; post-restart the executor path is hit FIRST,
         # so without this the facade probes the stale default port (9222), 404s,

@@ -47,9 +47,113 @@ def check_name(name: str) -> str:
     return name
 
 
+#: Schemes a `--attach` URL may use. `ws`/`wss` are the endpoint itself and are
+#: passed to Chrome verbatim; `http`/`https` are a discovery URL we GET
+#: `/json/version` from.
+_ATTACH_SCHEMES = ("ws", "wss", "http", "https")
+
+_ATTACH_USAGE = (
+    "--attach takes either a port (--attach=9222) or a CDP URL "
+    "(--attach=ws://host:9222/devtools/browser/<id>, or "
+    "--attach=https://cloud.example/?token=... for a hosted browser)"
+)
+
+
+#: The two backend names #38 retired, and what to write instead. Lives in
+#: Layer 1 so both `daemon/cli.py` and Layer 2's `session_create` can use it
+#: without Layer 1 having to import Layer 2.
+_RETIRED_BACKENDS = {
+    "env": (
+        "backend 'env' is gone — it is now `cdp` with a per-session endpoint: "
+        "`session new --backend=cdp --attach=<ws-or-http-url>` (what BD_CDP_WS "
+        "/ BD_CDP_URL used to set process-wide, and those variables are no "
+        "longer read). One daemon can now hold many such sessions at once, so "
+        "the N-isolated-daemons setup is unnecessary."
+    ),
+    "rdp": (
+        "backend 'rdp' is now 'cdp'. `--remote-debugging-port` was only ever "
+        "one way to reach a browser that speaks CDP; the flag name made a poor "
+        "label for the family, since a cloud or anti-detect browser hands you a "
+        "URL and never a port. Use `--backend=cdp --create` or "
+        "`--backend=cdp --attach=<port|url>`."
+    ),
+}
+
+
+def retired_backend_message(backend: object) -> str | None:
+    """Migration text for a retired backend name, or None if it isn't one."""
+    return _RETIRED_BACKENDS.get(backend) if isinstance(backend, str) else None
+
+
+def check_cdp_attach(value: object) -> tuple[int | None, str | None]:
+    """Validate an `--attach` target; return `(port, endpoint)`, one of them set.
+
+    Runs at session-create time, which is the only moment a human supplies this
+    value — and the ledger is durable, so a bad value written there is a
+    permanently stuck row. The daemon deliberately does *not* re-validate: its
+    job on a malformed record is to fail closed onto the default port, not to
+    produce a friendly message.
+
+    Deliberately **not** rejected: userinfo, query strings, non-loopback hosts,
+    odd ports. Those are exactly the shapes cloud and anti-detect browsers hand
+    out, and refusing them would defeat the point of accepting a URL at all.
+    """
+    from .errors import UserError
+
+    # MUST precede the int check: `bool` is a subclass of `int`, and a bare
+    # `--attach` with no value parses to True — which used to sail through
+    # `int(attach)` and pin the session to port 1.
+    if isinstance(value, bool):
+        raise UserError(f"--attach needs a value. {_ATTACH_USAGE}")
+    if isinstance(value, int):
+        return _check_port(value), None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return _check_port(int(text)), None
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(text)
+            scheme, host = parts.scheme.lower(), parts.hostname
+        except ValueError:
+            scheme, host = "", None
+        if scheme not in _ATTACH_SCHEMES or not host:
+            hint = ""
+            if ":" in text and "//" not in text:
+                hint = f" For a bare host:port, write http://{text} instead."
+            raise UserError(f"invalid --attach target {value!r}. {_ATTACH_USAGE}.{hint}")
+        return None, text
+    raise UserError(f"invalid --attach target {value!r}. {_ATTACH_USAGE}")
+
+
+def _check_port(port: int) -> int:
+    if not 1 <= port <= 65535:
+        from .errors import UserError
+
+        raise UserError(f"--attach port {port} is out of range (1-65535)")
+    return port
+
+
 @dataclass
-class RdpConfig:
+class CdpConfig:
+    """Where the raw-CDP browser for one session is.
+
+    Exactly one of the two is in play:
+
+    - `port` — a browser on this machine, discovered via
+      `http://127.0.0.1:<port>/json/version`. Either one we launched
+      (`--create`) or a local one we were pointed at (`--attach=9222`).
+    - `endpoint` — a `ws(s)://` or `http(s)://` URL someone handed us
+      (`--attach=<url>`): a cloud browser, an anti-detect profile, anything we
+      did not start. Takes precedence when set.
+
+    `endpoint` is **per-session only** — it is set by `Daemon._cdp_cfg_for`
+    from that session's ledger record and never by `load()`. There is no env
+    var and no toml key for it, deliberately: one process-global endpoint is
+    exactly what stopped N sessions from driving N browsers (#38).
+    """
     port: int = 9222
+    endpoint: str | None = None
 
 
 @dataclass
@@ -97,7 +201,7 @@ class ExtensionConfig:
 
 @dataclass
 class BackendsConfig:
-    rdp: RdpConfig = field(default_factory=RdpConfig)
+    cdp: CdpConfig = field(default_factory=CdpConfig)
     extension: ExtensionConfig = field(default_factory=ExtensionConfig)
 
 
@@ -107,8 +211,6 @@ class Config:
 
     backend: str | None = None             # explicit --backend / BD_BACKEND
     timeout: float = 5.0                   # per-backend resolve timeout, seconds
-    cdp_ws: str | None = None              # BD_CDP_WS / BU_CDP_WS — env backend uses this
-    cdp_url: str | None = None             # BD_CDP_URL / BU_CDP_URL — env backend uses this
     chrome_binary: str | None = None       # BD_CHROME_BINARY — launch-chrome
     idle_close_after: float | None = None  # seconds; None = never (default)
     session_idle_prune: float | None = 24 * 3600  # ledger prune threshold
@@ -128,9 +230,6 @@ class Config:
     # > toml `facade_host` > DEFAULT_FACADE_HOST.
     facade_host: str = DEFAULT_FACADE_HOST
     backends: BackendsConfig = field(default_factory=BackendsConfig)
-    # Provenance for `env`: which alias key actually fired. Diagnostic-only.
-    cdp_ws_source: str | None = None       # "BD_CDP_WS" | "BU_CDP_WS" | None
-    cdp_url_source: str | None = None      # "BD_CDP_URL" | "BU_CDP_URL" | None
 
     def resolved_facade_port(self) -> int | None:
         """Collapse the tri-state ``facade_port`` to a bind decision.
@@ -208,9 +307,9 @@ def load(
                 f"{type(v).__name__}: {v!r}")
         cfg.backend = v
     backends = toml.get("backends", {}) if isinstance(toml.get("backends"), dict) else {}
-    rdp = backends.get("rdp", {}) if isinstance(backends.get("rdp"), dict) else {}
-    if "port" in rdp and isinstance(rdp["port"], int):
-        cfg.backends.rdp.port = rdp["port"]
+    cdp = backends.get("cdp", {}) if isinstance(backends.get("cdp"), dict) else {}
+    if "port" in cdp and isinstance(cdp["port"], int):
+        cfg.backends.cdp.port = cdp["port"]
     # extension.relay_url substitutes for DEFAULT_RELAY_PORT when set.
     ext = backends.get("extension", {}) if isinstance(backends.get("extension"), dict) else {}
     if isinstance(ext.get("relay_url"), str):
@@ -256,53 +355,46 @@ def load(
             raise UserError(
                 f"BD_SESSION_IDLE_PRUNE must be a number, got "
                 f"{e['BD_SESSION_IDLE_PRUNE']!r}")
-    if "BD_CDP_WS" in e:
-        cfg.cdp_ws = e["BD_CDP_WS"]
-        cfg.cdp_ws_source = "BD_CDP_WS"
-    elif "BU_CDP_WS" in e:
-        cfg.cdp_ws = e["BU_CDP_WS"]
-        cfg.cdp_ws_source = "BU_CDP_WS"
-    if "BD_CDP_URL" in e:
-        cfg.cdp_url = e["BD_CDP_URL"]
-        cfg.cdp_url_source = "BD_CDP_URL"
-    elif "BU_CDP_URL" in e:
-        cfg.cdp_url = e["BU_CDP_URL"]
-        cfg.cdp_url_source = "BU_CDP_URL"
+    # BD_CDP_WS / BD_CDP_URL / BU_* are gone (#38). A CDP endpoint is now a
+    # per-session value carried in the ledger and reaching the resolver as
+    # `backends.cdp.endpoint`; `load()` must never populate it. One
+    # process-global endpoint is precisely what forced the "run N isolated
+    # daemons to drive N profiles" workaround this replaced.
     if "BD_CHROME_BINARY" in e:
         cfg.chrome_binary = e["BD_CHROME_BINARY"]
-    # `BD_RDP_PORT` env override for the rdp backend's port (v0.4.1).
+    # `BD_CDP_PORT` env override for the cdp backend's port (v0.4.1).
     #
     # Originally (spec §8.2 first cut) we deliberately omitted this env var:
-    # the rdp port was config-file or `--port` only, to keep the env namespace
+    # the cdp port was config-file or `--port` only, to keep the env namespace
     # small. But the ai-e2e harness convention is "set env, run agent" — and
-    # without `BD_RDP_PORT`, callers reach for `BD_BACKEND=rdp` + (nothing),
+    # without `BD_CDP_PORT`, callers reach for `BD_BACKEND=cdp` + (nothing),
     # which silently falls through to the hard-coded 9222 default, which on
     # any developer machine **is the user's daily Chrome** (Chrome 144+ auto-
     # enables CDP without a cmdline flag). Connecting to that = Allow popup.
     #
     # Adding the env var makes "lock to my isolated Chrome's port" expressible
-    # without a config file. Precedence: CLI `--port` > BD_RDP_PORT > toml >
+    # without a config file. Precedence: CLI `--port` > BD_CDP_PORT > toml >
     # 9222 default (preserves the spec §5.1 ordering rule).
-    if "BD_RDP_PORT" in e:
+    if "BD_CDP_PORT" in e:
         try:
-            cfg.backends.rdp.port = int(e["BD_RDP_PORT"])
+            cfg.backends.cdp.port = int(e["BD_CDP_PORT"])
         except ValueError:
             from .errors import UserError
             raise UserError(
-                f"BD_RDP_PORT must be an integer, got {e['BD_RDP_PORT']!r}")
+                f"BD_CDP_PORT must be an integer, got {e['BD_CDP_PORT']!r}")
     elif "BD_PORT" in e:
         # v0.5.3 REVIEW.md F-4c: the v0.4 popup-storm incident's root cause
         # was a typo: `BD_PORT=9444` (intuitive name) didn't bind to anything
-        # and the rdp backend defaulted to 9222 = user's daily Chrome. We
-        # added `BD_RDP_PORT` but never defended the typo. Now we alias +
-        # warn: if user typed BD_PORT and not BD_RDP_PORT, accept the value
+        # and the cdp backend defaulted to 9222 = user's daily Chrome. We
+        # added `BD_CDP_PORT` but never defended the typo. Now we alias +
+        # warn: if user typed BD_PORT and not BD_CDP_PORT, accept the value
         # and print a deprecation hint to stderr so they migrate.
         try:
-            cfg.backends.rdp.port = int(e["BD_PORT"])
+            cfg.backends.cdp.port = int(e["BD_PORT"])
         except ValueError:
             from .errors import UserError
             raise UserError(
-                f"BD_PORT (alias for BD_RDP_PORT) must be an integer, got "
+                f"BD_PORT (alias for BD_CDP_PORT) must be an integer, got "
                 f"{e['BD_PORT']!r}")
         # Stderr (NOT stdout — `browserwright-daemon url`'s stdout is the URL).
         # In tests we sometimes silently want to set the env without warning
@@ -310,12 +402,12 @@ def load(
         if e.get("BD_PORT_QUIET", "") not in ("1", "true", "True"):
             import sys
             print(
-                f"warning: BD_PORT is a deprecated alias for BD_RDP_PORT — "
+                f"warning: BD_PORT is a deprecated alias for BD_CDP_PORT — "
                 f"please update your env / script. (BD_PORT={e['BD_PORT']!r} "
-                f"applied to rdp.port.)",
+                f"applied to cdp.port.)",
                 file=sys.stderr,
             )
-    # v0.5.3 Task #24: extension relay port via env. Symmetric to BD_RDP_PORT
+    # v0.5.3 Task #24: extension relay port via env. Symmetric to BD_CDP_PORT
     # — useful when the default 19989 is occupied by a stale daemon process
     # and the user can't write a config.toml on the fly. (playwriter sits on
     # 19988, so default conflict with it is no longer a concern.)
@@ -347,7 +439,7 @@ def load(
     if cli_timeout is not None:
         cfg.timeout = cli_timeout
     if cli_port is not None:
-        cfg.backends.rdp.port = cli_port
+        cfg.backends.cdp.port = cli_port
     if cli_chrome_binary is not None:
         cfg.chrome_binary = cli_chrome_binary
     if cli_extension_port is not None:

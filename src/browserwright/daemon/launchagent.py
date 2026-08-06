@@ -126,8 +126,20 @@ def build_plist(*, extension_port: int | None,
         '    </array>\n'
         '    <key>RunAtLoad</key><true/>\n'
         '    <key>KeepAlive</key>\n'
+        # Revive on EVERY exit — clean or crash (issue #39). The two
+        # conditions are OR-ed by launchd, so SuccessfulExit=true +
+        # Crashed=true means "always keep alive". This is deliberate:
+        #   - SuccessfulExit=false once classified a clean exit-0 (graceful
+        #     `stop`, the issue #15 control-socket watchdog self-exit) as
+        #     "job finished" and launchd never revived the global daemon —
+        #     permanent silent death until a human ran `restart`.
+        #   - Crashed=true is what revives a crash. The #15 crash-loop (a
+        #     half-alive port-holding daemon bouncing on EADDRINUSE) is NOT
+        #     prevented here — launchd throttles respawns (~10s) and `serve`
+        #     heals the cause by reclaiming stale ports before binding
+        #     (issue #15, 2.2), so a revival converges instead of looping.
         '    <dict>\n'
-        '        <key>SuccessfulExit</key><false/>\n'
+        '        <key>SuccessfulExit</key><true/>\n'
         '        <key>Crashed</key><true/>\n'
         '    </dict>\n'
         '    <key>EnvironmentVariables</key>\n'

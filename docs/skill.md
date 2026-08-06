@@ -37,7 +37,7 @@ browserwright repl stop
 # Isolated background Chrome (zero popups, zero banner) — preferred for
 # scripted / iterative work and the install wizard's default pick:
 browserwright-daemon launch-chrome --port 9333 --profile /tmp/bs-isolated &
-BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
+BD_PORT=9333 BD_BACKEND=cdp browserwright <<'PY'
 print(page_info())
 PY
 
@@ -109,10 +109,10 @@ user with that dialog. Two safe paths:
        --port 9333 \
        --profile bs-test-profile \
        --persistent &
-   # run a daemon against that isolated Chrome, then create an rdp session
+   # run a daemon against that isolated Chrome, then create an cdp session
    # so the skill talks to it over the daemon socket (Mode B):
    browserwright-daemon serve &
-   browserwright session new --backend=rdp
+   browserwright session new --backend=cdp
    pytest tests/
    ```
 
@@ -170,8 +170,8 @@ freshly-shipped daemon backend.
 
 | Backend | Picked via | Chrome process | Popup | Banner |
 |---|---|---|---|---|
-| `rdp` (isolated profile) | wizard option **1** (default) — `browserwright-daemon launch-chrome` | dedicated background user-data-dir | ❌ | ❌ |
-| `rdp` (fingerprint browser) | wizard option **2** — user runs AdsPower / MultiLogin / etc. | user's fingerprint browser | ❌ | ❌ |
+| `cdp` (isolated profile) | wizard option **1** (default) — `browserwright-daemon launch-chrome` | dedicated background user-data-dir | ❌ | ❌ |
+| `cdp` (fingerprint browser) | wizard option **2** — user runs AdsPower / MultiLogin / etc. | user's fingerprint browser | ❌ | ❌ |
 | `extension` | wizard option **3** — load unpacked extension | user's daily Chrome via `chrome.debugger` | ❌ | ❌ |
 | `env` | externally-owned browser via `BD_CDP_WS` / `BD_CDP_URL` | external (attach-owned, never closed on `session end`) | ❌ | ❌ |
 

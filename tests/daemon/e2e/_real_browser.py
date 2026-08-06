@@ -96,7 +96,7 @@ def launch_cft_with_extension(
     cft_binary: Path,
     ext_dir: Path,
     *,
-    rdp_port: int = 0,
+    cdp_port: int = 0,
 ) -> ChromeHandle:
     """Launch Chrome for Testing with --load-extension, wait for CDP ready.
 
@@ -109,7 +109,7 @@ def launch_cft_with_extension(
     args = [
         str(cft_binary),
         f"--user-data-dir={profile_dir}",
-        f"--remote-debugging-port={rdp_port}",
+        f"--remote-debugging-port={cdp_port}",
         "--no-first-run",
         "--no-default-browser-check",
         "--remote-allow-origins=*",

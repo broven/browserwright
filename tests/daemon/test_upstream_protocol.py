@@ -31,7 +31,7 @@ def test_both_adapters_satisfy_declared_upstream_protocol():
 
 
 def test_attach_and_detach_publish_one_atomic_router_reference():
-    router = Router(DaemonState("rdp"))
+    router = Router(DaemonState("cdp"))
     upstream = CdpUpstream(_noop, _noop)
 
     upstream.attach(router)

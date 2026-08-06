@@ -152,7 +152,7 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     )
     monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: cleanup_calls.append("cleanup"))
     monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: cleanup_calls.append(f"pid:{pid}"))
-    monkeypatch.setattr(listener_mod, "_cleanup_orphan_rdp_chrome", lambda: cleanup_calls.append("orphans"))
+    monkeypatch.setattr(listener_mod, "_cleanup_orphan_cdp_chrome", lambda: cleanup_calls.append("orphans"))
     monkeypatch.setattr(listener_mod, "_wire_logging", lambda: None)
     monkeypatch.setattr(listener_mod, "install_json_logging_if_requested", lambda: None)
     monkeypatch.setattr(listener_mod, "_open_server", lambda handler: asyncio.sleep(0, result=server))
@@ -277,9 +277,9 @@ async def test_extension_upstream_success_wires_callbacks_and_ready_events(monke
 
 
 @pytest.mark.asyncio
-async def test_rdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
-    cfg = Config(backend="rdp")
-    cfg.backends.rdp.port = 0
+async def test_cdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
+    cfg = Config(backend="cdp")
+    cfg.backends.cdp.port = 0
     launched: list[dict] = []
 
     async def fake_launch_chrome(cfg, *, profile, persistent, port, timeout):
@@ -287,27 +287,27 @@ async def test_rdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
         return {"extras": {"pid": 111, "profile_path": "/tmp/profile"}}
 
     monkeypatch.setattr("browserwright.daemon.launch_chrome.launch_chrome", fake_launch_chrome)
-    holder = listener_mod._UpstreamHolder(DaemonState("rdp"), _Router(), cfg, session_id="abc")
-    await holder._launch_rdp_chrome(cfg)
+    holder = listener_mod._UpstreamHolder(DaemonState("cdp"), _Router(), cfg, session_id="abc")
+    await holder._launch_cdp_chrome(cfg)
     assert launched == [
-        {"profile": "bs-sabc", "persistent": True, "port": holder.rdp_port, "timeout": 30.0}
+        {"profile": "bs-sabc", "persistent": True, "port": holder.cdp_port, "timeout": 30.0}
     ]
-    assert holder.rdp_pid == 111
-    assert holder.rdp_profile_dir == "/tmp/profile"
-    assert holder._cfg.backends.rdp.port == holder.rdp_port
+    assert holder.cdp_pid == 111
+    assert holder.cdp_profile_dir == "/tmp/profile"
+    assert holder._cfg.backends.cdp.port == holder.cdp_port
 
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr(listener_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
-    holder._kill_rdp_chrome()
-    assert holder.rdp_pid is None
+    holder._kill_cdp_chrome()
+    assert holder.cdp_pid is None
     assert killed == [(111, listener_mod.signal.SIGTERM)]
 
-    state = DaemonState("rdp")
-    await state.set_connected("ws://rdp")
+    state = DaemonState("cdp")
+    await state.set_connected("ws://cdp")
     router = _Router()
     dropped: list[str] = []
-    router.daemon = SimpleNamespace(drop_rdp_context=lambda sid: dropped.append(sid))
-    closing_holder = listener_mod._UpstreamHolder(state, router, Config(backend="rdp"), session_id="abc")
+    router.daemon = SimpleNamespace(drop_cdp_context=lambda sid: dropped.append(sid))
+    closing_holder = listener_mod._UpstreamHolder(state, router, Config(backend="cdp"), session_id="abc")
     class ClosingUpstream:
         is_open = True
 
@@ -329,20 +329,20 @@ async def test_rdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rdp_attach_session_ensure_open_does_not_launch(monkeypatch):
-    cfg = Config(backend="rdp")
-    cfg.backends.rdp.port = 9444
-    state = DaemonState("rdp")
+async def test_cdp_attach_session_ensure_open_does_not_launch(monkeypatch):
+    cfg = Config(backend="cdp")
+    cfg.backends.cdp.port = 9444
+    state = DaemonState("cdp")
     router = _Router()
     holder = listener_mod._UpstreamHolder(state, router, cfg, session_id="attach")
-    holder.rdp_owns_browser = False
+    holder.cdp_owns_browser = False
     launched: list[str] = []
 
     async def fake_launch(_cfg):
         launched.append("launch")
 
     async def fake_resolve(_cfg):
-        assert _cfg.backends.rdp.port == 9444
+        assert _cfg.backends.cdp.port == 9444
         return SimpleNamespace(ws_url="ws://127.0.0.1:9444/devtools/browser/x")
 
     class FakeConn:
@@ -365,7 +365,7 @@ async def test_rdp_attach_session_ensure_open_does_not_launch(monkeypatch):
             if bound_router.upstream is self:
                 bound_router.upstream = None
 
-    monkeypatch.setattr(holder, "_launch_rdp_chrome", fake_launch)
+    monkeypatch.setattr(holder, "_launch_cdp_chrome", fake_launch)
     monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
     monkeypatch.setattr(listener_mod, "CdpUpstream", FakeConn)
 
@@ -389,7 +389,7 @@ async def test_graceful_shutdown_closes_every_context_despite_errors(caplog):
     daemon = SimpleNamespace(
         all_contexts=lambda: [
             SimpleNamespace(backend="env", holder=SimpleNamespace(trigger_close=close_bad)),
-            SimpleNamespace(backend="rdp", holder=SimpleNamespace(trigger_close=close_ok)),
+            SimpleNamespace(backend="cdp", holder=SimpleNamespace(trigger_close=close_ok)),
         ]
     )
 

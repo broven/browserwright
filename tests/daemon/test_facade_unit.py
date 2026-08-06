@@ -24,7 +24,7 @@ from browserwright.daemon.server.facade import PlaywrightFacade, FACADE_WS_PATH
 
 @pytest.fixture
 async def facade():
-    f = PlaywrightFacade(cfg=Config(backend="rdp"), port=0)
+    f = PlaywrightFacade(cfg=Config(backend="cdp"), port=0)
     port = await f.start()
     assert port > 0
     assert f.port == port
@@ -42,9 +42,9 @@ async def test_json_version_payload(facade):
 
 async def test_json_version_payload_preserves_session_query(facade):
     port = facade.port
-    body = await _get_json(f"http://127.0.0.1:{port}/json/version?session=rdp%207")
+    body = await _get_json(f"http://127.0.0.1:{port}/json/version?session=cdp%207")
     assert body["webSocketDebuggerUrl"] == (
-        f"ws://127.0.0.1:{port}{FACADE_WS_PATH}?session=rdp%207"
+        f"ws://127.0.0.1:{port}{FACADE_WS_PATH}?session=cdp%207"
     )
 
 
@@ -88,7 +88,7 @@ async def test_json_version_tolerates_trailing_slash(facade):
 def test_ws_url_falls_back_to_configured_host_when_no_authority():
     # No Host header (e.g. a hand-rolled probe) → fall back to the configured
     # bind host:port so the advertised URL is still well-formed.
-    f = PlaywrightFacade(cfg=Config(backend="rdp"), port=29990, host="0.0.0.0")
+    f = PlaywrightFacade(cfg=Config(backend="cdp"), port=29990, host="0.0.0.0")
     assert f._ws_url() == f"ws://0.0.0.0:29990{FACADE_WS_PATH}"
     assert f._version_payload()["webSocketDebuggerUrl"] == (
         f"ws://0.0.0.0:29990{FACADE_WS_PATH}")
@@ -129,17 +129,17 @@ async def test_stop_cleans_up_inflight_session(facade):
     assert facade.port  # port still reported
     # The listening socket is closed: re-binding the facade succeeds (would
     # raise OSError(EADDRINUSE) if the old server leaked the socket).
-    again = PlaywrightFacade(cfg=Config(backend="rdp"), port=0)
+    again = PlaywrightFacade(cfg=Config(backend="cdp"), port=0)
     assert await again.start() > 0
     await again.stop()
 
 
 async def test_session_query_routes_facade_to_session_context(monkeypatch):
     shared_cfg = Config(backend="extension")
-    session_cfg = Config(backend="rdp")
-    session_cfg.backends.rdp.port = 9444
+    session_cfg = Config(backend="cdp")
+    session_cfg.backends.cdp.port = 9444
     holder = SimpleNamespace(_cfg=session_cfg, relay=None)
-    ctx = SimpleNamespace(backend="rdp", holder=holder)
+    ctx = SimpleNamespace(backend="cdp", holder=holder)
     calls = []
 
     class _Daemon:
@@ -150,19 +150,19 @@ async def test_session_query_routes_facade_to_session_context(monkeypatch):
     f = PlaywrightFacade(cfg=shared_cfg, port=0, daemon=_Daemon())
 
     async def fake_resolve(cfg):
-        assert cfg.backends.rdp.port == 9444
+        assert cfg.backends.cdp.port == 9444
         return SimpleNamespace(ws_url="ws://127.0.0.1:9444/devtools/browser/session")
 
     monkeypatch.setattr(
         "browserwright.daemon.server.facade.resolve_upstream", fake_resolve)
 
     class _Conn:
-        request = SimpleNamespace(path="/cdp?session=rdp-session")
+        request = SimpleNamespace(path="/cdp?session=cdp-session")
 
-    assert await f._resolve_rdp_ws(f._context_for_connection(_Conn())) == (
+    assert await f._resolve_cdp_ws(f._context_for_connection(_Conn())) == (
         "ws://127.0.0.1:9444/devtools/browser/session"
     )
-    assert calls == ["rdp-session"]
+    assert calls == ["cdp-session"]
 
 
 async def test_facade_without_session_keeps_shared_backend():
@@ -196,12 +196,27 @@ async def test_facade_unknown_session_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_sessionless_env_facade_fails_closed():
-    daemon = SimpleNamespace(
-        shared_context=SimpleNamespace(backend="env"),
-    )
-    f = PlaywrightFacade(
-        cfg=Config(backend="env"), port=0, daemon=daemon)
+async def test_sessionless_facade_client_is_no_longer_refused(monkeypatch):
+    """The `env`-era 1008 refusal is gone (#38).
+
+    A sessionless client used to be closed with "env facade requires
+    browserwright session" whenever the shared context was `env`: that context
+    had no session identity, and the ledger allowed only one env session per
+    daemon, so "whose browser is this?" genuinely had no answer.
+
+    With endpoints carried per session, a sessionless client cannot reach any
+    session's browser at all — it gets the operator-configured default port. The
+    ambiguity is gone, so the refusal is too.
+    """
+    daemon = SimpleNamespace(shared_context=SimpleNamespace(backend="cdp"))
+    f = PlaywrightFacade(cfg=Config(backend="cdp"), port=0, daemon=daemon)
+
+    handled = []
+
+    async def _fake_cdp(conn, ctx=None):
+        handled.append(ctx)
+
+    monkeypatch.setattr(f, "_handle_cdp_client", _fake_cdp)
 
     class _Conn:
         request = SimpleNamespace(path="/cdp")
@@ -213,7 +228,8 @@ async def test_sessionless_env_facade_fails_closed():
     conn = _Conn()
     await f._handle_client(conn)
 
-    assert conn.closed == [(1008, "env facade requires browserwright session")]
+    assert conn.closed == []
+    assert handled == [None]  # served by the shared context, not refused
 
 
 @pytest.mark.asyncio

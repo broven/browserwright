@@ -21,7 +21,7 @@ If `version check` reports an extension mismatch after installing the matching p
 
 ## Start With A Session
 
-A session is the isolation key. Create one session, then pass it to every later browser-driving call with `-s`. The `--name` value is a short task-specific label instead of a generic name like `personal`: extension sessions show it as the Chrome tab group title, while RDP sessions use it to label the isolated browser session.
+A session is the isolation key. Create one session, then pass it to every later browser-driving call with `-s`. The `--name` value is a short task-specific label instead of a generic name like `personal`: extension sessions show it as the Chrome tab group title, while CDP sessions use it to label the isolated browser session.
 
 ```bash
 sid=$(browserwright session new --backend=extension --name=hn-research)
@@ -32,7 +32,7 @@ print(page.title())
 browserwright session end --session=$sid
 ```
 
-Use `--backend=extension` for the user's daily Chrome. Use `--backend=rdp --create` for an isolated Chrome that the daemon owns. Use `--backend=env` to bind to an externally-owned browser the daemon was started against (`BD_CDP_WS=ws://... browserwright-daemon serve --backend env`) — e.g. an anti-detect / fingerprint profile; ending the session never closes it.
+Use `--backend=extension` for the user's daily Chrome. Use `--backend=cdp --create` for an isolated Chrome that the daemon owns. Use `--backend=cdp --attach=<port|url>` to bind to a browser someone else owns — a local port, or a `ws://`/`wss://`/`http://` endpoint for an anti-detect, fingerprint or cloud profile; ending the session never closes it. Each attached session carries its own endpoint, so one daemon can drive many external browsers at once.
 
 For multi-line code, heredocs, JSON literals, or complex quoting, prefer a file
 or stdin over a dense one-liner:

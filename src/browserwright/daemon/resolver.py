@@ -22,7 +22,7 @@ async def resolve(cfg: Config):
     """Return a ResolveResult for the first backend that succeeds.
 
     cfg.backend pinning behavior:
-    - None  -> try every backend in registry order (env > rdp), then bail.
+    - None  -> try every backend in registry order (env > cdp), then bail.
               `extension` is deliberately excluded from the auto-fallback
               (see _CHAIN_OPT_OUT below).
     - str   -> try only that one

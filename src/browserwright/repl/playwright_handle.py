@@ -9,7 +9,7 @@ against an injected ``page`` (and ``context``). The handle:
   - **connects through the daemon facade**: it reads the facade ws URL the
     daemon advertised (``browserwright-daemon status``'s ``facade.ws`` →
     ``_ipc.read_facade_file``) and ``chromium.connect_over_cdp`` to it. The
-    facade drives both the rdp and extension backends (see
+    facade drives both the cdp and extension backends (see
     ``.trellis/spec/backend/playwright-cdp-facade.md``).
   - **binds ``page`` to the session's current tab**: it resolves the session's
     ``current_target_id`` (ledger fast-path via ``ensure_session_target``) and
@@ -124,7 +124,7 @@ def _agent_page_targets(sess: Any) -> list[dict]:
     synthetic browser sessionId — both trip a Playwright-driver assert that
     kills the connection. The agent path is the daemon's own, fully-tested
     channel; its targetIds are exactly the daemon/ledger ids (extension
-    `ext-tab-N`, rdp real ids), so they line up with the ledger's
+    `ext-tab-N`, cdp real ids), so they line up with the ledger's
     `current_target_id` and with `connect_over_cdp`'s synthesized targetIds."""
     try:
         res = sess.cdp.send("Target.getTargets")
@@ -159,7 +159,7 @@ def connect_over_cdp(pw: Any, *, session_id: str | None = None,
     the connect fails — the actionable error the agent should see.
 
     ``attempts`` / ``backoff_s`` (defense-in-depth for the Phase B executor
-    cold-start, Failure #4): a freshly-restarted daemon launches the rdp Chrome
+    cold-start, Failure #4): a freshly-restarted daemon launches the cdp Chrome
     lazily, so the executor can race a Chrome that is still binding its CDP port
     — the facade then 404s/403s for a brief window. Retrying the connect a few
     times over a few seconds absorbs that startup race. The per-heredoc Phase C

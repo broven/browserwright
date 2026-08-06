@@ -6,7 +6,7 @@ had rewritten the same loop:
   1. ``cli stop``                       — SIGTERM the daemon we just pinged.
   2. ``_stale.reclaim_ports``           — SIGTERM a confirmed stale daemon.
   3. ``executor_registry._terminate``   — SIGTERM a session's executor.
-  4. ``listener._kill_rdp_chrome``      — SIGTERM a daemon-owned rdp Chrome.
+  4. ``listener._kill_cdp_chrome``      — SIGTERM a daemon-owned cdp Chrome.
 
 What they genuinely share is the *shape*: signal, poll a death predicate until
 a deadline, escalate to SIGKILL, poll again. That shape lives here as
@@ -45,10 +45,14 @@ and stays a five-line function. That is the honest boundary.
 from __future__ import annotations
 
 import enum
+import logging
 import os
 import signal
 import time
 from typing import Callable
+
+
+logger = logging.getLogger(__name__)
 
 
 class Outcome(enum.Enum):
@@ -116,6 +120,93 @@ def pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _pid_gone(pid: int) -> bool:
+    """Death predicate for :func:`terminate_orphan`: the pid is gone, OR it
+    is a zombie we are the parent of (reap it and count it gone).
+
+    ``pid_alive`` alone reports a dead-but-unreaped child (a zombie) as alive,
+    which would make the graded reap always "fail" after the SIGTERM when the
+    reaper happens to be the parent (tests; a CLI that spawned the process
+    itself). In production the executor's parent is the daemon, so a zombie is
+    reaped by init within milliseconds — this branch exists for the cases
+    where that is not true."""
+    if not pid_alive(pid):
+        return True
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False  # not our child; only init can reap it
+    except OSError:
+        return False
+    return reaped == pid
+
+
+def terminate_orphan(
+    pid: int,
+    start_time: str | None = None,
+    *,
+    grace: float = 3.0,
+    kill_grace: float = 1.0,
+    interval: float = 0.05,
+) -> bool:
+    """Bounded TERM→KILL reap for a process without a ``Popen`` handle.
+
+    ``start_time`` is the fingerprint recorded when the process was spawned
+    (for executors: written into the discovery file at bind time). A crash can
+    leave that file behind while the executor exits, and the OS is free to
+    hand the pid to anything — so liveness alone does not say the pid is still
+    ours, and signalling its whole *group* on that basis can take out an
+    unrelated process tree. Three cases, deliberately graded:
+
+    - recorded and matching  → ours; full group escalation.
+    - recorded and differing → someone else's; do not signal at all, and
+      report the orphan as gone so its stale files are cleaned up.
+    - not recorded (a discovery file written before this field existed)
+      → unverifiable; signal only the exact pid, never the group.
+
+    Returns True when the pid is gone afterwards (or was already gone, or was
+    provably recycled). Returns False only when the pid is STILL alive after
+    the escalation — callers must not claim the orphan was reaped.
+    """
+    if not pid_alive(pid):
+        return True
+    verified = False
+    if start_time is not None:
+        from .platforms import proc_start_time
+        current = proc_start_time(pid)
+        if current is not None and current != start_time:
+            # The pid was recycled — the orphan we recorded is gone; do not
+            # signal a stranger. Caller cleans up the stale files.
+            logger.info(
+                "orphan-cleanup: pid %d was recycled (start-time mismatch); "
+                "not signalling", pid)
+            return True
+        verified = current is not None
+    try:
+        try:
+            if not verified:
+                raise PermissionError("unverified pid: exact-pid signal only")
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGTERM)
+        logger.info("orphan-cleanup: SIGTERM stray executor pid %d", pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return _pid_gone(pid)
+    if wait_until(lambda: _pid_gone(pid), grace, interval=interval):
+        return True
+    try:
+        try:
+            if not verified:
+                raise PermissionError("unverified pid: exact-pid signal only")
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    return wait_until(lambda: _pid_gone(pid), kill_grace, interval=interval)
+
 
 
 def terminate(pid: int, *, is_dead: Callable[[], bool],

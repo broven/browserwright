@@ -1,6 +1,7 @@
 """File-locked session ledger: short id → session record (P1 isolation key)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -18,6 +19,11 @@ def _home() -> Path:
 def _dir() -> Path:
     d = _home() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
+    # A session record can hold a CDP endpoint with an embedded bearer token,
+    # so the directory is owner-only. Re-applying on every call is cheap and
+    # repairs a directory created by an older version under a looser umask.
+    with contextlib.suppress(OSError):
+        d.chmod(0o700)
     return d
 
 
@@ -27,55 +33,39 @@ def _ledger_path() -> Path:
 
 @contextmanager
 def _locked() -> Iterator[dict]:
-    """Exclusive flock around a read-modify-write of the ledger."""
+    """Exclusive flock around a read-modify-write of the ledger.
+
+    The write is temp-file-and-rename. Readers (`get`, `list_all`, `stale`)
+    deliberately bypass the lock for speed, so a plain in-place write left a
+    window where a crash — or just a slow write — exposed a truncated file to
+    them. `os.replace` is atomic, so a reader sees either the old ledger or the
+    new one, never half of one.
+
+    **Load-bearing: the write happens after the `yield`.** An exception raised
+    by the caller's body propagates before anything touches the file, which is
+    how every validation guard in this module leaves the ledger untouched on
+    rejection. Do not move the write into a `finally`.
+    """
     with FileLock(_dir() / ".lock"):
         p = _ledger_path()
         data = json.loads(p.read_text()) if p.exists() else {"next_id": 1, "sessions": {}}
         yield data
-        p.write_text(json.dumps(data))
+        tmp = p.with_name(p.name + ".tmp")
+        # The mode argument to `os.open` only applies when the file is created,
+        # so a stale tmp left by a crashed write could keep looser permissions;
+        # the explicit chmod repairs that case.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
 
 
 def allocate(*, backend: str, owner: str,
-             workspace: Optional[object] = None, name: Optional[str] = None,
-             unique_name: bool = False,
-             env_daemon_scope: Optional[str] = None) -> str:
+             workspace: Optional[object] = None, name: Optional[str] = None) -> str:
     now = time.time()
     with _locked() as data:
-        if env_daemon_scope is not None:
-            if backend != "env":
-                raise ValueError("env_daemon_scope is valid only for env sessions")
-            for e in data["sessions"].values():
-                if e.get("backend") != backend:
-                    continue
-                existing_scope = e.get("daemon_scope")
-                # Records written before daemon_scope existed cannot safely be
-                # assigned to a different daemon. Treat them as conflicts until
-                # explicitly ended rather than opening an unknown shared scope.
-                if existing_scope not in (None, env_daemon_scope):
-                    continue
-                conflict = e.get("id")
-                raise ValueError(
-                    f"daemon {env_daemon_scope!r} already has env session "
-                    f"{conflict!r}. An env daemon has one shared upstream, so "
-                    "reuse or end that session first. To drive N profiles, run "
-                    "N isolated daemons as documented in "
-                    "docs/session-workspaces.md § 'Scaling env to N profiles'."
-                )
-        if unique_name:
-            # Globally-unique name guard. Raising here (after the `yield` in
-            # _locked) aborts before `p.write_text`, so a rejected allocation
-            # leaves the ledger untouched.
-            for e in data["sessions"].values():
-                if e.get("name") == name:
-                    conflict = e.get("id")
-                    raise ValueError(
-                        f"session name {name!r} is already taken by session "
-                        f"{conflict!r}. Names must be globally unique. Either "
-                        f"pick a different --name, reuse the existing session "
-                        f"with `browserwright -s {conflict} -e ...`, or "
-                        f"end it first: browserwright session end "
-                        f"--session={conflict}"
-                    )
         sid = str(data["next_id"])
         data["next_id"] += 1
         record = {
@@ -83,8 +73,6 @@ def allocate(*, backend: str, owner: str,
             "workspace": workspace, "owner": owner, "name": name,
             "created_at": now, "last_seen": now,
         }
-        if env_daemon_scope is not None:
-            record["daemon_scope"] = env_daemon_scope
         data["sessions"][sid] = record
         return sid
 
@@ -96,24 +84,41 @@ def get(session_id: str) -> Optional[dict]:
     return json.loads(p.read_text())["sessions"].get(session_id)
 
 
-def claim_legacy_env_scope(session_id: str, daemon_scope: str) -> bool:
-    """Atomically bind one unscoped legacy env record to a daemon.
+def migrate_legacy_backends() -> dict:
+    """Clear ledger rows naming a backend that no longer exists (#38).
 
-    Records created before ``daemon_scope`` existed have no stronger ownership
-    evidence.  The first matching env daemon to route the record may migrate
-    it; an already-scoped, missing, or non-env record remains fail-closed.
+    Without this they are **immortal**: the daemon raises `UnknownSessionError`
+    for an unrecognised backend, so `session end` cannot confirm teardown and
+    keeps the row "for retry", and auto-prune skips it for the same reason. The
+    retry takes the same path to the same failure, forever.
+
+    Two different situations, two different answers:
+
+    - ``rdp`` → renamed to ``cdp``. Byte-identical semantics, same workspace,
+      same owner — a silent in-place migration is the honest thing.
+    - ``env`` → **evicted**. There is no equivalent row: an env session's
+      endpoint lived in its daemon's environment, not in the record, so there
+      is nothing to migrate it *to*. Returned to the caller so the eviction can
+      be logged rather than happening invisibly.
+
+    Goes through ``_locked`` directly, not ``update()`` — that guard rejects a
+    ``backend`` change by design, and rightly so for every caller but this one.
+
+    Returns ``{"migrated": [id, ...], "evicted": [record, ...]}``.
     """
-    if not isinstance(daemon_scope, str) or not daemon_scope:
-        return False
     with _locked() as data:
-        entry = data["sessions"].get(session_id)
-        if not isinstance(entry, dict) or entry.get("backend") != "env":
-            return False
-        existing_scope = entry.get("daemon_scope")
-        if existing_scope is None:
-            entry["daemon_scope"] = daemon_scope
-            return True
-        return existing_scope == daemon_scope
+        migrated: list[str] = []
+        evicted: list[dict] = []
+        for sid, entry in list(data["sessions"].items()):
+            if not isinstance(entry, dict):
+                continue
+            backend = entry.get("backend")
+            if backend == "rdp":
+                entry["backend"] = "cdp"
+                migrated.append(sid)
+            elif backend == "env":
+                evicted.append(data["sessions"].pop(sid))
+        return {"migrated": migrated, "evicted": evicted}
 
 
 def _with_entry(session_id: str, fn: Callable[[dict], object]) -> Optional[dict]:
@@ -153,6 +158,30 @@ def remove(session_id: str) -> Optional[dict]:
     """Drop a session from the ledger; return the removed record (or None)."""
     with _locked() as data:
         return data["sessions"].pop(session_id, None)
+
+
+def redacted(record: Optional[dict]) -> Optional[dict]:
+    """A record safe to print, with any endpoint credential stripped.
+
+    `workspace["url"]` is the one field here that can carry a secret: a cloud
+    or anti-detect browser's CDP URL routinely embeds a reusable token in its
+    userinfo or query string. Before #38 that value lived in a daemon's
+    environment and never in this file, so dumping a record wholesale was safe;
+    it isn't any more.
+
+    Lives beside the record shape on purpose — knowing which field is a
+    credential is part of knowing what a record *is*, and a caller that has to
+    remember to redact will eventually be a caller that forgot.
+    """
+    if not isinstance(record, dict):
+        return record
+    workspace = record.get("workspace")
+    if not isinstance(workspace, dict) or "url" not in workspace:
+        return record
+    from .daemon._net import redact_url
+
+    return {**record,
+            "workspace": {**workspace, "url": redact_url(workspace["url"])}}
 
 
 def list_all() -> list[dict]:
