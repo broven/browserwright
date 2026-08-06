@@ -30,9 +30,11 @@ import io
 import json
 import os
 import queue
+import secrets
 import socket
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
@@ -134,6 +136,13 @@ class _Worker:
         # _execute; collected into the ExecuteResponse.
         self._call_warnings: list[str] = []
         self._call_screenshots: list[dict[str, Any]] = []
+        # C1b: what this worker is running RIGHT NOW, and since when. `None`
+        # when idle. Read in-process (a SIGUSR1 dump lands next to it) and
+        # published to `_ipc.executor_inflight_path` so the daemon's `status`
+        # verb can answer "worker is 47s into a task" for a worker that is too
+        # busy — or too wedged — to answer an RPC. Monotonic, never wall clock.
+        self._inflight: dict[str, Any] | None = None
+        self._inflight_lock = threading.Lock()
 
         self._thread = threading.Thread(
             target=self._run, name="bw-executor-worker", daemon=True)
@@ -189,9 +198,11 @@ class _Worker:
             if item is None:
                 break
             req, box = item
+            self._begin_inflight(req)
             try:
                 response = self._execute(req)
             finally:
+                self._end_inflight()
                 # Values are restored out of os.environ by
                 # `_request_environment`; also drop the request mapping before
                 # this resident thread blocks on its next queue read.  Python
@@ -200,6 +211,60 @@ class _Worker:
                 req.env.clear()
             box.put(response)
         self._teardown()
+
+    # ---- in-flight introspection (C1b) ----------------------------------
+
+    def _begin_inflight(self, req: ExecuteRequest) -> None:
+        """Record + publish the call about to run.
+
+        Deliberately records no code-derived metadata: heredocs routinely carry
+        credentials, so a random request id provides correlation without an
+        offline oracle for guessed code."""
+
+        if req.task is not None:
+            what = f"task:{req.task.site}/{req.task.name or '?'}"
+        else:
+            what = "code"
+        entry = {
+            "session": self._session_id,
+            "executor_id": self._executor_id,
+            "pid": os.getpid(),
+            "what": what,
+            "request_id": secrets.token_hex(16),
+            "timeout_ms": req.timeout_ms,
+            "started_at": time.monotonic(),
+            "started_wall": time.time(),
+            "connected": self._connected,
+        }
+        with self._inflight_lock:
+            self._inflight = entry
+        self._publish_inflight(entry)
+
+    def _end_inflight(self) -> None:
+        with self._inflight_lock:
+            self._inflight = None
+        self._publish_inflight(None)
+
+    def _publish_inflight(self, entry: dict[str, Any] | None) -> None:
+        from ..daemon import _ipc
+
+        if entry is None:
+            _ipc.write_executor_inflight(self._session_id, None)
+            return
+        # `started_at` is monotonic and meaningless to another process; publish
+        # the wall-clock twin instead and let the reader age it.
+        published = {k: v for k, v in entry.items() if k != "started_at"}
+        _ipc.write_executor_inflight(self._session_id, published)
+
+    def inflight_snapshot(self) -> dict[str, Any] | None:
+        """The in-process view: what this worker is running, plus its age."""
+        with self._inflight_lock:
+            entry = dict(self._inflight) if self._inflight is not None else None
+        if entry is None:
+            return None
+        entry["elapsed_s"] = round(
+            max(0.0, time.monotonic() - entry["started_at"]), 3)
+        return entry
 
     def _ensure_cold_started(self) -> None:
         """Lazily connect the facade + bind the session's current tab — ON the
@@ -660,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     from ..daemon import _ipc
+    from ..daemon.observability import install_sigusr1_traceback
 
     parser = argparse.ArgumentParser(prog="browserwright._executor")
     parser.add_argument(
@@ -703,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
     # `finally` from a default-SIGTERM-killed process, so install a handler that
     # unlinks the discovery file/socket then hard-exits.
     _install_sigterm_cleanup(session_id)
+    install_sigusr1_traceback("executor")
 
     try:
         _serve(session_id, sock, worker)

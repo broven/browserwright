@@ -11,6 +11,7 @@ e2e suite (`tests/daemon/e2e/test_l1_playwright_facade.py`).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import urllib.request
 from types import SimpleNamespace
@@ -192,6 +193,84 @@ async def test_facade_unknown_session_fails_closed():
     conn = _Conn()
     await f._handle_client(conn)
     assert conn.closed == [(1008, "unknown browserwright session")]
+
+
+@pytest.mark.asyncio
+async def test_sessionless_env_facade_fails_closed():
+    daemon = SimpleNamespace(
+        shared_context=SimpleNamespace(backend="env"),
+    )
+    f = PlaywrightFacade(
+        cfg=Config(backend="env"), port=0, daemon=daemon)
+
+    class _Conn:
+        request = SimpleNamespace(path="/cdp")
+        closed = []
+
+        async def close(self, *, code=1000, reason=""):
+            self.closed.append((code, reason))
+
+    conn = _Conn()
+    await f._handle_client(conn)
+
+    assert conn.closed == [(1008, "env facade requires browserwright session")]
+
+
+@pytest.mark.asyncio
+async def test_ending_session_revokes_parked_facade_client(monkeypatch):
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState
+
+    class _Router:
+        daemon = None
+
+    class _Registry:
+        async def terminate_session(self, session_id, teardown, *, budget=None):
+            return {"reaped": True}, await teardown()
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=_Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **_kw: pytest.fail("should not create"))
+    daemon.executors = _Registry()
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension"},
+    )
+    facade = PlaywrightFacade(
+        cfg=Config(backend="extension"), port=0, daemon=daemon)
+    parked = asyncio.Event()
+
+    async def park(_conn, _ctx):
+        parked.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(facade, "_handle_extension_client", park)
+
+    class _Conn:
+        request = SimpleNamespace(path="/cdp?session=session-a")
+
+        def __init__(self):
+            self.closed = []
+
+        async def close(self, *, code=1000, reason=""):
+            self.closed.append((code, reason))
+
+    conn = _Conn()
+    client_task = asyncio.create_task(facade._handle_client(conn))
+    await parked.wait()
+
+    async def teardown():
+        return {"ok": True, "backend": "extension"}
+
+    _reap, result = await daemon.terminate_session("session-a", teardown)
+
+    assert result["ok"] is True
+    assert conn.closed == [(1008, "browserwright session ended")]
+    assert client_task.done()
+    assert daemon._session_leases.get("session-a") in (None, {})
 
 
 async def _get_json(url: str, host: str | None = None):

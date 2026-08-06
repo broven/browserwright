@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from browserwright.daemon import cli
+from browserwright.daemon import cli, launchagent
 from browserwright.daemon.config import Config
 from browserwright.daemon.errors import DaemonError, Unavailable, UserError
+from browserwright.daemon.probe import DaemonProbe
 
 
 def _ns(**kwargs):
     return SimpleNamespace(**kwargs)
+
+
+def _cmd(name):
+    """A forwarding subcommand's handler, by subcommand name.
+
+    `open-background` / `close-tab` / `end-session` / `kill-executor` are rows in
+    `cli._FORWARDS` rather than hand-written functions, so the dispatch table is
+    where you get at them."""
+    return cli._DISPATCH[name]
 
 
 class _AsyncWs:
@@ -58,17 +69,25 @@ def test_status_list_and_stop_error_branches(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(platforms, "proc_start_time", fake_proc_start)
     assert cli._cmd_stop(_ns(timeout=0), Config()) == 0
 
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: (None, None))
     # Isolate the control socket to a non-existent path so the issue #15 (2.1)
     # port-held-zombie probe is skipped — otherwise this unit test would pick up
     # a real daemon holding the default relay/facade ports on the dev machine.
-    monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "dead.sock")
-    monkeypatch.setattr(_ipc, "endpoint_describe", lambda: {
-        "transport": "unix",
-        "path": str(tmp_path / "dead.sock"),
-    })
-    assert cli._cmd_status(_ns(json=False), Config()) == 2
-    monkeypatch.setattr(cli, "_launchagent_plist_path", lambda: tmp_path / "absent.plist")
+    class _DeadProbe(DaemonProbe):
+        def ping(self, timeout):
+            return (None, None)
+
+        def socket_present(self):
+            return False
+
+        def endpoint(self):
+            return {"transport": "unix", "path": str(tmp_path / "dead.sock")}
+
+        def facade(self):
+            return (None, None)
+
+    assert cli._cmd_status(_ns(json=False), Config(),
+                           probe=_DeadProbe(Config())) == 2
+    monkeypatch.setattr(launchagent, "plist_path", lambda: tmp_path / "absent.plist")
     monkeypatch.setattr(cli, "_ipc_ping", lambda: None)
     assert cli._cmd_list(_ns(json=False), Config()) == 0
 
@@ -279,7 +298,7 @@ def test_tab_rpc_handlers_cover_success_and_failures(monkeypatch, capsys):
         Unavailable("socket down"),
         {"closed": [1]},
         DaemonError("close boom"),
-        {"closed": [], "kept": ["T"]},
+        {"ok": True, "closed": [], "failed": [], "kept": ["T"]},
         DaemonError("end boom"),
     ]
 
@@ -296,12 +315,12 @@ def test_tab_rpc_handlers_cover_success_and_failures(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
     monkeypatch.setattr(cli, "_run", fake_run)
 
-    assert cli._cmd_open_background(_ns(url="https://example.test/", group="G", session="bw-s"), Config()) == 0
-    assert cli._cmd_open_background(_ns(url="https://down.test/", group="G", session="bw-s"), Config()) == 2
-    assert cli._cmd_close_tab(_ns(session="bw-s", session_id="S", target_id="T"), Config()) == 0
-    assert cli._cmd_close_tab(_ns(session="bw-s", session_id=None, target_id="T2"), Config()) == 3
-    assert cli._cmd_end_session(_ns(session="sess", group_id=None), Config()) == 0
-    assert cli._cmd_end_session(_ns(session="sess", group_id=8), Config()) == 3
+    assert _cmd("open-background")(_ns(url="https://example.test/", group="G", session="bw-s"), Config()) == 0
+    assert _cmd("open-background")(_ns(url="https://down.test/", group="G", session="bw-s"), Config()) == 2
+    assert _cmd("close-tab")(_ns(session="bw-s", session_id="S", target_id="T"), Config()) == 0
+    assert _cmd("close-tab")(_ns(session="bw-s", session_id=None, target_id="T2"), Config()) == 3
+    assert _cmd("end-session")(_ns(session="sess", group_id=None), Config()) == 0
+    assert _cmd("end-session")(_ns(session="sess", group_id=8), Config()) == 3
 
     assert calls[0] == (
         "BrowserwrightDaemon.openBackgroundTab",
@@ -338,8 +357,8 @@ def test_end_and_kill_executor_pass_browser_session_for_ws_scoping(monkeypatch):
     monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
     monkeypatch.setattr(cli, "_run", lambda value: value)
 
-    assert cli._cmd_end_session(_ns(session="bw-s", group_id=None), Config()) == 0
-    assert cli._cmd_kill_executor(_ns(session="bw-s"), Config()) == 0
+    assert _cmd("end-session")(_ns(session="bw-s", group_id=None), Config()) == 0
+    assert _cmd("kill-executor")(_ns(session="bw-s"), Config()) == 0
 
     end_method, end_kwargs = calls[0]
     assert end_method == "BrowserwrightDaemon.endSession"
@@ -361,7 +380,7 @@ def test_kill_executor_requires_confirmed_reap(monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "_rpc_via_ws", not_reaped)
 
-    assert cli._cmd_kill_executor(_ns(session="bw-s"), Config()) == 3
+    assert _cmd("kill-executor")(_ns(session="bw-s"), Config()) == 3
     streams = capsys.readouterr()
     assert streams.out == ""
     assert "did not confirm executor death" in streams.err
@@ -375,13 +394,13 @@ def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, 
 
     with monkeypatch.context() as m:
         m.setattr(subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("missing")))
-        assert cli._launchctl("load", "x") == (-1, "", "missing")
+        assert launchagent.launchctl("load", "x") == (-1, "", "missing")
 
-    monkeypatch.setattr(cli.sys, "platform", "darwin")
-    monkeypatch.setattr(cli, "_launchagent_plist_path", lambda: plist)
-    monkeypatch.setattr(cli, "_resolve_browserwright_daemon_bin", lambda: "/bin/browserwright-daemon")
-    monkeypatch.setattr(cli.os.path, "expanduser", lambda p: str(tmp_path / "home" / p.removeprefix("~/")))
-    monkeypatch.setattr(cli, "_launchctl", lambda *args: launchctl_calls.append(args) or (0, "", ""))
+    monkeypatch.setattr(launchagent.sys, "platform", "darwin")
+    monkeypatch.setattr(launchagent, "plist_path", lambda: plist)
+    monkeypatch.setattr(launchagent, "resolve_daemon_bin", lambda: "/bin/browserwright-daemon")
+    monkeypatch.setattr(launchagent.os.path, "expanduser", lambda p: str(tmp_path / "home" / p.removeprefix("~/")))
+    monkeypatch.setattr(launchagent, "launchctl", lambda *args: launchctl_calls.append(args) or (0, "", ""))
 
     assert cli._cmd_install(_ns(backend=None, extension_port=29999, force=False), Config()) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -405,7 +424,32 @@ def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, 
     assert cli._cmd_uninstall(_ns(), Config()) == 0
     assert json.loads(capsys.readouterr().out)["reason"] == "no LaunchAgent installed"
 
-    monkeypatch.setattr(cli, "_launchctl", lambda *args: (9, "", "load failed"))
+    monkeypatch.setattr(launchagent, "launchctl", lambda *args: (9, "", "load failed"))
     assert cli._cmd_install(_ns(backend=None, extension_port=None, force=True), Config()) == 3
     assert not plist.exists()
     assert "launchctl load failed: load failed" in capsys.readouterr().err
+
+
+def test_every_declared_subcommand_has_a_handler_and_vice_versa():
+    """The failure mode a dispatch table invites: add a parser subcommand and
+    forget the row (argparse accepts it, `main` prints help and exits 1), or add
+    a row and forget the parser (dead code nobody can reach). Lock both."""
+    parser = cli._build_parser()
+    declared = set(
+        next(a for a in parser._actions
+             if isinstance(a, argparse._SubParsersAction)).choices)
+
+    assert declared == set(cli._DISPATCH), (
+        "parser subcommands and _DISPATCH disagree: "
+        f"parser-only={sorted(declared - set(cli._DISPATCH))} "
+        f"dispatch-only={sorted(set(cli._DISPATCH) - declared)}")
+    assert set(cli._FORWARDS) <= declared
+
+
+def test_forwarded_methods_are_namespaced_daemon_verbs():
+    """Every forwarding row must target a `BrowserwrightDaemon.*` verb — a bare
+    CDP method here would be forwarded upstream instead of answered by the
+    daemon, which is a silently different (and wrong) code path."""
+    for name, spec in cli._FORWARDS.items():
+        assert spec.method.startswith("BrowserwrightDaemon."), (name, spec.method)
+        assert spec.label.startswith("cli-"), (name, spec.label)

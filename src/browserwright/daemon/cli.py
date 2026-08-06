@@ -1,4 +1,4 @@
-"""argparse + subcommand dispatch.
+"""argparse + subcommand dispatch. Nothing else lives here.
 
 Spec §5: Skill talks via subprocess and parses stdout/stderr/exit codes.
 Stdout discipline (every subcommand):
@@ -11,6 +11,15 @@ Exit codes (§5.1):
   2 backend(s) unavailable
   3 internal / unexpected error
   6 launch-chrome: Chrome binary not found
+
+The work each subcommand names lives in its own module; this file parses, calls
+one of them, and formats the answer:
+
+  `_rpc`         one-shot BrowserwrightDaemon.* JSON-RPC over the control socket
+  `probe`        daemon liveness observations, behind `status` (and `serve`)
+  `supervise`    graceful-then-forced process termination, behind `stop`
+  `launchagent`  macOS service registration, behind `install`/`uninstall`/`restart`
+  `relay_status` the relay's /__status__ endpoint, behind `version --check`
 """
 from __future__ import annotations
 
@@ -19,15 +28,8 @@ import asyncio
 import json
 import os
 import sys
-import time
-from xml.sax.saxutils import escape as _xml_escape
-from typing import NoReturn, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    # Type-checking only: the runtime imports pathlib lazily inside the few
-    # LaunchAgent helpers that need it, so this keeps `Path` resolvable in
-    # annotations without adding a module-level runtime import.
-    from pathlib import Path
+from dataclasses import dataclass
+from typing import Callable, NoReturn
 
 from . import __version__
 from .backends import names
@@ -139,6 +141,20 @@ def _build_parser() -> argparse.ArgumentParser:
     # status (v0.2)
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
     p_status.add_argument("--json", action="store_true")
+
+    # ps — in-flight introspection. Sibling of `status`, NOT a flag on it:
+    # `status` answers "is a daemon there" (liveness, used by the skill layer as
+    # a health ping) and must stay cheap and stable. `ps` answers "what is it
+    # doing right now", which is a different question with a different failure
+    # mode — you run it precisely when `status` already said "alive".
+    p_ps = sub.add_parser(
+        "ps",
+        help="list what the running daemon is waiting on (clients, in-flight "
+             "requests, executors)")
+    p_ps.add_argument("--json", action="store_true",
+                      help="emit the raw status payload instead of tables")
+    p_ps.add_argument("--timeout", type=float, default=5.0,
+                      help="seconds to wait for the daemon to answer")
 
     # logs (v0.2)
     p_logs = sub.add_parser("logs", help="print the daemon log file path or tail it")
@@ -380,22 +396,27 @@ def _cmd_serve(args, cfg: Config) -> int:
 
 
 def _cmd_stop(args, cfg: Config) -> int:
-    """Send SIGTERM to a running daemon, wait briefly, fall back to SIGKILL.
+    """Stop the running daemon: SIGTERM, wait, SIGKILL.
+
+    Exits 0 for every outcome the user can act on — already stopped, stopped
+    now, or refused because the pid was recycled (in which case there is nothing
+    left to stop). Only an OS refusal to signal at all exits 3.
 
     We do NOT trust the pid file alone — we ping first to verify it's our
     daemon, then signal that pid. (Mirrors browser-harness `_ipc.identify`.)
 
     PID-reuse guard: between the ping and the kill the daemon could die and the
     OS recycle its pid for an unrelated process. We fingerprint the pid's
-    process start-time and re-verify it just before each signal; if it changed,
-    the pid was reused and we refuse to signal it. When the platform can't
-    report a start-time (``proc_start_time`` → None), we degrade to the old
-    behaviour rather than block the stop.
+    process start-time and hand that check to `supervise.terminate` as its
+    `guard`, which re-verifies before each signal. When the platform can't
+    report a start-time (``proc_start_time`` → None) the guard passes, so an
+    unverifiable platform degrades to "signal anyway" rather than blocking a
+    legitimate stop.
+
+    Death is measured by the *ping*, not by the process table: a daemon that has
+    stopped answering has stopped serving, which is all `stop` promises.
     """
-    from . import _ipc
-    from . import platforms
-    import signal
-    import time
+    from . import _ipc, platforms, supervise
 
     pid = _ipc.ping_sync(timeout=1.0)
     if pid is None:
@@ -408,35 +429,31 @@ def _cmd_stop(args, cfg: Config) -> int:
     start0 = platforms.proc_start_time(pid)
 
     def _same_process() -> bool:
-        """True if pid still names the daemon we pinged. Unknowable (None
-        start-time) counts as True so the guard never blocks a legit stop."""
         if start0 is None:
             return True
         return platforms.proc_start_time(pid) == start0
 
-    if not _same_process():
-        _ipc.cleanup_endpoint()
+    outcome = supervise.terminate(
+        pid,
+        is_dead=lambda: _ipc.ping_sync(timeout=0.3) is None,
+        grace=args.timeout,
+        # Nothing left to do after the SIGKILL but clean up and exit, so don't
+        # spend another ping confirming it.
+        kill_grace=0,
+        interval=0.1,
+        guard=_same_process,
+    )
+    if outcome is supervise.Outcome.EXITED:
+        # Graceful shutdown cleans up its own socket/pid/facade files.
+        return 0
+    if outcome is supervise.Outcome.SIGNAL_FAILED:
+        print(f"error: cannot signal daemon pid {pid} (not permitted?); "
+              f"stop it manually", file=sys.stderr)
+        return 3
+    if outcome is supervise.Outcome.REFUSED:
         print(f"daemon pid {pid} was recycled by another process; not "
               f"signalling it", file=sys.stderr)
-        return 0
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _ipc.cleanup_endpoint()
-        return 0
-    # Wait for the daemon to exit gracefully.
-    deadline = time.monotonic() + args.timeout
-    while time.monotonic() < deadline:
-        if _ipc.ping_sync(timeout=0.3) is None:
-            return 0
-        time.sleep(0.1)
-    # Still alive — force, but only if the pid is still the same process.
-    if _same_process():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    else:
+    elif outcome is supervise.Outcome.REFUSED_ESCALATION:
         print(f"daemon pid {pid} was recycled before SIGKILL; not signalling "
               f"it", file=sys.stderr)
     _ipc.cleanup_endpoint()
@@ -483,77 +500,52 @@ async def _run_backend_info(args, cfg: Config) -> int:
     return 0
 
 
-def _cmd_status(args, cfg: Config) -> int:
-    """Report endpoint + liveness. JSON shape used by Skill for status pings."""
-    from . import _ipc, _stale
-    pid, version = _ipc.ping_status_sync(timeout=1.0)
-    probe_state = "ok" if pid is not None else "not_running"
-    # issue #15 (2.1): pid of the process holding the relay/facade ports when
-    # the control socket is dead but its file lingers — a half-alive daemon.
-    port_holder_pid = None
-    if pid is None and _ipc.sock_path().exists():
-        deadline = time.monotonic() + 0.6
-        while time.monotonic() < deadline:
-            time.sleep(0.15)
-            pid, version = _ipc.ping_status_sync(timeout=0.3)
-            if pid is not None:
-                probe_state = "ok_after_retry"
-                break
-        else:
-            probe_state = "transient_probe_failed"
-            # Still unresponsive, but its socket file is present — a half-alive
-            # daemon may be holding the relay/facade ports. Report the truth
-            # instead of a bare "not_running" that loops the user through
-            # restarts that crash on EADDRINUSE.
-            ports = _stale.daemon_tcp_ports(cfg)
-            if any(_stale.port_is_listening("127.0.0.1", p) for p in ports):
-                probe_state = "port_held_by_unresponsive_process"
-                port_holder_pid = _stale.confirmed_stale_holder(ports)
-                if port_holder_pid is None:
-                    # lsof unavailable / non-daemon holder — surface the
-                    # pid-file pid as a best-effort hint (never a kill target).
-                    fp = _ipc.read_pid()
-                    if fp and _stale.pid_alive(fp):
-                        port_holder_pid = fp
-    ep = _ipc.endpoint_describe()
-    facade_ws, facade_port = _ipc.read_facade_file()
-    status = {
-        "schema_version": 1,
-        "alive": pid is not None,
-        "probe_state": probe_state,
-        "pid": pid,
-        # issue #15 (2.1): pid of the process holding the relay/facade ports
-        # when the daemon is unresponsive. Actionable: `browserwright-daemon
-        # restart` reclaims it, or kill it manually.
-        "port_holder_pid": port_holder_pid,
-        "version": version,
-        "endpoint": ep,
-        # Playwright facade discovery (Phase C). None when the facade is
-        # disabled or the daemon predates auto-enable. The skill layer reads
-        # this to `connect_over_cdp` the heredoc `page`/`context`.
-        "facade": (
-            {"ws": facade_ws, "port": facade_port}
-            if (pid is not None and facade_ws) else None
-        ),
-    }
+def _cmd_status(args, cfg: Config, *, probe=None) -> int:
+    """Report endpoint + liveness. JSON shape used by Skill for status pings.
+
+    `probe` overrides the side-effecting observations (see `probe.DaemonProbe`);
+    production passes nothing. This is the daemon *existence* check — in-flight
+    introspection is a separate subcommand, not a field here.
+    """
+    from .probe import PORT_HELD, daemon_status
+
+    st = daemon_status(cfg, probe=probe)
     if args.json:
-        print(json.dumps(status, sort_keys=True))
+        print(json.dumps(st.to_dict(), sort_keys=True))
+    elif st.alive:
+        print(f"daemon alive (pid {st.pid})")
+        print(f"  socket: {st.endpoint['path']}")
+        if st.facade:
+            print(f"  facade: {st.facade['ws']}")
+    elif st.probe_state == PORT_HELD:
+        held = f" (pid {st.port_holder_pid})" if st.port_holder_pid else ""
+        print("daemon unresponsive but holding its ports"
+              f"{held} — a half-alive daemon.")
+        print("  fix: `browserwright-daemon restart` reclaims the "
+              "ports; or kill the pid above manually.")
     else:
-        if pid is None:
-            if probe_state == "port_held_by_unresponsive_process":
-                held = f" (pid {port_holder_pid})" if port_holder_pid else ""
-                print("daemon unresponsive but holding its ports"
-                      f"{held} — a half-alive daemon.")
-                print("  fix: `browserwright-daemon restart` reclaims the "
-                      "ports; or kill the pid above manually.")
-            else:
-                print("daemon not running")
+        print("daemon not running")
+    return 0 if st.alive else 2
+
+
+def _cmd_ps(args, cfg: Config) -> int:
+    """Print what the daemon is currently waiting on.
+
+    Three tables side by side — router hop, relay hop, executor hop — because
+    each hop keeps its own request ids in its own id space. Correlating them is
+    left to the reader's eyes (method name + elapsed), which is enough for a
+    local daemon where concurrent in-flight requests are a single-digit number,
+    and avoids threading a synthetic request id through five id spaces and the
+    executor wire format to get it.
+    """
+    def _emit(payload: dict) -> None:
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
         else:
-            print(f"daemon alive (pid {pid})")
-            print(f"  socket: {ep['path']}")
-            if facade_ws:
-                print(f"  facade: {facade_ws}")
-    return 0 if pid is not None else 2
+            _pretty_ps(payload)
+
+    return _rpc_cmd(cfg, "BrowserwrightDaemon.status", {},
+                    client_label="cli-ps", timeout=args.timeout, emit=_emit)
 
 
 def _cmd_attach_active(args, cfg: Config) -> int:
@@ -668,18 +660,10 @@ def _cmd_version(args, cfg: Config) -> int:
 
 
 def _extension_relay_status(cfg: Config) -> dict | None:
-    import httpx
+    from .relay_status import fetch_json
 
     host, port = cfg.backends.extension.resolved_host_port()
-    try:
-        with httpx.Client(timeout=1.0, trust_env=False, mounts={}) as client:
-            resp = client.get(f"http://{host}:{port}/__status__")
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-        return payload if isinstance(payload, dict) else None
-    except Exception:
-        return None
+    return fetch_json(host, port)
 
 
 def _cmd_extension(args, cfg: Config) -> int:
@@ -702,54 +686,15 @@ def _cmd_extension(args, cfg: Config) -> int:
 async def _rpc_via_ws(cfg: Config, method: str, params: dict,
                       *, client_label: str, timeout: float = 10.0,
                       browser_session: str | None = None) -> dict:
-    """Open a transient ws to the running daemon, send one BrowserwrightDaemon.*
-    RPC, read the response, close, and return the parsed result (or raise
-    with the daemon's error message).
+    """Module-local seam over `_rpc.call` (see that module for the protocol).
 
-    Used by `attach-active`, `open-background`, `close-tab`, `end-session`,
-    `kill-executor`, `backend-info`, `extension reload`, and `userscript`
-    subcommands.
+    Kept as a name in this module so every handler — and every test that fakes
+    the daemon — has exactly one place to hook, instead of each handler reaching
+    into `_rpc` behind its own lazy import.
     """
-    import websockets
-    from . import _ipc
-    from urllib.parse import quote
-
-    session_q = (
-        f"&session={quote(str(browser_session), safe='')}"
-        if browser_session else "")
-
-    async def _drain_until_response(ws) -> dict:
-        # Lifecycle events (upstreamConnecting/Ready) can arrive ahead of the
-        # actual id=1 response, especially when lazy-open is triggered by the
-        # RPC. Drain frames until we see ours.
-        for _ in range(20):
-            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-            msg = json.loads(raw)
-            if msg.get("id") == 1:
-                return msg
-        raise DaemonError(f"{method} no id=1 response after 20 frames")
-
-    path = _ipc.sock_path()
-    if not path.exists():
-        raise Unavailable("no daemon running")
-    async with websockets.unix_connect(
-        str(path),
-        uri=f"ws://localhost/?client={client_label}{session_q}",
-        compression=None,
-    ) as ws:
-        await ws.send(json.dumps({
-            "id": 1, "method": method, "params": params,
-        }))
-        msg = await _drain_until_response(ws)
-    if "error" in msg:
-        err = msg["error"] or {}
-        raise DaemonError(
-            f"{method} failed: {err.get('message', err)} (code={err.get('code')})"
-        )
-    result = msg.get("result")
-    if not isinstance(result, dict):
-        raise DaemonError(f"{method} returned non-dict result: {result!r}")
-    return result
+    from . import _rpc
+    return await _rpc.call(cfg, method, params, client_label=client_label,
+                           timeout=timeout, browser_session=browser_session)
 
 
 def _rpc_cmd(cfg: Config, method: str, params: dict, *,
@@ -882,272 +827,167 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
     return 0
 
 
-def _cmd_open_background(args, cfg: Config) -> int:
-    if not args.session:
-        print("error: provide --session or set BD_SESSION", file=sys.stderr)
-        return 2
-    # Always emits JSON — single-line spec §5.1 discipline; the response is
-    # structured so a tab-separated form would lose fields.
-    return _rpc_cmd(
-        cfg, "BrowserwrightDaemon.openBackgroundTab",
-        {"url": args.url, "groupName": args.group, "bsSession": args.session},
-        client_label="cli-open-background", timeout=15.0,
-        browser_session=args.session)
-
-
-def _cmd_close_tab(args, cfg: Config) -> int:
-    if not args.session:
-        print("error: provide --session or set BD_SESSION", file=sys.stderr)
-        return 2
-    if not args.session_id and not args.target_id:
-        print("error: provide --session-id or --target-id", file=sys.stderr)
-        return 2
-    params: dict = {"bsSession": args.session}
-    if args.session_id:
-        params["sessionId"] = args.session_id
-    if args.target_id:
-        params["targetId"] = args.target_id
-    return _rpc_cmd(
-        cfg, "BrowserwrightDaemon.closeTab", params,
-        client_label="cli-close-tab", timeout=10.0,
-        browser_session=args.session)
-
-
-def _cmd_end_session(args, cfg: Config) -> int:
-    """P5: tear down a browserwright session's extension tabs (owned closed,
-    borrowed kept). Prints the {closed, kept} JSON result."""
-    es_params: dict = {"session": args.session}
-    if getattr(args, "group_id", None) is not None:
-        es_params["groupId"] = args.group_id
-    return _rpc_cmd(
-        cfg, "BrowserwrightDaemon.endSession", es_params,
-        client_label="cli-end-session", timeout=10.0,
-        browser_session=args.session)
-
-
-def _cmd_kill_executor(args, cfg: Config) -> int:
-    """Phase B: reap a session's resident executor (no browser teardown).
-
-    The RPC is idempotent when no executor exists, but a wait-mode response is
-    successful only when the daemon explicitly confirms ``reaped: true``.
-    ``session end`` may still treat a nonzero result as best-effort; ``session
-    reset`` relies on it to avoid claiming a live executor was recycled."""
-
-    def require_reaped(result: dict) -> None:
-        if result.get("reaped") is not True:
-            raise DaemonError(
-                "BrowserwrightDaemon.killExecutor did not confirm executor "
-                f"death: {result!r}"
-            )
-
-    return _rpc_cmd(
-        cfg, "BrowserwrightDaemon.killExecutor",
-        {"session": args.session, "wait": True},
-        client_label="cli-kill-executor", timeout=10.0,
-        browser_session=args.session,
-        validate_result=require_reaped)
-
-
-# ---- LaunchAgent service (macOS) ----------------------------------------
+# ---- pure-forwarding subcommands -------------------------------------------
 #
-# Goal: the daemon is a long-running service, not a per-session subprocess.
-# macOS LaunchAgents are the right primitive — Linux/systemd-user support
-# is deferred (no users hitting it yet on this codebase).
-
-# There is exactly one global daemon, so the LaunchAgent has one fixed label
-# and one plist (no per-instance name — BD_NAME was removed).
-_LAUNCHAGENT_LABEL = "com.browserwright-daemon"
-
-
-def _launchagent_dir() -> Path:
-    from pathlib import Path
-    return Path.home() / "Library" / "LaunchAgents"
+# These subcommands do nothing but name a verb and shape its params, so they are
+# a table rather than four near-identical functions: adding the fifth is one row,
+# and `_FORWARDS` doubles as the auditable inventory of which CLI surface maps to
+# which `BrowserwrightDaemon.*` verb. Anything with bespoke output
+# (`attach-active`'s tab-separated form) or bespoke error mapping stays a real
+# handler above — the table is for forwarding, not for "almost forwarding".
 
 
-def _launchagent_plist_path() -> Path:
-    return _launchagent_dir() / f"{_LAUNCHAGENT_LABEL}.plist"
+@dataclass(frozen=True)
+class _Forward:
+    """One `(subcommand → verb)` row."""
+
+    method: str
+    label: str
+    timeout: float
+    #: Build the RPC params from the parsed args.
+    params: Callable[[argparse.Namespace], dict]
+    #: Reject a bad arg combination before opening a socket. Returns the error
+    #: line to print (→ exit 2), or None to proceed.
+    precheck: Callable[[argparse.Namespace], str | None] | None = None
+    #: Reject a technically-successful response that doesn't mean what the
+    #: caller needs. Raises DaemonError (→ exit 3).
+    validate: Callable[[dict], None] | None = None
 
 
-def _resolve_browserwright_daemon_bin() -> str:
-    """Find the absolute path to the `browserwright-daemon` console script. The
-    plist needs a fully-qualified path; LaunchAgents don't inherit the
-    user's shell PATH."""
-    import shutil
-    path = shutil.which("browserwright-daemon")
-    if path:
-        return path
-    # Fallback to "<sys.prefix>/bin/browserwright-daemon".
-    from pathlib import Path
-    candidate = Path(sys.prefix) / "bin" / "browserwright-daemon"
-    if candidate.exists():
-        return str(candidate)
-    raise UserError(
-        "browserwright-daemon binary not found on PATH; "
-        "install it via pip/uv before running `browserwright-daemon install`"
-    )
+def _need_session(a) -> str | None:
+    return None if a.session else "error: provide --session or set BD_SESSION"
 
 
-def _build_plist(*, extension_port: int | None,
-                 facade_host: str | None = None,
-                 facade_port: int | None = None) -> str:
-    """Emit the plist content. Kept inline (no XML lib) — the schema is
-    fixed + tiny, and we avoid a dependency. Every interpolated value passes
-    through ``xml.sax.saxutils.escape``. Pure: no side effects — the caller is
-    responsible for creating the log dir.
-    """
-    bin_path = _resolve_browserwright_daemon_bin()
-    args = [bin_path, "serve"]
-    if extension_port is not None:
-        args += ["--extension-port", str(extension_port)]
-    if facade_port is not None:
-        args += ["--facade-port", str(facade_port)]
-    if facade_host is not None:
-        args += ["--facade-host", str(facade_host)]
-    log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
-    stdout_path = f"{log_dir}/browserwright-daemon.stdout.log"
-    stderr_path = f"{log_dir}/browserwright-daemon.stderr.log"
-    label = _LAUNCHAGENT_LABEL
-    # PATH carried over so any subprocess the daemon spawns (e.g. chrome)
-    # is discoverable. /usr/local/bin + /opt/homebrew/bin cover both
-    # Intel and Apple Silicon Homebrew layouts. Constant, no escape needed.
-    env_path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
-    arg_xml = "\n        ".join(
-        f"<string>{_xml_escape(a)}</string>" for a in args
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n'
-        '<dict>\n'
-        f'    <key>Label</key><string>{_xml_escape(label)}</string>\n'
-        '    <key>ProgramArguments</key>\n'
-        '    <array>\n'
-        f'        {arg_xml}\n'
-        '    </array>\n'
-        '    <key>RunAtLoad</key><true/>\n'
-        '    <key>KeepAlive</key>\n'
-        '    <dict>\n'
-        '        <key>SuccessfulExit</key><false/>\n'
-        '        <key>Crashed</key><true/>\n'
-        '    </dict>\n'
-        '    <key>EnvironmentVariables</key>\n'
-        '    <dict>\n'
-        f'        <key>PATH</key><string>{env_path}</string>\n'
-        '    </dict>\n'
-        f'    <key>StandardOutPath</key><string>{_xml_escape(stdout_path)}</string>\n'
-        f'    <key>StandardErrorPath</key><string>{_xml_escape(stderr_path)}</string>\n'
-        f'    <key>WorkingDirectory</key><string>{_xml_escape(os.path.expanduser("~"))}</string>\n'
-        '</dict>\n'
-        '</plist>\n'
-    )
+def _need_tab_ref(a) -> str | None:
+    return _need_session(a) or (
+        None if (a.session_id or a.target_id)
+        else "error: provide --session-id or --target-id")
 
 
-def _launchctl(*args: str) -> tuple[int, str, str]:
-    import subprocess
-    try:
-        proc = subprocess.run(["launchctl", *args],
-                              capture_output=True, text=True, timeout=10)
-        return proc.returncode, proc.stdout, proc.stderr
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        return -1, "", str(e)
+def _close_tab_params(a) -> dict:
+    return {"bsSession": a.session,
+            **({"sessionId": a.session_id} if a.session_id else {}),
+            **({"targetId": a.target_id} if a.target_id else {})}
+
+
+def _end_session_params(a) -> dict:
+    gid = getattr(a, "group_id", None)
+    return {"session": a.session,
+            **({"groupId": gid} if gid is not None else {})}
+
+
+def _require_reaped(result: dict) -> None:
+    """`kill-executor` is idempotent, but a wait-mode response only counts when
+    the daemon confirms ``reaped: true``. `session end` may treat a nonzero exit
+    as best-effort; `session reset` relies on this to avoid claiming a live
+    executor was recycled."""
+    if result.get("reaped") is not True:
+        raise DaemonError(
+            "BrowserwrightDaemon.killExecutor did not confirm executor "
+            f"death: {result!r}")
+
+
+def _require_complete_end_session(result: dict) -> None:
+    """A partial extension close is not a successful workspace teardown."""
+    if result.get("ok") is not True:
+        raise DaemonError(
+            "BrowserwrightDaemon.endSession left tabs open: "
+            f"{result!r}")
+
+
+#: Every forwarding subcommand. All emit the sorted-JSON RPC result verbatim
+#: (spec §5.1 single-line discipline) — these responses are structured, so a
+#: tab-separated form would lose fields. Each passes `browser_session`, so the
+#: transient ws carries `?session=`; without it the daemon's
+#: `_require_browser_session` rejects the connection before the verb ever runs.
+_FORWARDS: dict[str, _Forward] = {
+    "open-background": _Forward(
+        "BrowserwrightDaemon.openBackgroundTab", "cli-open-background", 15.0,
+        lambda a: {"url": a.url, "groupName": a.group, "bsSession": a.session},
+        precheck=_need_session),
+    "close-tab": _Forward(
+        "BrowserwrightDaemon.closeTab", "cli-close-tab", 10.0,
+        _close_tab_params, precheck=_need_tab_ref),
+    # P5 teardown: close owned tabs, keep borrowed. `--session` is
+    # argparse-required here, hence no precheck.
+    "end-session": _Forward(
+        "BrowserwrightDaemon.endSession", "cli-end-session", 10.0,
+        _end_session_params, validate=_require_complete_end_session),
+    # Phase B: reap a session's resident executor, no browser teardown.
+    "kill-executor": _Forward(
+        "BrowserwrightDaemon.killExecutor", "cli-kill-executor", 10.0,
+        lambda a: {"session": a.session, "wait": True},
+        validate=_require_reaped),
+}
+
+
+def _forwarding_handler(spec: _Forward):
+    def handler(args, cfg: Config) -> int:
+        if spec.precheck is not None and (err := spec.precheck(args)):
+            print(err, file=sys.stderr)
+            return 2
+        return _rpc_cmd(cfg, spec.method, spec.params(args),
+                        client_label=spec.label, timeout=spec.timeout,
+                        browser_session=args.session,
+                        validate_result=spec.validate)
+    handler.__name__ = f"_cmd_{spec.label.removeprefix('cli-').replace('-', '_')}"
+    return handler
+
+
+# ---- LaunchAgent service (macOS) -------------------------------------------
+#
+# The operations live in `launchagent.py`; these three handlers only translate
+# its return values / LaunchAgentError into stdout, stderr and exit codes.
 
 
 def _cmd_install(args, cfg: Config) -> int:
-    if sys.platform != "darwin":
-        print("error: `install` is macOS-only (LaunchAgent); "
-              "for Linux run `browserwright-daemon serve` from a systemd-user "
-              "unit yourself for now", file=sys.stderr)
-        return 1
-    if getattr(args, "backend", None):
-        print("warning: `browserwright-daemon install --backend` is ignored; "
-              "the LaunchAgent runs the single global daemon and session "
-              "backends route per session", file=sys.stderr)
-    label = _LAUNCHAGENT_LABEL
-    plist_path = _launchagent_plist_path()
-    if plist_path.exists() and not args.force:
-        print(f"error: {plist_path} already exists. "
-              f"Use --force to replace.", file=sys.stderr)
-        return 1
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
-    # Create the log dir before launchctl tries to write to it. Kept out of
-    # `_build_plist` so the generator stays pure / unit-testable (N-1).
-    log_dir = os.path.expanduser("~/.cache/browserwright-daemon/logs")
-    os.makedirs(log_dir, exist_ok=True)
-    content = _build_plist(
-        extension_port=args.extension_port,
-        facade_host=getattr(args, "facade_host", None),
-        facade_port=getattr(args, "facade_port", None),
-    )
-    # If --force and the plist exists, unload the old one first so launchctl
-    # picks up the new ProgramArguments cleanly.
-    if plist_path.exists():
-        _launchctl("unload", str(plist_path))
-    plist_path.write_text(content)
-    rc, _, err = _launchctl("load", "-w", str(plist_path))
-    if rc != 0:
-        # Rollback: remove the just-written plist so a re-run isn't blocked
-        # by the "already exists" check (L-3).
-        plist_path.unlink(missing_ok=True)
-        print(f"error: launchctl load failed: {err.strip()}",
-              file=sys.stderr)
-        return 3
-    print(json.dumps({
-        "ok": True,
-        "label": label,
-        "plist": str(plist_path),
-        "extension_port": args.extension_port,
-        "facade_host": getattr(args, "facade_host", None),
-        "facade_port": getattr(args, "facade_port", None),
-    }, sort_keys=True))
-    return 0
+    from . import launchagent
+
+    def op() -> dict:
+        # Platform first: on Linux the `--backend` warning would be noise on top
+        # of a hard "macOS-only" refusal.
+        launchagent.require_darwin("install")
+        if getattr(args, "backend", None):
+            print("warning: `browserwright-daemon install --backend` is "
+                  "ignored; the LaunchAgent runs the single global daemon and "
+                  "session backends route per session", file=sys.stderr)
+        return launchagent.install(
+            extension_port=args.extension_port,
+            facade_host=getattr(args, "facade_host", None),
+            facade_port=getattr(args, "facade_port", None),
+            force=args.force,
+        )
+
+    return _launchagent_cmd(op)
 
 
 def _cmd_uninstall(args, cfg: Config) -> int:
-    if sys.platform != "darwin":
-        print("error: `uninstall` is macOS-only", file=sys.stderr)
-        return 1
-    plist_path = _launchagent_plist_path()
-    if not plist_path.exists():
-        print(json.dumps({"ok": False,
-                          "reason": "no LaunchAgent installed"},
-                         sort_keys=True))
-        return 0
-    rc, _, err = _launchctl("unload", str(plist_path))
-    # Even on unload failure (e.g. wasn't loaded), we still remove the plist.
-    plist_path.unlink()
-    payload = {"ok": True, "removed": str(plist_path)}
-    if rc != 0 and err.strip():
-        payload["unload_warning"] = err.strip()
-    print(json.dumps(payload, sort_keys=True))
-    return 0
+    from . import launchagent
+    return _launchagent_cmd(launchagent.uninstall)
 
 
 def _cmd_restart(args, cfg: Config) -> int:
-    if sys.platform != "darwin":
-        print("error: `restart` is macOS-only (LaunchAgent)", file=sys.stderr)
-        return 1
-    plist_path = _launchagent_plist_path()
-    if not plist_path.exists():
-        print(
-            "error: no LaunchAgent installed; run `browserwright-daemon install` "
-            "or restart your foreground `serve` process manually",
-            file=sys.stderr,
-        )
-        return 2
-    _launchctl("unload", str(plist_path))
-    rc, _, err = _launchctl("load", "-w", str(plist_path))
-    if rc != 0:
-        print(f"error: launchctl load failed: {err.strip()}", file=sys.stderr)
-        return 3
-    print(json.dumps({"ok": True, "restarted": str(plist_path)}, sort_keys=True))
+    from . import launchagent
+    return _launchagent_cmd(launchagent.restart)
+
+
+def _launchagent_cmd(op) -> int:
+    """Run a `launchagent` operation; print its report or its error."""
+    from .launchagent import LaunchAgentError
+    try:
+        report = op()
+    except LaunchAgentError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return e.exit_code
+    print(json.dumps(report, sort_keys=True))
     return 0
 
 
 def _cmd_list(args, cfg: Config) -> int:
     """Report the single global daemon: whether it's installed as a
     LaunchAgent and whether it's running on the socket."""
-    plist_path = _launchagent_plist_path()
+    from . import launchagent
+    plist_path = launchagent.plist_path()
     installed = plist_path.exists()
     service = "launchagent" if installed else "manual"
     running_pid = _ipc_ping()
@@ -1189,24 +1029,102 @@ _DISPATCH = {
     "stop": _cmd_stop,
     "restart": _cmd_restart,
     "status": _cmd_status,
+    "ps": _cmd_ps,
     "logs": _cmd_logs,
     # v0.5
     "backend-info": _cmd_backend_info,
     # v0.5.4 — extension backend
     "attach-active": _cmd_attach_active,
-    "open-background": _cmd_open_background,
-    "close-tab": _cmd_close_tab,
-    "end-session": _cmd_end_session,
-    "kill-executor": _cmd_kill_executor,
     "userscript": _cmd_userscript,
     # v0.5.5 — LaunchAgent service (macOS) so the daemon is long-running.
     "install": _cmd_install,
     "uninstall": _cmd_uninstall,
     "list": _cmd_list,
+    # open-background / close-tab / end-session / kill-executor
+    **{name: _forwarding_handler(spec) for name, spec in _FORWARDS.items()},
 }
 
 
 # ---- pretty print ----------------------------------------------------------
+
+
+def _secs(v) -> str:
+    """Render a duration. `-` when the source had no timestamp to offer — an
+    absent clock must not be printed as `0.0s`, which is a different claim."""
+    if not isinstance(v, (int, float)):
+        return "-"
+    if v < 60:
+        return f"{v:.1f}s"
+    if v < 3600:
+        return f"{int(v // 60)}m{int(v % 60):02d}s"
+    return f"{int(v // 3600)}h{int((v % 3600) // 60):02d}m"
+
+
+def _pretty_ps(p: dict) -> None:
+    d = p.get("daemon") or {}
+    print(f"daemon pid {d.get('pid')} version {d.get('version')} "
+          f"schema {p.get('schema_version')}")
+
+    empty = True
+    for ctx in p.get("contexts") or []:
+        label = ctx.get("session_id") or "(shared)"
+        print(f"\ncontext {label}  backend={ctx.get('backend')} "
+              f"upstream={ctx.get('upstream_phase')} "
+              f"idle={_secs(ctx.get('idle_s'))} "
+              f"targets={ctx.get('targets')} attachers={ctx.get('attachers')}")
+        clients = ctx.get("clients") or []
+        if clients:
+            print(f"  {'CLIENT':<8} {'LABEL':<22} {'SESSION':<20} "
+                  f"{'SESS':<5} {'BUF':<4} {'CONNECTED':<10} {'LAST CMD':<10}")
+            for c in clients:
+                print(f"  {str(c.get('client_id')):<8} "
+                      f"{str(c.get('label') or '')[:22]:<22} "
+                      f"{str(c.get('session_id') or '-')[:20]:<20} "
+                      f"{c.get('sessions', 0):<5} "
+                      f"{c.get('pre_open_buffered', 0):<4} "
+                      f"{_secs(c.get('connected_age_s')):<10} "
+                      f"{_secs(c.get('last_command_age_s')):<10}")
+        for r in ctx.get("pending_requests") or []:
+            empty = False
+            print(f"  IN-FLIGHT  hop=router  method={r.get('method')}  "
+                  f"elapsed={_secs(r.get('elapsed_s'))}  "
+                  f"client={r.get('client_id')}  upstream_id={r.get('upstream_id')}")
+
+    relay = p.get("relay") or {}
+    if relay.get("running"):
+        exts = relay.get("extensions") or []
+        print(f"\nrelay  extensions={len(exts)}")
+        for e in exts:
+            print(f"  {e.get('install_id') or '?'}  "
+                  f"version={e.get('browserwright_version') or '?'}  "
+                  f"pending={e.get('pending', 0)}  "
+                  f"oldest={_secs(e.get('oldest_pending_s'))}")
+        for r in relay.get("inflight") or []:
+            empty = False
+            name = r.get("method") or r.get("kind")
+            print(f"  IN-FLIGHT  hop=relay  method={name}  "
+                  f"elapsed={_secs(r.get('elapsed_s'))}  "
+                  f"tab={r.get('tab_id')}  id={r.get('id')}")
+
+    executors = p.get("executors") or []
+    print(f"\nexecutors  {len(executors)}")
+    if executors:
+        print(f"  {'SESSION':<22} {'PID':<8} {'ALIVE':<6} {'AGE':<10} {'IDLE':<10}")
+    for e in executors:
+        print(f"  {str(e.get('session_id'))[:22]:<22} "
+              f"{str(e.get('pid')):<8} "
+              f"{('yes' if e.get('alive') else 'no'):<6} "
+              f"{_secs(e.get('age_s')):<10} {_secs(e.get('idle_s')):<10}")
+        fl = e.get("inflight")
+        if fl:
+            empty = False
+            print(f"    IN-FLIGHT  hop=executor  what={fl.get('what')}  "
+                  f"elapsed={_secs(fl.get('elapsed_s'))}  "
+                  f"request={fl.get('request_id')}  "
+                  f"budget={fl.get('timeout_ms')}ms")
+
+    if empty:
+        print("\nnothing in flight")
 
 
 def _pretty_doctor(out: dict) -> None:

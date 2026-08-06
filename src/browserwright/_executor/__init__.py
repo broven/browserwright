@@ -29,19 +29,9 @@ Status: PR1 (process skeleton + data plane), PR2 (daemon-side supervision —
 idle reap / endSession kill / crash reap / orphan sweep), and PR3 (``reset()`` +
 full output protocol: warnings / screenshots / truncation / traceback-bearing
 errors + per-call timeout enforcement) are all in place.
+
+This package deliberately re-exports nothing: import ``.protocol`` (wire
+types) or ``.client`` (thin client) directly, which is what every call site
+already does.
 """
 from __future__ import annotations
-
-from .protocol import (
-    ExecuteRequest,
-    ExecuteResponse,
-    recv_message,
-    send_message,
-)
-
-__all__ = [
-    "ExecuteRequest",
-    "ExecuteResponse",
-    "recv_message",
-    "send_message",
-]

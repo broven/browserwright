@@ -25,3 +25,87 @@ jobs:
 
       - name: Run the fast gate
         run: mise run test
+
+  e2e:
+    # The real-Chrome suite is the only thing that tests the actual system:
+    # a real Chrome for Testing, the unpacked extension, the relay, and a live
+    # daemon. It has never run in CI, so every extension-backend regression has
+    # had to be caught by hand.
+    #
+    # NON-BLOCKING FOR NOW (continue-on-error). A separate work item is
+    # establishing the current pass/fail baseline for this suite; flip
+    # `continue-on-error` off once that baseline is known and green. Until then
+    # this job exists to produce the signal, not to gate merges.
+    name: Real-Chrome E2E (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mise (python + uv per mise.toml)
+        uses: jdx/mise-action@v2
+
+      - name: Install dependencies
+        run: mise run install
+
+      - name: Install Chrome for Testing
+        # The e2e harness probes /tmp/chrome-for-testing first
+        # (tests/daemon/e2e/_real_browser.py).
+        run: npx --yes @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing
+
+      - name: Install xvfb
+        # The harness launches Chrome headed with --load-extension; MV3 service
+        # workers are exercised for real, so it needs a display.
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Enable unprivileged user namespaces (Chrome sandbox)
+        # CfT refuses to start on this runner: FATAL "No usable sandbox!" —
+        # Ubuntu 23.10+ ships kernel.apparmor_restrict_unprivileged_userns=1,
+        # so unprivileged user namespaces (the only sandbox a CfT zip has;
+        # it carries no setuid chrome-sandbox) are blocked. The image's
+        # preinstalled Google Chrome still works because its deb installs a
+        # setuid chrome-sandbox — which is exactly why the rdp half of the
+        # suite passed while every extension test errored at fixture setup.
+        # Re-enable namespaces for this job's VM (Chrome's own doc:
+        # docs/security/apparmor-userns-restrictions.md).
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Chrome smoke probe
+        # The extension fixture launches CfT headful under xvfb and discards
+        # stderr, so a Chrome that dies at startup has so far surfaced as 25
+        # identical fixture errors with zero evidence. Probe the exact launch
+        # shapes up front (headless + headful, sandboxed) so the real failure
+        # message lands in the job log instead.
+        run: |
+          CHROME=$(ls -d /tmp/chrome-for-testing/chrome/*/chrome-linux64/chrome | sort | tail -1)
+          echo "probe binary: $CHROME"
+          "$CHROME" --version
+          for mode in headless headful; do
+            if [ "$mode" = headful ]; then
+              LAUNCH="xvfb-run -a"; EXTRA=""
+            else
+              LAUNCH=""; EXTRA="--headless=new"
+            fi
+            P=$(mktemp -d)
+            if timeout 45 $LAUNCH "$CHROME" $EXTRA --user-data-dir="$P" \
+                 --no-first-run --remote-debugging-port=0 about:blank \
+                 >"/tmp/probe-$mode.out" 2>"/tmp/probe-$mode.err"; then
+              echo "$mode probe: OK (Chrome stayed up)"
+            else
+              echo "$mode probe: FAILED rc=$? (124 = alive, killed by timeout)"
+            fi
+            echo "--- stderr ($mode) ---"
+            head -c 2000 "/tmp/probe-$mode.err" || true
+            echo
+            rm -rf "$P"
+          done
+
+      - name: Run the real-Chrome E2E suite
+        run: xvfb-run -a mise run test:e2e
+
+      - name: Reclaim leaked daemons / Chrome
+        if: always()
+        run: mise run teardown

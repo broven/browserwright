@@ -356,7 +356,7 @@ The install wizard codifies this same decision tree —
 ```
 src/browserwright/
 ├── cli.py                ← argv dispatch — start here when wiring a new subcommand
-├── api.py                ← `from browserwright import *` surface
+├── __init__.py           ← `EXPORTS` = the `from browserwright import *` surface
 ├── install.py            ← the wizard (doctor-driven option detection)
 ├── mode_b_client.py      ← Mode B socket client + client_for_session() resolver
 ├── session_create.py / session_registry.py / session_runtime.py
@@ -365,6 +365,14 @@ src/browserwright/
 ├── primitives/           ← agent-facing API surface (page / interact / inspect / site)
 ├── memory/               ← `~/.browserwright/global.md` + per-site memory
 ├── daemon/               ← Layer 1: the global daemon, backends, relay, facade
+│   ├── cli.py            ← `browserwright-daemon` argparse + dispatch, nothing else
+│   ├── _rpc.py           ← one-shot BrowserwrightDaemon.* RPC over the control socket
+│   ├── probe.py          ← daemon liveness observations, shared by `status` + `serve`
+│   ├── supervise.py      ← the one graceful→forced process-termination loop
+│   ├── _stale.py         ← detect + reclaim a half-alive daemon's relay/facade ports
+│   ├── launchagent.py    ← macOS service registration (install / uninstall / restart)
+│   ├── relay_status.py   ← the relay's /__status__ endpoint, fetched from one place
+│   └── server/           ← listener, Router/proxy, relay, facade, executor registry
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
 tests/

@@ -64,7 +64,7 @@ def stub_terminate(monkeypatch):
         handle.proc.terminate()
         killed.append(handle.session_id)
 
-    monkeypatch.setattr(er, "_terminate", _fake)
+    monkeypatch.setattr(er, "_terminate_and_wait", _fake)
     # Don't touch the real runtime dir's discovery files on cleanup.
     monkeypatch.setattr(_ipc, "cleanup_executor", lambda *_a, **_k: None)
     return killed
@@ -73,7 +73,8 @@ def stub_terminate(monkeypatch):
 # ---- idle reap -------------------------------------------------------------
 
 
-def test_reap_idle_signals_and_pops_stale(stub_terminate, monkeypatch):
+@pytest.mark.asyncio
+async def test_reap_idle_signals_and_pops_stale(stub_terminate, monkeypatch):
     reg = ExecutorRegistry()
     stale = _handle("sess-stale")
     fresh = _handle("sess-fresh")
@@ -86,21 +87,22 @@ def test_reap_idle_signals_and_pops_stale(stub_terminate, monkeypatch):
 
     monkeypatch.setattr(ExecutorHandle, "idle_seconds", _idle)
 
-    reaped = reg.reap_idle(idle_after=30.0)
+    reaped = await reg.reap_idle(idle_after=30.0)
     assert reaped == ["sess-stale"]
     assert stub_terminate == ["sess-stale"]
     assert reg.get("sess-stale") is None
     assert reg.get("sess-fresh") is fresh  # untouched
 
 
-def test_reap_idle_skips_dead_handles(stub_terminate, monkeypatch):
+@pytest.mark.asyncio
+async def test_reap_idle_skips_dead_handles(stub_terminate, monkeypatch):
     reg = ExecutorRegistry()
     dead = _handle("sess-dead", alive=False)
     reg._handles[dead.session_id] = dead
     monkeypatch.setattr(ExecutorHandle, "idle_seconds",
                         lambda self, *, now=None: 999.0)
     # A dead handle is the crash-reaper's job, not idle-reap — don't double-kill.
-    assert reg.reap_idle(idle_after=1.0) == []
+    assert await reg.reap_idle(idle_after=1.0) == []
     assert stub_terminate == []
 
 
@@ -143,44 +145,49 @@ async def test_reaped_dead_handle_cold_respawns(stub_terminate, monkeypatch):
 # ---- kill / kill_all -------------------------------------------------------
 
 
-def test_kill_signals_and_pops(stub_terminate):
+@pytest.mark.asyncio
+async def test_kill_signals_and_pops(stub_terminate):
     reg = ExecutorRegistry()
     reg._handles["sess"] = _handle("sess")
-    assert reg.kill("sess") is True
+    assert await reg.kill("sess") is True
     assert stub_terminate == ["sess"]
     assert reg.get("sess") is None
     # Idempotent: killing again is a no-op (already popped).
-    assert reg.kill("sess") is False
+    assert await reg.kill("sess") is False
 
 
-def test_kill_all_signals_every_executor(stub_terminate):
+@pytest.mark.asyncio
+async def test_kill_all_signals_every_executor(stub_terminate):
     reg = ExecutorRegistry()
     for sid in ("a", "b", "c"):
         reg._handles[sid] = _handle(sid)
-    reg.kill_all()
+    await reg.kill_all()
     assert sorted(stub_terminate) == ["a", "b", "c"]
     assert reg.all_handles() == []
 
 
-def test_kill_unlinks_discovery_file(monkeypatch):
+@pytest.mark.asyncio
+async def test_kill_unlinks_discovery_file(monkeypatch):
     """Failure 3: endSession SIGTERMs the executor AND removes its discovery
     file/socket so the test (and the next daemon's discovery) doesn't latch onto
     a stale `bw-exec-*.json`. Assert `kill` invokes `_ipc.cleanup_executor`."""
-    monkeypatch.setattr(er, "_terminate", lambda handle: handle.proc.terminate())
+    monkeypatch.setattr(
+        er, "_terminate_and_wait", lambda handle: handle.proc.terminate())
     cleaned: list[str] = []
     monkeypatch.setattr(_ipc, "cleanup_executor",
                         lambda sid: cleaned.append(sid))
     reg = ExecutorRegistry()
     reg._handles["sess"] = _handle("sess")
-    assert reg.kill("sess") is True
+    assert await reg.kill("sess") is True
     assert cleaned == ["sess"]
 
 
-def test_kill_isolated_per_session(stub_terminate):
+@pytest.mark.asyncio
+async def test_kill_isolated_per_session(stub_terminate):
     reg = ExecutorRegistry()
     reg._handles["x"] = _handle("x")
     reg._handles["y"] = _handle("y")
-    reg.kill("x")
+    await reg.kill("x")
     assert stub_terminate == ["x"]
     assert reg.get("x") is None
     assert reg.get("y") is not None  # no cross-talk
@@ -254,6 +261,9 @@ def _router_with_client(backend: str):
         return None
 
     router.bind_lifecycle(_ensure, _disc)
+    async def _upstream_send(_text):
+        return None
+    router.update_upstream_send(_upstream_send)
     client = state.allocate_client("c")
     client.session_id = "sess"
     captured[client.client_id] = []
@@ -269,9 +279,9 @@ class _RecordingRegistry:
     def __init__(self):
         self.killed: list[str] = []
 
-    def kill(self, session_id):
+    async def kill_current_and_wait(self, session_id):
         self.killed.append(session_id)
-        return True
+        return {"killed": True, "reaped": True, "matched": True}
 
 
 @pytest.mark.asyncio
@@ -287,7 +297,7 @@ async def test_end_session_kills_executor_extension():
         return {"ok": True, "closed": [], "kept": []}
 
     router.daemon = _Daemon()
-    router._end_session = _end_session
+    router.upstream.end_session = _end_session
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.endSession",
@@ -310,6 +320,10 @@ async def test_end_session_kills_executor_rdp():
             return True
 
     router.daemon = _Daemon()
+    async def _end_session(session, *args):
+        await router.daemon.teardown_rdp_context(session)
+        return {"ok": True, "closed": [], "kept": [], "backend": "rdp"}
+    router.upstream.end_session = _end_session
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.endSession",
@@ -337,7 +351,7 @@ async def test_idle_watchdog_crash_reaps_even_when_idle_off(monkeypatch):
             calls["reap_dead"] += 1
             return []
 
-        def reap_idle(self, idle_after):
+        async def reap_idle(self, idle_after):
             calls["reap_idle"] += 1
             return []
 
@@ -375,7 +389,7 @@ async def test_idle_watchdog_idle_reaps_when_configured(monkeypatch):
             calls["reap_dead"] += 1
             return []
 
-        def reap_idle(self, idle_after):
+        async def reap_idle(self, idle_after):
             calls["reap_idle"] += 1
             assert idle_after == 30.0
             return []
@@ -414,8 +428,9 @@ async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypat
         def __init__(self):
             self.killed: list[str] = []
 
-        def kill(self, session_id):
+        async def kill_current_and_wait(self, session_id):
             self.killed.append(session_id)
+            return {"killed": True, "reaped": True, "matched": True}
 
     class _Daemon:
         cfg = Config(session_idle_prune=12.5)
@@ -467,8 +482,9 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
         def __init__(self):
             self.killed: list[str] = []
 
-        def kill(self, session_id):
+        async def kill_current_and_wait(self, session_id):
             self.killed.append(session_id)
+            return {"killed": True, "reaped": True, "matched": True}
 
     class _Upstream:
         def __init__(self):
@@ -477,7 +493,7 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
         async def end_session(self, session_id, group_id=None):
             assert reg.get(session_id) is not None
             self.ended.append((session_id, group_id))
-            return {"closed": [], "kept": []}
+            return {"ok": True, "closed": [], "failed": [], "kept": []}
 
     upstream = _Upstream()
     daemon = SimpleNamespace(
@@ -497,6 +513,50 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_auto_prune_env_respects_daemon_scope(tmp_path, monkeypatch):
+    from browserwright import session_registry as reg
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server import listener
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState
+
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("BS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    local_scope = str((runtime_dir / "browserwright-daemon.sock").resolve())
+    local = reg.allocate(
+        backend="env", owner="attach", name="local",
+        env_daemon_scope=local_scope)
+    foreign = reg.allocate(
+        backend="env", owner="attach", name="foreign",
+        env_daemon_scope="/tmp/foreign/browserwright-daemon.sock")
+    for sid in (local, foreign):
+        reg._with_entry(sid, lambda e: e.update(last_seen=0.0))
+
+    class _Router:
+        daemon = None
+
+    class _Registry:
+        async def terminate_session(self, session_id, teardown, *, budget=None):
+            return {"reaped": True}, await teardown()
+
+    shared = UpstreamContext(
+        backend="env", state=DaemonState("env"),
+        router=_Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(backend="env", session_idle_prune=1.0),
+        shared_context=shared,
+        make_context=lambda **_kw: pytest.fail("should not create"))
+    daemon.executors = _Registry()
+
+    pruned = await listener._auto_prune_sessions(daemon, reason="test")
+
+    assert [rec["id"] for rec in pruned] == [local]
+    assert reg.get(local) is None
+    assert reg.get(foreign) is not None
+
+
+@pytest.mark.asyncio
 async def test_idle_watchdog_periodically_prunes_sessions(monkeypatch):
     import asyncio
 
@@ -510,7 +570,7 @@ async def test_idle_watchdog_periodically_prunes_sessions(monkeypatch):
             calls["reap_dead"] += 1
             return []
 
-        def reap_idle(self, idle_after):
+        async def reap_idle(self, idle_after):
             return []
 
     class _Daemon:

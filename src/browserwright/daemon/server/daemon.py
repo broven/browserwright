@@ -3,7 +3,7 @@
 `docs/refactor-single-daemon.md` §"Key insight: the engine already exists":
 `Router` + `DaemonState` + `_UpstreamHolder` are already a complete
 single-upstream / multi-client engine — they only touch `self.state.*` and one
-`self._upstream_send`. So this module does NOT rewrite any routing/translation
+one attached ``Upstream``. So this module does NOT rewrite routing/translation
 logic. It:
 
   - bundles one `(state, router, holder)` triple per upstream into an
@@ -27,10 +27,14 @@ Phase boundaries (this file is Phase 2):
 from __future__ import annotations
 
 import dataclasses
+import asyncio
 import itertools
 import logging
+import time
+from collections.abc import Awaitable, Callable
 
 from ... import session_registry
+from .. import _ipc
 from ..config import Config
 from .state import DaemonState
 from .proxy import Router
@@ -88,6 +92,10 @@ class Daemon:
                  make_context):
         self.cfg = cfg
         self.shared_context = shared_context
+        # An env record is authorized for exactly the daemon socket scope that
+        # allocated it.  Capture once at daemon construction so later ambient
+        # environment changes cannot move the boundary underneath live clients.
+        self.daemon_scope = str(_ipc.sock_path().resolve())
         self.contexts: dict[str, UpstreamContext] = {}
         # Phase B: per-session persistent executor subprocesses, keyed by
         # session id (mirrors `contexts`). Lazily spawned by the
@@ -103,6 +111,16 @@ class Daemon:
         # Global, unique-across-contexts client id source — purely for
         # log-friendliness so two contexts never print the same client #.
         self._next_client_id: "itertools.count[int]" = itertools.count(1)
+        # Every session-bound downstream connection holds a daemon lease.  The
+        # registry is transport-neutral: control websocket and facade clients
+        # are revoked by the same terminal lifecycle operation.
+        self._session_leases: dict[
+            str, dict[object, tuple[str, Callable[[], Awaitable[None]]]]
+        ] = {}
+        self._lease_sessions: dict[object, str] = {}
+        self._session_phases: dict[str, str] = {}
+        self._session_results: dict[str, dict] = {}
+        self._termination_locks: dict[str, asyncio.Lock] = {}
         # Back-reference set on each context's router so RPC handlers
         # (endSession etc.) can reach the daemon to create/drop
         # an rdp context.
@@ -136,12 +154,151 @@ class Daemon:
         backend = record.get("backend")
         if backend == "rdp":
             return self._ensure_rdp_context(session_id, record)
-        # extension / env → shared upstream.
-        return self.shared_context
+        if backend == "extension":
+            if self.shared_context.backend == "extension":
+                return self.shared_context
+            raise UnknownSessionError(session_id)
+        if backend == "env":
+            if self.shared_context.backend != "env":
+                raise UnknownSessionError(session_id)
+            record_scope = record.get("daemon_scope")
+            if record_scope == self.daemon_scope:
+                return self.shared_context
+            # Upgrade records written before daemon scoping existed.  The
+            # compare-and-set is ledger-locked so two isolated env daemons
+            # cannot both claim the same legacy session.  Explicitly foreign
+            # scopes still fail closed.
+            if (record_scope is None
+                    and session_registry.claim_legacy_env_scope(
+                        session_id, self.daemon_scope)):
+                return self.shared_context
+            raise UnknownSessionError(session_id)
+        # A malformed/forward-version record must never inherit the shared
+        # browser merely because it is not named "rdp".
+        raise UnknownSessionError(session_id)
 
     def context_for_required(self, session_id: str) -> UpstreamContext:
         """Resolve an explicitly session-bound context, failing closed."""
         return self.context_for(session_id, require_known=True)
+
+    def acquire_session_lease(
+        self,
+        session_id: str,
+        token: object,
+        revoke: Callable[[], Awaitable[None]],
+        *,
+        kind: str,
+    ) -> UpstreamContext:
+        """Authorize and register one live session-bound connection.
+
+        Resolution and lease publication contain no await, so a termination
+        cannot begin between the authorization check and registration.  A
+        terminal control connection is allowed solely so a lost endSession
+        acknowledgement can be retried; Router gates every other command.
+        Facade clients never have a legitimate post-terminal operation.
+        """
+        ctx = self.context_for_required(session_id)
+        phase = self._session_phases.get(session_id, "active")
+        if phase != "active" and kind != "control":
+            raise UnknownSessionError(session_id)
+        if token in self._lease_sessions:
+            raise RuntimeError("session lease token is already registered")
+        self._session_leases.setdefault(session_id, {})[token] = (kind, revoke)
+        self._lease_sessions[token] = session_id
+        return ctx
+
+    def release_session_lease(self, token: object) -> None:
+        """Forget a connection lease after its transport has exited."""
+        session_id = self._lease_sessions.pop(token, None)
+        if session_id is None:
+            return
+        leases = self._session_leases.get(session_id)
+        if leases is None:
+            return
+        leases.pop(token, None)
+        if not leases:
+            self._session_leases.pop(session_id, None)
+
+    async def revoke_session_lease(self, token: object) -> None:
+        """Close one leased transport and forget it after closure confirms."""
+        session_id = self._lease_sessions.get(token)
+        if session_id is None:
+            return
+        lease = self._session_leases.get(session_id, {}).get(token)
+        if lease is None:
+            self.release_session_lease(token)
+            return
+        _kind, revoke = lease
+        await revoke()
+        self.release_session_lease(token)
+
+    def session_is_terminal(self, session_id: str | None) -> bool:
+        return bool(
+            session_id
+            and self._session_phases.get(session_id) == "ended")
+
+    def session_is_restricted(self, session_id: str | None) -> bool:
+        """Whether only a retry of endSession may use this control lease."""
+        return bool(
+            session_id
+            and self._session_phases.get(session_id, "active") != "active")
+
+    async def terminate_session(
+        self,
+        session_id: str,
+        teardown: Callable[[], Awaitable[dict]],
+        *,
+        caller_token: object | None = None,
+        budget: float | None = None,
+    ) -> tuple[dict[str, object], dict]:
+        """Atomically revoke clients, reap executor, and tear down workspace."""
+        lock = self._termination_locks.setdefault(session_id, asyncio.Lock())
+        revocations: list[asyncio.Task[None]] = []
+        try:
+            async with lock:
+                cached = self._session_results.get(session_id)
+                if cached is not None:
+                    return ({
+                        "killed": False,
+                        "reaped": True,
+                        "matched": True,
+                        "executor_id": None,
+                    }, dict(cached))
+                self._session_phases[session_id] = "terminating"
+                try:
+                    tokens = list(self._session_leases.get(session_id, {}))
+                    for token in tokens:
+                        if token is caller_token:
+                            continue
+                        # Closing starts promptly, but a control revoker may
+                        # join its handler task.  A concurrent endSession
+                        # handler is waiting for this same lock, so joining it
+                        # here would form a lock cycle.  Await every revocation
+                        # only after terminal state is published and the lock
+                        # is released below.
+                        revocations.append(asyncio.create_task(
+                            self.revoke_session_lease(token)))
+                    if revocations:
+                        # Give every close coroutine one turn so transports
+                        # begin shutting down before workspace teardown.  We
+                        # deliberately do not join their handler tasks here.
+                        await asyncio.sleep(0)
+                    reap, result = await self.executors.terminate_session(
+                        session_id, teardown, budget=budget)
+                except BaseException:
+                    self._session_phases[session_id] = "active"
+                    raise
+                if (reap.get("reaped") is True
+                        and isinstance(result, dict)
+                        and result.get("ok") is True):
+                    self._session_results[session_id] = dict(result)
+                    self._session_phases[session_id] = "ended"
+                else:
+                    self._session_phases[session_id] = "active"
+                return reap, result
+        finally:
+            if revocations:
+                await asyncio.gather(*revocations)
 
     def _ensure_rdp_context(self, session_id: str, record: dict) -> UpstreamContext:
         """Get or create the per-session rdp context.
@@ -207,7 +364,9 @@ class Daemon:
         dropping."""
         return self.contexts.pop(session_id, None)
 
-    async def teardown_rdp_context(self, session_id: str) -> bool:
+    async def teardown_rdp_context(
+        self, session_id: str, *, deadline: float | None = None,
+    ) -> bool:
         """Phase 3 endSession teardown: close the per-session upstream, kill the
         daemon-owned Chrome (the holder's `trigger_close` SIGTERMs `rdp_pid`),
         and drop the context. Returns True if a context was found + torn down.
@@ -217,13 +376,48 @@ class Daemon:
         ctx = self.contexts.get(session_id)
         if ctx is None:
             return False
+        holder = ctx.holder
+        # Terminate the owned process before the first cancellable close-
+        # etiquette await. A timeout can lose notifications, but cannot leak
+        # the Chrome or leave the context stuck in CLOSING.
+        kill = getattr(holder, "_kill_rdp_chrome", None)
+        if callable(kill):
+            if kill() is False:
+                raise RuntimeError(
+                    f"could not terminate rdp Chrome for session {session_id!r}")
         try:
             # "skill_disconnect" is the closest honest CloseReason — the client
             # explicitly asked to end this session (vs chrome_exit / idle).
-            await ctx.holder.trigger_close("skill_disconnect")  # type: ignore[attr-defined]
+            close = holder.trigger_close("skill_disconnect")  # type: ignore[attr-defined]
+            if deadline is None:
+                await close
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    close.close()
+                    abort = getattr(holder, "abort_rdp_teardown", None)
+                    if callable(abort):
+                        await abort()
+                    return False
+                await asyncio.wait_for(close, timeout=remaining)
+        except asyncio.TimeoutError:
+            abort = getattr(holder, "abort_rdp_teardown", None)
+            if callable(abort):
+                await abort()
+            logger.warning("teardown rdp context %s exceeded its budget", session_id)
+            return False
+        except asyncio.CancelledError:
+            abort = getattr(holder, "abort_rdp_teardown", None)
+            if callable(abort):
+                await asyncio.shield(abort())
+            raise
         except Exception as e:
+            abort = getattr(holder, "abort_rdp_teardown", None)
+            if callable(abort):
+                await abort()
             logger.warning("teardown rdp context %s close failed: %r",
                            session_id, e)
+            raise
         self.contexts.pop(session_id, None)
         logger.info("tore down rdp context for session %s", session_id)
         return True

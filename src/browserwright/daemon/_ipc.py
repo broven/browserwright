@@ -22,6 +22,8 @@ import asyncio
 import json
 import os
 import socket
+import stat
+import tempfile
 from pathlib import Path
 
 
@@ -127,6 +129,96 @@ def executor_file_path(session_id: str) -> Path:
     return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.json"
 
 
+def executor_inflight_path(session_id: str) -> Path:
+    """Sidecar file describing what the executor's worker thread is doing NOW.
+
+    Why a file and not an RPC: the executor's accept loop is deliberately
+    one-request-per-connection and BLOCKS on ``worker.submit`` (thread-affine
+    Playwright, Fork 3), so a hung call is exactly the state in which the
+    executor cannot answer a query. A file the worker writes *before* it starts
+    the call is readable precisely when asking would fail — which is the only
+    time anyone wants to know.
+
+    Deliberately NOT a ``*.json`` name: ``cleanup_orphan_executors`` globs
+    ``bw-exec-*.json`` and SIGTERMs whatever ``pid`` it finds inside, so a
+    sidecar matching that glob would be read as a second discovery record."""
+    return _executor_inflight_dir() / f"bw-exec-{_exec_shortid(session_id)}.inflight"
+
+
+def _executor_inflight_dir() -> Path:
+    """Per-user private home for executor observability sidecars."""
+    return _runtime_dir() / f"browserwright-{os.geteuid()}"
+
+
+def _ensure_executor_inflight_dir() -> Path:
+    """Create and verify the sidecar directory without following a symlink."""
+    directory = _executor_inflight_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(directory, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(directory)
+        if metadata.st_uid != os.geteuid():
+            raise PermissionError(
+                f"executor inflight directory is owned by uid {metadata.st_uid}, "
+                f"expected {os.geteuid()}: {directory}"
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return directory
+
+
+def write_executor_inflight(session_id: str, payload: dict | None) -> None:
+    """Publish (or clear, with ``payload=None``) the executor's current call.
+
+    Best-effort on every path: an unwritable runtime dir costs observability,
+    never correctness, and this runs on the executor's hot path."""
+    tmp_path: str | None = None
+    tmp_fd = -1
+    try:
+        _ensure_executor_inflight_dir()
+        fp = executor_inflight_path(session_id)
+        if payload is None:
+            fp.unlink(missing_ok=True)
+            return
+        serialized = json.dumps(payload)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{fp.name}.", suffix=".tmp", dir=fp.parent)
+        os.fchmod(tmp_fd, 0o600)
+        with os.fdopen(tmp_fd, "w") as tmp_file:
+            tmp_fd = -1
+            tmp_file.write(serialized)
+        os.replace(tmp_path, fp)
+        tmp_path = None
+    except (OSError, ValueError, TypeError):
+        pass
+    finally:
+        if tmp_fd >= 0:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+
+
+def read_executor_inflight(session_id: str) -> dict | None:
+    """Read the executor's current-call sidecar, or ``None`` when idle/absent."""
+    try:
+        _ensure_executor_inflight_dir()
+        d = json.loads(executor_inflight_path(session_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
 def write_executor_file(
     session_id: str,
     sock: str,
@@ -141,6 +233,14 @@ def write_executor_file(
     fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_name(fp.name + ".tmp")
     payload = {"sock": sock, "pid": pid, "session": session_id}
+    # Start-time fingerprint so a later sweep can tell "our executor is still
+    # running" from "the OS handed this pid to somebody else". Without it the
+    # orphan cleanup can only check that *a* process holds the pid, and its
+    # SIGKILL escalation would take out an unrelated process group.
+    from .platforms import proc_start_time
+    started = proc_start_time(pid)
+    if started is not None:
+        payload["start_time"] = started
     if executor_id is not None:
         payload["executor_id"] = executor_id
     tmp.write_text(json.dumps(payload))
@@ -197,6 +297,7 @@ def cleanup_executor(session_id: str) -> None:
             p.unlink()
         except (FileNotFoundError, IsADirectoryError, OSError):
             pass
+    write_executor_inflight(session_id, None)
 
 
 def make_executor_socket(session_id: str) -> socket.socket:

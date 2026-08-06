@@ -26,7 +26,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 from .state import (
     ClientState, DaemonState, UpstreamPhase, PRE_OPEN_BUFFER_LIMIT,
@@ -40,6 +40,85 @@ from .verbs import (  # noqa: F401 - re-exports are part of proxy's surface
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .upstream import TargetOwnership, Upstream
+
+
+class _SendOnlyUpstream:
+    """Compatibility adapter for Router's historical public test harness.
+
+    Production attaches a real Upstream. ``update_upstream_send`` remains as a
+    public surface for cold-router contract tests, but it now installs this one
+    adapter reference instead of restoring a mutable callback slot.
+    """
+
+    def __init__(self, send: Callable[[str], Awaitable[None]]):
+        self._send = send
+
+    ws_url = None
+    is_open = True
+
+    def attach(self, router: "Router") -> None:
+        router.upstream = self  # type: ignore[assignment]
+
+    def detach(self, router: "Router") -> None:
+        if router.upstream is self:
+            router.upstream = None
+
+    async def send_cdp(self, frame: str) -> None:
+        await self._send(frame)
+
+    async def open(self, ws_url=None, *, timeout: float = 30.0) -> None:
+        return None
+
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        return None
+
+    async def _unavailable(self, *args, **kwargs):
+        raise RuntimeError("upstream adapter is unavailable in cold-router harness")
+
+    open_tab = close_tab = list_tabs = get_targets = current_page = attach_active = _unavailable
+    end_session = _unavailable
+
+    async def close_session_tab(
+        self, session_id: str, target_id: str,
+    ) -> dict:
+        raise RuntimeError(
+            "forwarding-only upstream cannot close a session tab")
+
+    async def target_belongs_to_session(
+        self, session_id: str, target_id: str,
+    ) -> "TargetOwnership":
+        # A wire sender is not a session-binding authority. Raw-CDP callers may
+        # rely on their browser-instance workspace boundary; shared extension
+        # callers must fail closed when this answer is unavailable.
+        return None
+
+    async def end_session_before(
+        self, session_id: str, group_id: int | None = None, *, deadline: float,
+    ) -> dict:
+        raise RuntimeError(
+            "forwarding-only upstream cannot end a session")
+
+    async def recover(self, *args, **kwargs) -> dict:
+        return {"recovered": [], "groupId": -1, "tabs": []}
+
+    async def wait_session_announce(self, session_id: str,
+                                    timeout: float = 2.0) -> bool:
+        return True
+
+    async def userscript_request(self, *args, **kwargs) -> dict:
+        raise RuntimeError("userscript upstream unavailable")
+
+    async def reload_extensions(self, **kwargs) -> dict:
+        return {
+            "ok": False,
+            "sent": 0,
+            "extensions": [],
+            "applicable": False,
+            "reason": "upstream adapter unavailable",
+        }
 
 
 # ---- helpers --------------------------------------------------------------
@@ -62,63 +141,23 @@ class Router(SessionVerbsMixin):
     Bindings change shape from v0.2:
     - `client_send` becomes a `dict[client_id, send_fn]` registry, so the
       router can fan out events to the right subset of clients.
-    - `upstream_send` remains a single callable (only one upstream conn).
+    - `upstream` is one session-shaped adapter (only one upstream connection).
     """
 
     def __init__(self, state: DaemonState):
         self.state = state
         # Phase 2: back-reference to the global Daemon, set by Daemon.__init__
-        # / _ensure_rdp_context. Lets the session-verb handlers (endSession
-        # etc.) create or drop an rdp UpstreamContext. None in unit tests
+        # / _ensure_rdp_context. Lets session verbs reach global services such
+        # as the executor registry. None in unit tests
         # that build a bare Router — those handlers degrade gracefully.
         self.daemon: object | None = None
-        self._upstream_send: Callable[[str], Awaitable[None]] | None = None
+        # The one browser-facing seam.  Adapter publication is atomic through
+        # Upstream.attach()/detach(); no verb callback slots live on Router.
+        self.upstream: "Upstream | None" = None
         self._client_sends: dict[int, Callable[[str], Awaitable[None]]] = {}
         self._ensure_upstream: Callable[[], Awaitable[None]] | None = None
         self._trigger_disconnect: Callable[[str], Awaitable[None]] | None = None
-        # Extension-backend-only verbs. listener.py sets these only when
-        # backend=extension; other backends leave them None and the proxy
-        # handlers respond -32601. `_close_tab_by_target_id` is the fallback
-        # close-path used when the original opener disconnected and the
-        # per-client session binding was reaped.
-        self._attach_active_tab: Callable[[], Awaitable[dict]] | None = None
-        self._open_background_tab: (
-            Callable[[str, str | None], Awaitable[dict]] | None) = None
-        self._close_tab: Callable[[str], Awaitable[dict]] | None = None
-        self._close_tab_by_target_id: (
-            Callable[[str], Awaitable[dict]] | None) = None
-        # P5: per-session teardown (extension backend only). Closes the
-        # session's owned tabs, keeps borrowed ones.
-        self._end_session: Callable[[str], Awaitable[dict]] | None = None
-        # Session-reconnect-recovery (extension backend only). Rebuilds a
-        # session's tab bindings from the durable tab group, found by its
-        # persisted numeric groupId (not the title). Signature:
-        # (bs_session | None, *, group_id) -> dict.
-        self._recover_session: (
-            Callable[..., Awaitable[dict]] | None) = None
-        self._wait_session_announce: (
-            Callable[[str, float], Awaitable[bool]] | None) = None
-        self._userscript_request: (
-            Callable[[str, dict], Awaitable[dict | None]] | None) = None
-        self._reload_extensions: (
-            Callable[..., Awaitable[dict]] | None) = None
-        # Extension-backend-only: scope Target.getTargets to a session's tab
-        # group so sessions sharing the one Chrome are mutually invisible.
-        # listener wires this to ExtensionUpstream.scoped_target_infos.
-        # Signature: (session_id) -> list[targetInfo dict]; scopes by the
-        # session's bound groupId.
-        self._scoped_targets: (
-            Callable[[str | None], Awaitable[list[dict]]] | None) = None
-        # Phase 3 (docs/refactor-single-daemon.md): rdp raw-CDP command channel.
-        # Set by listener._open_chrome_upstream to the UpstreamConnection's
-        # daemon-internal `send_command` when this is an rdp (or env)
-        # context. The unified session verbs (openBackgroundTab / closeTab /
-        # userscript) dispatch to a CDP implementation through this when the
-        # context's backend is rdp, instead of the extension callbacks (which
-        # stay None on an rdp context). Signature mirrors
-        # UpstreamConnection.send_command: (method, params?, session_id?) -> result.
-        self._upstream_command: (
-            Callable[..., Awaitable[dict]] | None) = None
+        self._prepare_executor: Callable[[str], Awaitable[None]] | None = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -132,6 +171,21 @@ class Router(SessionVerbsMixin):
 
     def unregister_client(self, client_id: int) -> None:
         self._client_sends.pop(client_id, None)
+
+    def update_upstream_send(
+        self, fn: Callable[[str], Awaitable[None]] | None,
+    ) -> None:
+        """Compatibility shim: install/remove one forwarding-only adapter."""
+        if fn is None:
+            if isinstance(self.upstream, _SendOnlyUpstream):
+                self.upstream = None
+            return
+        _SendOnlyUpstream(fn).attach(self)
+
+    @property
+    def _raw_cdp_backend(self) -> bool:
+        """Whether the browser connection itself is the workspace boundary."""
+        return self.state.backend_name != "extension"
 
     async def release_client(self, client_id: int) -> ClientState | None:
         """Release a downstream client and close its primary upstream sessions.
@@ -149,7 +203,7 @@ class Router(SessionVerbsMixin):
 
     async def _detach_upstream_best_effort(self, upstream_session_id: str) -> None:
         """Send an upstream detach without expecting a client response."""
-        if self._upstream_send is None:
+        if self.upstream is None:
             return
         upstream_id = self.state.allocate_upstream_id()
         msg = {
@@ -158,26 +212,30 @@ class Router(SessionVerbsMixin):
             "params": {"sessionId": upstream_session_id},
         }
         try:
-            await self._upstream_send(json.dumps(msg))
+            await self.upstream.send_cdp(json.dumps(msg))
         except Exception as e:  # noqa: BLE001 - disconnect cleanup is best-effort.
             logger.warning("best-effort upstream detach failed: %r", e)
-
-    def update_upstream_send(self, fn: Callable[[str], Awaitable[None]] | None) -> None:
-        self._upstream_send = fn
 
     def bind_lifecycle(
         self,
         ensure_upstream: Callable[[], Awaitable[None]],
         trigger_disconnect: Callable[[str], Awaitable[None]],
+        prepare_executor: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._ensure_upstream = ensure_upstream
         self._trigger_disconnect = trigger_disconnect
+        self._prepare_executor = prepare_executor
 
     # ---- downstream → upstream ------------------------------------------
 
     async def route_from_client(self, client: ClientState, text: str) -> None:
         msg = _json_safe(text)
         if msg is None:
+            restricted = getattr(self.daemon, "session_is_restricted", None)
+            if (callable(restricted) and restricted(client.session_id)):
+                await self._send_to_client(client.client_id, _error_response(
+                    None, -32603, "browserwright session has ended"))
+                return
             # Garbage frame — best-effort forward, upstream will error if it
             # cares. We still gate on upstream readiness so the frame doesn't
             # vanish during the lazy-open window.
@@ -197,6 +255,13 @@ class Router(SessionVerbsMixin):
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") or {}
         local_sid = msg.get("sessionId") if isinstance(msg.get("sessionId"), str) else None
+
+        restricted = getattr(self.daemon, "session_is_restricted", None)
+        if (callable(restricted) and restricted(client.session_id)
+                and method != "BrowserwrightDaemon.endSession"):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "browserwright session has ended"))
+            return
 
         # --- BrowserwrightDaemon.* namespace ---
         # Self-answered: doesn't need upstream, so no gate.
@@ -218,24 +283,32 @@ class Router(SessionVerbsMixin):
         if not await self._gate_upstream_ready(client, text, msg=msg):
             return
 
-        # --- Target.getTargets scoping (extension: this session's group only) ---
-        # The skill's list_tabs / current_page enumerate via Target.getTargets.
-        # On the shared extension upstream the raw handler returns EVERY ghost
-        # across all sessions; scope it to the requesting client's tab group so
-        # sessions stay mutually invisible. rdp keeps the normal forward (its
-        # Chrome is already private to the session).
+        # --- adapter-owned Target.getTargets enumeration -------------------
+        # Extension synthesizes a session-scoped browser view. Raw-CDP returns
+        # Chrome's native envelope verbatim (including request filters,
+        # non-page targets, extra fields, and native errors). This seam is
+        # deliberately separate from high-level list_tabs(), which is allowed
+        # to expose only page targets.
         if (method == "Target.getTargets"
-                and self.state.backend_name == "extension"
-                and self._scoped_targets is not None
+                and self.upstream is not None
                 and client.session_id):
             try:
-                infos = await self._scoped_targets(client.session_id)
+                envelope = await self.upstream.get_targets(
+                    params, client.session_id)
             except Exception as e:  # noqa: BLE001
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603, f"getTargets scoping failed: {e!r}"))
                 return
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {"targetInfos": infos}))
+            if not isinstance(envelope, dict) or not (
+                    isinstance(envelope.get("result"), dict)
+                    or isinstance(envelope.get("error"), dict)):
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"getTargets adapter returned malformed envelope: {envelope!r}"))
+                return
+            response = dict(envelope)
+            response["id"] = req_id
+            await self._send_to_client(client.client_id, json.dumps(response))
             return
 
         # --- Target.attachToTarget interceptor ---
@@ -277,10 +350,10 @@ class Router(SessionVerbsMixin):
         rejected (overflow → -32603 sent to client).
 
         We treat upstream as "ready" only when the daemon has a live
-        `_upstream_send` callable AND DaemonState.upstream_phase is CONNECTED.
+        attached ``upstream`` AND DaemonState.upstream_phase is CONNECTED.
         Any other phase (DISCONNECTED / CONNECTING / CLOSING) → buffer.
         """
-        if (self._upstream_send is not None
+        if (self.upstream is not None
                 and self.state.upstream_phase == UpstreamPhase.CONNECTED):
             return True
 
@@ -378,6 +451,47 @@ class Router(SessionVerbsMixin):
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602, "Target.attachToTarget requires params.targetId"))
             return
+
+        if client.session_id is not None:
+            try:
+                # Ownership is part of the declared Upstream contract. A
+                # capability-limited adapter must report ``None`` explicitly;
+                # probing for the member here would turn an incomplete adapter
+                # into a silent authorization bypass.
+                ownership = await self.upstream.target_belongs_to_session(
+                    client.session_id, target_id)
+            except Exception as e:  # noqa: BLE001 - fail closed on unknown scope
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"target ownership check failed: {e!r}"))
+                return
+            if ownership is None:
+                if not self._raw_cdp_backend:
+                    await self._send_to_client(
+                        client.client_id,
+                        _error_response(
+                            req_id, -32603,
+                            "target ownership is unavailable for the shared "
+                            "extension workspace",
+                        ),
+                    )
+                    return
+                # The compatibility adapter cannot inspect membership. For a
+                # raw-CDP workspace, authorization already happened when the
+                # session was routed to its browser instance (and env admits
+                # only one session per daemon), so attach may proceed here.
+            elif ownership is False:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32602,
+                    f"target {target_id} does not belong to session "
+                    f"{client.session_id!r}"))
+                return
+            elif ownership is not True:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"target ownership check returned invalid value "
+                    f"{ownership!r}"))
+                return
 
         existing = self.state.attachers.get(target_id)
         if existing is None:
@@ -477,11 +591,11 @@ class Router(SessionVerbsMixin):
         which case a dropped frame is acceptable, the client will see
         `upstreamClosed` shortly).
         """
-        if self._upstream_send is None:
+        if self.upstream is None:
             # Defensive: this is only reachable if upstream torn down mid-call.
             logger.warning("dropped frame (no upstream): %s", text[:80])
             return
-        await self._upstream_send(text)
+        await self.upstream.send_cdp(text)
 
     # ---- upstream → downstream -------------------------------------------
 

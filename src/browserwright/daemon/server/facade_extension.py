@@ -129,17 +129,13 @@ class ExtensionFacadeBridge:
         self, *, client: ServerConnection, relay: RelayServer,
         session_id: str | None = None, session_name: str | None = None,
         session_group_id: int | None = None,
+        binding_owner: ExtensionUpstream | None = None,
     ):
         self._client = client
         self._relay = relay
         self._session_id = session_id
-        loaded_name, loaded_group_id = self._load_session_scope(session_id)
+        loaded_name, _loaded_group_id = self._load_session_scope(session_id)
         self._session_name = session_name or loaded_name or session_id
-        self._group_id = (
-            session_group_id
-            if isinstance(session_group_id, int) and session_group_id >= 0
-            else loaded_group_id
-        )
         # A dedicated ExtensionUpstream over the SAME relay. on_frame routes
         # synthesized/forwarded frames back to THIS Playwright client. on_close
         # is a no-op — the facade owns connection teardown, not the upstream.
@@ -147,9 +143,13 @@ class ExtensionFacadeBridge:
             relay=relay,
             on_frame=self._send_to_client,
             on_close=self._noop_close,
+            group_owner=binding_owner,
         )
-        if self._session_id is not None and self._group_id is not None:
-            self._ext._bind_group(self._session_id, self._group_id)  # noqa: SLF001
+        self._binding_owner = binding_owner or self._ext
+        # Ledger group ids are recovery candidates, not proof of live
+        # ownership: Chrome can recycle them after restart. The shared
+        # ExtensionUpstream validates title + known-tab membership before it
+        # promotes one into the live binding map.
         # tab_id → synthetic flat sessionId we've handed Playwright for it. One
         # entry per tab we've announced via attachedToTarget, so a later
         # `targetDestroyed`/`detachedFromTarget` references the same session and
@@ -210,11 +210,10 @@ class ExtensionFacadeBridge:
         gid = gid if isinstance(gid, int) and gid >= 0 else None
         return name, gid
 
-    def _persist_group_id(self, group_id: int) -> None:
+    def _record_group_binding(self, group_id: int) -> None:
         if not self._session_id or group_id < 0:
             return
-        self._group_id = group_id
-        self._ext._bind_group(self._session_id, group_id)  # noqa: SLF001
+        self._binding_owner._bind_group(self._session_id, group_id)  # noqa: SLF001
         try:
             rec = session_registry.get(self._session_id) or {}
             runtime = dict(rec.get("runtime") or {})
@@ -223,23 +222,6 @@ class ExtensionFacadeBridge:
             session_registry.update(self._session_id, runtime=runtime)
         except Exception:
             pass
-
-    def _refresh_session_group_id(self) -> int | None:
-        """Refresh the session group before creating a tab.
-
-        The daemon's agent path may have bound the group after this facade
-        bridge was constructed. The relay-scoped map is the same-process fast
-        path; the ledger is the restart/reconnect fallback.
-        """
-        if not self._session_id:
-            return self._group_id
-        gid = self._relay.session_group(self._session_id)
-        if gid is None:
-            _name, gid = self._load_session_scope(self._session_id)
-        if gid is not None:
-            self._group_id = gid
-            self._ext._bind_group(self._session_id, gid)  # noqa: SLF001
-        return self._group_id
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -332,6 +314,8 @@ class ExtensionFacadeBridge:
             tab_id = (_tab_id_from_target_id(tid)
                       if isinstance(tid, str) else None)
             if tab_id is not None:
+                if not await self._authorize_target(req_id, tid):
+                    return
                 await self._respond(req_id, {"targetInfo": self._target_info(tab_id)})
             else:
                 await self._respond(req_id, {"targetInfo": self._browser_target_info()})
@@ -371,6 +355,22 @@ class ExtensionFacadeBridge:
         # Browser.getVersion). Its responses carry no sessionId, which is
         # correct for these browser-level methods. ---
         if session_id is None:
+            if method == "Target.getTargets" and self._session_id is not None:
+                try:
+                    envelope = await self._ext.get_targets(
+                        params, self._session_id)
+                except Exception as e:  # noqa: BLE001
+                    await self._error(
+                        req_id, -32603, f"getTargets scoping failed: {e!r}")
+                    return
+                if isinstance(envelope.get("error"), dict):
+                    error = envelope["error"]
+                    await self._error(
+                        req_id, int(error.get("code", -32603)),
+                        str(error.get("message", "getTargets failed")))
+                else:
+                    await self._respond(req_id, envelope.get("result") or {})
+                return
             if method == "Target.attachToTarget":
                 await self._handle_attach_to_target(req_id, params)
                 return
@@ -392,7 +392,7 @@ class ExtensionFacadeBridge:
                                        params: dict) -> None:
         """Forward a session-scoped command to the tab's chrome.debugger and
         echo `{id, sessionId, result|error}`."""
-        tab_id = self._ext.resolve_tab_id(session_id)
+        tab_id = self._tab_id_for_session(session_id)
         if tab_id is None:
             await self._error(req_id, -32602,
                               f"unknown sessionId {session_id!r}",
@@ -445,6 +445,9 @@ class ExtensionFacadeBridge:
         target_id = params.get("targetId")
         tab_id = (_tab_id_from_target_id(target_id)
                   if isinstance(target_id, str) else None)
+        if (isinstance(target_id, str)
+                and not await self._authorize_target(req_id, target_id)):
+            return
         # Reuse an already-announced session for this tab if we have one, so
         # auto-attach replay + an explicit attachToTarget agree on one session.
         if tab_id is not None and tab_id in self._tab_sessions:
@@ -495,13 +498,6 @@ class ExtensionFacadeBridge:
         self._creating += 1
         try:
             group_name = self._session_name or "Agent"
-            group_id = self._refresh_session_group_id()
-            # Same session-group discipline as the agent `open_background`
-            # verb: when the Playwright facade is session-scoped, tabs created
-            # by context.new_page() must belong to that session so session end
-            # can close them.
-            if self._session_id is not None and group_id is not None:
-                self._ext._bind_group(self._session_id, group_id)  # noqa: SLF001
             gt = await self._ext.open_background_tab(
                 url, group_name=group_name,
                 session_id=self._session_id,
@@ -510,7 +506,7 @@ class ExtensionFacadeBridge:
             tab_id = int(gt["tabId"])
             created_group = gt.get("groupId")
             if isinstance(created_group, int) and created_group >= 0:
-                self._persist_group_id(created_group)
+                self._record_group_binding(created_group)
             # PR3 (research delta #2): a brand-new, not-yet-navigated tab must be
             # reported to Playwright with the initial-empty-document url ":" (NOT
             # "about:blank"), so CRPage's `isInitialEmptyPage = mainFrame().url()
@@ -546,13 +542,21 @@ class ExtensionFacadeBridge:
             # CDP returns success:false for an unknown target rather than erroring.
             await self._respond(req_id, {"success": False})
             return
+        if not await self._authorize_target(
+                req_id, f"ext-tab-{tab_id}", close_response=True):
+            return
+        validated_generation = self._relay.connection_generation
         sid = self._tab_sessions.get(tab_id)
         try:
             # Same core as the agent path's closeTab-by-targetId verb: evicts
             # the upstream's fabricated sessions for the tab + relay close.
-            await self._ext.close_tab_by_target_id(f"ext-tab-{tab_id}")
+            await self._ext.close_tab_by_target_id(
+                f"ext-tab-{tab_id}",
+                expected_generation=validated_generation)
         except Exception as e:  # noqa: BLE001
-            logger.debug("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
+            logger.warning("facade(ext) closeTarget tab %s failed: %r", tab_id, e)
+            await self._respond(req_id, {"success": False})
+            return
         # Evict the facade-local per-tab state too.
         self._evict_tab(tab_id)
         await self._respond(req_id, {"success": True})
@@ -595,7 +599,7 @@ class ExtensionFacadeBridge:
         AND already observes the extension event fan-out via `_on_relay_event` —
         so it is the one place that can both drive the re-subscribe and watch
         for the resulting event without a second transport hop."""
-        tab_id = self._ext.resolve_tab_id(session_id)
+        tab_id = self._tab_id_for_session(session_id)
         if tab_id is None:
             await self._error(req_id, -32602,
                               f"unknown sessionId {session_id!r}",
@@ -635,6 +639,64 @@ class ExtensionFacadeBridge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._ctx_waiters.setdefault(tab_id, []).append(fut)
         return fut
+
+    def _tab_id_for_session(self, session_id: str) -> int | None:
+        """Resolve only sids this facade connection actually handed out.
+
+        ``ExtensionUpstream.resolve_tab_id`` intentionally understands the
+        synthetic sid's text format for daemon-internal recovery. It is not an
+        authorization boundary: a facade client could otherwise invent
+        ``ext-sid-<foreign-tab>-anything`` and bypass attachToTarget entirely.
+        """
+        return next(
+            (tab_id for tab_id, sid in self._tab_sessions.items()
+             if sid == session_id),
+            None,
+        )
+
+    async def _authorize_target(
+        self, req_id: int | None, target_id: str, *, close_response: bool = False,
+    ) -> bool:
+        if self._session_id is None:
+            return True
+        try:
+            ownership = await self._binding_owner.target_belongs_to_session(
+                self._session_id, target_id)
+        except Exception as e:  # noqa: BLE001 - unknown ownership fails closed
+            if close_response:
+                await self._respond(req_id, {"success": False})
+            else:
+                await self._error(
+                    req_id, -32603, f"target ownership check failed: {e!r}")
+            return False
+        if ownership is True:
+            return True
+        if ownership is None:
+            if close_response:
+                await self._respond(req_id, {"success": False})
+            else:
+                await self._error(
+                    req_id, -32603,
+                    "target ownership is unavailable for the shared extension "
+                    "workspace")
+            return False
+        if ownership is not False:
+            if close_response:
+                await self._respond(req_id, {"success": False})
+            else:
+                await self._error(
+                    req_id, -32603,
+                    f"target ownership check returned invalid value "
+                    f"{ownership!r}")
+            return False
+        if close_response:
+            await self._respond(req_id, {"success": False})
+        else:
+            await self._error(
+                req_id, -32602,
+                f"target {target_id} does not belong to session "
+                f"{self._session_id!r}")
+        return False
 
     def _disarm_context_waiter(self, tab_id: int,
                                fut: asyncio.Future) -> None:

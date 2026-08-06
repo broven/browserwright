@@ -19,11 +19,14 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import AsyncIterator
 
+import pytest
 import websockets
 
 from browserwright import session_registry as reg
+from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.facade_extension import ExtensionFacadeBridge
 from browserwright.daemon.server.relay import RelayServer
 
@@ -41,6 +44,7 @@ class _MockExtension:
         # method/type → callable(msg) -> result dict (None error). For
         # 'createTab' / 'attach' / 'command' we provide sane defaults.
         self.tabs_meta: dict[int, dict] = {}
+        self.group_titles: dict[int, str] = {}
         self._next_created_tab = 100
         self.create_tab_messages: list[dict] = []
         # Every chrome.debugger.sendCommand the relay forwarded, as
@@ -87,6 +91,8 @@ class _MockExtension:
             group_id = msg.get("groupId")
             if not isinstance(group_id, int) or group_id < 0:
                 group_id = 700 if msg.get("groupName") else -1
+            if group_id >= 0 and msg.get("groupName"):
+                self.group_titles[group_id] = str(msg["groupName"])
             self.tabs_meta[tab] = {
                 "url": url, "title": "new", "groupId": group_id}
             # The extension announces the attach (the relay turns it into a
@@ -113,6 +119,7 @@ class _MockExtension:
                 ]
             await self._respond(cmd_id, {
                 "groupId": gid if isinstance(gid, int) else -1,
+                "groupTitle": self.group_titles.get(gid, ""),
                 "tabs": tabs,
             })
             return
@@ -147,11 +154,14 @@ class _MockExtension:
         }))
 
     async def announce_attached(self, *, tab_id: int, url: str = "https://t/",
-                                title: str = "t", group_id: int | None = None) -> None:
+                                title: str = "t", group_id: int | None = None,
+                                group_title: str | None = None) -> None:
         assert self.ws is not None
         self.tabs_meta[tab_id] = {"url": url, "title": title}
         if group_id is not None:
             self.tabs_meta[tab_id]["groupId"] = group_id
+            if group_title is not None:
+                self.group_titles[group_id] = group_title
         await self.ws.send(json.dumps({
             "type": "attached", "tabId": tab_id,
             "targetInfo": {"url": url, "title": title},
@@ -305,13 +315,18 @@ async def test_set_discover_targets_acks_and_replays():
 
 async def test_session_bound_replay_only_announces_session_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={"group_id": 44})
+    reg.update(sid, runtime={
+        "group_id": 44,
+        "current_target_id": "ext-tab-10",
+    })
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
-    await ext.announce_attached(tab_id=10, url="https://mine/", group_id=44)
+    await ext.announce_attached(
+        tab_id=10, url="https://mine/", group_id=44,
+        group_title="Research")
     await ext.announce_attached(tab_id=11, url="https://other/", group_id=55)
     await asyncio.sleep(0.05)
     client = _FakeClient()
@@ -340,6 +355,162 @@ async def test_session_bound_replay_only_announces_session_group(tmp_home):
         await relay.stop()
 
 
+async def test_session_bound_browser_methods_reject_foreign_targets(tmp_home):
+    sid = reg.allocate(backend="extension", owner="create", name="Research")
+    reg.update(sid, runtime={
+        "group_id": 44,
+        "current_target_id": "ext-tab-10",
+    })
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    await ext.announce_attached(
+        tab_id=10, url="https://mine/", group_id=44,
+        group_title="Research")
+    await ext.announce_attached(
+        tab_id=11, url="https://secret/", group_id=55,
+        group_title="Other")
+    await asyncio.sleep(0.05)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        client.feed({"id": 1, "method": "Target.getTargets", "params": {
+            "filter": [{"type": "page", "exclude": False}],
+        }})
+        listed = await client.wait_for(lambda f: f.get("id") == 1)
+        assert {
+            info["targetId"] for info in listed["result"]["targetInfos"]
+        } == {"ext-tab-10"}
+
+        client.feed({"id": 2, "method": "Target.attachToTarget",
+                     "params": {"targetId": "ext-tab-11"}})
+        attached = await client.wait_for(lambda f: f.get("id") == 2)
+        assert attached["error"]["code"] == -32602
+
+        client.feed({"id": 3, "method": "Target.getTargetInfo",
+                     "params": {"targetId": "ext-tab-11"}})
+        info = await client.wait_for(lambda f: f.get("id") == 3)
+        assert info["error"]["code"] == -32602
+
+        client.feed({"id": 4, "method": "Target.closeTarget",
+                     "params": {"targetId": "ext-tab-11"}})
+        closed = await client.wait_for(lambda f: f.get("id") == 4)
+        assert closed["result"]["success"] is False
+        assert 11 in ext.tabs_meta
+
+        before = list(ext.commands_seen)
+        client.feed({
+            "id": 5,
+            "sessionId": "ext-sid-11-FORGED",
+            "method": "Runtime.evaluate",
+            "params": {"expression": "document.cookie"},
+        })
+        forged = await client.wait_for(lambda f: f.get("id") == 5)
+        assert forged["error"]["code"] == -32602
+        assert ext.commands_seen == before
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
+
+
+async def test_session_scope_is_enforced_without_transport():
+    class _Relay:
+        port = 19989
+        connection_generation = 1
+
+        def __init__(self):
+            self.closed: list[int] = []
+            self.commands: list[tuple[int, str]] = []
+
+        def list_ghost_targets(self):
+            return [
+                SimpleNamespace(
+                    target_id="ext-tab-10", type="page",
+                    url="https://mine/", title="Mine"),
+                SimpleNamespace(
+                    target_id="ext-tab-11", type="page",
+                    url="https://secret/", title="Secret"),
+            ]
+
+        async def query_group_tabs(self, *, group_id, timeout=10.0):
+            members = {44: [10], 55: [11]}.get(group_id, [])
+            return {"groupId": group_id, "tabs": [
+                {"tabId": tab_id} for tab_id in members
+            ]}
+
+        async def close_tab(self, tab_id):
+            self.closed.append(tab_id)
+
+        async def attach_tab(
+            self, tab_id, *, expected_generation=None, timeout=10.0,
+        ):
+            return None
+
+        async def send_cdp(self, tab_id, method, params):
+            self.commands.append((tab_id, method))
+            return {}
+
+        def set_session_announce(self, _session_id):
+            return None
+
+        def reset_session_announce(self, _session_id):
+            return None
+
+    async def _noop(_value):
+        return None
+
+    relay = _Relay()
+    owner = ExtensionUpstream(relay, _noop, _noop)
+    owner._bind_group("session-A", 44)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(
+        client=client,
+        relay=relay,
+        session_id="session-A",
+        session_name="A",
+        binding_owner=owner,
+    )
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 1, "method": "Target.getTargets", "params": {},
+    }))
+    assert {
+        info["targetId"] for info in client.result_for(1)["targetInfos"]
+    } == {"ext-tab-10"}
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 2, "method": "Target.attachToTarget",
+        "params": {"targetId": "ext-tab-11"},
+    }))
+    assert next(f for f in client.sent if f.get("id") == 2)["error"]["code"] == -32602
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 3, "method": "Target.getTargetInfo",
+        "params": {"targetId": "ext-tab-11"},
+    }))
+    assert next(f for f in client.sent if f.get("id") == 3)["error"]["code"] == -32602
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 4, "method": "Target.closeTarget",
+        "params": {"targetId": "ext-tab-11"},
+    }))
+    assert client.result_for(4)["success"] is False
+    assert relay.closed == []
+
+    await bridge._handle_client_frame(json.dumps({
+        "id": 5, "sessionId": "ext-sid-11-FORGED",
+        "method": "Runtime.evaluate", "params": {"expression": "secret"},
+    }))
+    assert next(f for f in client.sent if f.get("id") == 5)["error"]["code"] == -32602
+    assert relay.commands == []
+
+
 # ---- A3: createTarget maps to a background tab -----------------------------
 
 
@@ -360,14 +531,29 @@ async def test_create_target_opens_background_tab():
 
 async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={"group_id": 44})
+    reg.update(sid, runtime={
+        "group_id": 44,
+        "current_target_id": "ext-tab-10",
+    })
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
+    await ext.announce_attached(
+        tab_id=10, url="https://existing/", group_id=44,
+        group_title="Research")
     client = _FakeClient()
-    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    async def _noop_frame(_text):
+        return None
+
+    async def _noop_close(_reason):
+        return None
+
+    binding_owner = ExtensionUpstream(relay, _noop_frame, _noop_close)
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay, session_id=sid,
+        binding_owner=binding_owner)
     run_task = asyncio.create_task(bridge.run())
     try:
         client.feed({"id": 3, "method": "Target.createTarget",
@@ -427,14 +613,22 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
     client = _FakeClient()
-    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    async def _noop_frame(_text):
+        return None
+
+    async def _noop_close(_reason):
+        return None
+
+    binding_owner = ExtensionUpstream(relay, _noop_frame, _noop_close)
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay, session_id=sid,
+        binding_owner=binding_owner)
     run_task = asyncio.create_task(bridge.run())
     try:
         # Simulate the agent path winning the race after the facade bridge was
-        # constructed: the group id is now in the shared in-process truth, but
-        # not in bridge._group_id's constructor-time cache.
-        relay.bind_session_group(sid, 88)
-        assert bridge._group_id is None  # noqa: SLF001
+        # constructed: the adapter-owned live binding is immediately visible
+        # to the facade; neither the relay nor bridge keeps a duplicate cache.
+        binding_owner._bind_group(sid, 88)  # noqa: SLF001
 
         client.feed({"id": 3, "method": "Target.createTarget",
                      "params": {"url": "https://new/"}})
@@ -442,7 +636,7 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
         tid = res["result"]["targetId"]
         tab_id = int(tid.rsplit("-", 1)[1])
         assert ext.tabs_meta[tab_id]["groupId"] == 88
-        assert bridge._group_id == 88  # noqa: SLF001
+        assert binding_owner.group_for_session(sid) == 88
         assert (reg.get(sid).get("runtime") or {})["group_id"] == 88
     finally:
         client.eof()
@@ -483,7 +677,7 @@ async def test_session_scoped_create_target_persists_group_id(monkeypatch):
     assert isinstance(fields["runtime"]["updated_at"], float)
 
 
-async def test_session_scoped_create_target_reuses_persisted_group_id():
+async def test_session_scoped_create_target_does_not_trust_bare_group_id():
     async with _wired() as (relay, ext, client, bridge):
         bridge = ExtensionFacadeBridge(
             client=client, relay=relay,
@@ -494,8 +688,8 @@ async def test_session_scoped_create_target_reuses_persisted_group_id():
         assert ext.create_tab_messages
         created = ext.create_tab_messages[-1]
         assert created["groupName"] == "Scoped Session"
-        assert created["groupId"] == 42
-        assert bridge._ext._groups["bw-s"] == 42  # noqa: SLF001
+        assert "groupId" not in created
+        assert bridge._ext._groups["bw-s"] == 700  # noqa: SLF001
 
 
 # ---- A4: Runtime.enable barrier --------------------------------------------
@@ -817,3 +1011,69 @@ async def test_main_frame_id_rewrite_round_trip_and_agent_path_isolation():
         await client.wait_for(lambda f: f.get("id") == 61 and "result" in f)
         assert captured and captured[0]["frameId"] == real_frame_id, (
             f"inbound command frameId not rewritten back; got {captured}")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="KNOWN BUG (unfixed): the session's first tab is never announced to "
+           "a session-bound facade bridge. See the docstring for the exact "
+           "ordering. This is a real, deterministic defect found while "
+           "diagnosing PageBindTimeout; it is NOT the whole cause of the "
+           "extension e2e PageBindTimeout failures (fixing it alone leaves "
+           "context.pages empty because Playwright's CRPage init still never "
+           "completes), so it is recorded here rather than papered over.",
+)
+async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
+    """Cold-bind regression: the session's FIRST tab must reach Playwright.
+
+    When the AGENT path opens the first tab of a session that has no tab group
+    yet, the extension emits ``attached`` BEFORE the createTab response, so the
+    relay fan-out reaches this bridge while the session→group binding (written
+    from that response) still does not exist. The visibility check then reports
+    "not in my group" and the announce is skipped -- permanently, because no
+    later event ever re-announces a tab. Playwright's ``context.pages`` stays
+    empty and ``bind_current_page`` raises ``PageBindTimeout`` no matter how
+    long it waits.
+    """
+    from browserwright.daemon.server.extension_upstream import ExtensionUpstream
+
+    sid = reg.allocate(backend="extension", owner="create", name="Cold")
+    # NOTE: deliberately NO runtime={"group_id": ...} -- this is a cold session.
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        # Playwright completes its discovery handshake FIRST: the executor
+        # cold-start connects the facade before it resolves the session target.
+        client.feed({"id": 1, "method": "Target.setDiscoverTargets",
+                     "params": {"discover": True}})
+        assert await client.wait_for(lambda f: f.get("id") == 1
+                                     and "result" in f)
+
+        # Now the AGENT path opens the session's first tab.
+        async def _noop(_):
+            return None
+
+        agent = ExtensionUpstream(relay, _noop, _noop)
+        opened = await agent.open_background_tab(
+            "about:blank", group_name="Cold", session_id=sid,
+            skip_post_attach_commands=True)
+        target_id = opened["targetId"]
+
+        # The authoritative target MUST be announced to Playwright.
+        await client.wait_for(
+            lambda f: f.get("method") == "Target.attachedToTarget"
+            and f["params"]["targetInfo"]["targetId"] == target_id,
+            timeout=3.0)
+    finally:
+        client.eof()
+        with contextlib_suppress():
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()

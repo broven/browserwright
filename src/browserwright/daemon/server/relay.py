@@ -102,6 +102,61 @@ class GhostTarget:
 
 
 @dataclass
+class _InflightCall:
+    """What one entry of ``_ExtensionConn.pending`` is *for*, and since when.
+
+    ``pending`` itself stays a bare ``dict[int, Future]`` (several tests hand-
+    insert futures into it, and a Future is all the resolve path needs). This
+    parallel table carries the operator-facing answer — "which call, how long"
+    — so a stuck relay hop can name itself in `browserwright-daemon ps` instead
+    of showing up as an anonymous count. Entries are best-effort: a future
+    inserted directly into ``pending`` simply has no meta row.
+    """
+
+    id: int
+    kind: str                    # the app-level `type` (command / createTab / …)
+    method: str = ""             # CDP method, for `type == "command"`
+    tab_id: int | None = None
+    started_at: float = field(default_factory=time.monotonic)
+    attempt: int = 1             # 2 on a post-reconnect retry
+
+    def elapsed_s(self, *, now: float | None = None) -> float:
+        now = time.monotonic() if now is None else now
+        return max(0.0, now - self.started_at)
+
+    def describe(self, *, now: float | None = None) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "method": self.method,
+            "tab_id": self.tab_id,
+            "attempt": self.attempt,
+            "elapsed_s": round(self.elapsed_s(now=now), 3),
+        }
+
+
+def _oldest_pending_s(ext: "_ExtensionConn") -> float | None:
+    """Age of this connection's longest-outstanding relay call, or None when it
+    is idle (or when every pending future was inserted without meta)."""
+    metas = getattr(ext, "pending_meta", None)
+    if not metas:
+        return None
+    now = time.monotonic()
+    return round(max(m.elapsed_s(now=now) for m in metas.values()), 3)
+
+
+def _inflight_from_body(body: dict, cmd_id: int, *, attempt: int = 1) -> _InflightCall:
+    tab_id = body.get("tabId")
+    return _InflightCall(
+        id=cmd_id,
+        kind=str(body.get("type") or "?"),
+        method=str(body.get("method") or ""),
+        tab_id=tab_id if isinstance(tab_id, int) else None,
+        attempt=attempt,
+    )
+
+
+@dataclass
 class _ExtensionConn:
     """One connected extension. v0.4 supports multiple in theory (e.g., user
     runs Chrome + Edge with the extension installed in both); the daemon
@@ -116,6 +171,9 @@ class _ExtensionConn:
     version_drift: str = VersionDrift.UNKNOWN.value
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     pending: dict[int, asyncio.Future] = field(default_factory=dict)
+    #: Same keys as `pending`, describing what each awaited call is (see
+    #: `_InflightCall`). Maintained only by `_request` / the retry path.
+    pending_meta: dict[int, _InflightCall] = field(default_factory=dict)
     tabs: dict[int, GhostTarget] = field(default_factory=dict)
     last_frame_ts: float = field(default_factory=time.monotonic)
     app_ping_task: asyncio.Task | None = None
@@ -134,6 +192,11 @@ class RelayServer:
         self._host = host
         self._server: Any = None
         self._extensions: dict[str, _ExtensionConn] = {}
+        # Monotonic connection epoch. A fresh extension hello may represent a
+        # Chrome restart, where numeric tab/group ids can be recycled. Session
+        # adapters use this to demote in-memory group bindings back to
+        # ownership-checked recovery candidates after every reconnect.
+        self._connection_generation: int = 0
         self._next_cmd_id: int = 1
         self._first_ready = asyncio.Event()
         # Hook: every event-frame from any extension gets called back here so
@@ -147,11 +210,6 @@ class RelayServer:
         # the relay calls alongside `_on_event` — the facade registers/removes
         # itself here per connection without disturbing the agent handler.
         self._event_listeners: set[Callable[[dict], Awaitable[None]]] = set()
-        # Shared extension-session state. The daemon's primary
-        # ExtensionUpstream and every Playwright facade bridge are separate
-        # adapter instances over this one relay, so relay-scoped state is the
-        # in-process truth they can all see immediately.
-        self._session_groups: dict[str, int] = {}
         self._session_announce_events: dict[str, asyncio.Event] = {}
         self._reload_attempts: set[tuple[str, str, str]] = set()
 
@@ -209,6 +267,18 @@ class RelayServer:
     def is_ready(self) -> bool:
         return any(e.hello_received.is_set() for e in self._extensions.values())
 
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
+
+    def _require_generation(self, expected_generation: int | None) -> None:
+        """Refuse a destructive command after its ownership epoch changed."""
+        if (expected_generation is not None
+                and expected_generation != self._connection_generation):
+            raise ConnectionError(
+                "extension generation changed after ownership validation; "
+                "destructive request was not sent")
+
     def set_event_handler(
         self, handler: Callable[[dict], Awaitable[None]] | None,
     ) -> None:
@@ -236,15 +306,6 @@ class RelayServer:
     ) -> None:
         """Drop a fan-out observer (facade disconnect/stop). Idempotent."""
         self._event_listeners.discard(handler)
-
-    def bind_session_group(self, session_id: str, group_id: int) -> None:
-        if isinstance(group_id, int) and group_id >= 0:
-            self._session_groups[session_id] = group_id
-
-    def session_group(self, session_id: str | None) -> int | None:
-        if not session_id:
-            return None
-        return self._session_groups.get(session_id)
 
     def reset_session_announce(self, session_id: str | None) -> None:
         if not session_id:
@@ -286,10 +347,12 @@ class RelayServer:
         [{tabId,url,title,active,lastAccessed}, ...]}`` — ``groupId == -1`` /
         empty tabs when no group matches (the session's browser has no tabs).
         Returns None when no extension is connected (caller falls back)."""
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
         ext = self._pick_active_extension()
         if ext is None:
             return None
-        ext = await self._ensure_extension_fresh(ext)
+        ext = await self._ensure_extension_fresh(
+            ext, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
         if ext is None:
             return None
         body: dict = {"type": "queryGroup"}
@@ -297,11 +360,15 @@ class RelayServer:
             body["groupName"] = group_name
         if isinstance(group_id, int) and group_id >= 0:
             body["groupId"] = group_id
-        return await self._request(ext, body, timeout=timeout)
+        return await self._request(
+            ext, body,
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            replay_safe=True)
 
     async def attach_active_tab(self, *,
                                 group_name: str | None = None,
                                 group_id: int | None = None,
+                                expected_generation: int | None = None,
                                 timeout: float = 10.0) -> GhostTarget:
         """Daemon-driven adopt (docs C1): ask the extension to MOVE Chrome's
         currently-focused-window active tab into this session's tab group and
@@ -321,7 +388,8 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
-        ext = await self._ensure_extension_fresh_or_raise(ext)
+        ext = await self._ensure_extension_fresh_or_raise(ext, timeout=timeout)
+        self._require_generation(expected_generation)
         last_err: Exception | None = None
         body: dict = {"type": "attachActive"}
         if group_name:
@@ -358,6 +426,7 @@ class RelayServer:
             "attach active failed (no error captured)")
 
     async def attach_tab(self, tab_id: int, *,
+                         expected_generation: int | None = None,
                          timeout: float = 5.0) -> GhostTarget:
         """Tell the extension to `chrome.debugger.attach({tabId})`. Retries
         up to ATTACH_RETRY_LIMIT on "already attached" errors.
@@ -367,7 +436,8 @@ class RelayServer:
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
-        ext = await self._ensure_extension_fresh_or_raise(ext)
+        ext = await self._ensure_extension_fresh_or_raise(ext, timeout=timeout)
+        self._require_generation(expected_generation)
         # Idempotency: extension may already hold chrome.debugger.attach on
         # this tab (popup click, prior daemon lifecycle — the SW survives
         # daemon restarts and re-announces attached tabs on reconnect, so
@@ -406,7 +476,7 @@ class RelayServer:
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             return
-        ext = await self._ensure_extension_fresh(ext)
+        ext = await self._ensure_extension_fresh(ext, timeout=timeout)
         if ext is None:
             return
         try:
@@ -424,6 +494,7 @@ class RelayServer:
         group_id: int | None = None,
         background: bool = True,
         skip_post_attach_commands: bool = False,
+        expected_generation: int | None = None,
         timeout: float = 10.0,
     ) -> GhostTarget:
         """Spec Phase B Feature 1: open a tab in the background (active=false)
@@ -442,10 +513,13 @@ class RelayServer:
         (which may be ``-1`` when no group was requested or grouping failed in
         a recoverable way).
         """
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
-        ext = await self._ensure_extension_fresh_or_raise(ext)
+        ext = await self._ensure_extension_fresh_or_raise(
+            ext, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+        self._require_generation(expected_generation)
         body: dict = {"type": "createTab", "url": url}
         if group_name:
             body["groupName"] = group_name
@@ -458,7 +532,9 @@ class RelayServer:
             body["background"] = False
         if skip_post_attach_commands:
             body["skipPostAttachCommands"] = True
-        result = await self._request(ext, body, timeout=timeout) or {}
+        result = await self._request(
+            ext, body,
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time())) or {}
         tab_id = int(result.get("tabId", -1))
         if tab_id < 0:
             raise RuntimeError(
@@ -482,10 +558,11 @@ class RelayServer:
         return gt
 
     async def close_tab(self, tab_id: int, *,
+                        expected_generation: int | None = None,
                         timeout: float = 5.0) -> None:
         """Spec Phase B Feature 2: close a tab via chrome.tabs.remove (not a
-        debugger detach). Clears the ghost-target entry whether or not the
-        extension confirmed.
+        debugger detach). Clears the ghost-target entry only after the
+        extension confirms Chrome removed the tab.
 
         Raises if no extension is connected at all — silently returning
         success here would lie to callers about a close that never went
@@ -494,15 +571,16 @@ class RelayServer:
         ghost registration), so a None return means "no extension exists"
         rather than "no extension owns this specific tab id".
         """
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             raise RuntimeError(f"no extension knows tab {tab_id}")
-        ext = await self._ensure_extension_fresh_or_raise(ext)
-        try:
-            await self._request(
-                ext, {"type": "closeTab", "tabId": tab_id}, timeout=timeout)
-        except Exception as e:
-            logger.warning("close_tab(tab=%d) failed: %r", tab_id, e)
+        ext = await self._ensure_extension_fresh_or_raise(
+            ext, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+        self._require_generation(expected_generation)
+        await self._request(
+            ext, {"type": "closeTab", "tabId": tab_id},
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
         ext.tabs.pop(tab_id, None)
 
     async def send_cdp(self, tab_id: int, method: str, params: dict,
@@ -513,7 +591,7 @@ class RelayServer:
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             raise RuntimeError(f"no extension owns tab {tab_id}")
-        ext = await self._ensure_extension_fresh_or_raise(ext)
+        ext = await self._ensure_extension_fresh_or_raise(ext, timeout=timeout)
         return await self._request(ext, {
             "type": "command",
             "tabId": tab_id,
@@ -522,19 +600,50 @@ class RelayServer:
         }, timeout=timeout) or {}
 
     async def userscript_request(self, verb: str, payload: dict,
-                                 *, timeout: float = 5.0) -> dict | None:
+                                 *, timeout: float = 5.0,
+                                 **kwargs: Any) -> dict | None:
         """Forward a userscript control request to any ready extension.
 
         Userscript operations are extension-global rather than tab-scoped, so
         unlike ``send_cdp`` they only need a connected extension, not a tab
         owner.
+
+        ``session_ids`` (sent by the verb layer to scope installs on the
+        raw-CDP backend, where the workspace is the browser instance) is
+        accepted and dropped here: the extension owns the scripts, the
+        extension's ``background.js`` dispatch reads no session ids, and the
+        message must not carry keys it does not understand.
         """
         ext = self._pick_active_extension()
         if ext is None:
             raise RuntimeError("no extension connected")
-        ext = await self._ensure_extension_fresh_or_raise(ext)
+        ext = await self._ensure_extension_fresh_or_raise(ext, timeout=timeout)
         return await self._request(
             ext, {"type": f"userscript.{verb}", **payload}, timeout=timeout)
+
+    def inflight_snapshot(self) -> list[dict]:
+        """Every relay call currently awaiting an extension response.
+
+        This is the hop the original diagnosis could not see: a future left in
+        `_ExtensionConn.pending` forever produced no log line, no `/__status__`
+        change, and no error — the daemon just went quiet. One row per awaited
+        call, newest last, each carrying how long it has been outstanding.
+
+        Read-only and allocation-cheap; safe to call from an RPC handler.
+        """
+        now = time.monotonic()
+        rows: list[dict] = []
+        for ext in self._extensions.values():
+            for cmd_id, fut in sorted(ext.pending.items()):
+                meta = ext.pending_meta.get(cmd_id)
+                row = (meta.describe(now=now) if meta is not None
+                       else {"id": cmd_id, "kind": "?", "method": "",
+                             "tab_id": None, "attempt": 1, "elapsed_s": None})
+                row["install_id"] = ext.install_id
+                row["done"] = fut.done()
+                rows.append(row)
+        rows.sort(key=lambda r: (r["elapsed_s"] is None, -(r["elapsed_s"] or 0.0)))
+        return rows
 
     def status_payload(self) -> dict:
         extensions = [
@@ -613,6 +722,11 @@ class RelayServer:
             "protocol_compatible": protocol_compatible,
             "app_compatible": app_compatible,
             "version_drift": drift,
+            # How many relay calls this connection is currently awaiting. The
+            # diagnosis that motivated C1 had exactly one stuck entry here while
+            # `/__status__` reported a perfectly healthy `extensions=1`.
+            "pending": len(getattr(ext, "pending", ())),
+            "oldest_pending_s": _oldest_pending_s(ext),
         }
 
     async def _send_reload_extension(
@@ -697,7 +811,7 @@ class RelayServer:
         return (time.monotonic() - ext.last_frame_ts) > STALE_FRAME_AFTER
 
     async def _ensure_extension_fresh(
-        self, ext: _ExtensionConn,
+        self, ext: _ExtensionConn, *, timeout: float | None = None,
     ) -> _ExtensionConn | None:
         """Return a live extension connection, force-closing ghost sockets.
 
@@ -708,17 +822,33 @@ class RelayServer:
         """
         if not self._extension_is_stale(ext):
             return ext
+        deadline = (
+            None if timeout is None
+            else asyncio.get_running_loop().time() + max(0.0, timeout))
         await self._force_close_extension(ext, reason="stale app-level heartbeat")
-        return await self._wait_for_replacement(ext, timeout=RECONNECT_WAIT_TIMEOUT)
+        wait_timeout = RECONNECT_WAIT_TIMEOUT
+        if deadline is not None:
+            wait_timeout = min(
+                wait_timeout,
+                max(0.0, deadline - asyncio.get_running_loop().time()))
+        return await self._wait_for_replacement(ext, timeout=wait_timeout)
 
     async def _ensure_extension_fresh_or_raise(
-        self, ext: _ExtensionConn,
+        self, ext: _ExtensionConn, *, timeout: float | None = None,
     ) -> _ExtensionConn:
-        fresh = await self._ensure_extension_fresh(ext)
+        fresh = await self._ensure_extension_fresh(ext, timeout=timeout)
+        wait_timeout = (
+            RECONNECT_WAIT_TIMEOUT if timeout is None
+            else min(RECONNECT_WAIT_TIMEOUT, max(0.0, timeout)))
         if fresh is None:
             raise RuntimeError(
                 "extension relay connection appears stale and did not reconnect "
-                f"within {RECONNECT_WAIT_TIMEOUT:.0f}s")
+                f"within {wait_timeout:.3g}s")
+        if fresh is not ext:
+            raise ConnectionError(
+                "extension reconnected before a non-replayable request; "
+                "request was not sent on the replacement connection and the "
+                "caller must revalidate ownership")
         return fresh
 
     async def _force_close_extension(self, ext: _ExtensionConn, *, reason: str) -> None:
@@ -775,9 +905,11 @@ class RelayServer:
         timeout: float,
         loop: asyncio.AbstractEventLoop,
     ) -> dict | None:
+        deadline = loop.time() + max(0.0, timeout)
         await self._force_close_extension(ext, reason=f"{body.get('type')} request failed")
+        remaining = max(0.0, deadline - loop.time())
         replacement = await self._wait_for_replacement(
-            ext, timeout=RECONNECT_WAIT_TIMEOUT)
+            ext, timeout=min(RECONNECT_WAIT_TIMEOUT, remaining))
         if replacement is None:
             raise ConnectionError(
                 "extension relay did not reconnect after request failure")
@@ -785,35 +917,64 @@ class RelayServer:
         retry_body = {**{k: v for k, v in body.items() if k != "id"}, "id": retry_id}
         retry_fut: asyncio.Future = loop.create_future()
         replacement.pending[retry_id] = retry_fut
+        replacement.pending_meta[retry_id] = _inflight_from_body(
+            retry_body, retry_id, attempt=2)
         try:
-            await replacement.conn.send(json.dumps(retry_body))
-            return await asyncio.wait_for(retry_fut, timeout=timeout)
+            remaining = max(0.0, deadline - loop.time())
+            await asyncio.wait_for(
+                replacement.conn.send(json.dumps(retry_body)),
+                timeout=remaining)
+            remaining = max(0.0, deadline - loop.time())
+            return await asyncio.wait_for(retry_fut, timeout=remaining)
         finally:
             replacement.pending.pop(retry_id, None)
+            replacement.pending_meta.pop(retry_id, None)
 
-    async def _request(self, ext: _ExtensionConn, body: dict, *,
-                       timeout: float) -> dict | None:
+    async def _request(
+        self, ext: _ExtensionConn, body: dict, *, timeout: float,
+        replay_safe: bool = False,
+    ) -> dict | None:
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
         cmd_id = self._alloc_id()
         body = {**body, "id": cmd_id}
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ext.pending[cmd_id] = fut
+        ext.pending_meta[cmd_id] = _inflight_from_body(body, cmd_id)
         try:
-            await ext.conn.send(json.dumps(body))
-            return await asyncio.wait_for(fut, timeout=timeout)
+            remaining = max(0.0, deadline - loop.time())
+            await asyncio.wait_for(
+                ext.conn.send(json.dumps(body)), timeout=remaining)
+            remaining = max(0.0, deadline - loop.time())
+            return await asyncio.wait_for(fut, timeout=remaining)
         except asyncio.TimeoutError:
             if not self._extension_is_stale(ext):
                 raise
+            if not replay_safe:
+                await self._force_close_extension(
+                    ext, reason=f"{body.get('type')} outcome unknown")
+                raise ConnectionError(
+                    "non-replayable extension request lost its connection; "
+                    "outcome is unknown, request was not retried, and the "
+                    "caller must revalidate ownership")
             return await self._retry_request_on_replacement(
-                ext, body, timeout=timeout, loop=loop)
+                ext, body, timeout=max(0.0, deadline - loop.time()), loop=loop)
         except (ConnectionError, websockets.exceptions.ConnectionClosed):
+            if not replay_safe:
+                await self._force_close_extension(
+                    ext, reason=f"{body.get('type')} outcome unknown")
+                raise ConnectionError(
+                    "non-replayable extension request lost its connection; "
+                    "outcome is unknown, request was not retried, and the "
+                    "caller must revalidate ownership")
             return await self._retry_request_on_replacement(
-                ext, body, timeout=timeout, loop=loop)
+                ext, body, timeout=max(0.0, deadline - loop.time()), loop=loop)
         finally:
             if not fut.cancelled():
                 with contextlib.suppress(BaseException):
                     fut.exception()
             ext.pending.pop(cmd_id, None)
+            ext.pending_meta.pop(cmd_id, None)
 
     # ---- ws handlers -----------------------------------------------------
 
@@ -898,6 +1059,7 @@ class RelayServer:
         kind = msg.get("type")
 
         if kind == "hello":
+            self._connection_generation += 1
             ext.install_id = str(msg.get("installId") or "")
             ext.browser = str(msg.get("browser") or "")
             ext.version = str(msg.get("version") or "")
@@ -1006,6 +1168,11 @@ class RelayServer:
             if tab_id < 0:
                 return
             ext.tabs.pop(tab_id, None)
+            if self._on_event is not None:
+                try:
+                    await self._on_event(msg)
+                except Exception as e:
+                    logger.warning("relay detached handler raised: %r", e)
             self._schedule_fanout_listeners(msg)
             return
 
@@ -1013,6 +1180,7 @@ class RelayServer:
             rid = msg.get("id")
             if isinstance(rid, int) and rid in ext.pending:
                 fut = ext.pending.pop(rid)
+                ext.pending_meta.pop(rid, None)
                 if not fut.done():
                     if "error" in msg:
                         err = msg["error"] or {}

@@ -23,6 +23,11 @@ run it after interrupting an e2e run.
 
 ## Project Architecture Reference
 
+**[CONTEXT.md](CONTEXT.md) is the glossary** — what `session`, `workspace`,
+`upstream`, `executor`, `facade`, `relay`, `ledger`, and `binding` mean here,
+plus the trap attached to each. Read it before writing about this system; when
+it and the code disagree, one of them is a bug — don't invent a third word.
+
 Before changing session routing, backend semantics, tab creation, Playwright
 facade behavior, or teardown semantics, read `docs/session-workspaces.md`.
 

@@ -263,11 +263,37 @@ class PlaywrightFacade:
         through the shared relay with target-event synthesis (PR2); otherwise
         resolve the rdp Chrome's real CDP ws and pump frames byte-for-byte."""
         task = asyncio.current_task()
+        lease_token: object | None = None
         if task is not None:
             self._sessions.add(task)
+
+        async def revoke_connection() -> None:
+            with contextlib.suppress(Exception):
+                await conn.close(code=1008, reason="browserwright session ended")
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
         try:
             try:
-                ctx = self._context_for_connection(conn)
+                session_id = self._session_for_connection(conn)
+                shared = getattr(self._daemon, "shared_context", None)
+                if (not session_id and shared is not None
+                        and getattr(shared, "backend", None) == "env"):
+                    with contextlib.suppress(Exception):
+                        await conn.close(
+                            code=1008,
+                            reason="env facade requires browserwright session")
+                    return
+                acquire = getattr(self._daemon, "acquire_session_lease", None)
+                if session_id and callable(acquire):
+                    lease_token = object()
+                    ctx = acquire(
+                        session_id, lease_token, revoke_connection,
+                        kind="facade")
+                else:
+                    ctx = self._context_for_connection(conn)
             except UnknownSessionError:
                 with contextlib.suppress(Exception):
                     await conn.close(code=1008, reason="unknown browserwright session")
@@ -278,6 +304,9 @@ class PlaywrightFacade:
                 return
             await self._handle_rdp_client(conn, ctx)
         finally:
+            release = getattr(self._daemon, "release_session_lease", None)
+            if lease_token is not None and callable(release):
+                release(lease_token)
             if task is not None:
                 self._sessions.discard(task)
 
@@ -298,21 +327,22 @@ class PlaywrightFacade:
                 await conn.close(code=1011, reason="extension relay unavailable")
             return
         session_id = self._session_for_connection(conn)
-        session_name = None
-        session_group_id = None
-        if session_id:
-            from ... import session_registry
-            rec = session_registry.get(session_id)
-            if isinstance(rec, dict):
-                session_name = rec.get("name")
-                runtime = rec.get("runtime") or {}
-                gid = runtime.get("group_id") if isinstance(runtime, dict) else None
-                if isinstance(gid, int) and gid >= 0:
-                    session_group_id = gid
+        binding_owner = None
+        if ctx is not None:
+            try:
+                await ctx.holder.ensure_open()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("facade(ext): upstream unavailable: %r", e)
+                with contextlib.suppress(Exception):
+                    await conn.close(code=1011, reason="extension upstream unavailable")
+                return
+            from .extension_upstream import ExtensionUpstream
+            candidate = ctx.router.upstream
+            if isinstance(candidate, ExtensionUpstream):
+                binding_owner = candidate
         bridge = ExtensionFacadeBridge(
             client=conn, relay=relay,
-            session_id=session_id, session_name=session_name,
-            session_group_id=session_group_id)
+            session_id=session_id, binding_owner=binding_owner)
         try:
             await bridge.run()
         except websockets.exceptions.ConnectionClosed:

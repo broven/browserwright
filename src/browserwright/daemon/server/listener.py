@@ -3,12 +3,12 @@
 This module wires together:
   - `_ipc` (socket file / ping)
   - `state` (DaemonState)
-  - `upstream` (UpstreamConnection)
+  - `upstream` (the Upstream protocol and its adapters)
   - `proxy` (Router)
 
 Spec §8.5: the listener task accepts clients, the upstream-lifecycle task
 opens/closes the upstream ws lazily, and the keepalive task is built into
-UpstreamConnection (heartbeat) + websockets server (ws-level pings).
+CdpUpstream (heartbeat) + websockets server (ws-level pings).
 
 v0.2 single-client model: the second ws upgrade is rejected with HTTP 503
 + a clear body. spec §9.2.
@@ -35,11 +35,14 @@ from .. import __version__
 from ..config import Config
 from ..errors import Unavailable
 from ..resolver import resolve
-from ..observability import install_json_logging_if_requested
+from ..observability import (
+    install_json_logging_if_requested,
+    install_sigusr1_traceback,
+)
 from .state import CloseReason, DaemonState, UpstreamPhase
 from .proxy import Router
 from .daemon import Daemon, UnknownSessionError, UpstreamContext
-from .upstream import UpstreamConnection
+from .upstream import CdpUpstream, Upstream
 from .relay import RelayServer
 from .extension_upstream import ExtensionUpstream
 from .facade import PlaywrightFacade
@@ -47,6 +50,26 @@ from .facade import PlaywrightFacade
 logger = logging.getLogger(__name__)
 
 _SESSION_PRUNE_INTERVAL_S = 3600.0
+
+
+def _executor_ready_budget_s() -> float:
+    """Bound extension reconnect grace below the control-plane deadline."""
+    try:
+        return float(os.environ.get("BW_EXT_READY_BUDGET_S", "") or 10.0)
+    except (TypeError, ValueError):
+        return 10.0
+
+
+_EXECUTOR_READY_BUDGET_S = _executor_ready_budget_s()
+
+_NO_EXTENSION_CONNECTED_MSG = (
+    "no browserwright extension is connected to the daemon (session {sid}). "
+    "Open the browser where the extension is installed and ensure it is "
+    "enabled; if you just installed or upgraded browserwright, reload the "
+    "extension at chrome://extensions so its service worker reconnects to the "
+    "daemon relay. Then retry. (Use --backend=rdp --create for an isolated "
+    "Chrome that needs no extension.)"
+)
 
 
 # ---- per-upstream context factory ------------------------------------------
@@ -75,16 +98,25 @@ def make_context(*, backend: str, cfg: Config,
 # ---- top-level entry -------------------------------------------------------
 
 
-def _reclaim_stale_daemon_ports(cfg: Config) -> None:
+def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
     """Reclaim the relay/facade ports from a *confirmed* stale browserwright
     daemon (issue #15, 2.2). No-op when the ports are free or held by an
-    unconfirmed process (we never SIGTERM a stranger)."""
+    unconfirmed process (we never SIGTERM a stranger).
+
+    The write-side twin of `cli status`: both read the world through the same
+    `probe.DaemonProbe` so they can never disagree about which ports matter or
+    who counts as a confirmed holder. Only the reclaim itself is local, because
+    only this side mutates. `probe` is injectable for tests; production passes
+    nothing.
+    """
     from .. import _stale
-    ports = _stale.daemon_tcp_ports(cfg)
-    held = [p for p in ports if _stale.port_is_listening("127.0.0.1", p)]
+    from ..probe import DaemonProbe
+
+    p = probe if probe is not None else DaemonProbe(cfg)
+    held = p.listening_ports(p.daemon_ports())
     if not held:
         return
-    pid = _stale.confirmed_stale_holder(held)
+    pid = p.confirmed_stale_holder(held)
     if pid is None:
         logger.warning(
             "ports %s are in use but no confirmed browserwright daemon holds "
@@ -180,6 +212,10 @@ async def run_serve(cfg: Config) -> int:
     # v0.5: opt-in JSON log formatter. After _wire_logging adds the
     # file/console handlers, swap formatters in place if BD_LOG_JSON=1.
     install_json_logging_if_requested()
+    # `kill -USR1 <daemon pid>` dumps every thread's stack into the daemon log.
+    # `ps` answers "who is waiting"; this answers "on what line". Armed before
+    # anything can hang, and a no-op until someone signals.
+    install_sigusr1_traceback("daemon")
     logger.info("browserwright-daemon %s starting (backend=%s)",
                 __version__, cfg.backend or "extension")
 
@@ -513,9 +549,29 @@ class _ClientHandler:
         label = query.get("client", "anonymous")
         session_id = query.get("session") or None
 
+        lease_token: object | None = None
+        handler_task = asyncio.current_task()
+
+        async def revoke_connection() -> None:
+            with contextlib.suppress(Exception):
+                await conn.close(code=1008, reason="browserwright session ended")
+            if (handler_task is not None
+                    and handler_task is not asyncio.current_task()):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await handler_task
+
         try:
-            ctx = (self.daemon.context_for_required(session_id)
-                   if session_id else self.daemon.context_for(None))
+            if session_id:
+                acquire = getattr(self.daemon, "acquire_session_lease", None)
+                if callable(acquire):
+                    lease_token = object()
+                    ctx = acquire(
+                        session_id, lease_token, revoke_connection,
+                        kind="control")
+                else:
+                    ctx = self.daemon.context_for_required(session_id)
+            else:
+                ctx = self.daemon.context_for(None)
         except UnknownSessionError:
             logger.warning("refusing client %s: unknown session %s",
                            label, session_id)
@@ -539,6 +595,7 @@ class _ClientHandler:
         client = state.allocate_client(
             label, client_id=next(self.daemon._next_client_id),
             session_id=session_id, session_name=session_name)
+        client.connection_token = lease_token
 
         async def send_to_client(text: str) -> None:
             try:
@@ -550,13 +607,8 @@ class _ClientHandler:
         router.bind_lifecycle(
             ensure_upstream=holder.ensure_open,
             trigger_disconnect=holder.trigger_close,
+            prepare_executor=holder.prepare_executor,
         )
-
-        # If upstream is already open (warm from another client), make sure the
-        # router has the send fn wired. (The first ensure_open call wires it
-        # internally; subsequent client sessions inherit it.)
-        if holder.is_open:
-            router.update_upstream_send(holder.send_text)
 
         logger.info("client %d connected (label=%s, session=%s, backend=%s, total=%d)",
                     client.client_id, label, session_id or "-", ctx.backend,
@@ -574,6 +626,10 @@ class _ClientHandler:
         finally:
             await router.release_client(client.client_id)
             router.unregister_client(client.client_id)
+            if lease_token is not None:
+                release = getattr(self.daemon, "release_session_lease", None)
+                if callable(release):
+                    release(lease_token)
             # Upstream stays warm so other clients (or the next reconnect)
             # don't pay banner-flash for our churn.
 
@@ -582,7 +638,7 @@ class _ClientHandler:
 
 
 class _UpstreamHolder:
-    """Owns the single UpstreamConnection. Provides lazy-open + graceful-close
+    """Owns the single Upstream adapter. Provides lazy-open + graceful-close
     primitives the Router can call.
 
     v0.4: when `cfg.backend == "extension"` we replace the conventional ws
@@ -596,7 +652,10 @@ class _UpstreamHolder:
                  *, session_id: str | None = None):
         self.state = state
         self.router = router
-        self.upstream: UpstreamConnection | ExtensionUpstream | None = None
+        self.upstream: Upstream | None = None
+        # Keep the extension adapter (and its live session→group bindings)
+        # across idle detach/reattach. The relay is transport only.
+        self._extension_adapter: ExtensionUpstream | None = None
         self._open_lock = asyncio.Lock()
         self._cfg: Config = cfg
         # v0.4: only populated when backend=extension. Owned by the holder
@@ -620,17 +679,37 @@ class _UpstreamHolder:
         return self.upstream is not None and self.upstream.is_open
 
     async def send_text(self, frame: str) -> None:
-        """Proxy to the live UpstreamConnection.send_text.
+        """Proxy to the live Upstream.send_cdp.
 
-        Exposed on the holder so callers in this module can pass
-        `holder.send_text` as the router's `upstream_send` callable without
-        needing to drill through `holder.upstream.send_text` (which races
-        with close: holder.upstream may become None mid-call).
+        Exposed for lifecycle callers that should not drill through
+        ``holder.upstream`` while it may be replaced or cleared on reconnect.
         """
         conn = self.upstream
         if conn is None:
             raise RuntimeError("upstream not open")
-        await conn.send_text(frame)
+        await conn.send_cdp(frame)
+
+    async def prepare_executor(self, session_id: str) -> None:
+        """Backend-owned cold-start preflight for ``ensureExecutor``.
+
+        Raw-CDP holders need no separate readiness check: ``ensure_open`` below
+        launches/resolves their browser. The extension holder gives its
+        service worker a short reconnect grace and then fails with the useful
+        diagnosis before the normal 60-second interactive open can outlive the
+        control-plane response deadline. This probe never mutates the upstream
+        state machine, so a later extension reconnect remains recoverable.
+        """
+        if self.relay is None:
+            return
+        if self.relay.is_ready:
+            return
+        try:
+            await self.relay.wait_ready(timeout=_EXECUTOR_READY_BUDGET_S)
+        except Exception:  # noqa: BLE001 - timeout + relay reconnect hiccups
+            pass
+        if not self.relay.is_ready:
+            raise Unavailable(
+                _NO_EXTENSION_CONNECTED_MSG.format(sid=session_id))
 
     async def _broadcast_event(self, method: str, params: dict) -> None:
         """Fan a `{method, params}` envelope to every connected client.
@@ -652,7 +731,7 @@ class _UpstreamHolder:
           - extension → wait for the relay's first extension to send hello,
             wrap in ExtensionUpstream, mark CONNECTED
           - everything else → resolve a CDP ws URL and connect a real
-            UpstreamConnection
+            CdpUpstream
 
         v0.5.3 F-3: emits two lifecycle events to subscribed clients:
           - `BrowserwrightDaemon.upstreamConnecting {backend}` at the start of
@@ -705,7 +784,7 @@ class _UpstreamHolder:
 
             # Task #76: any client frame that arrived during the lazy-open
             # window was buffered per-client. Replay them now that the
-            # upstream is live and `_upstream_send` is wired.
+            # upstream is live and atomically attached to the router.
             try:
                 await self.router.drain_pre_open_buffers()
             except Exception as e:
@@ -721,9 +800,11 @@ class _UpstreamHolder:
             raise
 
         try:
-            conn = UpstreamConnection(
+            conn = CdpUpstream(
                 on_frame=self.router.forward_from_upstream,
                 on_close=self._on_upstream_closed,
+                state=self.state,
+                on_end_session=self._end_raw_session,
             )
             await conn.open(rr.ws_url, timeout=cfg.timeout)
         except Exception as e:
@@ -732,14 +813,8 @@ class _UpstreamHolder:
             await self.state.set_disconnected()
             raise
         self.upstream = conn
-        self.router.update_upstream_send(conn.send_text)
-        # Phase 3: expose the upstream's daemon-internal command channel to the
-        # Router so the unified session verbs (openBackgroundTab / closeTab /
-        # userscript) have an rdp implementation via raw CDP — Target.create/
-        # closeTarget, Page.addScriptToEvaluateOnNewDocument. Distinct id space
-        # from client traffic (UpstreamConnection.send_command). Cleared on
-        # close (symmetric with the extension callbacks).
-        self.router._upstream_command = conn.send_command
+        # Publish the complete adapter before CONNECTED becomes visible.
+        conn.attach(self.router)
         # Tell Chrome to gossip about all targets so we can maintain the
         # last_activated table without needing the client to enable it.
         # `waitForDebuggerOnStart=False` keeps target creation immediate.
@@ -804,24 +879,30 @@ class _UpstreamHolder:
         self.rdp_profile_dir = extras.get("profile_path")
         self.rdp_port = port
 
-    def _kill_rdp_chrome(self) -> None:
+    def _kill_rdp_chrome(self) -> bool:
         """Phase 3 teardown: SIGTERM the daemon-owned Chrome for this rdp
         session (best-effort; the process may already be gone). Clears the pid
         so a later relaunch starts fresh. Leaves the profile dir on disk — it's
         a persistent `bs-s{id}` dir that orphan-cleanup sweeps on next startup;
         removing it inline races Chrome's shutdown writeback."""
         pid = self.rdp_pid
-        self.rdp_pid = None
         if pid is None:
-            return
+            return True
         import os as _os
         import signal as _signal
         try:
             _os.kill(pid, _signal.SIGTERM)
+            self.rdp_pid = None
             logger.info("killed rdp Chrome pid %d for session %s",
                         pid, self.session_id)
-        except (ProcessLookupError, PermissionError, OSError) as e:
+            return True
+        except ProcessLookupError as e:
+            self.rdp_pid = None
             logger.debug("rdp Chrome pid %s already gone: %r", pid, e)
+            return True
+        except (PermissionError, OSError) as e:
+            logger.warning("could not terminate rdp Chrome pid %s: %r", pid, e)
+            return False
 
     async def _open_extension_upstream(self, cfg: Config) -> None:
         """v0.4 extension backend: the daemon IS the upstream.
@@ -840,11 +921,14 @@ class _UpstreamHolder:
                 "extension backend selected but relay was never started — "
                 "internal bug, please report")
         try:
-            ext = ExtensionUpstream(
-                relay=self.relay,
-                on_frame=self.router.forward_from_upstream,
-                on_close=self._on_upstream_closed,
-            )
+            ext = self._extension_adapter
+            if ext is None or ext._relay is not self.relay:  # noqa: SLF001
+                ext = ExtensionUpstream(
+                    relay=self.relay,
+                    on_frame=self.router.forward_from_upstream,
+                    on_close=self._on_upstream_closed,
+                )
+                self._extension_adapter = ext
             # Use the daemon's open timeout (default 5s in tests) but allow
             # the user a generous window (60s) to load the extension. Spec
             # §8.4 'extension-permission' ux_cost — user has to click the
@@ -863,33 +947,26 @@ class _UpstreamHolder:
             await self.state.set_disconnected()
             raise
         self.upstream = ext
-        self.router.update_upstream_send(ext.send_text)
-        # IMPORTANT: wire all extension-only verb callbacks BEFORE
-        # state.set_connected — concurrent BrowserwrightDaemon.* handlers in the
-        # proxy gate on state.upstream_phase == CONNECTED to skip the lazy-
-        # open call, so if we flip the phase first they'd see callback=None
-        # and respond -32601 incorrectly. Tear-down in trigger_close runs
-        # the opposite order (clear callbacks AFTER set_disconnected) for
-        # the symmetric reason.
-        # v0.5.4: wire the daemon-driven attach-active path. Only the
-        # extension backend has an out-of-band attach verb; other backends
-        # leave the callback as None so the proxy errors -32601.
-        self.router._attach_active_tab = ext.attach_active_tab
-        # Phase B: open_background + close_tab — same extension-only contract.
-        self.router._open_background_tab = ext.open_background_tab
-        self.router._close_tab = ext.close_tab
-        self.router._close_tab_by_target_id = ext.close_tab_by_target_id
-        self.router._end_session = ext.end_session  # P5 per-session teardown
-        # Session-reconnect-recovery: rebuild a session's tab bindings from the
-        # persisted numeric tab-group id.
-        self.router._recover_session = ext.recover_session
-        self.router._wait_session_announce = ext.wait_session_announce
-        self.router._userscript_request = ext.userscript_request
-        self.router._reload_extensions = ext.reload_extensions
-        # Scope Target.getTargets to the requesting session's tab group so
-        # extension sessions sharing one Chrome are mutually invisible.
-        self.router._scoped_targets = ext.scoped_target_infos
+        # Atomic publication replaces the old twelve-field callback wiring.
+        ext.attach(self.router)
+        # Prefer the adapter's own pseudo-URL: it carries the relay port, which
+        # is what `daemon ps` shows per context. "ext://relay" is only the
+        # fallback for an adapter that reports nothing.
         await self.state.set_connected(ext.ws_url or "ext://relay")
+
+    async def _end_raw_session(
+        self, session_id: str, *, deadline: float | None = None,
+    ) -> bool | None:
+        """Apply the raw adapter's ownership policy through its daemon context."""
+        daemon = getattr(self.router, "daemon", None)
+        contexts = getattr(daemon, "contexts", None)
+        teardown = getattr(daemon, "teardown_rdp_context", None)
+        if (isinstance(contexts, dict) and session_id in contexts
+                and callable(teardown)):
+            return bool(await teardown(session_id, deadline=deadline))
+        # env and attach-owned raw browsers are external: ending a browserwright
+        # session must not fabricate ownership or kill them.
+        return None
 
     async def trigger_close(self, reason: CloseReason) -> None:
         """Run the spec §6.5 close etiquette + tear down upstream.
@@ -938,23 +1015,6 @@ class _UpstreamHolder:
         # Tear down upstream ws.
         up = self.upstream
         self.upstream = None
-        self.router.update_upstream_send(None)
-        # v0.5.4: drop the extension-backend attach-active callback so
-        # post-close BrowserwrightDaemon.attachActiveTab returns -32601 instead
-        # of racing against a torn-down upstream.
-        self.router._attach_active_tab = None
-        self.router._open_background_tab = None
-        self.router._close_tab = None
-        self.router._close_tab_by_target_id = None
-        self.router._end_session = None
-        self.router._recover_session = None
-        self.router._wait_session_announce = None
-        self.router._userscript_request = None
-        self.router._reload_extensions = None
-        # Phase 3: drop the rdp raw-CDP command channel (symmetric with the
-        # extension callbacks above) so a post-close verb returns a clean error
-        # instead of racing a torn-down upstream.
-        self.router._upstream_command = None
         if up is not None:
             try:
                 await up.close(code=1000, reason=reason)
@@ -973,9 +1033,32 @@ class _UpstreamHolder:
         # for prompt teardown we'd need to plumb each ServerConnection in
         # — left as a follow-up since the natural-exit path is reliable.
         await self.state.set_disconnected()
+        # Inverse of open: publish DISCONNECTED before removing the one adapter
+        # reference, so concurrent verbs lazy-open instead of seeing a connected
+        # router with an absent implementation.
+        if up is not None:
+            up.detach(self.router)
+
+    async def abort_rdp_teardown(self) -> None:
+        """Restore a retryable, non-CLOSING context after bounded teardown."""
+        self._kill_rdp_chrome()
+        up = self.upstream
+        self.upstream = None
+        await self.state.set_disconnected()
+        if up is not None:
+            up.detach(self.router)
+            # Detaching only unhooks it from the Router; the websocket, its
+            # reader task and the heartbeat keep running. For an attach-owned
+            # session _kill_rdp_chrome is deliberately a no-op, so nothing else
+            # ends them — and a retry would open a second adapter while frames
+            # from this abandoned one still arrive at the Router. Best-effort:
+            # this path exists because teardown already ran out of budget, so a
+            # failing close must not stop the context becoming retryable.
+            with contextlib.suppress(Exception):
+                await up.close(reason="teardown_aborted")
 
     async def _on_upstream_closed(self, reason: str) -> None:
-        """Called by UpstreamConnection's reader when upstream drops on its
+        """Called by CdpUpstream's reader when upstream drops on its
         own (Chrome exited, etc.). We translate to a CloseReason and run
         the close-etiquette path.
 
@@ -1022,19 +1105,34 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
         sid = str(rec.get("id") or "")
         if not sid:
             continue
-        try:
-            daemon.executors.kill(sid)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("auto session-prune executor kill failed "
-                           "(session=%s): %r", sid, e)
-        if rec.get("backend") == "rdp" and rec.get("owner") == "create":
+        context_for_required = getattr(daemon, "context_for_required", None)
+        if callable(context_for_required):
             try:
+                # Use the same ledger/backend/scope boundary as every live
+                # client. An isolated env daemon must never prune another
+                # daemon's slot.
+                context_for_required(sid)
+            except UnknownSessionError:
+                continue
+
+        async def teardown_workspace() -> dict:
+            if rec.get("backend") == "rdp":
+                # Every rdp context, not just create-owned. The scope check
+                # above goes through context_for_required, which for rdp
+                # *creates* the per-session context as a side effect of
+                # validating it — so skipping teardown here would strand that
+                # context, and any upstream socket it opened, for the rest of
+                # the daemon's life once the ledger row is gone.
+                #
+                # Safe for attach: the holder only SIGTERMs a pid it launched
+                # itself, and an attach-owned holder has none, so this closes
+                # our websocket and drops the context without touching the
+                # external browser — the ownership rule in
+                # docs/session-workspaces.md is preserved.
                 await daemon.teardown_rdp_context(sid)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("auto session-prune rdp teardown failed "
-                               "(session=%s): %r", sid, e)
-        elif rec.get("backend") == "extension":
-            try:
+                return {"ok": True, "backend": "rdp", "closed": [],
+                        "failed": [], "kept": []}
+            if rec.get("backend") == "extension":
                 runtime = rec.get("runtime") or {}
                 group_id = runtime.get("group_id")
                 group_id = (
@@ -1042,13 +1140,64 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
                     if isinstance(group_id, int) and group_id >= 0
                     else None
                 )
+                clean = {"ok": True, "backend": "extension", "closed": [],
+                         "failed": [], "kept": []}
+                if group_id is None:
+                    # Nothing was ever bound in Chrome, so there is nothing to
+                    # tear down and the record is already clean. Saying so is
+                    # what lets it be pruned at all — this path runs from the
+                    # idle watchdog, which fires when nobody has touched the
+                    # session, i.e. exactly when the lazily-opened adapter is
+                    # cold.
+                    return clean
                 holder = daemon.shared_context.holder
+                if holder.upstream is None:
+                    relay = holder.relay
+                    if relay is None or not relay.is_ready:
+                        # No extension is connected, so we cannot prove the
+                        # group is gone. Leave the record for a later sweep
+                        # rather than deleting state we cannot verify or
+                        # blocking the watchdog on a 60s cold open.
+                        raise RuntimeError(
+                            "extension not connected; deferring prune")
+                    await holder.ensure_open()
                 upstream = holder.upstream
-                if hasattr(upstream, "end_session"):
-                    await upstream.end_session(sid, group_id)  # type: ignore[attr-defined]
-            except Exception as e:  # noqa: BLE001
-                logger.warning("auto session-prune extension teardown failed "
-                               "(session=%s): %r", sid, e)
+                if upstream is None:
+                    raise RuntimeError("extension upstream unavailable")
+                return await upstream.end_session(sid, group_id)
+            return {"ok": True, "backend": str(rec.get("backend") or "unknown"),
+                    "closed": [], "failed": [], "kept": []}
+
+        teardown_ok = True
+        try:
+            terminate = getattr(daemon, "terminate_session", None)
+            if callable(terminate):
+                reap, result = await terminate(sid, teardown_workspace)
+            else:
+                legacy_terminate = getattr(
+                    daemon.executors, "terminate_session", None)
+                if callable(legacy_terminate):
+                    reap, result = await legacy_terminate(
+                        sid, teardown_workspace)
+                else:
+                    reap = await daemon.executors.kill_current_and_wait(sid)
+                    result = await teardown_workspace()
+            if reap.get("reaped") is not True:
+                teardown_ok = False
+                logger.warning(
+                    "auto session-prune could not confirm executor death "
+                    "(session=%s): %r", sid, reap)
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                teardown_ok = False
+                logger.warning(
+                    "auto session-prune workspace teardown incomplete "
+                    "(session=%s): %r", sid, result)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("auto session-prune teardown failed "
+                           "(session=%s): %r", sid, e)
+            teardown_ok = False
+        if not teardown_ok:
+            continue
         try:
             removed = session_registry.remove(sid)
         except Exception as e:  # noqa: BLE001
@@ -1104,7 +1253,7 @@ async def _idle_watchdog(
             try:
                 daemon.executors.reap_dead()
                 if idle_after:
-                    daemon.executors.reap_idle(idle_after)
+                    await daemon.executors.reap_idle(idle_after)
             except Exception as e:  # noqa: BLE001 - never let reap break the loop
                 logger.warning("executor reap failed: %r", e)
             # --- upstream idle-close (gated) ---
@@ -1148,7 +1297,7 @@ async def _graceful_shutdown(daemon: "Daemon") -> None:
     # Phase B (PR2): SIGTERM every registered executor — they are daemon
     # children and must die with us (mirrors the per-context close above).
     try:
-        daemon.executors.kill_all()
+        await daemon.executors.kill_all()
     except Exception as e:  # noqa: BLE001
         logger.warning("executor shutdown kill failed: %r", e)
 

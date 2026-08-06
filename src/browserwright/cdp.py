@@ -137,6 +137,11 @@ class CDPSession:
         self._lock = threading.Lock()
         self._next_id = 1
         self._inflight: dict[int, dict] = {}
+        # C1b: `_inflight` uses an empty dict as its "no reply yet" sentinel, so
+        # it cannot carry a timestamp without breaking that truthiness test.
+        # Metadata therefore rides alongside, keyed identically:
+        # id -> (method, started_at_monotonic). Read by `inflight_snapshot`.
+        self._inflight_meta: dict[int, tuple[str, float]] = {}
         self._inflight_cv = threading.Condition(self._lock)
         self._closed = False
         self._closed_reason: Optional[str] = None
@@ -159,6 +164,7 @@ class CDPSession:
             if session:
                 msg["sessionId"] = session
             self._inflight[mid] = {}
+            self._inflight_meta[mid] = (method, time.monotonic())
         payload = json.dumps(msg)
         try:
             self._ws.send(payload)
@@ -172,10 +178,12 @@ class CDPSession:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._inflight.pop(mid, None)
+                    self._inflight_meta.pop(mid, None)
                     raise CDPError(method=method, params=params,
                                    cdp_message="timeout waiting for CDP reply")
                 self._inflight_cv.wait(timeout=remaining)
             entry = self._inflight.pop(mid, None)
+            self._inflight_meta.pop(mid, None)
         if self._closed and not entry:
             raise CDPError(method=method, params=params,
                            cdp_message=f"ws closed: {self._closed_reason}")
@@ -185,6 +193,25 @@ class CDPSession:
                            cdp_message=err.get("message", str(err)),
                            fix=_rpc_error_fix(method, err))
         return entry.get("result", {})
+
+    def inflight_snapshot(self) -> list[dict]:
+        """Every CDP request this client is still waiting on, oldest first.
+
+        The client-side twin of the daemon's `status` verb: same question, one
+        hop earlier. Nothing polls this in production — it exists so a wedged
+        agent process can be asked (from a debugger, or alongside a SIGUSR1
+        stack dump) which CDP call it is parked on rather than guessing from a
+        bare 30s timeout."""
+        now = time.monotonic()
+        with self._lock:
+            rows = [
+                {"id": mid, "method": meth,
+                 "elapsed_s": round(max(0.0, now - started), 3),
+                 "replied": bool(self._inflight.get(mid))}
+                for mid, (meth, started) in self._inflight_meta.items()
+            ]
+        rows.sort(key=lambda r: -r["elapsed_s"])
+        return rows
 
     def attach(self, target_id: str) -> str:
         """Attach (or reuse attachment) to ``target_id`` and return sessionId."""

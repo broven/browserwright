@@ -27,10 +27,22 @@ Releases are driven entirely by a **git tag** matching `v*`
 (`.github/workflows/release.yml`):
 
 - The repo's `pyproject.toml` `version` and `chrome-extension/manifest.json`
-  `version` are intentionally **NOT bumped per release** — they stay at a
-  placeholder in git. CI overwrites both **from the tag** at build time. So the
-  tag is the single source of truth for the version; do not edit `pyproject`
-  `version` in a release commit.
+  `version` are intentionally **NOT bumped per release** — they stay at the
+  placeholder **`0.0.0`** in git. CI overwrites both **from the tag** at build
+  time. So the tag is the single source of truth for the version; do not edit
+  `pyproject` `version` in a release commit.
+- The placeholder is `0.0.0` so it can never be mistaken for a real release. It
+  previously sat at `0.6.2` — a version that *had* shipped — which made every
+  checkout look like it was eight releases behind (`browserwright version` said
+  `0.6.2` while tags were at `v0.8.0`) and made a locally built wheel look
+  installable when it was really an unstamped dev build.
+- `tests/skill/test_release_versioning.py` (in the fast gate) replays the
+  workflow's own stamping code against the current `pyproject.toml` /
+  `manifest.json` and fails if CI could no longer stamp them — a trailing
+  comment on the `version` line, a second top-level `version =`, a switch to
+  `dynamic = ["version"]`, drift between the two placeholders, or the two jobs'
+  tag regexes disagreeing. Without it those break the release **after** the tag
+  is pushed, when the only fix is deleting and re-cutting the tag.
 - Job `publish-pypi` builds the sdist+wheel and uploads to **PyPI** via OIDC
   **trusted publishing** (no stored token), gated on the GitHub `pypi`
   environment.

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from browserwright.daemon.server.proxy import Router, _cmd_result
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+from browserwright.daemon.server.upstream import CdpUpstream, Upstream
 
 
 class Capture:
@@ -80,6 +83,199 @@ def last_error(cap: Capture, client) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_target_attach_and_close_are_authorized_by_browser_session():
+    state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    client.session_id = "session-A"
+
+    class _ScopedUpstream:
+        is_open = True
+
+        def __init__(self):
+            self.closed: list[str] = []
+            self.forwarded: list[dict] = []
+
+        async def target_belongs_to_session(self, session_id, target_id):
+            return session_id == "session-A" and target_id == "ext-tab-1"
+
+        async def send_cdp(self, text):
+            self.forwarded.append(json.loads(text))
+
+        async def close_tab(self, target):
+            self.closed.append(target)
+            return {"ok": True, "tabId": int(target.rsplit("-", 1)[1])}
+
+        async def close_session_tab(self, _session_id, target_id):
+            return await self.close_tab(target_id)
+
+    upstream = _ScopedUpstream()
+    router.upstream = upstream
+
+    await router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "ext-tab-2"},
+    }))
+    assert last_error(cap, client)["code"] == -32602
+    assert upstream.forwarded == []
+
+    await router.route_from_client(client, json.dumps({
+        "id": 2,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"targetId": "ext-tab-2"},
+    }))
+    assert last_error(cap, client)["code"] == -32602
+    assert upstream.closed == []
+
+    await router.route_from_client(client, json.dumps({
+        "id": 3,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"targetId": "ext-tab-1"},
+    }))
+    assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
+    assert upstream.closed == ["ext-tab-1"]
+
+
+@pytest.mark.asyncio
+async def test_send_only_adapter_without_extension_authority_fails_closed():
+    _state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=True)
+    client.session_id = "session-A"
+    assert isinstance(router.upstream, Upstream)
+
+    await router.route_from_client(client, json.dumps({
+        "id": 31,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "ext-tab-1"},
+    }))
+
+    assert last_error(cap, client)["code"] == -32603
+    assert "ownership is unavailable" in last_error(cap, client)["message"]
+    assert cap.upstream == []
+
+
+@pytest.mark.asyncio
+async def test_send_only_adapter_forwards_rdp_attach_at_browser_boundary():
+    _state, router, cap, (client,) = setup_router(
+        backend="rdp", wire_upstream=True)
+
+    await router.route_from_client(client, json.dumps({
+        "id": 32,
+        "method": "Target.attachToTarget",
+        "params": {"targetId": "rdp-tab-1"},
+    }))
+
+    assert [frame["method"] for frame in cap.upstream] == [
+        "Target.attachToTarget",
+    ]
+    assert cap.upstream[0]["params"]["targetId"] == "rdp-tab-1"
+
+
+@pytest.mark.asyncio
+async def test_close_tab_session_id_rechecks_live_ownership():
+    state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    client.session_id = "session-A"
+    state.bind_session(client.client_id, "local-1", "upstream-1", "ext-tab-1")
+    state.claim_attacher(
+        "ext-tab-1", client.client_id, "local-1", "upstream-1")
+
+    class _MovedTabUpstream:
+        is_open = True
+
+        def __init__(self):
+            self.closed: list[str] = []
+
+        async def target_belongs_to_session(self, session_id, target_id):
+            assert (session_id, target_id) == ("session-A", "ext-tab-1")
+            return False
+
+        async def close_tab(self, target):
+            self.closed.append(target)
+            return {"ok": True, "tabId": 1}
+
+        async def close_session_tab(self, _session_id, target_id):
+            return await self.close_tab(target_id)
+
+    upstream = _MovedTabUpstream()
+    router.upstream = upstream
+
+    await router.route_from_client(client, json.dumps({
+        "id": 4,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"sessionId": "local-1"},
+    }))
+
+    assert last_error(cap, client)["code"] == -32602
+    assert upstream.closed == []
+
+
+@pytest.mark.asyncio
+async def test_close_tab_rejects_mismatched_session_and_target_ids():
+    state, router, cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    client.session_id = "session-A"
+    state.bind_session(client.client_id, "local-1", "upstream-1", "ext-tab-1")
+
+    class _Upstream:
+        is_open = True
+
+        async def close_tab(self, _target):
+            raise AssertionError("mismatched addresses must not close a tab")
+
+        async def close_session_tab(self, _session_id, target_id):
+            return await self.close_tab(target_id)
+
+    router.upstream = _Upstream()
+    await router.route_from_client(client, json.dumps({
+        "id": 5,
+        "method": "BrowserwrightDaemon.closeTab",
+        "params": {"sessionId": "local-1", "targetId": "ext-tab-2"},
+    }))
+
+    assert last_error(cap, client)["code"] == -32602
+
+
+@pytest.mark.asyncio
+async def test_extension_detached_event_invalidates_router_binding():
+    from types import SimpleNamespace
+
+    from browserwright.daemon.server.extension_upstream import ExtensionUpstream
+
+    state, router, _cap, (client,) = setup_router(
+        backend="extension", wire_upstream=False)
+    state.bind_session(client.client_id, "local-7", "ext-sid-7-known", "ext-tab-7")
+    state.claim_attacher(
+        "ext-tab-7", client.client_id, "local-7", "ext-sid-7-known")
+
+    async def _noop(_value):
+        return None
+
+    upstream = ExtensionUpstream(
+        SimpleNamespace(port=19989), router.forward_from_upstream, _noop)
+    upstream.register_session(7, "ext-sid-7-known")
+
+    await upstream._handle_extension_event({"type": "detached", "tabId": 7})
+
+    assert "local-7" not in client.sessions
+    assert "ext-tab-7" not in state.attachers
+
+
+def attach_cdp(router: Router, cap: Capture, command, *, on_end_session=None):
+    async def on_close(_reason: str) -> None:
+        return None
+
+    upstream = CdpUpstream(
+        router.forward_from_upstream, on_close, state=router.state,
+        on_end_session=on_end_session)
+    upstream.send_command = command
+    upstream.send_cdp = cap.upstream_send
+    router.upstream = None
+    upstream.attach(router)
+    return upstream
+
+
+@pytest.mark.asyncio
 async def test_raw_frames_lifecycle_failure_and_broadcast_edges():
     state, router, cap, (client,) = setup_router()
     await router.route_from_client(client, "{not json")
@@ -135,7 +331,7 @@ async def test_self_answer_backend_info_and_target_table():
 
 
 @pytest.mark.asyncio
-async def test_wait_session_announce_is_extension_only_noop_for_rdp():
+async def test_wait_session_announce_uses_upstream_shim_for_rdp():
     state, router, cap, (client,) = setup_router("rdp-session", backend="rdp")
     called = False
 
@@ -144,51 +340,137 @@ async def test_wait_session_announce_is_extension_only_noop_for_rdp():
         called = True
         return False
 
-    router._wait_session_announce = wait_session_announce
+    router.upstream.wait_session_announce = wait_session_announce
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.waitForSessionAnnounce",
         "params": {"timeout": 0.01},
     }))
 
-    assert cap.per_client[client.client_id][-1]["result"] == {"announced": True}
-    assert called is False
+    assert cap.per_client[client.client_id][-1]["result"] == {"announced": False}
+    assert called is True
 
 
 @pytest.mark.asyncio
-async def test_extension_scoped_get_targets_success_error_and_fallback():
+async def test_adapter_scoped_get_targets_success_and_error():
     state, router, cap, (scoped, sessionless) = setup_router(
         "scoped", "sessionless", backend="extension")
     scoped.session_id = "sess-1"
-    seen: list[str] = []
+    seen: list[tuple[dict, str]] = []
 
-    async def scoped_targets(session_id: str):
-        seen.append(session_id)
-        return [{"targetId": "only-mine", "type": "page"}]
+    async def scoped_targets(params: dict, session_id: str):
+        seen.append((params, session_id))
+        return {"result": {
+            "targetInfos": [{"targetId": "only-mine", "type": "page"}],
+        }}
 
-    router._scoped_targets = scoped_targets
+    router.upstream.get_targets = scoped_targets
     await router.route_from_client(scoped, json.dumps({
         "id": 10, "method": "Target.getTargets",
+        "params": {"filter": [{"type": "page"}]},
     }))
-    assert seen == ["sess-1"]
+    assert seen == [({"filter": [{"type": "page"}]}, "sess-1")]
     assert cap.per_client[scoped.client_id][-1]["result"]["targetInfos"][0]["targetId"] == "only-mine"
     assert cap.upstream == []
 
-    async def broken_scoped(session_id: str):
+    async def broken_scoped(params: dict, session_id: str):
         raise RuntimeError(f"bad scope {session_id}")
 
-    router._scoped_targets = broken_scoped
+    router.upstream.get_targets = broken_scoped
     await router.route_from_client(scoped, json.dumps({
         "id": 11, "method": "Target.getTargets",
     }))
     assert last_error(cap, scoped)["code"] == -32603
 
-    router._scoped_targets = None
-    await router.route_from_client(sessionless, json.dumps({
-        "id": 12, "method": "Target.getTargets",
+
+@pytest.mark.asyncio
+async def test_get_targets_delegates_to_adapter_regardless_of_backend_name():
+    """Only the extension synthesizes scope; raw CDP preserves native data."""
+    _state, router, cap, (client,) = setup_router(
+        "wrapped", backend="wrapped-extension")
+    seen: list[tuple[dict, str]] = []
+
+    async def get_targets(params: dict, session_id: str):
+        seen.append((params, session_id))
+        return {"result": {"targetInfos": [{
+                "targetId": "only-this-session",
+                "type": "page",
+                "url": "https://example.test/",
+                "title": "Example",
+                "attached": True,
+            }]}}
+
+    router.upstream.get_targets = get_targets
+    await router.route_from_client(client, json.dumps({
+        "id": 13, "method": "Target.getTargets", "params": {"filter": []},
     }))
-    assert cap.upstream[-1]["method"] == "Target.getTargets"
-    assert state.pending_requests[cap.upstream[-1]["id"]].client_request_id == 12
+
+    assert seen == [({"filter": []}, "s-wrapped")]
+    assert cap.upstream == []
+    assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == [
+        {
+            "targetId": "only-this-session",
+            "type": "page",
+            "url": "https://example.test/",
+            "title": "Example",
+            "attached": True,
+        }
+    ]
+
+    raw_params = {"filter": [{"type": "service_worker", "exclude": False}]}
+    native_infos = [
+        {"targetId": "browser", "type": "browser", "url": ""},
+        {
+            "targetId": "worker", "type": "service_worker",
+            "url": "chrome-extension://worker.js", "title": "worker",
+            "attached": True,
+        },
+        {
+            "targetId": "raw-page",
+            "type": "page",
+            "url": "https://raw.test/",
+            "title": "Raw",
+            "attached": False,
+            "browserContextId": "context-1",
+            "canAccessOpener": False,
+        },
+    ]
+
+    async def raw_command(method, params=None, session_id=None, timeout=10.0):
+        assert method == "Target.getTargets"
+        assert params == raw_params
+        return {"result": {"targetInfos": native_infos}}
+
+    attach_cdp(router, cap, raw_command)
+    await router.route_from_client(client, json.dumps({
+        "id": 14, "method": "Target.getTargets", "params": raw_params,
+    }))
+    assert cap.per_client[client.client_id][-1]["result"]["targetInfos"] == native_infos
+
+    native_error = {
+        "error": {
+            "code": -32602,
+            "message": "invalid filter",
+            "data": {"field": "filter"},
+        },
+        "nativeExtra": "preserved",
+    }
+
+    async def raw_error(method, params=None, session_id=None, timeout=10.0):
+        assert method == "Target.getTargets"
+        assert params == {"filter": "bad"}
+        return native_error
+
+    attach_cdp(router, cap, raw_error)
+    await router.route_from_client(client, json.dumps({
+        "id": 15,
+        "method": "Target.getTargets",
+        "params": {"filter": "bad"},
+    }))
+    assert cap.per_client[client.client_id][-1] == {
+        **native_error,
+        "id": 15,
+    }
 
 
 @pytest.mark.asyncio
@@ -326,7 +608,8 @@ async def test_upstream_event_table_orphan_and_pending_auto_attach_edges():
 @pytest.mark.asyncio
 async def test_attach_active_extension_lazy_malformed_reuse_and_conflict():
     state, router, cap, (alice, bob) = setup_router(
-        "alice", "bob", backend="extension", phase=UpstreamPhase.DISCONNECTED)
+        "alice", "bob", backend="extension", phase=UpstreamPhase.DISCONNECTED,
+        wire_upstream=False)
 
     async def failing_ensure() -> None:
         raise RuntimeError("offline")
@@ -338,11 +621,12 @@ async def test_attach_active_extension_lazy_malformed_reuse_and_conflict():
     assert last_error(cap, alice)["code"] == -32603
 
     state.upstream_phase = UpstreamPhase.CONNECTED
+    router.update_upstream_send(cap.upstream_send)
 
     async def malformed_attach(**kwargs):
         return {"sessionId": 123, "targetId": None}
 
-    router._attach_active_tab = malformed_attach
+    router.upstream.attach_active = malformed_attach
     await router.route_from_client(alice, json.dumps({
         "id": 2, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -354,7 +638,7 @@ async def test_attach_active_extension_lazy_malformed_reuse_and_conflict():
             "tabId": 7, "url": "https://active/", "title": "Active",
         }
 
-    router._attach_active_tab = attach
+    router.upstream.attach_active = attach
     await router.route_from_client(alice, json.dumps({
         "id": 3, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -384,7 +668,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def bad_open(*args, **kwargs):
         return {"sessionId": "UP"}
 
-    router._open_background_tab = bad_open
+    router.upstream.open_tab = bad_open
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -395,7 +679,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def ok_open(*args, **kwargs):
         return {"sessionId": "UP", "targetId": "T", "tabId": 1}
 
-    router._open_background_tab = ok_open
+    router.upstream.open_tab = ok_open
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -403,37 +687,53 @@ async def test_open_recover_close_and_end_error_translation_branches():
     }))
     local_sid = cap.per_client[client.client_id][-1]["result"]["sessionId"]
 
-    async def failing_close(upstream_sid: str):
-        raise RuntimeError(f"nope {upstream_sid}")
+    ownership_checks: list[tuple[str, str]] = []
 
-    router._close_tab = failing_close
+    async def owns_target(session_id: str, target_id: str) -> bool:
+        ownership_checks.append((session_id, target_id))
+        return True
+
+    close_attempts: list[tuple[str, str]] = []
+
+    async def failing_close(session_id: str, target_id: str):
+        close_attempts.append((session_id, target_id))
+        raise RuntimeError(f"business close failed for {target_id}")
+
+    router.upstream.target_belongs_to_session = owns_target
+    router.upstream.close_session_tab = failing_close
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.closeTab",
         "params": {"sessionId": local_sid},
     }))
     assert last_error(cap, client)["code"] == -32603
-    assert local_sid not in client.sessions
-    assert "T" not in state.attachers
+    assert "business close failed" in last_error(cap, client)["message"]
+    assert ownership_checks == [("s-client", "T")]
+    assert close_attempts == [("s-client", "T")]
+    assert local_sid in client.sessions
+    assert "T" in state.attachers
 
     state.note_target_info({"targetId": "ghost", "type": "page"})
 
-    async def failing_close_by_target(target_id: str):
-        raise RuntimeError(target_id)
+    async def failing_close_by_target(session_id: str, target_id: str):
+        close_attempts.append((session_id, target_id))
+        raise RuntimeError(f"business close failed for {target_id}")
 
-    router._close_tab_by_target_id = failing_close_by_target
+    router.upstream.close_session_tab = failing_close_by_target
     await router.route_from_client(client, json.dumps({
         "id": 5,
         "method": "BrowserwrightDaemon.closeTab",
         "params": {"targetId": "ghost"},
     }))
     assert last_error(cap, client)["code"] == -32603
-    assert "ghost" not in state.targets
+    assert "business close failed" in last_error(cap, client)["message"]
+    assert close_attempts[-1] == ("s-client", "ghost")
+    assert "ghost" in state.targets
 
     async def malformed_recover(*args, **kwargs):
         return {"sessionId": "UP"}
 
-    router._recover_session = malformed_recover
+    router.upstream.recover = malformed_recover
     await router.route_from_client(client, json.dumps({
         "id": 6,
         "method": "BrowserwrightDaemon.recoverSession",
@@ -444,7 +744,7 @@ async def test_open_recover_close_and_end_error_translation_branches():
     async def end_with_group(session: str, group_id: int):
         return {"session": session, "groupId": group_id}
 
-    router._end_session = end_with_group
+    router.upstream.end_session = end_with_group
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.endSession",
@@ -473,6 +773,11 @@ async def test_end_session_daemon_edge_cases():
 
     good = TeardownDaemon()
     router.daemon = good
+    async def unused_command(*args, **kwargs):
+        raise AssertionError("endSession must not send CDP")
+    attach_cdp(
+        router, cap, unused_command,
+        on_end_session=good.teardown_rdp_context)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.endSession",
@@ -483,12 +788,148 @@ async def test_end_session_daemon_edge_cases():
 
     bad = TeardownDaemon(fail=True)
     router.daemon = bad
+    router.upstream._on_end_session = bad.teardown_rdp_context
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "sess"},
     }))
     assert last_error(cap, client)["code"] == -32603
+
+
+@pytest.mark.asyncio
+async def test_rdp_end_session_does_not_turn_false_teardown_into_success():
+    state, router, cap, (client,) = setup_router()
+    client.session_id = "sess"
+
+    async def refused(_session: str) -> bool:
+        return False
+
+    attach_cdp(router, cap, lambda *_args, **_kwargs: None,
+               on_end_session=refused)
+    await router.route_from_client(client, json.dumps({
+        "id": 4,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["ok"] is False
+    assert result["failed"] == ["workspace"]
+
+
+@pytest.mark.asyncio
+async def test_raw_external_workspace_noop_end_remains_successful():
+    state, router, cap, (client,) = setup_router()
+    client.session_id = "sess"
+
+    async def not_owned(_session: str) -> None:
+        return None
+
+    attach_cdp(router, cap, lambda *_args, **_kwargs: None,
+               on_end_session=not_owned)
+    await router.route_from_client(client, json.dumps({
+        "id": 5,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_session_cold_open_respects_budget_and_restores_phase(
+    monkeypatch,
+):
+    from browserwright.daemon.server import verbs as verbs_mod
+
+    state, router, cap, (client,) = setup_router()
+    client.session_id = "sess"
+    router.upstream = None
+    state.upstream_phase = UpstreamPhase.DISCONNECTED
+    ensure_cancelled = False
+
+    async def slow_ensure():
+        nonlocal ensure_cancelled
+        await state.begin_connecting("extension")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            ensure_cancelled = True
+            raise
+
+    class Registry:
+        async def terminate_session(self, session, teardown, *, budget=None):
+            return ({"reaped": True}, await teardown())
+
+    async def disconnect(_reason):
+        return None
+
+    router.daemon = SimpleNamespace(executors=Registry())
+    router.bind_lifecycle(
+        ensure_upstream=slow_ensure, trigger_disconnect=disconnect)
+    monkeypatch.setattr(verbs_mod, "_END_SESSION_BUDGET_S", 0.55)
+
+    await router.route_from_client(client, json.dumps({
+        "id": 6,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert result["timedOut"] is True
+    assert ensure_cancelled is True
+    assert state.upstream_phase is UpstreamPhase.DISCONNECTED
+
+
+@pytest.mark.parametrize("backend", ["rdp", "env"])
+@pytest.mark.asyncio
+async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
+    monkeypatch, backend,
+):
+    from browserwright import session_registry
+
+    state, router, cap, (client,) = setup_router(
+        backend=backend, phase=UpstreamPhase.DISCONNECTED,
+        wire_upstream=False)
+    client.session_id = "sess"
+    monkeypatch.setattr(
+        session_registry,
+        "get",
+        lambda sid: {
+            "id": sid, "backend": backend, "owner": "attach",
+        },
+    )
+
+    class Registry:
+        async def terminate_session(self, session, teardown, *, budget=None):
+            return {"reaped": True}, await teardown()
+
+    class Daemon:
+        executors = Registry()
+
+        def __init__(self):
+            self.teardown_calls = []
+
+        async def teardown_rdp_context(self, session, *, deadline=None):
+            self.teardown_calls.append((session, deadline))
+            return True
+
+    daemon = Daemon()
+    router.daemon = daemon
+    await router.route_from_client(client, json.dumps({
+        "id": 7,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": "sess"},
+    }))
+
+    assert cap.ensure_calls == 0
+    result = cap.per_client[client.client_id][-1]["result"]
+    assert result["ok"] is True
+    assert result["backend"] == backend
+    assert len(daemon.teardown_calls) == (1 if backend == "rdp" else 0)
 
 
 @pytest.mark.asyncio
@@ -507,7 +948,7 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = malformed_create
+    attach_cdp(router, cap, malformed_create)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -522,13 +963,13 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = malformed_attach
+    attach_cdp(router, cap, malformed_attach)
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.openBackgroundTab",
         "params": {"url": "https://x/"},
     }))
-    assert "attach returned" in last_error(cap, client)["message"]
+    assert "Target.attachToTarget returned" in last_error(cap, client)["message"]
 
     calls: list[tuple[str, Any, Any]] = []
 
@@ -542,7 +983,7 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
             raise RuntimeError("close boom")
         raise AssertionError(method)
 
-    router._upstream_command = rdp_cmd
+    attach_cdp(router, cap, rdp_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -556,8 +997,8 @@ async def test_rdp_open_attach_close_error_translation_and_cleanup():
     }))
     assert calls[-1][0] == "Target.closeTarget"
     assert last_error(cap, client)["code"] == -32603
-    assert local_sid not in client.sessions
-    assert "T" not in state.targets
+    assert local_sid in client.sessions
+    assert "T" in state.targets
 
     await router.route_from_client(client, json.dumps({
         "id": 6,
@@ -587,7 +1028,7 @@ async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
             return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = env_cmd
+    attach_cdp(router, cap, env_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 1,
         "method": "BrowserwrightDaemon.openBackgroundTab",
@@ -607,7 +1048,7 @@ async def test_env_backend_dispatches_tab_verbs_to_raw_cdp():
 
 
 @pytest.mark.asyncio
-async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targets():
+async def test_rdp_attach_active_reuses_local_page_then_surfaces_enumeration_errors():
     state, router, cap, (client,) = setup_router(backend="rdp")
     state.bind_session(client.client_id, "local", "UP", "T")
     state.claim_attacher("T", client.client_id, "local", "UP")
@@ -621,7 +1062,7 @@ async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targ
         calls.append(method)
         raise AssertionError(method)
 
-    router._upstream_command = should_not_call
+    attach_cdp(router, cap, should_not_call)
     await router.route_from_client(client, json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
@@ -630,22 +1071,47 @@ async def test_rdp_attach_active_reuses_local_page_and_falls_back_after_bad_targ
 
     state.unbind_session_by_local(client.client_id, "local")
 
-    async def fallback_cmd(method: str, params=None, session_id=None):
+    # This used to assert the opposite: that a failed Target.getTargets fell
+    # through to createTarget. That is not a fallback, it is a fabrication —
+    # a CDP error means we could not ask which tabs exist, not that there are
+    # none, and creating one then duplicates a tab the user can see and splits
+    # the persisted target from the selected page. docs/session-workspaces.md
+    # requires failing retryably under uncertainty; open_tab is reserved for a
+    # *confirmed* empty browser.
+    async def failing_enumeration(method: str, params=None, session_id=None):
         calls.append(method)
         if method == "Target.getTargets":
             return {"id": -1, "error": {"message": "bad"}}
-        if method == "Target.createTarget":
-            return {"id": -1, "result": {"targetId": "NEW"}}
-        if method == "Target.attachToTarget":
-            return {"id": -1, "result": {"sessionId": "UP-NEW"}}
-        raise AssertionError(method)
+        raise AssertionError(f"must not reach {method} on an unknown target set")
 
-    router._upstream_command = fallback_cmd
+    attach_cdp(router, cap, failing_enumeration)
     await router.route_from_client(client, json.dumps({
         "id": 2, "method": "BrowserwrightDaemon.attachActiveTab",
     }))
-    assert calls[-3:] == ["Target.getTargets", "Target.createTarget", "Target.attachToTarget"]
-    assert cap.per_client[client.client_id][-1]["result"]["targetId"] == "NEW"
+    assert calls[-1] == "Target.getTargets"
+    assert "error" in cap.per_client[client.client_id][-1]
+
+
+@pytest.mark.asyncio
+async def test_rdp_recover_reuses_existing_local_binding():
+    state, router, cap, (client,) = setup_router(backend="rdp")
+    state.bind_session(client.client_id, "local", "UP", "T")
+    state.claim_attacher("T", client.client_id, "local", "UP")
+    state.note_target_info({
+        "targetId": "T", "type": "page", "url": "https://front/", "title": "Front",
+    })
+
+    async def should_not_call(method: str, params=None, session_id=None):
+        raise AssertionError(method)
+
+    attach_cdp(router, cap, should_not_call)
+    await router.route_from_client(client, json.dumps({
+        "id": 1, "method": "BrowserwrightDaemon.recoverSession",
+    }))
+
+    assert cap.per_client[client.client_id][-1]["result"]["sessionId"] == "local"
+    assert list(client.sessions) == ["local"]
+    assert state.attachers["T"].primary_local_session == "local"
 
 
 @pytest.mark.asyncio
@@ -656,7 +1122,7 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
         "method": "BrowserwrightDaemon.userscript.install",
         "params": {"script": {"source": "1"}},
     }))
-    assert last_error(cap, client)["code"] == -32603
+    assert last_error(cap, client)["code"] == -32000
 
     state.bind_session(client.client_id, "l1", "UP1", "T1")
     state.bind_session(client.client_id, "l2", "UP1", "T1")
@@ -667,16 +1133,18 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
         if method == "Page.addScriptToEvaluateOnNewDocument":
             return {"id": -1, "result": {"identifier": f"id-{session_id}"}}
         if method == "Page.removeScriptToEvaluateOnNewDocument":
-            raise RuntimeError("ignored")
+            return {"id": -1, "result": {}}
         raise AssertionError(method)
 
-    router._upstream_command = us_cmd
+    attach_cdp(router, cap, us_cmd)
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.userscript.install",
-        "params": {"script": {"identity": "u", "source": "console.log(1)"}},
+        "params": {"script": {
+            "id": "hash-u", "identity": "u", "source": "console.log(1)"}},
     }))
     assert cap.per_client[client.client_id][-1]["result"]["identity"] == "u"
+    assert cap.per_client[client.client_id][-1]["result"]["id"] == "hash-u"
     add_calls = [c for c in calls if c[0] == "Page.addScriptToEvaluateOnNewDocument"]
     assert [c[2] for c in add_calls] == ["UP1"]
 
@@ -690,7 +1158,7 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
         "method": "BrowserwrightDaemon.userscript.toggle",
         "params": {"key": "missing"},
     }))
-    assert cap.per_client[client.client_id][-1]["result"]["ok"] is False
+    assert last_error(cap, client)["code"] == -32000
 
     await router.route_from_client(client, json.dumps({
         "id": 5,
@@ -700,18 +1168,48 @@ async def test_rdp_userscript_registry_success_error_and_unsupported_paths():
     assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
 
     await router.route_from_client(client, json.dumps({
+        "id": 55,
+        "method": "BrowserwrightDaemon.userscript.toggle",
+        "params": {"key": "u", "enabled": True},
+    }))
+    assert cap.per_client[client.client_id][-1]["result"]["enabled"] is True
+    assert calls[-1][0] == "Page.addScriptToEvaluateOnNewDocument"
+
+    async def failing_remove(method: str, params=None, session_id=None):
+        if method == "Page.removeScriptToEvaluateOnNewDocument":
+            raise RuntimeError("still registered")
+        raise AssertionError(method)
+
+    router.upstream.send_command = failing_remove
+    await router.route_from_client(client, json.dumps({
+        "id": 56,
+        "method": "BrowserwrightDaemon.userscript.toggle",
+        "params": {"key": "u", "enabled": False},
+    }))
+    failed_sync = cap.per_client[client.client_id][-1]["result"]
+    assert failed_sync["ok"] is False
+    assert failed_sync["sync"]["ok"] is False
+    assert failed_sync["sync"]["failed"]
+
+    await router.route_from_client(client, json.dumps({
+        "id": 57,
+        "method": "BrowserwrightDaemon.userscript.install",
+        "params": {"script": {
+            "id": "hash-u", "identity": "u", "source": "console.log(2)"}},
+    }))
+    assert last_error(cap, client)["code"] == -32000
+
+    await router.route_from_client(client, json.dumps({
         "id": 6,
         "method": "BrowserwrightDaemon.userscript.logs",
     }))
-    assert cap.per_client[client.client_id][-1]["result"] == {
-        "logs": [], "backend": "rdp",
-    }
+    assert cap.per_client[client.client_id][-1]["result"] == {"logs": []}
 
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.userscript.mystery",
     }))
-    assert cap.per_client[client.client_id][-1]["result"]["ok"] is False
+    assert last_error(cap, client)["code"] == -32601
 
     assert _cmd_result({"id": -1, "result": {"ok": True}}) == {"ok": True}
     with pytest.raises(RuntimeError):

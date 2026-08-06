@@ -8,28 +8,11 @@ observes with ``snapshot()`` (see ``repl/_namespace.build_globals``). The
 internal tab lifecycle that binding glue still needs lives in
 ``browserwright.session_runtime``.
 
-What remains here is exactly the set re-exported by ``browserwright.api``:
-``http_get`` (no-browser escape hatch), the site/memory verbs, and the
-site-skill discovery/task layer. Keep it boring — no decorators, no
-metaprogramming — so the agent gets stable, greppable names.
+What remains here is exactly the set listed in ``browserwright.EXPORTS``:
+``http_get`` (no-browser escape hatch, ``.http``), the site/memory verbs
+(``.site``), and the site-skill discovery/task layer (``.discovery_api``).
+Import them from the top-level ``browserwright`` package (or from the
+submodule directly) — this ``__init__`` deliberately re-exports nothing, so
+there is exactly one place the surface is spelled out. Keep it boring — no
+decorators, no metaprogramming — so the agent gets stable, greppable names.
 """
-from .discovery_api import (  # noqa: F401
-    list_site_skills,
-    load_site_skill,
-    run_task,
-)
-from .http import http_get  # noqa: F401
-from .site import (  # noqa: F401
-    bootstrap_site,
-    memory_read,
-    remember,
-    remember_global,
-    remember_preference,
-)
-
-__all__ = [
-    "list_site_skills", "load_site_skill", "run_task",
-    "http_get",
-    "bootstrap_site", "memory_read", "remember", "remember_global",
-    "remember_preference",
-]

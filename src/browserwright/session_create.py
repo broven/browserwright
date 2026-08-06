@@ -22,6 +22,7 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 """
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 from typing import Optional
@@ -57,6 +58,44 @@ def _run(cmd: list[str]) -> int:
         return 1
 
 
+def _running_daemon_backend() -> str | None:
+    """The shared backend of the daemon on this socket, or None if unknown.
+
+    None means "could not establish", never "mismatch" — callers must not
+    block a legitimate action on a probe they could not read.
+    """
+    try:
+        out = subprocess.run(
+            ["browserwright-daemon", "backend-info", "--json"],
+            capture_output=True, timeout=10, text=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        data = json.loads(out.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not data.get("running"):
+        return None
+    name = data.get("backend") or data.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _daemon_is_running() -> bool:
+    """True iff a daemon answers on this XDG_RUNTIME_DIR's socket right now.
+
+    Deliberately does not care about version match — callers use it to decide
+    whether teardown has anything to talk to, not whether to upgrade.
+    """
+    from .daemon import _ipc
+    try:
+        pid, _version = _ipc.ping_status_sync(timeout=1.0)
+        return pid is not None
+    except Exception:
+        return False
+
+
 def _ensure_daemon_running() -> None:
     """Make sure the ONE global daemon is up; spawn ``serve`` detached if not.
 
@@ -78,32 +117,24 @@ def _ensure_daemon_running() -> None:
     _spawn_detached(["browserwright-daemon", "serve"])
 
 
-def _close_browser(record: dict) -> None:
-    """Tear down a create-owned rdp session's browser via the single daemon.
+def _end_daemon_session(record: dict) -> bool:
+    """End every session through the daemon's atomic terminal lifecycle.
 
-    The daemon owns the per-session Chrome (launched on ``ensureSession``), so
-    ``endSession`` closes the upstream + SIGTERMs that Chrome + drops the
-    context. Best-effort: a dead daemon just means the (ephemeral, C2) Chrome
-    already died with it. Only create-owned sessions reach here — attach
-    sessions never launched a browser we own."""
+    The daemon, not Layer 2, applies workspace ownership: extension closes its
+    group, rdp create closes its Chrome, while rdp attach/env keep the external
+    browser.  All four still revoke live control/facade clients and reap the
+    executor before this function confirms success.
+    """
     sid = record.get("id")
-    if sid:
-        _run(["browserwright-daemon", "end-session", "--session", str(sid)])
-
-
-def _reap_executor(record: dict) -> None:
-    """Best-effort: reap this session's resident Phase B executor (no browser
-    teardown). Called for EVERY owner on `end()` so an attach session's
-    long-lived executor subprocess doesn't leak — the full `endSession` path is
-    create-only and would also close the browser an attach session must keep.
-
-    Best-effort by contract: a dead daemon / no-executor / stale binary all
-    return non-zero from `_run`, which we ignore — `session end` must never fail
-    because the executor couldn't be reaped (the orphan-sweep on the next daemon
-    start is the backstop)."""
-    sid = record.get("id")
-    if sid:
-        _run(["browserwright-daemon", "kill-executor", "--session", str(sid)])
+    if not sid:
+        return True
+    cmd = ["browserwright-daemon", "end-session", "--session", str(sid)]
+    if record.get("backend") == "extension":
+        runtime = record.get("runtime") or {}
+        gid = runtime.get("group_id")
+        if isinstance(gid, int) and gid >= 0:
+            cmd += ["--group-id", str(gid)]
+    return _run(cmd) == 0
 
 
 def reset_executor(record: dict) -> str:
@@ -143,11 +174,8 @@ def reap(*, idle_seconds: float) -> list[dict]:
     stale = reg.stale(idle_seconds=idle_seconds)
     pruned: list[dict] = []
     for rec in stale:
-        _reap_executor(rec)
-        if rec.get("backend") == "extension":
-            _end_extension_workspace(rec)
-        if rec.get("owner") == "create":
-            _close_browser(rec)
+        if not _end_daemon_session(rec):
+            continue
         removed = reg.remove(str(rec.get("id")))
         if removed is not None:
             pruned.append(removed)
@@ -193,7 +221,31 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         # (docs/session-workspaces.md §"Routing And Facade"), not a per-session
         # UpstreamContext. Driving N external profiles → one env-backed daemon
         # (isolated XDG_RUNTIME_DIR + --facade-port + BD_CDP_WS) per profile.
-        sid = reg.allocate(backend="env", owner="attach", name=name)
+        from .daemon import _ipc
+
+        # The guard and allocation share the ledger's file lock, so concurrent
+        # creators cannot both observe an empty slot. Scope by the fixed daemon
+        # socket (XDG_RUNTIME_DIR) rather than by the global BS_HOME ledger;
+        # this preserves the documented N-isolated-daemon fleet pattern.
+        daemon_scope = str(_ipc.sock_path().resolve())
+        # Check the running daemon's backend BEFORE writing the row. The
+        # routing guard rejects every connection whose record does not match
+        # the shared context, so allocating first against, say, the default
+        # extension daemon reports success and leaves a row that nothing —
+        # not even endSession — can use, while it holds this daemon's only
+        # env slot. An unreadable probe returns None and is not treated as a
+        # mismatch: never block a legitimate create on a probe that failed.
+        running = _running_daemon_backend()
+        if running is not None and running != "env":
+            raise ValueError(
+                f"the daemon on this socket is serving backend {running!r}, "
+                "so an env session created here could never connect. Start an "
+                "env daemon with its own XDG_RUNTIME_DIR and BD_CDP_WS (see "
+                "docs/session-workspaces.md, 'Scaling env to N profiles').")
+        sid = reg.allocate(
+            backend="env", owner="attach", name=name,
+            env_daemon_scope=daemon_scope,
+        )
         _ensure_daemon_running()
         return sid
     if backend == "rdp":
@@ -213,44 +265,61 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     raise ValueError(f"unknown backend {backend!r} (use extension|rdp|env)")
 
 
-def _end_extension_workspace(record: dict) -> None:
-    """Close the session's agent-owned extension tabs via the single daemon.
-
-    Best-effort: the shared browser itself stays open (extension sessions are
-    attach-owned); only the tabs this session opened are closed. The
-    ``end-session`` CLI no longer takes ``--name`` — there is one daemon."""
-    cmd = ["browserwright-daemon", "end-session", "--session", record["id"]]
-    # Thread the durable numeric groupId (persisted in ledger.runtime on every
-    # open) so the daemon can close the whole group even when its in-memory
-    # binding was wiped (restart). The title is not used — names aren't unique.
-    runtime = record.get("runtime") or {}
-    gid = runtime.get("group_id")
-    if isinstance(gid, int) and gid >= 0:
-        cmd += ["--group-id", str(gid)]
-    _run(cmd)
-
-
 def end(record: dict) -> str:
     """Tear down a session honoring ownership. Returns a human-readable line.
 
     create-owned → the daemon closes the browser it launched (endSession).
     attach       → leave the browser running, remind the user.
     extension    → also close the session's agent-owned tabs (browser stays).
-    Always removes the ledger entry.
+    Removes the ledger entry only after the daemon confirms executor, clients,
+    and ownership-aware workspace teardown all completed.
     """
     sid = record["id"]
-    if record.get("backend") == "extension":
-        _end_extension_workspace(record)
+    # Terminal teardown needs the daemon, and after a crash, reboot or a
+    # foreground `serve` exiting there may not be one — in which case the RPC
+    # fails, the entry is kept "for retry", and the retry takes this same path
+    # to the same failure. A record that `session end` cannot clear.
+    #
+    # Only `extension` may be recovered by starting one, because a bare
+    # `serve` IS the extension daemon. An env fleet's daemon carries per-profile
+    # configuration (its own XDG_RUNTIME_DIR, BD_CDP_WS, facade port — see
+    # docs/session-workspaces.md §"Scaling env to N profiles"); spawning a bare
+    # one would come up on the wrong backend and get the end-session rejected
+    # for a mismatch, leaving the record AND still holding the single env slot.
+    if record.get("backend") == "extension" and not _daemon_is_running():
+        # A bare `serve` IS the extension daemon, so starting one recovers this
+        # case. Never do this for env: that fleet's daemon carries per-profile
+        # configuration (its own XDG_RUNTIME_DIR, BD_CDP_WS, facade port — see
+        # docs/session-workspaces.md §"Scaling env to N profiles"), and a bare
+        # one would come up on the wrong backend and have end-session rejected
+        # for a mismatch — leaving the record AND still holding the env slot.
+        _ensure_daemon_running()
+    if not _end_daemon_session(record):
+        from .errors import DaemonUnavailable
+
+        # The row stays. An unreachable daemon cannot prove clients were
+        # revoked, and dropping the row for a session whose external browser
+        # may still have live clients driving it is worse than leaving one that
+        # needs another attempt.
+        #
+        # env cannot be auto-recovered the way extension can: its daemon
+        # carries per-profile configuration, so tell the user what to restart
+        # instead of guessing. Without this the failure is a dead end — the
+        # record also holds that daemon's single env slot.
+        hint = ""
+        if record.get("backend") == "env" and not _daemon_is_running():
+            hint = (
+                " No daemon is answering on this XDG_RUNTIME_DIR. Restart this "
+                "profile's daemon with the same XDG_RUNTIME_DIR and BD_CDP_WS "
+                "(see docs/session-workspaces.md, 'Scaling env to N profiles'), "
+                "then run `session end` again."
+            )
+        raise DaemonUnavailable(
+            f"session {sid} termination was incomplete; its ledger entry was "
+            f"kept for retry.{hint}")
     if record.get("owner") == "create":
-        # `_close_browser` → daemon `endSession`, which ALSO kills the executor
-        # (symmetric in `_handle_end_session`), so no separate reap needed here.
-        _close_browser(record)
         msg = f"session {sid} ended; the browser it launched was closed."
     else:
-        # attach: leave the browser running (semantics unchanged) but still reap
-        # the session's resident executor so it doesn't leak — `endSession` is
-        # create-only and the attach path never otherwise contacts the daemon.
-        _reap_executor(record)
         msg = (f"session {sid} ended. The browser is still running — you "
                f"attached to it, so it was left untouched.")
     reg.remove(sid)

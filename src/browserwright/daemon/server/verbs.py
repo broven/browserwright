@@ -1,54 +1,52 @@
 """BrowserwrightDaemon.* session-verb handlers (split from proxy.py).
 
-Pure code motion from ``proxy.py`` (Batch 4a): the ``SessionVerbsMixin`` below
-carries the ``BrowserwrightDaemon.*`` RPC dispatcher, the extension
-session-verb handlers (openBackgroundTab / recoverSession /
-endSession / closeTab / ensureExecutor / killExecutor), and their rdp raw-CDP
-counterparts. ``Router`` in ``proxy.py`` mixes this in — every method still
-runs on the Router instance and uses the same attributes/callbacks wired by
-the listener, so behavior is byte-for-byte identical to the pre-split file.
+The ``SessionVerbsMixin`` carries the ``BrowserwrightDaemon.*`` RPC dispatcher
+and its validation / JSON-RPC response policy. Browser operations live behind
+the router's single ``Upstream`` reference; raw-CDP tab and userscript behavior
+belongs to ``CdpUpstream``, not to this dispatcher.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
-import os
 import secrets
+import time
+from functools import partial
+from typing import Any, Awaitable, Callable, Protocol
 
+from ... import session_registry
 from .state import ClientState, UpstreamPhase
 
 logger = logging.getLogger(__name__)
 
-
-# How long the executor control plane (`ensureExecutor`) waits for an extension
-# to (re)connect to the relay before failing with an actionable error. Kept WELL
-# under the client's CDP reply deadline (cdp.py ~30s) so the real cause reaches
-# the agent instead of a `ws closed` / `timeout` (GH #18) — and with margin for
-# the executor spawn that follows (`_SPAWN_READY_TIMEOUT_S`) on the ready path.
-# The full interactive extension grace (listener `_open_extension_upstream`,
-# ~60s) is unchanged — it governs paths a human drives, not the agent hot path.
-# Env-overridable (`BW_EXT_READY_BUDGET_S`) so out-of-process tests can shrink
-# the wait and operators can tune it; falls back to 10s on a bad value.
-def _ext_ready_budget_s() -> float:
-    try:
-        return float(os.environ.get("BW_EXT_READY_BUDGET_S", "") or 10.0)
-    except (TypeError, ValueError):
-        return 10.0
+_END_SESSION_BUDGET_S = 8.0
 
 
-_EXT_READY_BUDGET_S = _ext_ready_budget_s()
+def _teardown_budget_result(backend: str) -> dict:
+    return {
+        "ok": False,
+        "partial": True,
+        "timedOut": True,
+        "closed": [],
+        "failed": [],
+        "unknown": ["workspace"],
+        "kept": [],
+        "backend": backend,
+    }
 
-# Actionable message when an extension session has no extension connected to the
-# daemon relay. Names the concrete next action — the #1 real cause is a stale
-# service worker after a browserwright upgrade (the extension must reconnect).
-_NO_EXTENSION_CONNECTED_MSG = (
-    "no browserwright extension is connected to the daemon (session {sid}). "
-    "Open the browser where the extension is installed and ensure it is "
-    "enabled; if you just installed or upgraded browserwright, reload the "
-    "extension at chrome://extensions so its service worker reconnects to the "
-    "daemon relay. Then retry. (Use --backend=rdp --create for an isolated "
-    "Chrome that needs no extension.)"
-)
+
+class Handler(Protocol):
+    """Uniform call shape for one ``BrowserwrightDaemon.*`` verb."""
+
+    async def __call__(
+        self,
+        router: "SessionVerbsMixin",
+        client: ClientState,
+        params: dict,
+        req_id: int | None,
+    ) -> None: ...
 
 
 # ---- helpers shared with the translation engine (re-exported by proxy) ----
@@ -92,25 +90,10 @@ def _new_local_session_id(client_id: int) -> str:
 class SessionVerbsMixin:
     """BrowserwrightDaemon.* verb handlers, mixed into ``proxy.Router``.
 
-    All state lives on the Router (``self.state``, ``self.daemon``, the
-    listener-wired ``self._*`` callbacks); this class only groups the verb
+    All state lives on the Router (``self.state``, ``self.daemon``, and the
+    single attached ``self.upstream`` adapter); this class only groups the verb
     methods. Never instantiated on its own.
     """
-
-    @property
-    def _raw_cdp_backend(self) -> bool:
-        """True when this context speaks real browser-level CDP (rdp / env)
-        rather than the extension relay.
-
-        The unified tab-lifecycle verbs (openBackgroundTab / closeTab /
-        recoverSession / userscript / attachActiveTab) dispatch to their
-        raw-CDP implementation via ``_upstream_command`` for every such backend;
-        only the extension relay uses the callback-synthesis path. extension is
-        the sole LOCAL_RELAY backend, so "not extension" is exactly "raw
-        browser-level CDP". (issue #20: env joined this family — it resolves
-        BD_CDP_WS and shares ``_open_chrome_upstream``'s raw command channel,
-        same as rdp.)"""
-        return self.state.backend_name != "extension"
 
     def _session_group_name(
         self, client: ClientState, session_id: str,
@@ -148,69 +131,50 @@ class SessionVerbsMixin:
             return None
         return client.session_id
 
-    def _shared_relay(self):
-        """Best-effort handle to the daemon's extension relay, or None.
-
-        Extension sessions multiplex onto the shared context, whose holder owns
-        the single RelayServer. Reached defensively (the daemon back-ref is
-        ``object | None``) so a missing/partly-wired daemon never raises here —
-        the caller treats None as "can't tell, fall through to the normal
-        path"."""
-        daemon = self.daemon
-        shared = getattr(daemon, "shared_context", None)
-        holder = getattr(shared, "holder", None)
-        return getattr(holder, "relay", None)
-
-    async def _ready_callback(
-        self, client: ClientState, req_id: int | None,
-        attr: str, fail_prefix: str, method_label: str,
-    ):
-        """Lazy-open guard shared by every extension-callback verb.
-
-        The listener wires the extension callbacks (``_attach_active_tab``,
-        ``_open_background_tab``, …) inside ``_open_extension_upstream``, so a
-        cold daemon + already-connected extension becomes ready after one
-        ``_ensure_upstream()`` — trigger it once when the callback is still
-        None and the upstream isn't CONNECTED, then re-read the attribute.
-        Returns the ready callback, or None after having sent the error
-        envelope (-32603 on a failed upstream open, -32601 when the callback
-        is still unwired, i.e. not the extension backend).
-        """
-        cb = getattr(self, attr)
-        if cb is None:
-            if (self._ensure_upstream is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                try:
-                    await self._ensure_upstream()
-                except Exception as e:
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32603,
-                        f"{fail_prefix} (upstream open): {e!r}"))
-                    return None
-            cb = getattr(self, attr)
-        if cb is None:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32601,
-                f"{method_label} requires the extension backend"))
-            return None
-        return cb
-
-    async def _rdp_lazy_open(
+    async def _ready_upstream(
         self, client: ClientState, req_id: int | None, fail_prefix: str,
-    ) -> bool:
-        """Lazy-open guard for the raw-CDP verb impls: make sure the session's
-        upstream command channel exists before dispatching to a ``_rdp_*``
-        implementation. Returns False after sending the error envelope when
-        the open failed."""
-        if self._upstream_command is None and self._ensure_upstream is not None:
+    ):
+        """Return the single attached adapter, lazy-opening it when cold."""
+        if (self.upstream is None and self._ensure_upstream is not None
+                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
             try:
                 await self._ensure_upstream()
             except Exception as e:
                 await self._send_to_client(client.client_id, _error_response(
                     req_id, -32603,
                     f"{fail_prefix} (upstream open): {e!r}"))
-                return False
-        return True
+                return None
+        if self.upstream is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"{fail_prefix}: upstream not attached"))
+            return None
+        return self.upstream
+
+    async def _invoke_upstream(
+        self,
+        client: ClientState,
+        req_id: int | None,
+        fail_prefix: str,
+        invoke: Callable[[Any], Awaitable[Any]],
+        *,
+        error_code: int = -32603,
+        value_error_code: int | None = None,
+    ) -> Any | None:
+        """One readiness → invoke → error-response skeleton for verb handlers."""
+        upstream = await self._ready_upstream(client, req_id, fail_prefix)
+        if upstream is None:
+            return None
+        try:
+            return await invoke(upstream)
+        except ValueError as e:
+            code = value_error_code or error_code
+            detail = str(e) if value_error_code is not None else repr(e)
+        except Exception as e:  # noqa: BLE001 - surface adapter failures
+            code = error_code
+            detail = repr(e)
+        await self._send_to_client(client.client_id, _error_response(
+            req_id, code, f"{fail_prefix}: {detail}"))
+        return None
 
     async def _register_and_respond(
         self, client: ClientState, req_id: int | None, result: dict, *,
@@ -270,166 +234,128 @@ class SessionVerbsMixin:
         await self._send_to_client(
             client.client_id, _result_response(req_id, payload))
 
+    def _forget_tab_binding(
+        self, target_id: str, owner_client_id: int | None = None,
+        owner_local_sid: str | None = None,
+    ) -> None:
+        """Drop the router bookkeeping for one tab exactly once."""
+        if owner_client_id is not None and owner_local_sid is not None:
+            self.state.unbind_session_by_local(
+                owner_client_id, owner_local_sid)
+        self.state.note_target_destroyed(target_id)
+
     # ---- BrowserwrightDaemon.* (per-client RPC) -------------------------------
 
     async def _handle_browserdaemon(self, client: ClientState, msg: dict) -> None:
         method = msg["method"]
         req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        if isinstance(method, str) and method.startswith("BrowserwrightDaemon.userscript."):
-            session_id = await self._require_browser_session(
-                client, req_id, method, params)
-            if session_id is None:
-                return
-            # The schema-lock test scans this file for `method == "..."` string
-            # literals; this no-op registers the userscript.install verb literal
-            # for that scan (userscript.* is otherwise dispatched by prefix).
-            if False and method == "BrowserwrightDaemon.userscript.install":
-                pass
-            verb = method.split(".", 2)[2]
-            # rdp dispatch: the extension's userScripts API doesn't exist on a
-            # daemon-owned Chrome. Provide an honest shim via
-            # Page.addScriptToEvaluateOnNewDocument (see _rdp_userscript). Never
-            # -32601 on rdp.
-            if self._raw_cdp_backend:
-                await self._rdp_userscript(client, req_id, verb, params)
-                return
-            userscript_cb = await self._ready_callback(
-                client, req_id, "_userscript_request",
-                f"userscript {verb} failed", "BrowserwrightDaemon.userscript.*")
-            if userscript_cb is None:
-                return
-            try:
-                result = await userscript_cb(verb, params)
-            except Exception as e:  # noqa: BLE001 - surface to client
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32000, f"userscript {verb} failed: {e}"))
-                return
-            await self._send_to_client(
-                client.client_id, _result_response(req_id, result or {}))
+        handler = VERBS.get(method)
+        if handler is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32601, f"unknown BrowserwrightDaemon method: {method}"))
             return
-        if method == "BrowserwrightDaemon.getBackendInfo":
-            from ..backends import kind_for
-            # Report the live backend's real kind (extension is LOCAL_RELAY),
-            # not a hardcoded UPSTREAM_WS. Unknown/unresolved names ("auto")
-            # fall back to UPSTREAM_WS.
-            kind = kind_for(self.state.backend_name) or "UPSTREAM_WS"
-            await self._send_to_client(client.client_id, _result_response(req_id, {
-                "name": self.state.backend_name,
-                "kind": kind,
-                "ux_warnings": [],
-                "schema_version": 1,
-            }))
+        await handler(self, client, params, req_id)
+
+    async def _handle_get_backend_info(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        from ..backends import kind_for
+        kind = kind_for(self.state.backend_name) or "UPSTREAM_WS"
+        await self._send_to_client(client.client_id, _result_response(req_id, {
+            "name": self.state.backend_name,
+            "kind": kind,
+            "ux_warnings": [],
+            "schema_version": 1,
+        }))
+
+    async def _handle_status(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        # Status is deliberately whole-daemon and upstream-independent: it must
+        # remain answerable precisely when browser work is wedged.
+        from .status import snapshot
+        await self._send_to_client(
+            client.client_id,
+            _result_response(req_id, snapshot(self.daemon, state=self.state)))
+
+    async def _handle_wait_for_session_announce(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        session_id = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.waitForSessionAnnounce", params)
+        if session_id is None:
             return
-        if method == "BrowserwrightDaemon.waitForSessionAnnounce":
-            session_id = await self._require_browser_session(
-                client, req_id, method, params)
-            if session_id is None:
-                return
-            timeout = params.get("timeout")
-            timeout = float(timeout) if isinstance(timeout, (int, float)) else 2.0
-            if self.state.backend_name != "extension":
-                await self._send_to_client(client.client_id, _result_response(
-                    req_id, {"announced": True}))
-                return
-            announce_cb = await self._ready_callback(
-                client, req_id, "_wait_session_announce",
-                "waitForSessionAnnounce failed",
-                "BrowserwrightDaemon.waitForSessionAnnounce")
-            if announce_cb is None:
-                return
-            announced = await announce_cb(session_id, timeout)
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {"announced": bool(announced)}))
+        timeout = params.get("timeout")
+        timeout = float(timeout) if isinstance(timeout, (int, float)) else 2.0
+        announced = await self._invoke_upstream(
+            client, req_id, "waitForSessionAnnounce failed",
+            lambda upstream: upstream.wait_session_announce(
+                session_id, timeout))
+        if announced is None:
             return
-        if method == "BrowserwrightDaemon.extension.reload":
-            reload_cb = await self._ready_callback(
-                client, req_id, "_reload_extensions",
-                "extension reload failed", "BrowserwrightDaemon.extension.reload")
-            if reload_cb is None:
-                return
-            try:
-                result = await reload_cb(
-                    reason=str(params.get("reason") or "manual"),
-                    expected_version=(
-                        str(params.get("expectedVersion"))
-                        if params.get("expectedVersion") else None
-                    ),
-                )
-            except Exception as e:  # noqa: BLE001
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32000, f"extension reload failed: {e!r}"))
-                return
-            await self._send_to_client(
-                client.client_id, _result_response(req_id, result or {}))
+        await self._send_to_client(client.client_id, _result_response(
+            req_id, {"announced": bool(announced)}))
+
+    async def _handle_extension_reload(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        result = await self._invoke_upstream(
+            client, req_id, "extension reload failed",
+            lambda upstream: upstream.reload_extensions(
+                reason=str(params.get("reason") or "manual"),
+                expected_version=(str(params["expectedVersion"])
+                                  if params.get("expectedVersion") else None)),
+            error_code=-32000)
+        if result is None:
             return
-        if method == "BrowserwrightDaemon.attachActiveTab":
-            # Unified verb. On extension this adopts the user's focused-window
-            # active tab (the targetId isn't known until the extension picks
-            # it). On rdp the daemon owns the Chrome, so "the active tab" is
-            # the session's current front target (most-recently-fronted), and
-            # we create+attach one if none exists — an honest equivalent, NOT
-            # -32601 (docs §C1). Either path registers the resulting session
-            # in the binding tables so subsequent CDP commands route the same
-            # way an explicit attach would.
-            attach_params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-            attach_session = await self._require_browser_session(
-                client, req_id, method, attach_params)
-            if attach_session is None:
-                return
-            if self._raw_cdp_backend:
-                if not await self._rdp_lazy_open(
-                        client, req_id, "attach active failed"):
-                    return
-                await self._rdp_attach_active(client, req_id)
-                return
-            attach_cb = await self._ready_callback(
-                client, req_id, "_attach_active_tab",
-                "attach active failed", "BrowserwrightDaemon.attachActiveTab")
-            if attach_cb is None:
-                return
-            try:
-                # Adopt into THIS session's tab group. The title is cosmetic:
-                # prefer the ledger name when the daemon can see it, otherwise
-                # fall back to the bound session id. The durable association is
-                # still the returned numeric groupId.
-                info = await attach_cb(
-                    session_id=attach_session,
-                    group_name=self._session_group_name(client, attach_session))
-            except Exception as e:
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32000, f"attach active failed: {e!r}"))
-                return
-            await self._register_and_respond(
-                client, req_id, info,
-                malformed_msg="attach active returned malformed payload",
-                reuse_existing=True)
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, result or {}))
+
+    async def _handle_attach_active_tab(
+        self, client: ClientState, params: dict, req_id: int | None,
+    ) -> None:
+        session_id = await self._require_browser_session(
+            client, req_id, "BrowserwrightDaemon.attachActiveTab", params)
+        if session_id is None:
             return
-        if method == "BrowserwrightDaemon.openBackgroundTab":
-            await self._handle_open_background_tab(client, msg, req_id)
+        info = await self._invoke_upstream(
+            client, req_id, "attach active failed",
+            lambda upstream: upstream.attach_active(
+                session_id=session_id,
+                group_name=self._session_group_name(client, session_id)),
+            error_code=-32000)
+        if info is None:
             return
-        if method == "BrowserwrightDaemon.closeTab":
-            await self._handle_close_tab(client, msg, req_id)
+        await self._register_and_respond(
+            client, req_id, info,
+            malformed_msg="attach active returned malformed payload",
+            reuse_existing=True)
+
+    async def _handle_userscript(
+        self, client: ClientState, params: dict, req_id: int | None, verb: str,
+    ) -> None:
+        method = f"BrowserwrightDaemon.userscript.{verb}"
+        session_id = await self._require_browser_session(
+            client, req_id, method, params)
+        if session_id is None:
             return
-        if method == "BrowserwrightDaemon.endSession":
-            await self._handle_end_session(client, msg, req_id)
+        result = await self._invoke_upstream(
+            client, req_id, f"userscript {verb} failed",
+            lambda upstream: upstream.userscript_request(
+                verb, params,
+                session_ids=[b.upstream_session_id
+                             for b in client.sessions.values()]),
+            error_code=-32000)
+        if result is None:
             return
-        if method == "BrowserwrightDaemon.ensureExecutor":
-            await self._handle_ensure_executor(client, msg, req_id)
-            return
-        if method == "BrowserwrightDaemon.killExecutor":
-            await self._handle_kill_executor(client, msg, req_id)
-            return
-        if method == "BrowserwrightDaemon.recoverSession":
-            await self._handle_recover_session(client, msg, req_id)
-            return
-        await self._send_to_client(client.client_id, _error_response(
-            req_id, -32601, f"unknown BrowserwrightDaemon method: {method}"))
+        await self._send_to_client(
+            client.client_id, _result_response(req_id, result or {}))
 
     # ---- Phase B: BrowserwrightDaemon.openBackgroundTab / closeTab ----------
 
     async def _handle_open_background_tab(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Spec Phase B Feature 1.
 
@@ -440,12 +366,12 @@ class SessionVerbsMixin:
         subsequent CDP commands work through the same session-id translation
         path as Target.attachToTarget.
         """
-        # Param validation runs FIRST: the schema-lock smoke test calls
-        # every BrowserwrightDaemon.* method with no params and asserts the
-        # response code is NOT -32601 ("unknown method"). Returning -32602
-        # here for the missing required param keeps the lock satisfied
-        # without us wiring a real extension upstream in unit tests.
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        # Param validation runs FIRST so an empty-params call answers -32602
+        # ("bad params"), never -32601 ("unknown method") — checking backend
+        # wiring first would make a missing param indistinguishable from an
+        # unimplemented verb. Enforced by
+        # tests/daemon/test_verb_schema_lock.py::
+        # test_param_validation_runs_before_backend_wiring.
         url = params.get("url")
         if not isinstance(url, str) or not url:
             await self._send_to_client(client.client_id, _error_response(
@@ -462,21 +388,6 @@ class SessionVerbsMixin:
             client, req_id, "BrowserwrightDaemon.openBackgroundTab", params)
         if session is None:
             return
-        # rdp dispatch: on an rdp context there is no extension callback —
-        # implement the verb with raw CDP (Target.createTarget + attach). Every
-        # rdp tab is "background" (no human focus to protect), so `background`
-        # is a no-op and `groupId` is -1 (tab groups are an extension concept).
-        if self._raw_cdp_backend:
-            if not await self._rdp_lazy_open(
-                    client, req_id, "openBackgroundTab failed"):
-                return
-            await self._rdp_open_tab(client, req_id, url)
-            return
-        open_cb = await self._ready_callback(
-            client, req_id, "_open_background_tab",
-            "openBackgroundTab failed", "BrowserwrightDaemon.openBackgroundTab")
-        if open_cb is None:
-            return
         # Extension-only: the tab-group title comes from the session label in
         # the ledger unless explicitly overridden. The durable identity is the
         # numeric groupId returned by the extension path, not this title.
@@ -486,14 +397,13 @@ class SessionVerbsMixin:
         background = params.get("background")
         background = background if isinstance(background, bool) else True
         skip_post_attach_commands = params.get("skipPostAttachCommands") is True
-        try:
-            result = await open_cb(
+        result = await self._invoke_upstream(
+            client, req_id, "openBackgroundTab failed",
+            lambda upstream: upstream.open_tab(
                 url, group_name=group_name, session_id=session,
                 background=background,
-                skip_post_attach_commands=skip_post_attach_commands)
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"openBackgroundTab failed: {e!r}"))
+                skip_post_attach_commands=skip_post_attach_commands))
+        if result is None:
             return
         # groupId is just metadata for the caller.
         await self._register_and_respond(
@@ -502,7 +412,7 @@ class SessionVerbsMixin:
             extra={"groupId": result.get("groupId", -1)})
 
     async def _handle_recover_session(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Session-reconnect-recovery.
 
@@ -512,62 +422,45 @@ class SessionVerbsMixin:
         Recover the tabs from that group, re-attach, and register a regular
         client-side binding for the representative tab so subsequent CDP
         commands route through the normal sessionId translation path (mirrors
-        openBackgroundTab). Requires backend=extension."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        # rdp is ephemeral (decision 9): the daemon-owned Chrome dies with the
-        # daemon, so there is nothing durable to recover. Surviving targets are
-        # re-attached by the skill's in-process / ledger fast paths, so recover
-        # is an honest no-op here — NEVER -32601 (revised Rule: same-shape,
-        # honest, nearest equivalent). This runs before param validation so the
-        # schema-lock smoke test (no params) sees a result, not an error.
-        if self._raw_cdp_backend:
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {"recovered": [], "groupId": -1, "tabs": []}))
-            return
-        # Recovery keys on the persisted numeric groupId (the session's durable
-        # tab-group id from the ledger), NOT the title — names aren't unique.
-        # Validation FIRST so the schema-lock smoke test sees -32602, != -32601.
+        openBackgroundTab). The adapter decides whether recovery means durable
+        group reconstruction or raw-CDP current-page rebinding."""
         group_id = params.get("groupId")
-        if not isinstance(group_id, int) or group_id < 0:
+        if group_id is not None and (
+                not isinstance(group_id, int) or group_id < 0):
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserwrightDaemon.recoverSession requires params.groupId"))
+                "BrowserwrightDaemon.recoverSession params.groupId must be "
+                "a non-negative integer"))
             return
-        bs_session = await self._require_browser_session(
+        session_id = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.recoverSession", params)
-        if bs_session is None:
+        if session_id is None:
             return
-        recover_cb = await self._ready_callback(
-            client, req_id, "_recover_session",
-            "recoverSession failed", "BrowserwrightDaemon.recoverSession")
-        if recover_cb is None:
+        result = await self._invoke_upstream(
+            client, req_id, "recoverSession failed",
+            lambda upstream: upstream.recover(
+                session_id,
+                group_id=group_id if isinstance(group_id, int) else None),
+            value_error_code=-32602)
+        if result is None:
             return
-        try:
-            result = await recover_cb(bs_session, group_id=group_id)
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"recoverSession failed: {e!r}"))
-            return
-        # Register the representative tab's session binding (same as
-        # openBackgroundTab) so the client can drive it immediately.
         await self._register_and_respond(
             client, req_id, result,
             malformed_msg="recoverSession returned malformed result",
             extra={"groupId": result.get("groupId", -1),
-                   "recovered": result.get("recovered", [])})
+                   "recovered": result.get("recovered", [])},
+            reuse_existing=True)
 
     async def _handle_end_session(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """P5.4 / Phase 2: tear down a browserwright session.
 
-        extension: close the session's extension workspace (owned tabs closed,
-        borrowed kept) via the wired `_end_session` callback.
+        extension: close every tab in the session's adapter-owned tab group.
 
         rdp: the per-session context owns a dedicated Chrome. Close that Chrome
         (SIGTERM the launched pid), close the upstream, and drop the context —
         the uniform, non-`-32601` success shape (docs §RPCs)."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = params.get("session")
         if not isinstance(session, str) or not session:
             await self._send_to_client(client.client_id, _error_response(
@@ -579,59 +472,151 @@ class SessionVerbsMixin:
         ) is None:
             return
 
-        # Phase B (PR2): kill this session's persistent executor FIRST, symmetric
-        # for rdp + extension (each session has its own executor keyed on the
-        # daemon registry, even though extension sessions share one
-        # UpstreamContext). Idempotent — a no-op when no executor was spawned.
         daemon = self.daemon
         registry = getattr(daemon, "executors", None) if daemon is not None else None
-        if registry is not None:
-            try:
-                registry.kill(session)
-            except Exception as e:  # noqa: BLE001 - executor kill is best-effort
-                logger.warning("endSession: executor kill for %s failed: %r",
-                               session, e)
 
-        # rdp branch: if this session has a live per-session context, tear it
-        # down — close the upstream + SIGTERM the daemon-owned Chrome + drop the
-        # context. A later session connect recreates a fresh context + relaunches.
-        if daemon is not None and getattr(daemon, "contexts", None) is not None:
-            if session in daemon.contexts:  # type: ignore[attr-defined]
-                try:
-                    await daemon.teardown_rdp_context(session)  # type: ignore[attr-defined]
-                except Exception as e:
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32603, f"endSession failed (rdp teardown): {e!r}"))
-                    return
-                await self._send_to_client(client.client_id, _result_response(
-                    req_id, {"ok": True, "closed": [], "kept": [],
-                             "backend": "rdp"}))
-                return
         group_id = params.get("groupId")
         group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
-        end_cb = await self._ready_callback(
-            client, req_id, "_end_session",
-            "endSession failed", "BrowserwrightDaemon.endSession")
-        if end_cb is None:
-            return
-        try:
-            # Pass group_id only when provided so callbacks with the legacy
-            # single-arg signature stay compatible. group_id is the persisted
-            # numeric tab-group id end_session uses to resolve the group's live
-            # membership (and close the whole group) when the session's bound
-            # groupId is unavailable (e.g. after a daemon restart).
-            if group_id is not None:
-                result = await end_cb(session, group_id)
-            else:
-                result = await end_cb(session)
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"endSession failed: {e!r}"))
-            return
+        # Adapters stop cooperatively at this deadline, after committing every
+        # confirmed mutation. The registry deliberately never hard-cancels the
+        # callback between a browser write and its durable checkpoint.
+        teardown_deadline = time.monotonic() + _END_SESSION_BUDGET_S - 0.5
+
+        async def teardown_workspace() -> dict:
+            # This readiness + teardown runs under ExecutorRegistry's lifecycle
+            # gate in production. A queued ensure therefore cannot reopen the
+            # workspace between executor reap and terminal teardown.
+            record = session_registry.get(session)
+            record_backend = (
+                record.get("backend") if isinstance(record, dict) else None)
+            attach_owned_raw = (
+                isinstance(record, dict)
+                and record.get("owner") == "attach"
+                and record_backend in ("rdp", "env")
+            )
+            if attach_owned_raw and self.upstream is None:
+                ended: bool | None = None
+                if record_backend == "rdp":
+                    ended = False
+                    teardown_rdp = getattr(
+                        daemon, "teardown_rdp_context", None)
+                    if callable(teardown_rdp):
+                        ended = await teardown_rdp(
+                            session, deadline=teardown_deadline)
+                ok = ended is not False
+                return {
+                    "ok": ok,
+                    "partial": not ok,
+                    "timedOut": (
+                        not ok and time.monotonic() >= teardown_deadline),
+                    "closed": [],
+                    "failed": [] if ok else ["workspace"],
+                    "unknown": [] if ok else ["workspace"],
+                    "kept": [],
+                    "backend": record_backend,
+                }
+            if (self.upstream is None and self._ensure_upstream is not None
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                remaining = max(0.0, teardown_deadline - time.monotonic())
+                if remaining <= 0:
+                    return _teardown_budget_result(self.state.backend_name)
+                try:
+                    await asyncio.wait_for(
+                        self._ensure_upstream(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    # ensure_open may have been cancelled *after* publishing an
+                    # adapter — assigned and attached — but before
+                    # set_connected. Keying the reset on `upstream is None`
+                    # left exactly that case in CONNECTING permanently, where
+                    # _gate_upstream_ready neither forwards frames nor starts
+                    # another open, so client traffic piles up unanswered in
+                    # the pre-open buffer. Reset whenever the open did not
+                    # finish, and take the half-published adapter down with it.
+                    # No workspace mutation follows this result.
+                    if self.state.upstream_phase != UpstreamPhase.CONNECTED:
+                        partial = self.upstream
+                        self.upstream = None
+                        if partial is not None:
+                            with contextlib.suppress(Exception):
+                                partial.detach(self)
+                            with contextlib.suppress(Exception):
+                                await partial.close(reason="open_timeout")
+                        await self.state.set_disconnected()
+                    return _teardown_budget_result(self.state.backend_name)
+            upstream = self.upstream
+            if upstream is None:
+                raise RuntimeError("upstream not attached")
+            # Declared on the protocol, so called directly — see the
+            # target_belongs_to_session note below on why probing is wrong.
+            return await upstream.end_session_before(
+                session, group_id, deadline=teardown_deadline)
+
+        daemon_terminate = getattr(daemon, "terminate_session", None)
+        terminate = (
+            daemon_terminate if callable(daemon_terminate)
+            else getattr(registry, "terminate_session", None))
+        if callable(terminate):
+            try:
+                if callable(daemon_terminate):
+                    reap, result = await terminate(
+                        session, teardown_workspace,
+                        caller_token=client.connection_token,
+                        budget=_END_SESSION_BUDGET_S)
+                else:
+                    reap, result = await terminate(
+                        session, teardown_workspace,
+                        budget=_END_SESSION_BUDGET_S)
+                if reap.get("reaped") is not True:
+                    await self._send_to_client(
+                        client.client_id,
+                        _error_response(
+                            req_id, -32603,
+                            "endSession could not confirm executor death: "
+                            f"{reap!r}"),
+                    )
+                    return
+                if isinstance(result, dict):
+                    result.setdefault("backend", self.state.backend_name)
+            except Exception as e:  # noqa: BLE001 - executor kill is best-effort
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    f"endSession failed: {e!r}"))
+                return
+        else:
+            # Lightweight test doubles and old embedders retain the prior
+            # sequence; the real daemon registry always takes the atomic path.
+            if registry is not None:
+                try:
+                    reap = await registry.kill_current_and_wait(session)
+                    if reap.get("reaped") is not True:
+                        await self._send_to_client(
+                            client.client_id,
+                            _error_response(
+                                req_id, -32603,
+                                "endSession could not confirm executor death: "
+                                f"{reap!r}"),
+                        )
+                        return
+                except Exception as e:  # noqa: BLE001
+                    await self._send_to_client(client.client_id, _error_response(
+                        req_id, -32603,
+                        f"endSession executor reap failed: {e!r}"))
+                    return
+            result = await self._invoke_upstream(
+                client, req_id, "endSession failed",
+                lambda upstream: upstream.end_session(session, group_id))
+            if result is None:
+                return
         await self._send_to_client(client.client_id, _result_response(req_id, result))
+        if (isinstance(result, dict) and result.get("ok") is True
+                and client.connection_token is not None
+                and daemon is not None):
+            revoke = getattr(daemon, "revoke_session_lease", None)
+            if callable(revoke):
+                await revoke(client.connection_token)
 
     async def _handle_ensure_executor(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Phase B (Fork 2 control plane): lazily spawn the session's persistent
         executor and return its data-plane socket path.
@@ -641,7 +626,6 @@ class SessionVerbsMixin:
         waits for it to bind + write its `_ipc` discovery file, and returns
         ``{exec_sock}``. The thin heredoc client then connects DIRECTLY to that
         socket to ship code (bulk data never touches this event loop)."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.ensureExecutor", params)
         if session is None:
@@ -653,28 +637,6 @@ class SessionVerbsMixin:
                 req_id, -32603,
                 "ensureExecutor unavailable: daemon has no executor registry"))
             return
-        # Extension backend fast-fail: if no extension is connected to the
-        # relay, the blocking `_ensure_upstream` below would wait the full
-        # 60s extension grace — far longer than the control-plane CDP reply
-        # deadline (cdp.py ~30s) — so the client's facade ws gives up first
-        # and the agent sees an unhelpful `ws closed` / `timeout` instead of
-        # the real cause (GH #18). Surface an actionable error WITHIN the
-        # deadline. We give the service worker a short grace to (re)connect
-        # (it may be mid-reconnect after a daemon restart / upgrade), then
-        # fail fast if still absent. This never mutates the upstream state
-        # machine (no `ensure_open`), so a later reconnect still works.
-        if (self.state.backend_name == "extension"
-                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-            relay = self._shared_relay()
-            if relay is not None and not relay.is_ready:
-                try:
-                    await relay.wait_ready(timeout=_EXT_READY_BUDGET_S)
-                except Exception:  # noqa: BLE001 - TimeoutError + any relay hiccup
-                    pass
-                if not relay.is_ready:
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32603, _NO_EXTENSION_CONNECTED_MSG.format(sid=session)))
-                    return
         # Failure #4 fix: ensure the session's UPSTREAM (rdp Chrome) is launched
         # + ready BEFORE we spawn the executor. The executor's cold-start
         # `connect_over_cdp(facade)` resolves the rdp Chrome's DYNAMIC port,
@@ -685,17 +647,28 @@ class SessionVerbsMixin:
         # and the executor exits during cold-start. Mirror the other verbs'
         # lazy-open (openBackgroundTab / closeTab). Best-effort + bounded: a
         # launch failure surfaces as a proper error envelope, never a crash.
-        if (self._ensure_upstream is not None
-                and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-            try:
-                await self._ensure_upstream()
-            except Exception as e:  # noqa: BLE001
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"ensureExecutor failed (upstream open): {e!r}"))
-                return
+        async def preflight() -> None:
+            if (self._prepare_executor is not None
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                try:
+                    await self._prepare_executor(session)
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"upstream readiness: {e}") from e
+            if (self._ensure_upstream is not None
+                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
+                try:
+                    await self._ensure_upstream()
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"upstream open: {e!r}") from e
         try:
-            sock_path = await registry.ensure(session)
+            ensure_with_preflight = getattr(
+                registry, "ensure_with_preflight", None)
+            if callable(ensure_with_preflight):
+                sock_path = await ensure_with_preflight(session, preflight)
+            else:
+                await preflight()
+                sock_path = await registry.ensure(session)
         except Exception as e:  # noqa: BLE001
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"ensureExecutor failed: {e!r}"))
@@ -710,7 +683,7 @@ class SessionVerbsMixin:
             client.client_id, _result_response(req_id, result))
 
     async def _handle_kill_executor(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Reap ONLY this session's persistent executor — no browser teardown.
 
@@ -720,7 +693,6 @@ class SessionVerbsMixin:
         Idempotent: a no-op `{ok: True, killed: False}` when no executor exists.
         Best-effort — a missing registry still answers a clean (non-`-32601`)
         result so a stale-daemon caller never errors on `session end`."""
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.killExecutor", params)
         if session is None:
@@ -736,17 +708,11 @@ class SessionVerbsMixin:
         wait = params.get("wait") is True
         if registry is not None:
             try:
-                if wait:
-                    result = await registry.kill_and_wait(
-                        session, executor_id=executor_id)
-                    killed = bool(result.get("killed"))
-                    reaped = bool(result.get("reaped"))
-                    matched = bool(result.get("matched", True))
-                else:
-                    killed = bool(registry.kill(session))
-                    # The legacy fire-and-forget path has acknowledged only the
-                    # signal, not process death.
-                    reaped = not killed
+                result = await registry.kill_and_wait(
+                    session, executor_id=executor_id)
+                killed = bool(result.get("killed"))
+                reaped = bool(result.get("reaped"))
+                matched = bool(result.get("matched", True))
             except Exception as e:  # noqa: BLE001 - executor kill is best-effort
                 logger.warning("killExecutor: kill for %s failed: %r", session, e)
         response = {"ok": True, "killed": killed}
@@ -756,20 +722,20 @@ class SessionVerbsMixin:
             client.client_id, _result_response(req_id, response))
 
     async def _handle_close_tab(
-        self, client: ClientState, msg: dict, req_id: int | None,
+        self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
         """Spec Phase B Feature 2.
 
         Maps the client-facing LOCAL sessionId to the upstream sessionId
         (mirroring _handle_detach's translation), invokes upstream.close_tab,
-        and tears down the local state bindings whether the close succeeded
-        or not — the tab is gone either way.
+        and tears down local state bindings only after upstream confirms the
+        close. On failure the binding remains available for retry.
         """
-        # Param validation runs FIRST (same rationale as openBackgroundTab).
+        # Param validation runs FIRST (same rationale as openBackgroundTab:
+        # empty params must answer -32602, never -32601).
         # Accept either `sessionId` (per-client; for persistent-ws callers like
         # Skill REPL) or `targetId` (global; for CLI subcommands whose
         # transient ws can't share per-client session state).
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         local_sid = params.get("sessionId")
         target_id_param = params.get("targetId")
         has_sid = isinstance(local_sid, str) and local_sid
@@ -779,37 +745,24 @@ class SessionVerbsMixin:
                 req_id, -32602,
                 "BrowserwrightDaemon.closeTab requires params.sessionId or params.targetId"))
             return
-        if await self._require_browser_session(
+        browser_session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.closeTab", params,
-        ) is None:
+        )
+        if browser_session is None:
             return
-        # rdp dispatch: close via Target.closeTarget. Resolve the targetId from
-        # the local sessionId binding when only a sessionId was given.
-        if self._raw_cdp_backend:
-            if not await self._rdp_lazy_open(client, req_id, "closeTab failed"):
-                return
-            await self._rdp_close_tab(
-                client, req_id,
-                local_sid=local_sid if has_sid else None,
-                target_id_param=target_id_param if has_tid else None)
+        upstream = await self._ready_upstream(client, req_id, "closeTab failed")
+        if upstream is None:
             return
-        close_cb = await self._ready_callback(
-            client, req_id, "_close_tab",
-            "closeTab failed", "BrowserwrightDaemon.closeTab")
-        if close_cb is None:
-            return
-        # Resolve to (target_id, upstream_sid, owner_client_id, owner_local_sid).
+        # Resolve to (target_id, owner_client_id, owner_local_sid).
         # sessionId path = per-client lookup; targetId path = state.attachers
         # global lookup, valid even across different ws clients.
         target_id: str | None = None
-        upstream_sid: str | None = None
         owner_client_id: int | None = None
         owner_local_sid: str | None = None
         if has_sid:
             binding = client.sessions.get(local_sid)
             if binding is not None:
                 target_id = binding.target_id
-                upstream_sid = binding.upstream_session_id
                 owner_client_id = client.client_id
                 owner_local_sid = local_sid
         if target_id is None and has_tid:
@@ -818,363 +771,97 @@ class SessionVerbsMixin:
             if attacher is not None:
                 owner_client_id = attacher.primary_client_id
                 owner_local_sid = attacher.primary_local_session
-                upstream_sid = attacher.upstream_session_id
-        # Fallback path: targetId given but no live attacher (original opener
-        # disconnected — common for CLI subcommands). The tab still exists in
-        # Chrome; close via targetId-only path that bypasses session lookup.
-        if upstream_sid is None and has_tid:
-            target_id = target_id_param
-            if self._close_tab_by_target_id is None:
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32601,
-                    "BrowserwrightDaemon.closeTab (by targetId) requires the extension backend"))
-                return
-            try:
-                result = await self._close_tab_by_target_id(target_id)
-            except Exception as e:
-                # Match the regular path's policy: tear down bookkeeping even
-                # on error so callers can't reuse the stale targetId. There's
-                # no session/attacher binding to drop here by construction —
-                # that's why the attacher lookup failed in the first place —
-                # so just dropping the target visibility entry is enough.
-                self.state.note_target_destroyed(target_id)
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603, f"closeTab failed: {e!r}"))
-                return
-            self.state.note_target_destroyed(target_id)
-            await self._send_to_client(client.client_id, _result_response(req_id, {
-                "ok": True,
-                "tabId": result.get("tabId"),
-            }))
-            return
-        if target_id is None or upstream_sid is None:
+        if target_id is None:
             ident = local_sid if has_sid else target_id_param
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602, f"unknown sessionId/targetId {ident}"))
             return
+
+        if has_sid and has_tid and target_id_param != target_id:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                "sessionId and targetId refer to different tabs"))
+            return
+
+        # A local sessionId is only an address, not continuing authority. Both
+        # forms are canonicalized to targetId before checking live group
+        # membership, so a tab dragged to another session fails closed.
+        # Called directly, never probed for. Wrapping an authorization check in
+        # `if callable(getattr(...))` fails OPEN — an adapter missing the
+        # method skips the check silently. Every adapter declares it.
         try:
-            result = await close_cb(upstream_sid)
+            ownership = await upstream.target_belongs_to_session(
+                browser_session, target_id)
+        except Exception as e:  # noqa: BLE001 - unknown must fail closed
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"closeTab ownership check failed: {e!r}"))
+            return
+        if ownership is None:
+            if not self._raw_cdp_backend:
+                await self._send_to_client(client.client_id, _error_response(
+                    req_id, -32603,
+                    "closeTab target ownership is unavailable for the shared "
+                    "extension workspace"))
+                return
+            # Raw-CDP authorization is the browser-instance routing boundary.
+            # The operation below can still fail if a forwarding-only adapter
+            # does not implement close_session_tab; that is a capability error,
+            # not an ownership denial.
+        elif ownership is False:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602,
+                f"target {target_id} does not belong to session "
+                f"{browser_session!r}"))
+            return
+        elif ownership is not True:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"closeTab ownership check returned invalid value "
+                f"{ownership!r}"))
+            return
+        try:
+            # Every adapter declares close_session_tab, so this is one call and
+            # not a hasattr probe: dispatching on whether a method exists is
+            # the backend fork the Upstream protocol removed, and it hides the
+            # behaviour change when an adapter later grows the method. No
+            # attacher is required for the one-shot CLI path either — the live
+            # ownership check above is the authorization boundary.
+            result = await upstream.close_session_tab(browser_session, target_id)
         except Exception as e:
-            # Even when upstream signals an error, tear down our bookkeeping
-            # so the caller can't reuse the (now-invalid) sessionId.
-            if owner_client_id is not None and owner_local_sid is not None:
-                self.state.unbind_session_by_local(
-                    owner_client_id, owner_local_sid)
-            self.state.note_target_destroyed(target_id)
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"closeTab failed: {e!r}"))
             return
-        # Success: clean up the session + attacher bindings; drop the target.
-        if owner_client_id is not None and owner_local_sid is not None:
-            self.state.unbind_session_by_local(
-                owner_client_id, owner_local_sid)
-        self.state.note_target_destroyed(target_id)
+        self._forget_tab_binding(
+            target_id, owner_client_id, owner_local_sid)
         await self._send_to_client(client.client_id, _result_response(req_id, {
             "ok": True,
             "tabId": result.get("tabId"),
         }))
 
-    # ---- rdp unified-verb implementations -------------------------------
-    #
-    # On an rdp context (state.backend_name == "rdp") the extension callbacks
-    # (`_open_background_tab` etc.) are never wired — instead we drive the
-    # daemon-owned Chrome with raw CDP through `self._upstream_command`
-    # (UpstreamConnection.send_command, a distinct id space from client
-    # traffic). These keep the wire-facing method names + result shapes
-    # identical to the extension impls so the downstream never branches on
-    # backend (docs §"Unified downstream interface"); divergences are honest,
-    # not -32601.
 
-    async def _rdp_open_tab(
-        self, client: ClientState, req_id: int | None, url: str,
-    ) -> None:
-        """rdp `openBackgroundTab`: Target.createTarget(url) then attach, and
-        register the same client-side binding openBackgroundTab's extension
-        path produces so subsequent CDP commands route through sessionId
-        translation. `groupId` is -1 (tab groups are extension-only); `tabId`
-        is null (Chrome tab ids are an extension concept — the targetId is the
-        rdp-native handle)."""
-        if self._upstream_command is None:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, "openBackgroundTab: rdp upstream not connected"))
-            return
-        try:
-            created = await self._upstream_command(
-                "Target.createTarget", {"url": url})
-            target_id = _cmd_result(created).get("targetId")
-            if not isinstance(target_id, str):
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"openBackgroundTab: Target.createTarget returned {created!r}"))
-                return
-            # Attach (flatten) so the daemon owns a session for this target.
-            attached = await self._upstream_command(
-                "Target.attachToTarget", {"targetId": target_id, "flatten": True})
-            upstream_sid = _cmd_result(attached).get("sessionId")
-            if not isinstance(upstream_sid, str):
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"openBackgroundTab: attach returned {attached!r}"))
-                return
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"openBackgroundTab failed: {e!r}"))
-            return
-        # Register the binding (mirror the extension path). tabId is None (rdp
-        # has no Chrome tab id; targetId is native) and groupId is -1 (tab
-        # groups are extension-only).
-        meta = self.state.targets.get(target_id) or {}
-        await self._register_and_respond(
-            client, req_id, {
-                "sessionId": upstream_sid,
-                "targetId": target_id,
-                "tabId": None,
-                "url": meta.get("url", url),
-                "title": meta.get("title", ""),
-            },
-            malformed_msg="openBackgroundTab returned malformed result",
-            extra={"groupId": -1})
-
-    async def _rdp_attach_active(
-        self, client: ClientState, req_id: int | None,
-    ) -> None:
-        """rdp `attachActiveTab` (docs §C1): the daemon owns this Chrome, so
-        there is no human-contended "focused tab". Define the active tab as the
-        session's current front target — reuse a page target this context is
-        already attached to (most-recently-fronted), else attach an existing
-        page target, else create one. Result shape matches the extension path.
-        This is an honest equivalent, never -32601."""
-        if self._upstream_command is None:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, "attachActiveTab: rdp upstream not connected"))
-            return
-        # 1. Reuse a page target this client already has bound (front tab).
-        for local_sid, binding in client.sessions.items():
-            tid = binding.target_id
-            meta = self.state.targets.get(tid) or {}
-            if meta.get("type", "page") == "page":
-                await self._send_to_client(client.client_id, _result_response(
-                    req_id, {
-                        "sessionId": local_sid,
-                        "targetId": tid,
-                        "tabId": None,
-                        "url": meta.get("url", ""),
-                        "title": meta.get("title", ""),
-                    }))
-                return
-        # 2. Attach an existing page target the daemon-owned Chrome already has.
-        target_id: str | None = None
-        url = ""
-        title = ""
-        try:
-            targets = _cmd_result(await self._upstream_command("Target.getTargets", {}))
-        except Exception:
-            targets = None
-        if isinstance(targets, dict):
-            for info in targets.get("targetInfos", []):
-                if not isinstance(info, dict) or info.get("type") != "page":
-                    continue
-                tid = info.get("targetId")
-                if isinstance(tid, str):
-                    target_id = tid
-                    url = info.get("url", "")
-                    title = info.get("title", "")
-                    break
-        if target_id is None:
-            # 3. No tab at all — create one (mirrors the empty-fallback in the
-            # skill's current_page → open()).
-            await self._rdp_open_tab(client, req_id, "about:blank")
-            return
-        try:
-            attached = await self._upstream_command(
-                "Target.attachToTarget", {"targetId": target_id, "flatten": True})
-            upstream_sid = _cmd_result(attached).get("sessionId")
-            if not isinstance(upstream_sid, str):
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"attachActiveTab: attach returned {attached!r}"))
-                return
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"attachActiveTab failed: {e!r}"))
-            return
-        existing = self.state.attachers.get(target_id)
-        if existing is not None and existing.primary_client_id == client.client_id:
-            local_sid = existing.primary_local_session
-        else:
-            local_sid = _new_local_session_id(client.client_id)
-            self.state.bind_session(
-                client.client_id, local_sid, upstream_sid, target_id)
-            self.state.claim_attacher(
-                target_id, client.client_id, local_sid, upstream_sid)
-        self.state.note_target_info({
-            "targetId": target_id, "type": "page", "url": url, "title": title,
-        })
-        await self._send_to_client(client.client_id, _result_response(req_id, {
-            "sessionId": local_sid,
-            "targetId": target_id,
-            "tabId": None,
-            "url": url,
-            "title": title,
-        }))
-
-    async def _rdp_close_tab(
-        self, client: ClientState, req_id: int | None,
-        *, local_sid: str | None, target_id_param: str | None,
-    ) -> None:
-        """rdp `closeTab`: Target.closeTarget(targetId). Resolve the targetId
-        from the client's local sessionId binding when only a sessionId was
-        given (mirrors the extension path's sessionId→target resolution), then
-        tear down local bookkeeping whether or not the close succeeded — the
-        tab is gone either way."""
-        target_id: str | None = None
-        owner_client_id: int | None = None
-        owner_local_sid: str | None = None
-        if local_sid is not None:
-            binding = client.sessions.get(local_sid)
-            if binding is not None:
-                target_id = binding.target_id
-                owner_client_id = client.client_id
-                owner_local_sid = local_sid
-        if target_id is None and target_id_param is not None:
-            target_id = target_id_param
-            attacher = self.state.attachers.get(target_id)
-            if attacher is not None:
-                owner_client_id = attacher.primary_client_id
-                owner_local_sid = attacher.primary_local_session
-        if target_id is None:
-            ident = local_sid or target_id_param
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32602, f"unknown sessionId/targetId {ident}"))
-            return
-        if self._upstream_command is None:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, "closeTab: rdp upstream not connected"))
-            return
-        try:
-            await self._upstream_command(
-                "Target.closeTarget", {"targetId": target_id})
-        except Exception as e:
-            # Tear down bookkeeping even on error so the caller can't reuse a
-            # stale id.
-            if owner_client_id is not None and owner_local_sid is not None:
-                self.state.unbind_session_by_local(owner_client_id, owner_local_sid)
-            self.state.note_target_destroyed(target_id)
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, f"closeTab failed: {e!r}"))
-            return
-        if owner_client_id is not None and owner_local_sid is not None:
-            self.state.unbind_session_by_local(owner_client_id, owner_local_sid)
-        self.state.note_target_destroyed(target_id)
-        await self._send_to_client(client.client_id, _result_response(req_id, {
-            "ok": True, "tabId": None,
-        }))
-
-    async def _rdp_userscript(
-        self, client: ClientState, req_id: int | None, verb: str, params: dict,
-    ) -> None:
-        """rdp `userscript.*` shim via Page.addScriptToEvaluateOnNewDocument.
-
-        Caveats (documented per docs §C3 — these are honest divergences from
-        the extension's userScripts API, NOT lies):
-          - The script runs in the page's MAIN world, not the extension's
-            ISOLATED world. There is no privileged `GM_*` API surface.
-          - There is NO match-pattern filtering: CDP injects the script into
-            EVERY new document on the attached target(s). The extension's
-            per-URL `@match` semantics are not reproduced — callers that need
-            URL scoping must guard inside the script body.
-          - `install` registers on the currently-attached rdp sessions; `list`
-            reports what we've registered this process; `remove`/`toggle` are
-            best-effort (CDP's removeScriptToEvaluateOnNewDocument by id).
-          - This persists only for the life of the (ephemeral, C2) Chrome.
-
-        We keep the result shape uniform with the extension impl and never
-        return -32601.
-        """
-        if self._upstream_command is None:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32603, "userscript: rdp upstream not connected"))
-            return
-        # Registry of scripts we've installed this process, keyed by identity.
-        # Lives on the Router (per-context) so list/remove can see it.
-        registry: dict = getattr(self, "_rdp_userscripts", None)
-        if registry is None:
-            registry = {}
-            self._rdp_userscripts = registry  # type: ignore[attr-defined]
-
-        try:
-            if verb == "install":
-                script = params.get("script") if isinstance(params.get("script"), dict) else {}
-                source = script.get("source") or script.get("body") or ""
-                identity = script.get("identity") or script.get("id") or f"rdp-us-{len(registry) + 1}"
-                if not isinstance(source, str) or not source:
-                    await self._send_to_client(client.client_id, _error_response(
-                        req_id, -32602, "userscript install requires script.source"))
-                    return
-                # Register on every attached rdp session (each its own target).
-                ids: list[str] = []
-                seen: set[str] = set()
-                for binding in list(client.sessions.values()):
-                    usid = binding.upstream_session_id
-                    if usid in seen:
-                        continue
-                    seen.add(usid)
-                    res = await self._upstream_command(
-                        "Page.addScriptToEvaluateOnNewDocument",
-                        {"source": source}, usid)
-                    sid_id = _cmd_result(res).get("identifier")
-                    if isinstance(sid_id, str):
-                        ids.append(sid_id)
-                registry[identity] = {"identity": identity, "ids": ids,
-                                      "enabled": True}
-                await self._send_to_client(client.client_id, _result_response(req_id, {
-                    "id": identity, "identity": identity,
-                    "sync": {"ok": True, "backend": "rdp",
-                             "note": "MAIN-world, no @match filtering (rdp shim)"},
-                }))
-                return
-            if verb == "list":
-                await self._send_to_client(client.client_id, _result_response(req_id, {
-                    "scripts": [
-                        {"identity": k, "enabled": v.get("enabled", True),
-                         "backend": "rdp"}
-                        for k, v in registry.items()
-                    ],
-                }))
-                return
-            if verb in ("remove", "toggle"):
-                key = params.get("key")
-                entry = registry.get(key) if isinstance(key, str) else None
-                if entry is None:
-                    await self._send_to_client(client.client_id, _result_response(
-                        req_id, {"ok": False, "reason": f"no such userscript {key!r}"}))
-                    return
-                # CDP can only un-register future injections (removeScript...);
-                # already-injected MAIN-world code can't be retracted.
-                for binding in list(client.sessions.values()):
-                    for ident in entry.get("ids", []):
-                        try:
-                            await self._upstream_command(
-                                "Page.removeScriptToEvaluateOnNewDocument",
-                                {"identifier": ident},
-                                binding.upstream_session_id)
-                        except Exception:
-                            pass
-                if verb == "remove":
-                    registry.pop(key, None)
-                else:
-                    enabled = bool(params.get("enabled"))
-                    entry["enabled"] = enabled
-                await self._send_to_client(client.client_id, _result_response(
-                    req_id, {"ok": True, "backend": "rdp"}))
-                return
-            if verb == "logs":
-                # No injection-log facility on rdp; honest empty list.
-                await self._send_to_client(client.client_id, _result_response(
-                    req_id, {"logs": [], "backend": "rdp"}))
-                return
-            await self._send_to_client(client.client_id, _result_response(
-                req_id, {"ok": False, "reason": f"unsupported userscript verb {verb!r} on rdp"}))
-        except Exception as e:
-            await self._send_to_client(client.client_id, _error_response(
-                req_id, -32000, f"userscript {verb} failed (rdp): {e!r}"))
+# The complete declared daemon-verb surface. Keep this explicit: recognition is
+# data, while each handler shares the same four-argument skeleton above.
+VERBS: dict[str, Handler] = {
+    "BrowserwrightDaemon.getBackendInfo": SessionVerbsMixin._handle_get_backend_info,
+    "BrowserwrightDaemon.status": SessionVerbsMixin._handle_status,
+    "BrowserwrightDaemon.waitForSessionAnnounce": SessionVerbsMixin._handle_wait_for_session_announce,
+    "BrowserwrightDaemon.attachActiveTab": SessionVerbsMixin._handle_attach_active_tab,
+    "BrowserwrightDaemon.openBackgroundTab": SessionVerbsMixin._handle_open_background_tab,
+    "BrowserwrightDaemon.closeTab": SessionVerbsMixin._handle_close_tab,
+    "BrowserwrightDaemon.endSession": SessionVerbsMixin._handle_end_session,
+    "BrowserwrightDaemon.ensureExecutor": SessionVerbsMixin._handle_ensure_executor,
+    "BrowserwrightDaemon.killExecutor": SessionVerbsMixin._handle_kill_executor,
+    "BrowserwrightDaemon.recoverSession": SessionVerbsMixin._handle_recover_session,
+    "BrowserwrightDaemon.extension.reload": SessionVerbsMixin._handle_extension_reload,
+    "BrowserwrightDaemon.userscript.install": partial(
+        SessionVerbsMixin._handle_userscript, verb="install"),
+    "BrowserwrightDaemon.userscript.list": partial(
+        SessionVerbsMixin._handle_userscript, verb="list"),
+    "BrowserwrightDaemon.userscript.remove": partial(
+        SessionVerbsMixin._handle_userscript, verb="remove"),
+    "BrowserwrightDaemon.userscript.toggle": partial(
+        SessionVerbsMixin._handle_userscript, verb="toggle"),
+    "BrowserwrightDaemon.userscript.logs": partial(
+        SessionVerbsMixin._handle_userscript, verb="logs"),
+}

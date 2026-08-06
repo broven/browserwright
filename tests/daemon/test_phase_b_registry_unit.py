@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 
 import pytest
@@ -150,6 +151,187 @@ async def test_kill_and_wait_confirms_matching_process_death(monkeypatch):
     }
     assert current.is_alive() is False
     assert reg.get("sess-reap") is None
+
+
+@pytest.mark.asyncio
+async def test_kill_blocks_replacement_until_exact_instance_is_dead(monkeypatch):
+    reg = ExecutorRegistry()
+    old = _handle("sess-race", "/tmp/old.sock", executor_id="executor-old")
+    reg._handles["sess-race"] = old
+    reap_started = threading.Event()
+    allow_death = threading.Event()
+    spawned: list[str] = []
+
+    def blocked_reap(handle):
+        assert handle is old
+        reap_started.set()
+        assert allow_death.wait(timeout=2)
+        handle.proc.terminate()
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(
+            session_id, "/tmp/new.sock", executor_id="executor-new")
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        blocked_reap,
+    )
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    kill_task = asyncio.create_task(reg.kill("sess-race"))
+    assert await asyncio.to_thread(reap_started.wait, 1)
+    ensure_task = asyncio.create_task(reg.ensure("sess-race"))
+    await asyncio.sleep(0.02)
+    assert spawned == []
+    assert ensure_task.done() is False
+
+    allow_death.set()
+    assert await kill_task is True
+    assert await ensure_task == "/tmp/new.sock"
+    assert spawned == ["sess-race"]
+    assert reg.get("sess-race").executor_id == "executor-new"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_kill_keeps_replacement_blocked_until_reap(monkeypatch):
+    reg = ExecutorRegistry()
+    old = _handle("sess-cancel", "/tmp/old.sock", executor_id="executor-old")
+    reg._handles["sess-cancel"] = old
+    reap_started = threading.Event()
+    allow_death = threading.Event()
+    spawned: list[str] = []
+
+    def blocked_reap(handle):
+        assert handle is old
+        reap_started.set()
+        assert allow_death.wait(timeout=2)
+        handle.proc.terminate()
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(
+            session_id, "/tmp/new.sock", executor_id="executor-new")
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        blocked_reap,
+    )
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    kill_task = asyncio.create_task(reg.kill_current_and_wait("sess-cancel"))
+    assert await asyncio.to_thread(reap_started.wait, 1)
+    kill_task.cancel()
+    ensure_task = asyncio.create_task(reg.ensure("sess-cancel"))
+    await asyncio.sleep(0.02)
+
+    assert spawned == []
+    assert ensure_task.done() is False
+
+    allow_death.set()
+    with pytest.raises(asyncio.CancelledError):
+        await kill_task
+    assert await ensure_task == "/tmp/new.sock"
+    assert spawned == ["sess-cancel"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_teardown_accepts_cooperative_retryable_partial(monkeypatch):
+    reg = ExecutorRegistry()
+    teardown_started = asyncio.Event()
+    teardown_cancelled = False
+    spawned: list[str] = []
+
+    async def teardown():
+        nonlocal teardown_cancelled
+        teardown_started.set()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            teardown_cancelled = True
+            raise
+        return {"ok": False, "partial": True, "timedOut": True}
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(session_id, "/tmp/retry.sock")
+
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._discovery_alive",
+        lambda _session_id: False,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    reap, result = await reg.terminate_session(
+        "sess-budget", teardown, budget=0.05)
+
+    assert reap["reaped"] is True
+    assert teardown_started.is_set()
+    assert teardown_cancelled is False
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert result["timedOut"] is True
+    assert await reg.ensure("sess-budget") == "/tmp/retry.sock"
+    assert spawned == ["sess-budget"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_teardown_blocks_and_then_rejects_ensure(monkeypatch):
+    reg = ExecutorRegistry()
+    teardown_started = asyncio.Event()
+    allow_teardown = asyncio.Event()
+    spawned: list[str] = []
+
+    async def teardown():
+        teardown_started.set()
+        await allow_teardown.wait()
+        return {"ok": True, "closed": [], "failed": []}
+
+    async def fake_spawn(session_id):
+        spawned.append(session_id)
+        return _handle(session_id, "/tmp/replacement.sock")
+
+    monkeypatch.setattr(reg, "_spawn", fake_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._discovery_alive",
+        lambda _session_id: False,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    end_task = asyncio.create_task(reg.terminate_session("sess-end", teardown))
+    await asyncio.wait_for(teardown_started.wait(), timeout=1.0)
+    preflight_calls: list[str] = []
+
+    async def preflight():
+        preflight_calls.append("opened workspace")
+
+    ensure_task = asyncio.create_task(
+        reg.ensure_with_preflight("sess-end", preflight))
+    await asyncio.sleep(0.02)
+    assert spawned == []
+    assert ensure_task.done() is False
+
+    allow_teardown.set()
+    assert (await end_task)[1]["ok"] is True
+    with pytest.raises(RuntimeError, match="has ended"):
+        await ensure_task
+    assert spawned == []
+    assert preflight_calls == []
 
 
 # ---- stale discovery-file robustness (Fork 4 / daemon restart) -------------
@@ -293,6 +475,107 @@ async def test_await_ready_requires_matching_executor_instance(
     await publisher
 
     assert sock == "/tmp/current.sock"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spawn_holds_fixed_path_until_exact_reap(monkeypatch):
+    reg = ExecutorRegistry()
+    readiness_started = asyncio.Event()
+    never_ready = asyncio.Event()
+    reaping_started = threading.Event()
+    allow_death = threading.Event()
+    procs: list[_FakeProc] = []
+
+    def fake_popen(*_args, **_kwargs):
+        proc = _FakeProc(alive=True)
+        proc.pid += len(procs)
+        procs.append(proc)
+        return proc
+
+    async def blocked_readiness(*_args, **_kwargs):
+        readiness_started.set()
+        await never_ready.wait()
+
+    def blocked_reap(handle):
+        reaping_started.set()
+        assert allow_death.wait(timeout=2)
+        handle.proc.terminate()
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(reg, "_await_ready", blocked_readiness)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        blocked_reap,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    first = asyncio.create_task(reg.ensure("sess-spawn-cancel"))
+    await asyncio.wait_for(readiness_started.wait(), timeout=1)
+    first.cancel()
+    second = asyncio.create_task(reg.ensure("sess-spawn-cancel"))
+    try:
+        await asyncio.sleep(0.05)
+        assert reaping_started.is_set()
+        assert len(procs) == 1
+        assert first.done() is False
+        assert second.done() is False
+    finally:
+        allow_death.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+
+@pytest.mark.asyncio
+async def test_spawn_readiness_timeout_confirms_exact_process_death(monkeypatch):
+    class _StubbornProc(_FakeProc):
+        def __init__(self):
+            super().__init__(alive=True)
+            self.terminate_calls = 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+    proc = _StubbornProc()
+    reaped: list[ExecutorHandle] = []
+
+    def reap(handle):
+        reaped.append(handle)
+        handle.proc._alive = False
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry.subprocess.Popen",
+        lambda *_args, **_kwargs: proc,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._SPAWN_READY_TIMEOUT_S",
+        0,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._terminate_and_wait",
+        reap,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    reg = ExecutorRegistry()
+    with pytest.raises(RuntimeError, match="never became ready"):
+        await reg.ensure("sess-spawn-timeout")
+
+    assert proc.poll() is not None
+    assert len(reaped) == 1
+    assert reaped[0].proc is proc
+    assert reg.get("sess-spawn-timeout") is None
 
 
 # ---- ensureExecutor verb dispatch ------------------------------------------
@@ -568,9 +851,13 @@ async def test_kill_executor_verb_reaps_and_acks():
 
     class _Daemon:
         class _Reg:
-            def kill(self, session_id):
+            async def kill_and_wait(self, session_id, *, executor_id=None):
                 killed.append(session_id)
-                return True
+                return {
+                    "killed": True,
+                    "reaped": True,
+                    "matched": True,
+                }
 
         executors = _Reg()
 

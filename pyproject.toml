@@ -4,7 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "browserwright"
-version = "0.6.2"
+# Placeholder, never bumped per release — the git tag is the single source of
+# truth. `.github/workflows/release.yml` rewrites this line (and
+# `chrome-extension/manifest.json`) from `GITHUB_REF_NAME` at build time, so a
+# release commit must NOT edit it. The sentinel is `0.0.0` on purpose: it is
+# valid semver, is below every published version, and can never be mistaken for
+# a real release — which a stale-but-plausible number (this used to sit at
+# "0.6.2" while tags had reached v0.8.0) very much could. Keep it in lockstep
+# with the manifest, keep the line on its own with no trailing comment: the
+# stamping regex is `^(version\s*=\s*)["'][^"']+["']\s*$` and CI aborts unless
+# it matches exactly once. `tests/skill/test_release_versioning.py` enforces all
+# of that before a tag is ever pushed. See RELEASING.md.
+version = "0.0.0"
 description = "Browserwright — let AI/code agents drive a real or isolated browser and author userscripts. Single package: the agent-facing REPL/site-skills/memory layer plus the bundled browser-resolving daemon (CDP proxy + extension/cloud backends)."
 requires-python = ">=3.11"
 dependencies = [

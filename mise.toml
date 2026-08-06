@@ -103,10 +103,29 @@ fi
 #    global daemon never do), and we additionally require ppid==1 so a sibling
 #    worktree's *running* e2e — whose Chrome still has a live pytest parent —
 #    is left alone. Orphans are exactly the leak this is meant to reap.
+#
+#    Only the extension Chrome for Testing (`bd-e2e-chrome-`, a tmpdir profile)
+#    is killed here. The daemon-launched rdp Chrome
+#    (`~/.cache/browserwright-daemon/profiles/bs-s<id>`) is deliberately NOT:
+#    that tree is shared across worktrees, isolated e2e ledgers routinely mint
+#    the same local session id, and after the documented macOS launcher handoff
+#    a sibling's *live* Chrome also has ppid 1 — so nothing observable on the
+#    process tells its browser apart from our leak. Killing the wrong one
+#    corrupts a run nobody is watching; leaving a leak costs disk. Report the
+#    candidates and let the daemon's own startup sweep, which is scoped to its
+#    runtime dir, reclaim them.
 orphans=$(ps -eo pid=,ppid=,command= 2>/dev/null \
   | grep -F -- "--user-data-dir=" \
-  | grep -F "bd-e2e-chrome-" \
+  | grep -F -- "bd-e2e-chrome-" \
   | awk '$2 == 1 {print $1}')
+shared=$(ps -eo pid=,ppid=,command= 2>/dev/null \
+  | grep -F -- "--user-data-dir=" \
+  | grep -F -- "/profiles/bs-se2e-" \
+  | awk '$2 == 1 {print $1}')
+if [ -n "${shared:-}" ]; then
+  echo "teardown: NOT killing shared-profile rdp Chrome (cannot prove it is"
+  echo "  this worktree's): $(echo "$shared" | tr '\n' ' ')"
+fi
 if [ -n "${orphans:-}" ]; then
   echo "teardown: killing orphaned e2e Chrome: $(echo "$orphans" | tr '\n' ' ')"
   echo "$orphans" | xargs kill 2>/dev/null

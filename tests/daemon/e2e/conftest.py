@@ -147,6 +147,59 @@ def e2e_artifacts_dir() -> Path:
     return d
 
 
+# ---- daemon log harvesting -------------------------------------------------
+#
+# The daemon does NOT log to its stdout/stderr unless stderr is a TTY (see
+# `_wire_logging` in daemon/server/listener.py) — it routes its logger to
+# `$TMPDIR/browserwright-daemon.log` instead. These fixtures pipe the daemon's
+# stderr to a file (never a TTY) and point TMPDIR at a throwaway dir they
+# `rmtree` at teardown, so every daemon log line was written and then deleted:
+# `_artifacts/daemon.log` has always been 0 bytes despite the README promising
+# it. That is a harness bug — the test deleting its own evidence — so it is
+# fixed here rather than by rerouting production logging.
+#
+# Two harvests, because they answer different questions:
+#   - per failing test, from the *live* file, so a failure carries the log as it
+#     stood at that moment;
+#   - at session teardown, appended to the artifact file, so the full run is
+#     kept after the throwaway TMPDIR is gone.
+
+#: label -> the daemon's own log file, for daemons that are currently running.
+#: Populated by the daemon fixtures so the failure hook can snapshot without
+#: depending on (and thereby starting) a daemon for tests that need none.
+_LIVE_DAEMON_LOGS: dict[str, Path] = {}
+
+
+def _daemon_log_file(runtime_dir: str) -> Path:
+    """Where `_wire_logging()` puts the daemon's log when TMPDIR=runtime_dir.
+
+    The basename is read back off production's own `_ipc.log_path()` rather
+    than hardcoded, so a rename there surfaces here instead of silently
+    reinstating the empty-artifact bug.
+    """
+    from browserwright.daemon import _ipc
+
+    return Path(runtime_dir) / _ipc.log_path().name
+
+
+def _harvest_daemon_log(runtime_dir: str, dest: Path, label: str) -> None:
+    """Append the daemon's own log to `dest` before the runtime dir is removed."""
+    src = _daemon_log_file(runtime_dir)
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    try:
+        with open(dest, "a", encoding="utf-8") as fh:
+            fh.write(
+                f"\n===== {label}: {src} "
+                f"(harvested at session teardown) =====\n"
+            )
+            fh.write(text)
+    except OSError:
+        pass
+
+
 @pytest.fixture(scope="session")
 def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     """Spawn `browserwright-daemon serve --extension-port N`
@@ -222,6 +275,8 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
             f"see {log_path}"
         )
 
+    _LIVE_DAEMON_LOGS["daemon"] = _daemon_log_file(runtime_dir)
+
     yield DaemonHandle(proc=proc, ext_port=TEST_EXT_PORT,
                        runtime_dir=runtime_dir, log_path=log_path)
 
@@ -233,6 +288,9 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
+    _LIVE_DAEMON_LOGS.pop("daemon", None)
+    # Keep the log before the throwaway TMPDIR that holds it is removed.
+    _harvest_daemon_log(runtime_dir, log_path, "extension daemon")
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
@@ -329,6 +387,28 @@ def _kill_chrome(pid: int):
         pass
 
 
+def e2e_headless() -> bool:
+    """Opt-in headless mode for the e2e Chrome (`BW_E2E_HEADLESS=1`).
+
+    Default OFF. Headful is the honest default: these tests exist to pin what a
+    real user's browser does, and a couple of them assert properties (tab
+    visibility, unthrottled rAF) whose meaning changes under headless. The flag
+    exists because a headful run repeatedly steals the active window, which
+    makes the suite hostile to run on the machine you are working on.
+
+    Tests whose semantics headless would quietly change must skip themselves —
+    see `requires_headful` — because a test that passes vacuously is worse than
+    one that fails.
+    """
+    return os.environ.get("BW_E2E_HEADLESS", "") == "1"
+
+
+def requires_headful(reason: str) -> None:
+    """Skip the calling test when the suite is running headless."""
+    if e2e_headless():
+        pytest.skip(f"needs a headful Chrome ({reason}); unset BW_E2E_HEADLESS")
+
+
 def _launch_cft_with_extension(
     cft_binary: Path, ext_dir: Path, *, rdp_port: int = 0,
 ) -> ChromeHandle:
@@ -336,6 +416,7 @@ def _launch_cft_with_extension(
     profile_dir = Path(tempfile.mkdtemp(prefix="bd-e2e-chrome-"))
     args = [
         str(cft_binary),
+        *(["--headless=new"] if e2e_headless() else []),
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={rdp_port}",
         "--no-first-run",
@@ -346,12 +427,27 @@ def _launch_cft_with_extension(
         f"--load-extension={ext_dir}",
         "about:blank",
     ]
+    # stderr goes to a file, never DEVNULL: a Chrome that dies at startup is
+    # undiagnosable without its message, and every extension test would error
+    # identically at fixture setup (CI 2026-08: 25 errors, one cause, zero
+    # evidence). The file lives inside the profile dir, which failure paths
+    # rmtree, so read the tail BEFORE that cleanup.
+    stderr_path = profile_dir / "_cft_stderr.log"
+    stderr_fh = open(stderr_path, "w")
     proc = subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_fh,
         start_new_session=True,
     )
+
+    def _stderr_tail() -> str:
+        stderr_fh.flush()
+        try:
+            return stderr_path.read_text(
+                encoding="utf-8", errors="replace")[-2000:]
+        except OSError:
+            return ""
 
     # Wait for DevToolsActivePort. On ANY failure path, kill Chrome and
     # remove the profile dir so we don't leak processes or tmpdir space.
@@ -365,6 +461,7 @@ def _launch_cft_with_extension(
                     port = int(lines[0].strip())
                     ws_path = lines[1].strip()
                     ws_url = f"ws://127.0.0.1:{port}{ws_path}"
+                    stderr_fh.close()
                     return ChromeHandle(
                         ws_url=ws_url,
                         profile_path=profile_dir,
@@ -375,15 +472,17 @@ def _launch_cft_with_extension(
                 pass
             if proc.poll() is not None:
                 raise RuntimeError(
-                    f"Chrome for Testing exited with code {proc.returncode}"
+                    f"Chrome for Testing exited with code {proc.returncode}; "
+                    f"stderr tail:\n{_stderr_tail()}"
                 )
             time.sleep(0.2)
 
         raise RuntimeError(
             f"Chrome for Testing did not write DevToolsActivePort within 15s; "
-            f"profile={profile_dir}"
+            f"profile={profile_dir}; stderr tail:\n{_stderr_tail()}"
         )
     except BaseException:
+        stderr_fh.close()
         _kill_chrome(proc.pid)
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise
@@ -422,7 +521,14 @@ def e2e_chrome(cft_binary, patched_ext_dir):
 
 @pytest.fixture(autouse=True)
 def _e2e_dump_artifacts_on_failure(request, e2e_artifacts_dir):
-    """When a `real_chrome` test fails, write env into `_artifacts/<nodeid>/`."""
+    """When a `real_chrome` test fails, write env + the live daemon log into
+    `_artifacts/<nodeid>/`.
+
+    The daemon log is copied from the *running* daemon's log file rather than
+    from the fixture's stdout capture, which stays empty (see the harvesting
+    note above). Copying at the moment of failure also scopes the log to the
+    failing test instead of handing you the whole session.
+    """
     yield
     rep = getattr(request.node, "rep_call", None)
     if rep is not None and rep.failed:
@@ -431,6 +537,12 @@ def _e2e_dump_artifacts_on_failure(request, e2e_artifacts_dir):
         env_lines = [f"{k}={v}" for k, v in sorted(os.environ.items())
                      if k.startswith(("BD_", "BS_", "BU_"))]
         (outdir / "env.txt").write_text("\n".join(env_lines), encoding="utf-8")
+        for label, src in _LIVE_DAEMON_LOGS.items():
+            try:
+                text = src.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            (outdir / f"{label}.log").write_text(text, encoding="utf-8")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -467,10 +579,89 @@ def ext_ready(e2e_daemon, e2e_chrome):
     )
 
 
+def rdp_headless() -> bool:
+    """Whether the rdp-backend Chromes run headless. Default **ON**.
+
+    Opposite default from `e2e_headless()` (the extension Chrome), and the
+    asymmetry is the point:
+
+    - The extension Chrome stays headful because tests in this suite assert
+      things only a real foreground window has (tab visibility, focus,
+      unthrottled rAF — `test_l2_background_render.py`).
+    - Nothing on the rdp side asserts any of that. The rdp tests cover executor
+      lifecycle, state persistence, page binding, tab reuse and timeout
+      reclamation, all of which are headless-clean. Their windows were pure
+      collateral damage: a full run popped ~18 rdp Chrome windows, each one
+      stealing the active window of whoever was working on the machine.
+
+    Escape hatch for debugging an rdp test visually: `BW_E2E_RDP_HEADFUL=1`.
+    """
+    return os.environ.get("BW_E2E_RDP_HEADFUL", "") != "1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _rdp_chrome_headless_env():
+    """Put `--headless=new` on every rdp Chrome launched during this session.
+
+    Two different launchers need it and only one is reachable from test code:
+
+    1. `e2e_chrome_rdp` calls `launch_chrome()` in-process (could take
+       `extra_args=`), and
+    2. the **daemon** calls `launch_chrome()` itself for every create-owned rdp
+       session (`server/listener.py::_launch_rdp_chrome`). That one runs in a
+       subprocess we only hand an environment to — no argument we pass here can
+       reach it.
+
+    So both go through the env hook (`launch_chrome.CHROME_EXTRA_ARGS_ENV`),
+    set on *this* process so every daemon spawned from `os.environ.copy()`
+    inherits it. Autouse + session-scoped so it is in place before any fixture
+    or in-test daemon spawn.
+
+    Deliberately does NOT touch the extension Chrome: that one is launched by
+    `_launch_cft_with_extension`, which never calls `launch_chrome()`.
+    """
+    key = _lc_mod.CHROME_EXTRA_ARGS_ENV
+    previous = os.environ.get(key)
+    if rdp_headless():
+        extra = "--headless=new"
+        os.environ[key] = f"{previous} {extra}" if previous else extra
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 @pytest.fixture
-def e2e_chrome_rdp(tmp_path_factory):
+def e2e_chrome_rdp(tmp_path_factory, _rdp_chrome_headless_env):
     """Chrome with --remote-debugging-port for RDP-backend tests.
     No extension — RDP backend doesn't need one. Uses regular Chrome.
+
+    Headless by default (`rdp_headless()`); `BW_E2E_RDP_HEADFUL=1` to watch it.
+
+    FUNCTION-scoped, and it must stay that way. It looks like an obvious
+    `scope="session"` win — it already serialises on the fixed `TEST_RDP_PORT`,
+    and 15 rdp tests each pay a Chrome launch for it. It was tried (2026-08,
+    headless, otherwise-identical tree) and it is NOT safe:
+
+        tests/daemon/e2e/test_l2_heredoc_playwright_page.py
+            ::test_cross_heredoc_tab_reuse_rdp
+        FAILED — PageBindTimeout: timed out binding Playwright to session
+        target '…' after 2s; no replacement page was created
+
+    …on the *first* run, in the *default* collection order — no shuffling
+    needed. That test passes on every function-scoped run. `CONTEXT.md` says why
+    this is structural rather than a bug to paper over: for an rdp session the
+    **workspace IS the browser instance**, so one shared Chrome means one shared
+    workspace, and a neighbour's leftover targets are visible to the session
+    that binds next. Function scope is the isolation the rdp tests are written
+    against.
+
+    The window-count problem it was going to solve is solved by
+    `_rdp_chrome_headless_env` instead: these Chromes cost 0 windows now, so
+    sharing them would buy nothing but flakiness.
     """
     cfg = _load_config(env={})
     profile_name = f"bd-e2e-rdp-{uuid.uuid4().hex[:8]}"
@@ -562,6 +753,8 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
             f"see {log_path}"
         )
 
+    _LIVE_DAEMON_LOGS["daemon-rdp"] = _daemon_log_file(runtime_dir)
+
     yield runtime_dir
 
     # Teardown.
@@ -574,4 +767,6 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         proc.kill()
         proc.wait(timeout=2)
     log_fh.close()
+    _LIVE_DAEMON_LOGS.pop("daemon-rdp", None)
+    _harvest_daemon_log(runtime_dir, log_path, "rdp daemon")
     shutil.rmtree(runtime_dir, ignore_errors=True)

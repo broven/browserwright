@@ -56,12 +56,71 @@ of display and a few seconds per case, which we keep out of the inner loop.
 Nothing escapes the test boundary. You can have your daily Chrome + extension
 running while these tests run.
 
+## Headless
+
+A headful Chrome repeatedly steals the active window, which makes the suite
+hostile to run on the machine you're working on. The two backends have
+**opposite defaults**, for a reason:
+
+| Chrome | Launched by | Default | Flag |
+|---|---|---|---|
+| extension (Chrome for Testing) | `_launch_cft_with_extension` | **headful** | `BW_E2E_HEADLESS=1` → headless |
+| rdp (fixture + daemon-owned) | `launch_chrome()` | **headless** | `BW_E2E_RDP_HEADFUL=1` → headful |
+
+**Extension headful by default** because these tests exist to pin what a real
+browser does. `test_l2_background_render.py` **must** run headful -- both cases
+compare a backgrounded tab against a real foreground window, and headless has no
+foreground, reports every tab visible, and never throttles rAF, so they would
+pass without exercising `keepTabRendered()` at all. They skip themselves under
+`BW_E2E_HEADLESS=1` rather than pass vacuously. Anything else asserting
+visibility, focus, or frame timing should do the same via
+`conftest.requires_headful`.
+
+**RDP headless by default** because nothing on the rdp side asserts any of
+that. Those tests cover executor lifecycle, state persistence, page binding, tab
+reuse and timeout reclamation -- all headless-clean. Their windows were pure
+collateral damage: measured on a full run, they were 18 of the 44 Chrome windows
+the suite popped, every one of them stealing the active window from whoever was
+using the machine. Measured before/after on the same tree, making them headless
+changed the failure set by **zero** tests.
+
+How it reaches the daemon-owned Chromes: for a create-owned rdp session the
+*daemon* calls `launch_chrome()` itself, in its own process, so no fixture
+argument can reach it. `conftest._rdp_chrome_headless_env` (session-scoped,
+autouse) instead sets `BD_CHROME_EXTRA_ARGS=--headless=new` on the pytest
+process, and every daemon spawned from `os.environ.copy()` inherits it.
+`BD_CHROME_EXTRA_ARGS` is a general "append this argv to every Chrome we launch"
+hook in `daemon/launch_chrome.py`, default-off in production.
+
+### Why `e2e_chrome_rdp` is not session-scoped
+
+It looks like free money -- it already serialises on the fixed `TEST_RDP_PORT`,
+and 15 tests each pay a Chrome launch. It was tried and it fails:
+`test_cross_heredoc_tab_reuse_rdp` dies with `PageBindTimeout` on the first run
+in the default order. For an rdp session the workspace *is* the browser instance
+(see `CONTEXT.md`), so one shared Chrome is one shared workspace and a
+neighbour's leftover targets are visible to whoever binds next. Since the
+Chromes are headless now, sharing them would save no windows at all -- only
+flakiness. See the fixture docstring.
+
 ## Artifacts on failure
 
 When a test fails, `_artifacts/<test-name>/` contains:
 
 - `env.txt` -- relevant `BD_*` / `BS_*` env vars at run time
-- (session-level) `daemon.log` -- daemon stderr (everything)
+- `daemon.log` / `daemon-rdp.log` -- the daemon's own log, copied out of the
+  live daemon at the moment that test failed
+
+Session-level `_artifacts/daemon.log` and `_artifacts/daemon-rdp.log` hold the
+daemon's stdout/stderr plus its full log, appended at session teardown.
+
+Why the copying: the daemon routes its logger to `$TMPDIR/browserwright-daemon.log`
+and only echoes to stderr when stderr is a TTY (`_wire_logging` in
+`daemon/server/listener.py`). These fixtures give it a pipe (never a TTY) and a
+throwaway `TMPDIR` they delete at teardown -- so for a long time every daemon log
+line was written and then thrown away, and `_artifacts/daemon.log` was always 0
+bytes. The fixtures now harvest the file before removing the directory. If you
+ever see an empty `daemon.log` again, that harvest is what broke.
 
 This directory is gitignored.
 
@@ -78,6 +137,11 @@ This directory is gitignored.
 ## When this fails
 
 - "port 29989 already in use" -> `lsof -i :29989`, kill the stale daemon.
+- "run.sh: REFUSING to start -- port 29989 is held by a process that is NOT
+  from this worktree" -> exactly what it says. :29989 is a fixed port shared by
+  every worktree, so that is very likely a **sibling worktree's e2e run in
+  progress**; run.sh used to kill it unconditionally, which voided both runs.
+  Wait for it to finish, or kill it by hand if you know it is dead weight.
 - "extension never connected within 10s" -> check `_artifacts/daemon.log`;
   most likely the patched `RELAY_URL` is wrong or Chrome failed to load the
   extension dir.
