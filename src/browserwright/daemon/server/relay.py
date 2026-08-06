@@ -600,12 +600,19 @@ class RelayServer:
         }, timeout=timeout) or {}
 
     async def userscript_request(self, verb: str, payload: dict,
-                                 *, timeout: float = 5.0) -> dict | None:
+                                 *, timeout: float = 5.0,
+                                 **kwargs: Any) -> dict | None:
         """Forward a userscript control request to any ready extension.
 
         Userscript operations are extension-global rather than tab-scoped, so
         unlike ``send_cdp`` they only need a connected extension, not a tab
         owner.
+
+        ``session_ids`` (sent by the verb layer to scope installs on the
+        raw-CDP backend, where the workspace is the browser instance) is
+        accepted and dropped here: the extension owns the scripts, the
+        extension's ``background.js`` dispatch reads no session ids, and the
+        message must not carry keys it does not understand.
         """
         ext = self._pick_active_extension()
         if ext is None:
