@@ -70,10 +70,20 @@ Hard invariants:
 - Probe tabs and real user-work tabs are not separate workspaces; they belong to
   the same group.
 - `runtime.group_id` in the session ledger is durable state, not a cosmetic
-  label. It lets the daemon recover the same group after restart.
+  label. It lets the daemon recover the same group after restart — as a
+  *candidate*, never as proof.
 - In-process relay state is the fast path; ledger `runtime.group_id` is the
   restart/reconnect fallback. A tab-creation path must refresh from these
   sources before asking Chrome to create a new group.
+- Group ownership is **derived from the extension's per-tab markers** (issue
+  #29): the extension stamps every tab it places in a session group
+  (`chrome.storage.session`, keyed by tabId, value = owning sessionId), and a
+  group is adopted only if a member tab carries the session's marker. The
+  title is never an anchor (user-editable, non-unique); recycled group/tab ids
+  after a browser restart make ownership unprovable, and an unproven group is
+  never adopted — opening, recovery, and teardown fail explicitly, and
+  `attachActiveTab` is the re-adoption escape (fresh group). Extensions too
+  old to report markers degrade to the legacy title+membership heuristic.
 
 The extension backend does not isolate cookies, localStorage, IndexedDB,
 extensions, downloads, or the Chrome profile. All extension sessions share the

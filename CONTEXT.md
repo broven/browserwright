@@ -82,6 +82,8 @@ extension `group_id`).
 
 **Trap:** `runtime.group_id` is load-bearing durable state, not a cosmetic
 label — it is how the daemon finds the same tab group again after a restart.
+It is a *candidate*, never proof: ownership of a group is proven by the
+extension's per-tab markers (see `binding`).
 
 ### daemon
 The single global process listening on
@@ -159,13 +161,19 @@ The link from a session to its live browser handle: the numeric `group_id` on
 `extension`, the attached target on `rdp` / `env`. Live binding lives in
 process; the ledger holds the durable copy used to recover after a restart.
 
-**Extension boundary:** Chrome tab groups expose no application-owned,
-persistent identity. Recovery therefore uses only best-effort evidence: the
-ledger's numeric group id, the user-editable/non-unique title, and last-known
-tab membership. Renaming a group can make recovery reject the original group;
-after Chrome restarts and recycles group/tab ids, a same-titled group can be
-misidentified. This is a known backend tradeoff, not something another daemon
-cache can turn into a stronger ownership proof.
+**Extension anchor (issue #29):** ownership is *derived*, not asserted. The
+extension stamps every tab it places in a session group with a per-tab marker
+(`chrome.storage.session`, keyed by tabId, value = owning sessionId); a group
+is proven to be the session's iff a member tab carries that session's marker.
+Chrome wipes `chrome.storage.session` on browser restart, so no stale marker
+can ever attach to a recycled tab id — and therefore **a browser restart makes
+ownership unprovable**: the ledger `group_id` is a *candidate*, never proof.
+Unproven groups are never adopted (no opening, recovery, teardown, or
+enumeration against them); `attachActiveTab` is the explicit re-adoption
+escape and falls back to a fresh group. The title is a human label, never an
+anchor. Extensions too old to report marker evidence degrade to the old
+title+membership heuristic with both failure directions still open — only an
+extension update closes them.
 
 ### ghost target
 A synthesized CDP `targetInfo` for an extension tab. The extension backend has
