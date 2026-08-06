@@ -1,8 +1,10 @@
-"""doctor — schema_version=1 lock + §9.4 zero-ws-side-effect 反测试.
+"""doctor — schema_version=3 lock + §9.4 zero-ws-side-effect 反测试.
 
-The schema_version=1 contract is the public contract: Skill reads it without
+The schema_version=3 contract is the public contract: Skill reads it without
 existence checks, so every key must be present even when null, and the field
-set must NOT change in v0.x.
+set must NOT change in v0.x. v3 (issue #28) added the daemon-liveness fields
+``alive`` / ``probe_state`` / ``pid`` — doctor must never again report the
+daemon healthy when no daemon process is running.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import browserwright.daemon.doctor as doctor_mod
 from browserwright.daemon.backends.base import DoctorResult
 from browserwright.daemon.config import load
 from browserwright.daemon.errors import UserError
+from browserwright.daemon.probe import DaemonStatus
 
 
 # ---- schema lock -----------------------------------------------------------
@@ -21,13 +24,42 @@ EXPECTED_BACKEND_KEYS = {
     "name", "available", "ws_url", "detail",
     "ux_warning", "needs_user_action", "ux_cost", "extras",
 }
-EXPECTED_TOP_KEYS = {"schema_version", "recommended", "backends"}
+EXPECTED_TOP_KEYS = {
+    "schema_version", "recommended", "backends",
+    # v3 (issue #28): daemon-liveness probe, same fields as `status --json`.
+    "alive", "probe_state", "pid",
+}
 KNOWN_UX_COSTS = {"none", "banner", "extension-permission"}
 
 
+@pytest.fixture(autouse=True)
+def _no_live_daemon(monkeypatch):
+    """Doctor's liveness probe must never reach the developer's own daemon
+    during tests. Stub it to a canonical 'not running' by default; liveness
+    tests call :func:`_stub_liveness` again to override."""
+    _stub_liveness(monkeypatch)
+
+
+def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
+                   pid=None):
+    async def _fake(cfg, *, probe=None):
+        return DaemonStatus(
+            alive=alive,
+            probe_state=probe_state,
+            pid=pid,
+            port_holder_pid=None,
+            version=None,
+            endpoint={"transport": "unix", "path": "/dev/null"},
+            facade=None,
+        )
+
+    monkeypatch.setattr(doctor_mod, "daemon_status_async", _fake)
+
+
 @pytest.mark.asyncio
-async def test_doctor_schema_v1_top_shape(monkeypatch):
-    """Top-level shape: schema_version=1, recommended:str|null, backends:list."""
+async def test_doctor_schema_v3_top_shape(monkeypatch):
+    """Top-level shape: schema_version=3, recommended:str|null, backends:list,
+    plus the v3 liveness fields alive/probe_state/pid."""
     _patch_all_unavailable(monkeypatch)
     out = await doctor_mod.doctor(load(env={}))
     assert set(out.keys()) == EXPECTED_TOP_KEYS
@@ -36,6 +68,30 @@ async def test_doctor_schema_v1_top_shape(monkeypatch):
     assert out["schema_version"] == SCHEMA_VERSION
     assert isinstance(out["backends"], list)
     assert out["recommended"] is None or isinstance(out["recommended"], str)
+
+
+@pytest.mark.asyncio
+async def test_doctor_blob_carries_liveness_fields(monkeypatch):
+    """v3 (issue #28): a live daemon is visible in the blob — alive, its
+    probe_state, and its pid. Without this, skill-side doctor checks can only
+    see 'the CLI answered', which is true with no daemon running at all."""
+    _stub_liveness(monkeypatch, alive=True, probe_state="ok", pid=4242)
+    _patch_all_unavailable(monkeypatch)
+    out = await doctor_mod.doctor(load(env={}))
+    assert out["alive"] is True
+    assert out["probe_state"] == "ok"
+    assert out["pid"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_doctor_blob_reports_not_running(monkeypatch):
+    """v3 (issue #28): with no daemon, doctor says so — the exact condition
+    the old v2 blob was silent about."""
+    _patch_all_unavailable(monkeypatch)
+    out = await doctor_mod.doctor(load(env={}))
+    assert out["alive"] is False
+    assert out["probe_state"] == "not_running"
+    assert out["pid"] is None
 
 
 @pytest.mark.asyncio
