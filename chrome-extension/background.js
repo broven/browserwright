@@ -519,6 +519,133 @@ async function handleDaemonMessage(msg) {
   }
 }
 
+// ---- bounded chrome.debugger calls ---------------------------------------
+//
+// Every chrome.debugger call in this file is awaited through one of the
+// wrappers below. Chrome can leave a chrome.debugger promise unsettled
+// forever (the OOPIF throttle, a renderer pinned by an infinite loop), and
+// an unbounded await means the extension never sends its `response` frame:
+// the daemon's `_ExtensionConn.pending` future then never resolves and the
+// caller eats the full `_request(timeout)` while this side leaks.
+//
+// Budgets are deliberately SMALLER than the daemon's matching `_request`
+// timeout (relay.py: send_cdp 10.0s, attach_tab/detach_tab 5.0s) so the
+// extension always answers FIRST with a distinguishable error frame; the
+// daemon's own timeout stays as a last-resort net for a wedged extension.
+// The agreement is locked by a test that parses both files
+// (test_extension_debugger_timeout_unit.py).
+//
+// Timeout semantics: the budget error carries code -32001 (CDP's
+// implementation-defined range -32000..-32099; Chrome itself never sends
+// it) and a `timedOut` flag, so the daemon surfaces it as a `_CommandError`
+// distinguishable from a genuine CDP error (-32000) and from its own bare
+// `TimeoutError` (-32603). The underlying promise is NOT cancelled — the
+// command may still land in Chrome later — but `Promise.race` settles the
+// wrapper at the budget, so a late completion is structurally discarded
+// (no second response frame, no state mutation). For the multi-await
+// attach/detach pipelines, where the race alone cannot cover the
+// "completes after detach" window, `tabEpochs` below guards the steps in
+// between.
+//
+// The title-marker path predates this and stays separate on purpose:
+// `markerCommandBefore` shares ONE deadline across the phases of a marker
+// install/remove (so hung calls cannot multiply the delay) and is guarded
+// by its own per-tab tokens. Do not merge the two without re-running the
+// marker unit tests.
+
+const DEBUGGER_COMMAND_TIMEOUT_MS = 9000;  // daemon send_cdp: 10.0s
+const DEBUGGER_ATTACH_TIMEOUT_MS = 3000;   // daemon attach paths: >= 5.0s
+const DEBUGGER_DETACH_TIMEOUT_MS = 3000;   // daemon detach_tab: 5.0s
+// Shared budget for Target.setDiscoverTargets + Target.setAutoAttach after
+// an attach. Arming is re-done by Playwright anyway, and it runs inside the
+// attach RPC's response path, so it must never hold the attach response
+// hostage: a wedged renderer must not push the attach reply past the
+// daemon's 5.0s wait.
+const DEBUGGER_ARM_TIMEOUT_MS = 1500;
+
+// The code the budget error carries. CDP implementation-defined range
+// (-32000..-32099); Chrome never emits it, so any -32001 crossing the relay
+// is by construction an extension-side timeout.
+const DEBUGGER_TIMEOUT_CODE = -32001;
+
+function debuggerTimeoutError(op, detail, timeoutMs) {
+  const err = new Error(
+    "chrome.debugger." + op + " timed out after " + timeoutMs + "ms (" +
+    detail + "); the command may still land in Chrome");
+  err.code = DEBUGGER_TIMEOUT_CODE;
+  err.timedOut = true;
+  return err;
+}
+
+function isDebuggerTimeout(e) {
+  return !!e && e.timedOut === true;
+}
+
+// Error-code passthrough for response frames: a budget timeout carries its
+// own -32001; everything else stays the extension's -32000.
+function errorCode(e) {
+  return (e && typeof e.code === "number") ? e.code : -32000;
+}
+
+// Race `start()` (a chrome.debugger call) against a budget timer. The timer
+// keeps the MV3 SW alive for the wait, like the maintainLoop trick, and is
+// cleared as soon as either side wins.
+function boundedDebuggerCall(start, { timeoutMs, op, detail }) {
+  let timer = null;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(debuggerTimeoutError(op, detail, timeoutMs)),
+      Math.max(1, timeoutMs));
+  });
+  // Defer the call so a synchronous throw becomes a rejection instead of
+  // escaping before the race exists (which would leak the guard timer and
+  // its eventual unhandled rejection).
+  const call = Promise.resolve().then(start);
+  return Promise.race([call, guard]).finally(() => {
+    if (timer !== null) clearTimeout(timer);
+  });
+}
+
+function debuggerCommand(target, method, params, { timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS } = {}) {
+  return boundedDebuggerCall(
+    () => chrome.debugger.sendCommand(target, method, params || {}),
+    { timeoutMs, op: "sendCommand", detail: method + " tabId=" + target.tabId });
+}
+
+function debuggerAttach(tabId) {
+  return boundedDebuggerCall(
+    () => chrome.debugger.attach({ tabId }, PROTOCOL_VERSION),
+    { timeoutMs: DEBUGGER_ATTACH_TIMEOUT_MS, op: "attach", detail: "tabId=" + tabId });
+}
+
+function debuggerDetach(tabId) {
+  return boundedDebuggerCall(
+    () => chrome.debugger.detach({ tabId }),
+    { timeoutMs: DEBUGGER_DETACH_TIMEOUT_MS, op: "detach", detail: "tabId=" + tabId });
+}
+
+// tabId → opaque epoch token for the attach/detach lifecycle. Bumped on
+// every attach attempt and every detach-path event (detachTab, onDetach,
+// onRemoved, doCloseTab); a continuation that would mutate tab bookkeeping
+// after a chrome.debugger call re-checks the token it captured at call
+// start. A step whose epoch went stale is abandoned, so a completion that
+// lands after a detach cannot resurrect bookkeeping for a tab we no longer
+// drive — and a detach that lands after a re-attach cannot tear down the
+// fresh attachment's bookkeeping (the ABA case).
+const tabEpochs = new Map();
+
+function bumpTabEpoch(tabId) {
+  const token = {};
+  tabEpochs.set(tabId, token);
+  return token;
+}
+
+function isTabEpochCurrent(tabId, token) {
+  // `undefined` = no epoch recorded (legacy path, e.g. re-announce on
+  // reconnect): nothing to compare against, treat as current.
+  return token === undefined || tabEpochs.get(tabId) === token;
+}
+
 // Shared attach sequence: chrome.debugger.attach → attachedTabs.add →
 // armAutoAttach → [announceAttached]. Options:
 //   announce (default true) — emit the `attached` ghost-target event. doAttach
@@ -526,13 +653,27 @@ async function handleDaemonMessage(msg) {
 //     response instead.
 //   skipIfAttached (default false) — skip the attach core when we already
 //     drive this tab (doAttachActive re-adopt path); announce still fires.
+// Returns true when the tab is tracked as attached afterwards; false when the
+// sequence was abandoned mid-flight (a detach raced in, or the attach budget
+// expired). Callers use that to skip post-attach cosmetics for a tab we no
+// longer drive.
 async function attachTab(tabId, { announce = true, skipIfAttached = false } = {}) {
-  if (!(skipIfAttached && attachedTabs.has(tabId))) {
-    await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
-    attachedTabs.add(tabId);
-    await armAutoAttach(tabId);
+  if (skipIfAttached && attachedTabs.has(tabId)) {
+    if (announce) await announceAttached(tabId);
+    return true;
   }
+  const epoch = bumpTabEpoch(tabId);
+  await debuggerAttach(tabId);
+  // A detach raced in while the attach was in flight (drag-out, DevTools,
+  // daemon-initiated). The attach may still have landed in Chrome, but we
+  // no longer drive this tab — abandon, and let onDetach clean up when
+  // Chrome eventually tears the session down.
+  if (!isTabEpochCurrent(tabId, epoch)) return false;
+  attachedTabs.add(tabId);
+  await armAutoAttach(tabId, epoch);
+  if (!isTabEpochCurrent(tabId, epoch)) return false;
   if (announce) await announceAttached(tabId);
+  return true;
 }
 
 // Post-attach niceties, deliberately NOT awaited by callers. Called at each
@@ -548,12 +689,17 @@ function postAttachCosmetics(tabId) {
 //   ignoreDetachError (default false) — swallow chrome.debugger.detach errors
 //     (already detached / tab gone) instead of throwing.
 async function detachTab(tabId, { announceReason = null, ignoreDetachError = false } = {}) {
+  const epoch = bumpTabEpoch(tabId);
   await unmarkTabBeforeDetach(tabId);
   try {
-    await chrome.debugger.detach({ tabId });
+    await debuggerDetach(tabId);
   } catch (e) {
     if (!ignoreDetachError) throw e;
   }
+  // A re-attach raced in while the detach was in flight: leave the fresh
+  // attachment's bookkeeping alone (and skip the `detached` announce — the
+  // daemon would drop a ghost that just re-joined).
+  if (!isTabEpochCurrent(tabId, epoch)) return;
   attachedTabs.delete(tabId);
   if (announceReason) {
     safeSend({ type: "detached", tabId, reason: announceReason });
@@ -564,7 +710,7 @@ async function doAttach(id, tabId) {
   try {
     // No announceAttached here — the daemon builds the ghost target from
     // this RPC response itself.
-    await attachTab(tabId, { announce: false });
+    const attached = await attachTab(tabId, { announce: false });
     const tab = await chrome.tabs.get(tabId);
     safeSend({
       type: "response",
@@ -576,12 +722,12 @@ async function doAttach(id, tabId) {
         },
       },
     });
-    postAttachCosmetics(tabId);
+    if (attached) postAttachCosmetics(tabId);
   } catch (e) {
     safeSend({
       type: "response",
       id,
-      error: { code: -32000, message: errMessage(e) },
+      error: { code: errorCode(e), message: errMessage(e) },
     });
   }
 }
@@ -629,7 +775,7 @@ async function doAttachActive(id, groupId, groupName) {
     // it with the session name for human-readable Chrome UI.
     const finalGroupId = await _ensureTabInGroup(
       tab.id, groupName, ourGroupId, tab.windowId);
-    await attachTab(tab.id, { skipIfAttached: true });
+    const attached = await attachTab(tab.id, { skipIfAttached: true });
     safeSend({
       type: "response",
       id,
@@ -640,12 +786,12 @@ async function doAttachActive(id, groupId, groupName) {
         groupId: finalGroupId,
       },
     });
-    postAttachCosmetics(tab.id);
+    if (attached) postAttachCosmetics(tab.id);
   } catch (e) {
     safeSend({
       type: "response",
       id,
-      error: { code: -32000, message: errMessage(e) },
+      error: { code: errorCode(e), message: errMessage(e) },
     });
   }
 }
@@ -687,7 +833,7 @@ async function doCreateTab(
       groupId = await _ensureTabInGroup(
         tab.id, groupName, resolved, tab.windowId);
     }
-    await attachTab(tab.id);
+    const attached = await attachTab(tab.id);
     let title = tab.title || "";
     let actualUrl = tab.url || url;
     try {
@@ -702,14 +848,14 @@ async function doCreateTab(
       id,
       result: { tabId: tab.id, url: actualUrl, title: stripMarker(title), groupId },
     });
-    if (!skipPostAttachCommands) {
+    if (!skipPostAttachCommands && attached) {
       postAttachCosmetics(tab.id);
     }
   } catch (e) {
     safeSend({
       type: "response",
       id,
-      error: { code: -32000, message: errMessage(e) },
+      error: { code: errorCode(e), message: errMessage(e) },
     });
   }
 }
@@ -756,6 +902,7 @@ async function doCloseTab(id, tabId) {
     // that operation. Commit our bookkeeping only after that confirmation;
     // otherwise a failed remove would leave a visible marker on a tab we had
     // already forgotten and detached.
+    bumpTabEpoch(tabId);
     invalidateMarkerInstall(tabId);
     markedTabs.delete(tabId);
     attachedTabs.delete(tabId);
@@ -764,6 +911,7 @@ async function doCloseTab(id, tabId) {
     const msg = String(e?.message || e || "").toLowerCase();
     if (msg.includes("no tab with id")) {
       // Already gone — caller wanted it closed, success-equivalent.
+      bumpTabEpoch(tabId);
       invalidateMarkerInstall(tabId);
       markedTabs.delete(tabId);
       attachedTabs.delete(tabId);
@@ -773,7 +921,7 @@ async function doCloseTab(id, tabId) {
     safeSend({
       type: "response",
       id,
-      error: { code: -32000, message: errMessage(e) },
+      error: { code: errorCode(e), message: errMessage(e) },
     });
   }
 }
@@ -787,7 +935,12 @@ async function doDetach(id, tabId) {
   } catch (e) {
     // "Debugger is not attached to the tab with id X" — surface as a
     // benign result rather than an error. Daemon already detached us.
-    if (String(e?.message || "").toLowerCase().includes("not attached")) {
+    const msg = String(e?.message || "").toLowerCase();
+    if (msg.includes("not attached") || isDebuggerTimeout(e)) {
+      // Timeout included: the detach decision stands on both sides (the
+      // daemon pops its ghost regardless of the outcome), and the tab may
+      // still be tearing down — report success so teardown isn't noisier.
+      // If Chrome detaches late, onDetach fires and cleans up.
       attachedTabs.delete(tabId);
       safeSend({ type: "response", id, result: {} });
       return;
@@ -795,50 +948,54 @@ async function doDetach(id, tabId) {
     safeSend({
       type: "response",
       id,
-      error: { code: -32000, message: errMessage(e) },
+      error: { code: errorCode(e), message: errMessage(e) },
     });
   }
 }
 
 async function doCommand(id, tabId, method, params) {
   try {
-    const result = await chrome.debugger.sendCommand({ tabId }, method, params);
+    const result = await debuggerCommand({ tabId }, method, params);
     safeSend({ type: "response", id, result: result || {} });
   } catch (e) {
     safeSend({
       type: "response",
       id,
-      error: { code: -32000, message: errMessage(e) },
+      error: { code: errorCode(e), message: errMessage(e) },
     });
   }
 }
 
-async function armAutoAttach(tabId) {
+async function armAutoAttach(tabId, epoch) {
   // With chrome.debugger attached, Chromium can pause new child targets
   // (OOPIFs/workers/prerenders) until the debugger resumes them. Arm
   // discovery + auto-attach before callers can navigate the tab. Chromium only
   // surfaces OOPIF child targets reliably after discovery is enabled.
   // Playwright may later send the same auto-attach command for its page
   // session; that is fine and keeps Chrome's page-session contract satisfied.
+  //
+  // Both commands share one budget (DEBUGGER_ARM_TIMEOUT_MS): arming runs
+  // inside the attach RPC's response path and must not push the reply past
+  // the daemon's wait. A hung first command skips the second — the deadline
+  // is gone either way.
+  const deadline = Date.now() + DEBUGGER_ARM_TIMEOUT_MS;
+  const remaining = () => Math.max(1, deadline - Date.now());
   try {
-    await chrome.debugger.sendCommand(
-      { tabId }, "Target.setDiscoverTargets", {
-        discover: true,
+    await debuggerCommand(
+      { tabId }, "Target.setDiscoverTargets", { discover: true, filter: [{}] },
+      { timeoutMs: remaining() });
+    if (!isTabEpochCurrent(tabId, epoch)) return;
+    await debuggerCommand(
+      { tabId }, "Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,
+        flatten: true,
         filter: [{}],
-      });
-  } catch (e) {
-    console.warn("[bd-relay] Target.setDiscoverTargets(" + tabId + ") failed:", e);
-  }
-  try {
-    await chrome.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
-      autoAttach: true,
-      waitForDebuggerOnStart: true,
-      flatten: true,
-      filter: [{}],
-    });
+      },
+      { timeoutMs: remaining() });
     await sleep(50);
   } catch (e) {
-    console.warn("[bd-relay] Target.setAutoAttach(" + tabId + ") failed:", e);
+    console.warn("[bd-relay] auto-attach arm(" + tabId + ") failed:", e);
   }
 }
 
@@ -897,8 +1054,12 @@ async function doQueryGroup(id, groupName, sessionGroupId) {
 }
 
 async function announceAttached(tabId) {
+  const epoch = tabEpochs.get(tabId);
   try {
     const tab = await chrome.tabs.get(tabId);
+    // Detached while we were reading the tab — a late `attached` frame
+    // after the `detached` one would recreate the daemon's ghost. Drop it.
+    if (!isTabEpochCurrent(tabId, epoch)) return;
     safeSend({
       type: "attached",
       tabId,
@@ -1255,13 +1416,13 @@ async function keepTabRendered(tabId) {
   // command is independently guarded so an unsupported one doesn't sink the
   // other, and a failure never fails the attach (cosmetic-ish, like markTab).
   try {
-    await chrome.debugger.sendCommand(
+    await debuggerCommand(
       { tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
   } catch (e) {
     console.warn("[bd-relay] setFocusEmulationEnabled(" + tabId + ") failed:", e);
   }
   try {
-    await chrome.debugger.sendCommand(
+    await debuggerCommand(
       { tabId }, "Page.setWebLifecycleState", { state: "active" });
   } catch (e) {
     console.warn("[bd-relay] setWebLifecycleState(" + tabId + ") failed:", e);
@@ -1297,9 +1458,10 @@ async function markTabAttached(tabId) {
       if (!isCurrent()) {
         // Best effort for a registration that completed as detach invalidated
         // us. Detach itself clears debugger-session registrations; this covers
-        // implementations where the completion won that race.
+        // implementations where the completion won that race. Bounded like
+        // every other chrome.debugger call here.
         if (reg?.identifier) {
-          chrome.debugger.sendCommand(
+          debuggerCommand(
             { tabId },
             "Page.removeScriptToEvaluateOnNewDocument",
             { identifier: reg.identifier },
@@ -1396,7 +1558,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       && params.sessionId) {
     if (params.waitingForDebugger) {
       const debuggerSession = { ...source, sessionId: params.sessionId };
-      chrome.debugger.sendCommand(
+      debuggerCommand(
         debuggerSession,
         "Runtime.runIfWaitingForDebugger",
         {},
@@ -1427,6 +1589,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source && typeof source.tabId === "number") {
+    // A detach invalidates every in-flight attach/arm continuation for this
+    // tab: whatever Chrome settles from here on is stale by construction.
+    bumpTabEpoch(source.tabId);
     invalidateMarkerInstall(source.tabId);
     attachedTabs.delete(source.tabId);
     // Unexpected detach (DevTools steals the session, tab crashes, etc.) —
@@ -1483,6 +1648,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // onDetach didn't fire first (rare close-ordering races).
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (!attachedTabs.has(tabId)) return;
+  bumpTabEpoch(tabId);
   invalidateMarkerInstall(tabId);
   attachedTabs.delete(tabId);
   markedTabs.delete(tabId);

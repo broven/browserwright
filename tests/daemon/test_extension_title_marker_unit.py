@@ -67,8 +67,14 @@ def _service_worker_marker_sources() -> dict[str, str]:
     handler_end = source.index("// Shared attach sequence", handler_start)
     close_start = source.index("async function doCloseTab(")
     close_end = source.index("\n\nasync function doDetach(", close_start)
+    # The bounded chrome.debugger wrapper region (issue #31): detachTab and
+    # doCloseTab route their chrome.debugger calls through it, so the probes
+    # that run those handlers need it injected too.
+    wrapper_start = source.index("// ---- bounded chrome.debugger calls")
+    wrapper_end = source.index("// Shared attach sequence:", wrapper_start)
     return {
         **_marker_sources(),
+        "wrapperRegion": source[wrapper_start:wrapper_end],
         "workerMarkerRegion": source[marker_start:marker_end],
         "detachTab": source[detach_start:detach_end],
         "handleDaemonMessage": source[handler_start:handler_end],
@@ -117,8 +123,10 @@ vm.runInContext(`
   const TITLE_PREFIX = "\\u{1F440} ";
   const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
   const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+  const PROTOCOL_VERSION = "1.3";
   const attachedTabs = new Set([17]);
   function safeSend() {}
+  ${input.wrapperRegion}
   ${markerRegion}
   ${input.detachTab}
 `, realm);
@@ -218,8 +226,10 @@ vm.runInContext(`
   const TITLE_PREFIX = "\\u{1F440} ";
   const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
   const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+  const PROTOCOL_VERSION = "1.3";
   const attachedTabs = new Set([17]);
   function safeSend() {}
+  ${input.wrapperRegion}
   ${markerRegion}
   ${input.detachTab}
 `, realm);
@@ -276,6 +286,7 @@ const chrome = {
 };
 function errMessage(error) { return String(error.message || error); }
 function safeSend(message) { calls.push({ kind: "response", message }); }
+vm.runInThisContext(input.wrapperRegion);
 vm.runInThisContext(input.doCloseTab);
 (async () => {
   await doCloseTab(9, 17);
@@ -366,6 +377,8 @@ function newWorkerRealm(attached) {
     const TITLE_PREFIX = "\\u{1F440} ";
     const MARKER_INSTALL_SCRIPT = ${JSON.stringify(input.installScript)};
     const MARKER_REMOVE_SCRIPT = ${JSON.stringify(input.removeScript)};
+    const PROTOCOL_VERSION = "1.3";
+    ${input.wrapperRegion}
     ${input.workerMarkerRegion}
     const attachedTabs = new Set(${attached ? "[17]" : "[]"});
     function safeSend() {}

@@ -587,6 +587,16 @@ class RelayServer:
                        *, timeout: float = 10.0) -> dict:
         """Forward a CDP method+params through the extension's
         `chrome.debugger.sendCommand(tabId, method, params)`.
+
+        Timeout pairing with the extension (chrome-extension/background.js,
+        "bounded chrome.debugger calls"): the extension bounds each
+        chrome.debugger call BELOW this wait — sendCommand 9000ms vs 10.0s,
+        attach/detach 3000ms vs the 5.0s attach/detach waits — and answers
+        with an error frame carrying code -32001 when its budget expires, so
+        this future normally settles with a distinguishable `_CommandError`
+        instead of a bare `asyncio.TimeoutError`. This timeout is the
+        last-resort net for a wedged extension, not the primary bound; a test
+        locks the two sides' agreement.
         """
         ext = self._extension_for_tab(tab_id)
         if ext is None:
