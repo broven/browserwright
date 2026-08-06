@@ -64,14 +64,29 @@ def e2e_cdp_facade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
 
     # Wait until the facade's /json/version answers (the daemon binds it during
     # run_serve startup).
+    # NOTE: on ANY setup failure we must reap ``proc`` before raising — the
+    # teardown section only runs after ``yield`` (leak guard, mirrors
+    # conftest.e2e_rdp_daemon).
+    def _fail(msg: str):
+        log_fh.flush()
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception:
+            pass
+        pytest.fail(msg)
+
     version_url = f"http://127.0.0.1:{TEST_FACADE_PORT}/json/version"
     deadline = time.monotonic() + 10.0
     last_err = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            log_fh.flush()
-            pytest.fail(f"cdp facade daemon exited early ({proc.returncode}); "
-                        f"see {log_path}")
+            _fail(f"cdp facade daemon exited early ({proc.returncode}); "
+                  f"see {log_path}")
         try:
             with urllib.request.urlopen(version_url, timeout=0.5) as resp:
                 if resp.status == 200:
@@ -80,9 +95,8 @@ def e2e_cdp_facade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
             last_err = e
             time.sleep(0.2)
     else:
-        log_fh.flush()
-        pytest.fail(f"facade /json/version never came up; last={last_err}; "
-                    f"see {log_path}")
+        _fail(f"facade /json/version never came up; last={last_err}; "
+              f"see {log_path}")
 
     yield TEST_FACADE_PORT
 

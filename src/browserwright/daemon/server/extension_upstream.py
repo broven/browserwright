@@ -1242,6 +1242,18 @@ class ExtensionUpstream:
                                       group_id: int) -> dict:
         resolved_group_id, info = await self._resolve_session_group(
             session_id, group_id)
+        # The adapter-memory fast path returns ``(gid, None)`` — the group
+        # query is deferred to the caller. Mirror `_group_member_tabs` and
+        # re-query by the resolved id before concluding the group is empty
+        # (e2e recovery test: an in-daemon session that just opened a tab
+        # hits the memory path and would otherwise be reported "group
+        # missing" despite a live group with tabs).
+        if info is None and isinstance(resolved_group_id, int) and resolved_group_id >= 0:
+            query_generation = self._relay_generation()
+            info = await self._relay.query_group_tabs(group_id=resolved_group_id)
+            if query_generation != self._relay_generation():
+                raise RuntimeError(
+                    "extension reconnected while resolving group membership")
         if not info or not info.get("tabs"):
             raise RuntimeError(
                 f"no recoverable tabs for group id {group_id} "
