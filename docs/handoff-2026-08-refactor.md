@@ -220,3 +220,41 @@ all because they are unreachable from a static diff: the real-Chrome e2e paths
   reported green once for a change that had a genuine regression.
 - Read `CONTEXT.md` first. It is the glossary this branch added, and
   `AGENTS.md` points at it.
+
+## 8. Addendum (2026-08-06) — the e2e job's first real CI signal
+
+The Real-Chrome E2E job ran in CI for the first time on this branch and
+failed wholesale: every extension fixture errored `Chrome for Testing
+exited with code -5` (SIGTRAP) with zero evidence — the fixture DEVNULL'd
+Chrome's stderr. Root cause: GitHub's ubuntu-24.04 runner ships
+`kernel.apparmor_restrict_unprivileged_userns=1`, and CfT refuses to
+start without user namespaces (its zip has no setuid chrome-sandbox;
+the runner's preinstalled Google Chrome does — which is why the rdp half
+passed). Fixed three ways, all still on the branch:
+
+- `tests/daemon/e2e/conftest.py` — Chrome's stderr is captured to the
+  profile dir and its tail rides the launch-failure RuntimeError. (The
+  stderr-capturing launch in `_real_browser.py` was dead code; the live
+  fixture used its own blind twin.)
+- `.github/workflows/test.yml` — `sudo sysctl -w
+  kernel.apparmor_restrict_unprivileged_userns=0` before the suite, plus
+  a cheap headless+headful smoke probe that names startup crashes in the
+  job log instead of 25 identical fixture errors.
+- Two real bugs the first CI run then surfaced: the C2 refactor made the
+  verb layer pass `session_ids=` to `userscript_request`, which
+  `RelayServer` never accepted (any `userscript install` on an extension
+  session died with TypeError — fixed by accepting and dropping it:
+  the extension backend is extension-global, `background.js` reads no
+  session ids); and the userscript e2e died on `userscript logs` with
+  1008 "unknown browserwright session" because `helpers.run_skill`
+  seeds its session by **overwriting the shared ledger file**, deleting
+  the test's own session mid-test. The probes now run under the test's
+  session (`extra_env={"BD_SESSION": ...}`), so run_skill writes no
+  ledger at all. The helper's destructive overwrite predates this
+  branch and remains a latent trap for any test that mixes sessions —
+  fix it by merging (see `_seed_ext_session` in
+  `test_userscripts_e2e.py` for the pattern) before writing such a test.
+
+Suite on CI now: **12 failed, 34 passed** — the 12 are exactly the #30
+family (11× PageBindTimeout + `test_recovery_via_group_id_when_runtime_stale`),
+the documented baseline, not new. `continue-on-error` stays on.
