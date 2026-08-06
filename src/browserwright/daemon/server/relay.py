@@ -369,7 +369,8 @@ class RelayServer:
                                 group_name: str | None = None,
                                 group_id: int | None = None,
                                 expected_generation: int | None = None,
-                                timeout: float = 10.0) -> GhostTarget:
+                                timeout: float = 10.0,
+                                session_id: str | None = None) -> GhostTarget:
         """Daemon-driven adopt (docs C1): ask the extension to MOVE Chrome's
         currently-focused-window active tab into this session's tab group and
         attach the debugger. ``group_id`` identifies the destination group;
@@ -396,6 +397,10 @@ class RelayServer:
             body["groupName"] = group_name
         if isinstance(group_id, int) and group_id >= 0:
             body["groupId"] = group_id
+        # Issue #29: the session id lets the extension stamp the adopted tab
+        # with its per-tab ownership marker (chrome.storage.session).
+        if session_id:
+            body["sessionId"] = session_id
         for i in range(ATTACH_RETRY_LIMIT):
             try:
                 result = await self._request(ext, body, timeout=timeout)
@@ -496,6 +501,7 @@ class RelayServer:
         skip_post_attach_commands: bool = False,
         expected_generation: int | None = None,
         timeout: float = 10.0,
+        session_id: str | None = None,
     ) -> GhostTarget:
         """Spec Phase B Feature 1: open a tab in the background (active=false)
         in the session's tab group, attach ``chrome.debugger`` to it, and
@@ -525,6 +531,11 @@ class RelayServer:
             body["groupName"] = group_name
         if isinstance(group_id, int) and group_id >= 0:
             body["groupId"] = group_id
+        # Issue #29: the session id lets the extension stamp the new tab with
+        # its per-tab ownership marker (chrome.storage.session) — the durable
+        # anchor that replaces the title/groupId heuristic.
+        if session_id:
+            body["sessionId"] = session_id
         # background=False opens the tab in the foreground (active:true);
         # default True keeps the user's focus tab. Only sent when foreground
         # is requested so existing extensions default to background.

@@ -72,6 +72,9 @@ def _service_worker_marker_sources() -> dict[str, str]:
     # that run those handlers need it injected too.
     wrapper_start = source.index("// ---- bounded chrome.debugger calls")
     wrapper_end = source.index("// Shared attach sequence:", wrapper_start)
+    ownership_start = source.index("// ---- ownership markers:")
+    ownership_end = source.index(
+        "// ---- group-membership = session membership", ownership_start)
     return {
         **_marker_sources(),
         "wrapperRegion": source[wrapper_start:wrapper_end],
@@ -79,6 +82,7 @@ def _service_worker_marker_sources() -> dict[str, str]:
         "detachTab": source[detach_start:detach_end],
         "handleDaemonMessage": source[handler_start:handler_end],
         "doCloseTab": source[close_start:close_end],
+        "ownershipRegion": source[ownership_start:ownership_end],
     }
 
 
@@ -283,16 +287,28 @@ const chrome = {
   tabs: {
     async remove() { calls.push({ kind: "remove" }); throw new Error("close denied"); },
   },
+  storage: {
+    session: {
+      async get() { return {}; },
+      async set(value) { calls.push({ kind: "storageSet", value }); },
+    },
+  },
 };
 function errMessage(error) { return String(error.message || error); }
 function safeSend(message) { calls.push({ kind: "response", message }); }
-vm.runInThisContext(input.wrapperRegion);
-vm.runInThisContext(input.doCloseTab);
+const realm = vm.createContext({
+  chrome, console, errMessage, safeSend,
+  attachedTabs, markedTabs,
+});
+vm.runInContext(input.ownershipRegion, realm);
+vm.runInContext(input.wrapperRegion, realm);
+vm.runInContext(input.doCloseTab, realm);
 (async () => {
-  await doCloseTab(9, 17);
+  await vm.runInContext("doCloseTab(9, 17)", realm);
   process.stdout.write(JSON.stringify({
     attached: attachedTabs.has(17),
     marked: markedTabs.has(17),
+    owned: vm.runInContext("ownedTabs.has(17)", realm),
     calls,
   }));
 })().catch((error) => {

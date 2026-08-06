@@ -274,15 +274,21 @@ async def test_terminal_teardown_accepts_cooperative_retryable_partial(monkeypat
         lambda _session_id: None,
     )
 
-    reap, result = await reg.terminate_session(
+    reap, initiated = await reg.terminate_session(
         "sess-budget", teardown, budget=0.05)
+    await asyncio.sleep(0)  # give the background teardown task its first turn
 
     assert reap["reaped"] is True
     assert teardown_started.is_set()
     assert teardown_cancelled is False
+    # Issue #32: terminate_session returns at the initiate boundary; the
+    # final result is available through await_termination.
+    assert initiated == {"ok": True, "initiated": True, "phase": "terminating"}
+    result = await reg.await_termination("sess-budget")
     assert result["ok"] is False
     assert result["partial"] is True
     assert result["timedOut"] is True
+    # A cooperative partial is retryable: no tombstone, ensure can spawn.
     assert await reg.ensure("sess-budget") == "/tmp/retry.sock"
     assert spawned == ["sess-budget"]
 
@@ -323,15 +329,118 @@ async def test_terminal_teardown_blocks_and_then_rejects_ensure(monkeypatch):
     ensure_task = asyncio.create_task(
         reg.ensure_with_preflight("sess-end", preflight))
     await asyncio.sleep(0.02)
+    # While the teardown is in flight the queued ensure must not proceed: it
+    # either blocks on the session lock or is refused by the pending marker
+    # (issue #32) — in both cases it must not spawn or reopen anything.
     assert spawned == []
-    assert ensure_task.done() is False
+    assert preflight_calls == []
+
+    # Issue #32: terminate_session resolves at the initiate boundary while the
+    # teardown task is still in flight; the final result comes from
+    # await_termination.
+    _reap, initiated = await end_task
+    assert initiated == {"ok": True, "initiated": True, "phase": "terminating"}
 
     allow_teardown.set()
-    assert (await end_task)[1]["ok"] is True
-    with pytest.raises(RuntimeError, match="has ended"):
+    result = await reg.await_termination("sess-end")
+    assert result["ok"] is True
+    with pytest.raises(RuntimeError, match="terminating|has ended"):
         await ensure_task
     assert spawned == []
     assert preflight_calls == []
+
+
+# ---- issue #32 initiate-then-join contract ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminate_retry_joins_inflight_teardown_and_returns_final(
+    monkeypatch,
+):
+    """A retried terminate_session while a teardown is in flight joins it and
+    returns the FINAL result — never a second initiate, never a race."""
+    reg = ExecutorRegistry()
+    teardown_started = asyncio.Event()
+    allow_teardown = asyncio.Event()
+
+    async def teardown():
+        teardown_started.set()
+        await allow_teardown.wait()
+        return {"ok": True, "closed": [1], "failed": [], "unknown": [],
+                "kept": []}
+
+    monkeypatch.setattr(reg, "_spawn", _never_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._discovery_alive",
+        lambda _session_id: False,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    first = asyncio.create_task(reg.terminate_session("sess-join", teardown))
+    await asyncio.wait_for(teardown_started.wait(), timeout=1.0)
+    retry = asyncio.create_task(reg.terminate_session("sess-join", teardown))
+    await asyncio.sleep(0.02)
+    # The retry must NOT have returned yet (it is joining, not racing).
+    assert retry.done() is False
+
+    allow_teardown.set()
+    _reap, first_result = await first
+    assert first_result == {"ok": True, "initiated": True,
+                            "phase": "terminating"}
+    _reap2, retry_result = await retry
+    assert retry_result["ok"] is True
+    assert retry_result["closed"] == [1]
+    assert retry_result.get("initiated") is not True
+
+
+@pytest.mark.asyncio
+async def test_teardown_exception_becomes_honest_partial_not_dead_task(
+    monkeypatch,
+):
+    """A background teardown that raises must surface as a partial result via
+    await_termination — and must NOT install the terminal tombstone, so the
+    session stays retryable."""
+    reg = ExecutorRegistry()
+    started = asyncio.Event()
+
+    async def teardown():
+        started.set()
+        raise RuntimeError("browser exploded")
+
+    monkeypatch.setattr(reg, "_spawn", _never_spawn)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._discovery_alive",
+        lambda _session_id: False,
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon.server.executor_registry._ipc.cleanup_executor",
+        lambda _session_id: None,
+    )
+
+    await reg.terminate_session("sess-boom", teardown)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    result = await reg.await_termination("sess-boom")
+
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert "workspace" in result["failed"]
+    assert reg._terminal_results.get("sess-boom") is None
+    assert reg._pending_teardowns.get("sess-boom") is None
+
+
+@pytest.mark.asyncio
+async def test_await_termination_non_terminating_session_is_honest_partial():
+    reg = ExecutorRegistry()
+    result = await reg.await_termination("never-terminating")
+    assert result["ok"] is False
+    assert result["partial"] is True
+
+
+async def _never_spawn(session_id):
+    raise AssertionError(f"must not spawn for {session_id}")
 
 
 # ---- stale discovery-file robustness (Fork 4 / daemon restart) -------------

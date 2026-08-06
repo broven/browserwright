@@ -386,6 +386,130 @@ def test_kill_executor_requires_confirmed_reap(monkeypatch, capsys):
     assert "did not confirm executor death" in streams.err
 
 
+def test_end_session_initiate_then_join_polls_to_the_final_result(
+    monkeypatch, capsys,
+):
+    """Issue #32: `end-session` initiates, then re-issues `endSession` to
+    join the daemon-side teardown, printing progress while it waits. Exit 0
+    only with the FINAL result."""
+    calls = []
+    responses = [
+        {"ok": True, "initiated": True, "phase": "terminating",
+         "backend": "extension"},
+        {"ok": True, "closed": [1, 2, 3], "failed": [], "unknown": [],
+         "kept": [], "backend": "extension"},
+    ]
+
+    def fake_rpc(cfg, method, params, **kwargs):
+        calls.append((method, params, kwargs))
+        return responses.pop(0)
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
+    monkeypatch.setattr(cli, "_run", lambda value: value)
+
+    assert _cmd("end-session")(_ns(session="bw-s", group_id=7), Config()) == 0
+
+    assert len(calls) == 2
+    assert calls[0][1] == {"session": "bw-s", "groupId": 7}
+    for _method, _params, kwargs in calls:
+        assert kwargs["browser_session"] == "bw-s"
+        assert kwargs["client_label"] == "cli-end-session"
+    streams = capsys.readouterr()
+    assert "tearing down" in streams.err
+    assert '"closed": [1, 2, 3]' in streams.out
+
+
+def test_end_session_old_daemon_final_result_needs_no_poll(
+    monkeypatch, capsys,
+):
+    """Against a daemon without the initiate contract the first response is
+    already the final result: no poll loop, no progress output."""
+    calls = []
+
+    def fake_rpc(cfg, method, params, **kwargs):
+        calls.append(method)
+        return {"ok": True, "closed": []}
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
+    monkeypatch.setattr(cli, "_run", lambda value: value)
+
+    assert _cmd("end-session")(_ns(session="bw-s", group_id=None), Config()) == 0
+    assert calls == ["BrowserwrightDaemon.endSession"]
+    streams = capsys.readouterr()
+    assert "tearing down" not in streams.err
+    assert '"closed": []' in streams.out
+
+
+def test_end_session_join_timeout_keeps_polling(monkeypatch, capsys):
+    """A join whose RPC times out (the daemon is still tearing down) is not a
+    failure: the CLI reports progress and re-issues the join."""
+    calls = []
+    responses = [
+        {"ok": True, "initiated": True, "phase": "terminating",
+         "backend": "extension"},
+        TimeoutError("join timed out"),
+        {"ok": True, "closed": [1], "failed": [], "unknown": [],
+         "kept": [], "backend": "extension"},
+    ]
+
+    def fake_rpc(cfg, method, params, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
+    monkeypatch.setattr(cli, "_run", lambda value: value)
+
+    assert _cmd("end-session")(_ns(session="bw-s", group_id=None), Config()) == 0
+    assert calls == [cli._END_SESSION_INITIATE_TIMEOUT,
+                     cli._END_SESSION_JOIN_TIMEOUT,
+                     cli._END_SESSION_JOIN_TIMEOUT]
+    assert "tearing down" in capsys.readouterr().err
+
+
+def test_end_session_still_terminating_hits_the_wait_cap(monkeypatch, capsys):
+    """A teardown that never completes must fail loudly — after visible
+    progress — instead of hanging the user silently."""
+    def fake_rpc(cfg, method, params, **kwargs):
+        return {"ok": True, "initiated": True, "phase": "terminating",
+                "backend": "extension"}
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
+    monkeypatch.setattr(cli, "_run", lambda value: value)
+    monkeypatch.setattr(cli, "_END_SESSION_TOTAL_WAIT_S", 0.05)
+    monkeypatch.setattr(cli, "_END_SESSION_JOIN_TIMEOUT", 0.01)
+
+    assert _cmd("end-session")(_ns(session="bw-s", group_id=None), Config()) == 3
+    streams = capsys.readouterr()
+    assert "still terminating" in streams.err
+    assert "browserwright-daemon ps" in streams.err
+    assert streams.out == ""
+
+
+def test_end_session_partial_join_is_an_error(monkeypatch, capsys):
+    """The join's final result is validated like any endSession result: a
+    partial workspace teardown is an honest failure, never a silent 0."""
+    responses = [
+        {"ok": True, "initiated": True, "phase": "terminating",
+         "backend": "extension"},
+        {"ok": False, "partial": True, "closed": [1],
+         "failed": ["workspace"], "unknown": [], "kept": []},
+    ]
+
+    def fake_rpc(cfg, method, params, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(cli, "_rpc_via_ws", fake_rpc)
+    monkeypatch.setattr(cli, "_run", lambda value: value)
+
+    assert _cmd("end-session")(_ns(session="bw-s", group_id=None), Config()) == 3
+    streams = capsys.readouterr()
+    assert "left tabs open" in streams.err
+    assert streams.out == ""
+
+
 def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, tmp_path):
     import subprocess
 

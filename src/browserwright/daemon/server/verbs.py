@@ -456,6 +456,13 @@ class SessionVerbsMixin:
     ) -> None:
         """P5.4 / Phase 2: tear down a browserwright session.
 
+        Issue #32 initiate contract: the response is sent after the bounded
+        fast phase (clients revoked, executor reaped, phase=terminating); the
+        unbounded workspace teardown keeps running daemon-side under the
+        session lock. A retried ``endSession`` (the CLI's poll) joins the
+        in-flight teardown and returns the FINAL result, so the caller can
+        never time out mid-teardown and never mistakes slow for hung.
+
         extension: close every tab in the session's adapter-owned tab group.
 
         rdp: the per-session context owns a dedicated Chrome. Close that Chrome
@@ -561,7 +568,13 @@ class SessionVerbsMixin:
                     reap, result = await terminate(
                         session, teardown_workspace,
                         caller_token=client.connection_token,
-                        budget=_END_SESSION_BUDGET_S)
+                        budget=_END_SESSION_BUDGET_S,
+                        # Issue #32: return at the initiate boundary. The
+                        # bounded fast phase (revoke + reap) completed; the
+                        # unbounded workspace teardown continues daemon-side
+                        # and the caller polls/joins for the final result — a
+                        # slow teardown can no longer outlive this RPC.
+                        wait=False)
                 else:
                     reap, result = await terminate(
                         session, teardown_workspace,

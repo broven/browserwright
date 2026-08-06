@@ -1,9 +1,8 @@
 """doctor + list-backends subcommands.
 
 Spec §5.2: doctor probes every backend (or a specific one) and outputs a JSON
-object with `schema_version=1`. The shape is locked — every backend must
-appear, every key must be present even when null, and adding a key in v0.x
-requires version bump.
+object. The shape is locked — every backend must appear, every key must be
+present even when null, and adding a key in v0.x requires version bump.
 
 Default behavior: ZERO ws side effects. `--probe-ws` is opt-in and explicitly
 not implemented in v0.1 beyond a clear "not yet" message — the spec mentions
@@ -16,6 +15,7 @@ import asyncio
 from .backends import all_backends, names
 from .config import Config
 from .errors import UserError
+from .probe import daemon_status_async
 
 
 # schema_version bumped to 2 in v0.5.3 (REVIEW.md F-1+F-2). v2 contract:
@@ -24,7 +24,14 @@ from .errors import UserError
 # or that count backend-entry keys (==7) will break against v0.5+ daemons —
 # they must be updated to v2-aware. Schema-lock test enforces no further
 # silent drift; future field additions require another version bump.
-SCHEMA_VERSION = 2
+#
+# schema_version bumped to 3 for issue #28: doctor previously answered only
+# "does the CLI work" — which it does with no daemon process at all — and the
+# blob had no liveness field to consult. v3 adds the same probe `status` uses:
+# top-level `alive` / `probe_state` / `pid` (DaemonStatus wire fields). The
+# liveness probe is local (socket ping + socket-file/port observations), zero
+# ws side effects, so it keeps the §9.4 contract.
+SCHEMA_VERSION = 3
 
 # Backends in this preference order are eligible to be `recommended`.
 # Driven by spec §5.2's `recommended` field: choose the lowest ux_cost available.
@@ -41,6 +48,11 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
     `backend=None` → probe all backends. `backend="rdp"` → probe just that one
     but still emit the full shape (other entries get the canonical 'unknown'
     record with available=false).
+
+    Liveness first (issue #28): the blob carries the same probe `status` uses
+    (``alive`` / ``probe_state`` / ``pid``) so skill-side checks can fail on a
+    down daemon. Run before the backend gather — its socket observations are
+    sequential I/O. Zero ws side effects either way.
     """
     if probe_ws:
         # Honest: v0.1 doesn't implement the opt-in handshake. We surface the
@@ -55,6 +67,8 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
             f"unknown backend {backend!r}; known: {', '.join(names())}"
         )
 
+    st = await daemon_status_async(cfg)
+
     backends = all_backends(cfg)
     results = await asyncio.gather(*[
         b.probe() if backend is None or b.name == backend else _skipped(b)
@@ -63,6 +77,11 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
 
     return {
         "schema_version": SCHEMA_VERSION,
+        # v3 (issue #28): the daemon-liveness probe, same fields as
+        # `status --json`. A down daemon must be visible in doctor.
+        "alive": st.alive,
+        "probe_state": st.probe_state,
+        "pid": st.pid,
         "recommended": _pick_recommended([_asdict(r) for r in results]),
         "backends": [_asdict(r) for r in results],
     }

@@ -69,7 +69,28 @@ def snapshot(daemon: object | None, *, state: object | None = None) -> dict:
         "contexts": [_context_row(c) for c in contexts],
         "executors": _executor_rows(daemon),
         "relay": _relay_row(contexts),
+        # Issue #32 read side: per-session termination phase. A session in
+        # `terminating` has an in-flight background teardown (watch `ps` to
+        # tell slow from hung); `ended` carries the final teardown result.
+        "sessions": _session_rows(daemon),
     }
+
+
+def _session_rows(daemon: object | None) -> list[dict]:
+    """Per-session lifecycle rows from the daemon's termination bookkeeping.
+    Absent daemon (bare-Router unit tests) yields an honest empty list."""
+    phases = getattr(daemon, "_session_phases", None)
+    results = getattr(daemon, "_session_results", None)
+    if not isinstance(phases, dict) or not isinstance(results, dict):
+        return []
+    return [
+        {
+            "session_id": sid,
+            "phase": phases.get(sid, "active"),
+            "result": results.get(sid),
+        }
+        for sid in sorted(set(phases) | set(results))
+    ]
 
 
 # ---- pieces ----------------------------------------------------------------

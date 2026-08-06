@@ -799,3 +799,144 @@ async def test_router_release_client_detaches_sessions():
     assert released is client
     assert [msg["params"]["sessionId"] for msg in sent] == ["up-primary"]
     assert client.client_id not in state.clients
+
+
+# ---- issue #32: initiate-then-join contract --------------------------------
+
+
+class _InitiateRegistry:
+    """Fake registry speaking the issue #32 initiate contract: terminate
+    returns at the initiate boundary, the final result comes from
+    await_termination (mirrors the real ExecutorRegistry)."""
+
+    def __init__(self, teardown):
+        self.teardown = teardown
+        self.task: asyncio.Task | None = None
+        self.result: dict = {}
+
+    async def terminate_session(self, session_id, teardown, *, budget=None):
+        if self.result:
+            return ({"killed": False, "reaped": True, "matched": True,
+                     "executor_id": None}, dict(self.result))
+        if self.task is not None:
+            result = await self.task
+            return ({"killed": False, "reaped": True, "matched": True,
+                     "executor_id": None}, dict(result))
+        self.task = asyncio.create_task(self._run(teardown))
+        return ({"killed": False, "reaped": True, "matched": True,
+                 "executor_id": None},
+                {"ok": True, "initiated": True, "phase": "terminating"})
+
+    async def _run(self, teardown):
+        result = await teardown()
+        self.result = dict(result)
+        return result
+
+    async def await_termination(self, session_id):
+        if self.task is not None:
+            await self.task
+        return dict(self.result)
+
+
+def _make_daemon(registry):
+    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
+    from browserwright.daemon.server.state import DaemonState
+
+    class Router:
+        daemon = None
+
+    shared = UpstreamContext(
+        backend="extension", state=DaemonState("extension"),
+        router=Router(), holder=object())
+    daemon = Daemon(
+        cfg=Config(), shared_context=shared,
+        make_context=lambda **kw: pytest.fail("should not create"))
+    daemon.executors = registry
+    return daemon
+
+
+@pytest.mark.asyncio
+async def test_daemon_initiate_returns_at_boundary_and_watcher_publishes_end(
+    monkeypatch,
+):
+    """wait=False (the verb handler's contract): terminate_session returns at
+    the initiate boundary with phase=terminating, and the daemon's watcher
+    publishes ended + the final result once the background teardown completes
+    — so `ps` is truthful even if no caller ever polls."""
+    from browserwright.daemon.server.daemon import UnknownSessionError
+
+    started = asyncio.Event()
+    allow = asyncio.Event()
+
+    async def teardown():
+        started.set()
+        await allow.wait()
+        return {"ok": True, "closed": [1], "backend": "extension"}
+
+    registry = _InitiateRegistry(teardown)
+    daemon = _make_daemon(registry)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension"},
+    )
+
+    reap, result = await daemon.terminate_session(
+        "session-a", teardown, wait=False)
+    assert reap["reaped"] is True
+    assert result == {"ok": True, "initiated": True, "phase": "terminating"}
+    assert daemon.session_is_terminal("session-a") is False
+    # Leases are gated from initiate time: only control connections allowed.
+    with pytest.raises(UnknownSessionError):
+        daemon.acquire_session_lease(
+            "session-a", object(), lambda: asyncio.sleep(0), kind="facade")
+
+    allow.set()
+    await asyncio.wait_for(registry.task, timeout=1.0)
+    await asyncio.sleep(0)  # let the watcher publish
+    assert daemon.session_is_terminal("session-a") is True
+    assert daemon._session_results["session-a"]["ok"] is True
+    assert daemon._session_results["session-a"]["closed"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_daemon_retry_joins_inflight_termination_and_returns_final(
+    monkeypatch,
+):
+    """A retried terminate_session against a terminating session joins the
+    in-flight teardown and returns the FINAL result (the CLI's poll), while a
+    fresh terminate afterwards gets the cached tombstone result."""
+    started = asyncio.Event()
+    allow = asyncio.Event()
+
+    async def teardown():
+        started.set()
+        await allow.wait()
+        return {"ok": True, "closed": [1, 2], "backend": "extension"}
+
+    registry = _InitiateRegistry(teardown)
+    daemon = _make_daemon(registry)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension"},
+    )
+
+    first = asyncio.create_task(daemon.terminate_session(
+        "session-a", teardown, wait=False))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    retry = asyncio.create_task(daemon.terminate_session(
+        "session-a", teardown, wait=False))
+
+    allow.set()
+    _reap, initiated = await first
+    assert initiated["initiated"] is True
+    _reap2, joined = await asyncio.wait_for(retry, timeout=1.0)
+    assert joined["ok"] is True
+    assert joined["closed"] == [1, 2]
+    assert joined.get("initiated") is not True
+    assert daemon.session_is_terminal("session-a") is True
+
+    # A subsequent terminate is idempotent: the cached tombstone result.
+    _reap3, cached = await daemon.terminate_session(
+        "session-a", teardown, wait=False)
+    assert cached["ok"] is True
+    assert cached["closed"] == [1, 2]

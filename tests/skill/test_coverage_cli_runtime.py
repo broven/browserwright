@@ -637,10 +637,136 @@ def test_doctor_checks_warns_on_unknown_schema_and_fails_without_backend(monkeyp
 
     checks = health.doctor_checks()["checks"]
     by_name = {check["name"]: check for check in checks}
-    assert by_name["daemon"]["status"] == "pass"
+    assert by_name["daemon_cli"]["status"] == "pass"
+    # No liveness fields in the blob (pre-v3 daemon): we can't verify the
+    # daemon is running, so the check warns instead of asserting health.
+    assert by_name["daemon_running"]["status"] == "warn"
     assert by_name["daemon_schema"]["status"] == "warn"
     assert by_name["backend"]["status"] == "fail"
     assert by_name["backend"]["fix"]
+
+
+def test_doctor_checks_no_daemon_is_single_root_cause_failure(monkeypatch):
+    """Gate (issue #28): with no daemon running, doctor emits exactly one
+    root-cause failure and it names the daemon. Backend/extension
+    unavailability are consequences of the down daemon, not independent
+    failures — reporting them independently is what misdirected users."""
+    from browserwright import health
+
+    monkeypatch.setattr(health, "_launchagent_installed", lambda: False)
+    monkeypatch.setattr(health, "daemon_doctor", lambda: {
+        "schema_version": 3,
+        "alive": False,
+        "probe_state": "not_running",
+        "pid": None,
+        "recommended": None,
+        "backends": [
+            {"name": "env", "available": False},
+            {"name": "rdp", "available": False},
+            {"name": "extension", "available": False,
+             "needs_user_action": "start the single global daemon, then load "
+                                  "the Chrome extension from `chrome-extension/`"},
+        ],
+    })
+
+    checks = health.doctor_checks()["checks"]
+    fails = [c for c in checks if c["status"] == "fail"]
+    assert [c["name"] for c in fails] == ["daemon_running"]
+    assert "browserwright-daemon serve" in fails[0]["fix"]
+    backend = next(c for c in checks if c["name"] == "backend")
+    assert backend["status"] == "warn"
+    assert "deferred" in backend["message"]
+
+
+def test_doctor_checks_daemon_down_with_launchagent_fix_says_restart(monkeypatch):
+    """A LaunchAgent-managed install restarts rather than serves: a bare
+    `serve` would fight launchd over the socket (issue #28)."""
+    from browserwright import health
+
+    monkeypatch.setattr(health, "_launchagent_installed", lambda: True)
+    monkeypatch.setattr(health, "daemon_doctor", lambda: {
+        "schema_version": 3, "alive": False,
+        "probe_state": "not_running", "pid": None, "backends": [],
+    })
+
+    checks = health.doctor_checks()["checks"]
+    running = next(c for c in checks if c["name"] == "daemon_running")
+    assert running["status"] == "fail"
+    assert "restart" in running["fix"]
+
+
+def test_doctor_checks_half_alive_daemon_fix_reclaims_ports(monkeypatch):
+    """A half-alive daemon (port_held_by_unresponsive_process) always needs
+    `restart` to reclaim its ports — never a plain `serve`, which would crash
+    on EADDRINUSE (issue #28 / #15)."""
+    from browserwright import health
+
+    monkeypatch.setattr(health, "_launchagent_installed", lambda: False)
+    monkeypatch.setattr(health, "daemon_doctor", lambda: {
+        "schema_version": 3, "alive": False,
+        "probe_state": "port_held_by_unresponsive_process", "pid": None,
+        "backends": [],
+    })
+
+    checks = health.doctor_checks()["checks"]
+    running = next(c for c in checks if c["name"] == "daemon_running")
+    assert running["status"] == "fail"
+    assert "restart" in running["fix"]
+    assert "serve" not in running["fix"]
+
+
+def test_doctor_checks_alive_daemon_passes_running(monkeypatch):
+    from browserwright import health
+
+    monkeypatch.setattr(health, "daemon_doctor", lambda: {
+        "schema_version": 3, "alive": True, "probe_state": "ok",
+        "pid": 4242, "backends": [],
+    })
+
+    checks = health.doctor_checks()["checks"]
+    by_name = {c["name"]: c for c in checks}
+    assert by_name["daemon_running"]["status"] == "pass"
+    assert "4242" in by_name["daemon_running"]["message"]
+
+
+def test_cmd_doctor_no_daemon_reports_daemon_running_as_headline(monkeypatch, capsys):
+    """End-to-end gate (issue #28): `browserwright doctor` with no daemon
+    running prints the daemon as the one root-cause failure — and never a
+    `✗ backend` that reads as an extension-side problem."""
+    from browserwright import cli, health
+
+    monkeypatch.setattr(health, "_launchagent_installed", lambda: False)
+    monkeypatch.setattr(health, "daemon_doctor", lambda: {
+        "schema_version": 3, "alive": False,
+        "probe_state": "not_running", "pid": None,
+        "backends": [{"name": "extension", "available": False}],
+    })
+
+    assert cli._cmd_doctor([]) == 1
+    out = capsys.readouterr().out
+    assert "✗ daemon_running" in out
+    assert "browserwright-daemon serve" in out
+    assert "✗ backend" not in out
+    assert "doctor: FAIL" in out
+
+
+def test_session_create_reset_fix_no_longer_loops_through_doctor(monkeypatch):
+    """Secondary (issue #28): `session reset`'s fix text used to say 'run
+    `browserwright doctor`' — which reported `✓ daemon` on a down daemon, so
+    the advice looped. It now names the actual check/start commands."""
+    from browserwright import session_create
+
+    sid = "deadbeef"
+    monkeypatch.setattr(session_create, "_run", lambda cmd: 1)
+    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    from browserwright.errors import DaemonUnavailable
+
+    with pytest.raises(DaemonUnavailable) as excinfo:
+        session_create.reset_executor({"id": sid})
+    assert "browserwright doctor" not in excinfo.value.fix
+    assert "browserwright-daemon status" in excinfo.value.fix
+    assert "browserwright-daemon serve" in excinfo.value.fix
+    assert sid in excinfo.value.fix
 
 
 def test_doctor_checks_extension_unavailable_is_actionable_warn(monkeypatch):
@@ -695,7 +821,10 @@ def test_doctor_checks_surfaces_available_backend_ux_warning(monkeypatch):
     assert warning["fix"] == "reload extension"
 
 
-def test_session_create_run_returns_one_for_spawn_errors(monkeypatch):
+def test_session_create_run_returns_three_for_timeout(monkeypatch):
+    """A timed-out end-session subprocess is a failure (exit 3, matching the
+    CLI's own TimeoutError mapping), never a crash — the ledger row is kept
+    for retry, and the retry joins the daemon-side teardown (issue #32)."""
     from browserwright import session_create
 
     def timeout(*args, **kwargs):
@@ -703,7 +832,7 @@ def test_session_create_run_returns_one_for_spawn_errors(monkeypatch):
 
     monkeypatch.setattr(session_create.subprocess, "run", timeout)
 
-    assert session_create._run(["browserwright-daemon", "end-session"]) == 1
+    assert session_create._run(["browserwright-daemon", "end-session"]) == 3
 
 
 def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monkeypatch):
@@ -717,7 +846,7 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
     reg._with_entry(ext_sid, lambda e: e.update(last_seen=0.0))
     ended = []
 
-    def _run(cmd):
+    def _run(cmd, **kwargs):
         sid = cmd[cmd.index("--session") + 1]
         assert reg.get(sid) is not None
         ended.append(sid)
@@ -742,7 +871,7 @@ def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
 
     sid = reg.allocate(backend="rdp", owner="create", name="owned")
     record = reg.get(sid)
-    monkeypatch.setattr(session_create, "_run", lambda _cmd: 3)
+    monkeypatch.setattr(session_create, "_run", lambda _cmd, **kwargs: 3)
 
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
         session_create.end(record)
@@ -755,7 +884,7 @@ def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: calls.append(["ensure"]))
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
     message = session_create.reset_executor(reg.get(sid))
 
@@ -810,7 +939,7 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
     sid = reg.allocate(backend="extension", owner="attach", name="shared")
     reg.update(sid, runtime={"group_id": 12})
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
     message = session_create.end(reg.get(sid))
 
@@ -854,7 +983,7 @@ def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):
 
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
     message = session_create.end(reg.get(sid))
 
     assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
@@ -871,7 +1000,7 @@ def test_session_create_end_create_rdp_does_not_double_reap(tmp_bs_home, monkeyp
     sid = reg.allocate(backend="rdp", owner="create", name="owned",
                        workspace={"port": 12345})
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
     message = session_create.end(reg.get(sid))
 
@@ -998,7 +1127,7 @@ def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch
 
     sid = reg.allocate(backend="env", owner="attach", name="cloak")
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
     message = session_create.end(reg.get(sid))
 
     assert calls == [["browserwright-daemon", "end-session", "--session", sid]]

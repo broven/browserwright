@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, NoReturn
 
@@ -835,6 +836,10 @@ def _cmd_userscript(args, cfg: Config | None = None) -> int:
 # which `BrowserwrightDaemon.*` verb. Anything with bespoke output
 # (`attach-active`'s tab-separated form) or bespoke error mapping stays a real
 # handler above — the table is for forwarding, not for "almost forwarding".
+#
+# end-session is deliberately NOT a row: it is the one forwarding-shaped verb
+# whose worst case outlives the CLI timeout (issue #32), so it has a real
+# handler (`_cmd_end_session`) implementing the initiate-then-join contract.
 
 
 @dataclass(frozen=True)
@@ -895,6 +900,81 @@ def _require_complete_end_session(result: dict) -> None:
             f"{result!r}")
 
 
+#: Issue #32 initiate-then-join contract. The initiate RPC only does the
+#: bounded fast phase (revoke + reap) and returns in well under a second; the
+#: unbounded workspace teardown continues daemon-side. The join RPC blocks
+#: until the teardown finishes (or the daemon restarts and re-initiates), so
+#: its per-attempt timeout covers the whole daemon-side worst case.
+_END_SESSION_INITIATE_TIMEOUT = 10.0
+_END_SESSION_JOIN_TIMEOUT = 20.0
+#: Total wall-clock budget for `session end` to reach the final result before
+#: giving up. Generous on purpose: progress is printed while waiting, so a
+#: slow teardown is visible, and a teardown still running after this long is
+#: wedged regardless of backend.
+_END_SESSION_TOTAL_WAIT_S = 90.0
+
+
+def _end_session_rpc(cfg: Config, params: dict, session: str,
+                     timeout: float) -> dict:
+    """One `endSession` RPC (initiate or join). Raises `TimeoutError` when
+    the daemon does not answer in time — never a fake result."""
+    return _run(_rpc_via_ws(
+        cfg, "BrowserwrightDaemon.endSession", params,
+        client_label="cli-end-session", timeout=timeout,
+        browser_session=session))
+
+
+def _cmd_end_session(args, cfg: Config) -> int:
+    """P5 teardown under the issue #32 initiate-then-join contract.
+
+    The first call initiates: the daemon revokes clients, reaps the executor,
+    publishes phase=terminating, and returns immediately while the unbounded
+    workspace teardown keeps running daemon-side. This handler then re-issues
+    `endSession` to JOIN the in-flight teardown, printing progress to stderr
+    so a slow teardown is distinguishable from a hung daemon. Exit 0 only
+    when the daemon confirms the workspace teardown completed; the ledger
+    entry is removed by Layer 2 only on that exit code.
+
+    Against an old daemon (no initiate contract) the first response is
+    already the final result, and the poll loop is skipped."""
+    params = _end_session_params(args)
+    deadline = time.monotonic() + _END_SESSION_TOTAL_WAIT_S
+    started = time.monotonic()
+    result: dict | None = None
+    try:
+        try:
+            result = _end_session_rpc(
+                cfg, params, args.session, _END_SESSION_INITIATE_TIMEOUT)
+        except TimeoutError:
+            # A previous teardown may still be joining; enter the poll loop.
+            pass
+        while result is None or result.get("initiated") is True:
+            if time.monotonic() >= deadline:
+                raise DaemonError(
+                    "BrowserwrightDaemon.endSession is still terminating "
+                    f"after {_END_SESSION_TOTAL_WAIT_S:.0f}s; watch progress "
+                    "with `browserwright-daemon ps`")
+            print(
+                f"session {args.session}: tearing down… "
+                f"({time.monotonic() - started:.0f}s)",
+                file=sys.stderr, flush=True)
+            try:
+                result = _end_session_rpc(
+                    cfg, params, args.session, _END_SESSION_JOIN_TIMEOUT)
+            except TimeoutError:
+                result = None  # join still running daemon-side; keep polling
+                continue
+            _require_complete_end_session(result)
+    except Unavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except DaemonError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 #: Every forwarding subcommand. All emit the sorted-JSON RPC result verbatim
 #: (spec §5.1 single-line discipline) — these responses are structured, so a
 #: tab-separated form would lose fields. Each passes `browser_session`, so the
@@ -910,9 +990,11 @@ _FORWARDS: dict[str, _Forward] = {
         _close_tab_params, precheck=_need_tab_ref),
     # P5 teardown: close owned tabs, keep borrowed. `--session` is
     # argparse-required here, hence no precheck.
-    "end-session": _Forward(
-        "BrowserwrightDaemon.endSession", "cli-end-session", 10.0,
-        _end_session_params, validate=_require_complete_end_session),
+    #
+    # NOTE: `end-session` is deliberately NOT a row (issue #32) — it is the
+    # one forwarding-shaped verb whose worst case outlives the CLI timeout,
+    # so it has a real handler (`_cmd_end_session`) implementing the
+    # initiate-then-join contract below.
     # Phase B: reap a session's resident executor, no browser teardown.
     "kill-executor": _Forward(
         "BrowserwrightDaemon.killExecutor", "cli-kill-executor", 10.0,
@@ -1041,6 +1123,7 @@ _DISPATCH = {
     "uninstall": _cmd_uninstall,
     "list": _cmd_list,
     # open-background / close-tab / end-session / kill-executor
+    "end-session": _cmd_end_session,  # issue #32: real handler, not a row
     **{name: _forwarding_handler(spec) for name, spec in _FORWARDS.items()},
 }
 
@@ -1106,6 +1189,20 @@ def _pretty_ps(p: dict) -> None:
                   f"elapsed={_secs(r.get('elapsed_s'))}  "
                   f"tab={r.get('tab_id')}  id={r.get('id')}")
 
+    sessions = p.get("sessions") or []
+    if sessions:
+        print(f"\nsessions  {len(sessions)}")
+        print(f"  {'SESSION':<22} {'PHASE':<12} RESULT")
+        for s in sessions:
+            result = s.get("result") or {}
+            ok = result.get("ok")
+            summary = ""
+            if isinstance(ok, bool):
+                summary = (f"ok={ok} closed={len(result.get('closed') or [])} "
+                           f"failed={result.get('failed') or []}")
+            print(f"  {str(s.get('session_id'))[:22]:<22} "
+                  f"{str(s.get('phase') or 'active')[:12]:<12} {summary}")
+
     executors = p.get("executors") or []
     print(f"\nexecutors  {len(executors)}")
     if executors:
@@ -1128,6 +1225,12 @@ def _pretty_ps(p: dict) -> None:
 
 
 def _pretty_doctor(out: dict) -> None:
+    # v3 (issue #28): lead with daemon liveness so a down daemon — the one
+    # condition that makes every backend unavailable — is never buried.
+    if out.get("alive"):
+        print(f"daemon: alive (pid {out.get('pid')})")
+    else:
+        print(f"daemon: not running (probe_state={out.get('probe_state')})")
     rec = out.get("recommended")
     print(f"recommended: {rec or '(none available)'}")
     print()

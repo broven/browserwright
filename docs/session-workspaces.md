@@ -70,10 +70,20 @@ Hard invariants:
 - Probe tabs and real user-work tabs are not separate workspaces; they belong to
   the same group.
 - `runtime.group_id` in the session ledger is durable state, not a cosmetic
-  label. It lets the daemon recover the same group after restart.
+  label. It lets the daemon recover the same group after restart — as a
+  *candidate*, never as proof.
 - In-process relay state is the fast path; ledger `runtime.group_id` is the
   restart/reconnect fallback. A tab-creation path must refresh from these
   sources before asking Chrome to create a new group.
+- Group ownership is **derived from the extension's per-tab markers** (issue
+  #29): the extension stamps every tab it places in a session group
+  (`chrome.storage.session`, keyed by tabId, value = owning sessionId), and a
+  group is adopted only if a member tab carries the session's marker. The
+  title is never an anchor (user-editable, non-unique); recycled group/tab ids
+  after a browser restart make ownership unprovable, and an unproven group is
+  never adopted — opening, recovery, and teardown fail explicitly, and
+  `attachActiveTab` is the re-adoption escape (fresh group). Extensions too
+  old to report markers degrade to the legacy title+membership heuristic.
 
 The extension backend does not isolate cookies, localStorage, IndexedDB,
 extensions, downloads, or the Chrome profile. All extension sessions share the
@@ -192,6 +202,25 @@ Ending a session follows ownership:
 - Env sessions (always attach-owned) leave the external browser running.
 
 Executor cleanup is separate from browser ownership and may run for any session.
+
+`endSession` is an **initiate-then-join** verb (issue #32), not a synchronous
+request/response verb: its worst case (serial tab closes over a cold extension
+reconnect window) outlives any caller's timeout, so the daemon returns at the
+**initiate boundary** — after the bounded fast phase (clients revoked,
+executor reaped and confirmed dead, phase `terminating`) — and the unbounded
+workspace teardown keeps running as a daemon-side task under the same
+per-session lock. The caller **joins** by re-issuing `endSession`, which
+blocks until the teardown finishes and returns the final result; the CLI
+(`session end`) does initiate → progress-printed join → final result, and
+`browserwright-daemon ps` exposes the per-session phase so a slow teardown is
+distinguishable from a hung daemon.
+
+The atomicity #33 bought is preserved: the `terminating` phase + a pending
+marker are published before the lock is released, so a queued/retried
+`ensureExecutor` is refused from the initiate moment, never between reap and
+tombstone. A failed/partial teardown flips the phase back to `active` and
+installs no tombstone, so `endSession` retries resume (extension retry anchors
+are written before the first destructive browser write).
 
 ## Common Mistakes To Avoid
 
