@@ -28,6 +28,12 @@ import os
 import time
 from typing import Any
 
+# Re-exported under its historical name: `_context_row` below and
+# `tests/daemon/test_status_redaction.py` both reach for `_redact_ws_url`.
+# The rule itself lives in `daemon/_net.py` because every path that prints an
+# endpoint — daemon logs, `session list --json`, resolver errors — needs it.
+from .._net import redact_url as _redact_ws_url
+
 from .. import __version__
 
 #: Bump when a consumer-visible key changes meaning. `browserwright-daemon ps`
@@ -94,31 +100,6 @@ def _session_rows(daemon: object | None) -> list[dict]:
 
 
 # ---- pieces ----------------------------------------------------------------
-
-
-def _redact_ws_url(url: object) -> object:
-    """Strip credentials from an upstream URL before it is reported.
-
-    `daemon ps --json` is meant to be pasted into a bug report, and `BD_CDP_WS`
-    for a cloud or anti-detect browser routinely carries a reusable token — in
-    the userinfo, or as a query parameter. Keep enough to identify the endpoint
-    (scheme, host, port, path) and drop the rest; the field exists to tell you
-    *which* upstream a context is on, never to authenticate to it.
-    """
-    if not isinstance(url, str) or "://" not in url:
-        return url
-    from urllib.parse import urlsplit, urlunsplit
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<unparseable>"
-    netloc = parts.hostname or ""
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
-    if parts.username or parts.password:
-        netloc = f"<redacted>@{netloc}"
-    query = "<redacted>" if parts.query else ""
-    return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
 
 
 def _contexts_of(daemon: object | None, context: object | None) -> list:

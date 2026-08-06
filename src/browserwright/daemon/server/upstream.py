@@ -23,10 +23,11 @@ import logging
 import os
 import time
 from typing import Any, Awaitable, Callable, Protocol, TYPE_CHECKING, runtime_checkable
-from urllib.parse import urlparse
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+from .._net import is_loopback_host
 
 logger = logging.getLogger(__name__)
 
@@ -858,12 +859,15 @@ class CdpUpstream:
 
 @contextlib.contextmanager
 def _localhost_bypass_proxy(ws_url: str):
-    """When the upstream URL is loopback, ensure NO_PROXY covers it. Same
-    rationale as `active_tab._localhost_bypass_proxy`. Spec doesn't mention
-    this — but Chrome runs on the user's machine, and the user often has
-    HTTPS_PROXY / ALL_PROXY set."""
-    host = (urlparse(ws_url).hostname or "").lower()
-    if host not in ("127.0.0.1", "localhost", "::1", "[::1]"):
+    """When the upstream URL is loopback, ensure NO_PROXY covers it.
+
+    Spec doesn't mention this — but a browser we launched runs on the user's
+    machine, and the user often has HTTPS_PROXY / ALL_PROXY set. An external
+    endpoint is the opposite case: there the proxy is usually intentional, so
+    we leave it alone. `is_loopback_host` is what decides which one this is,
+    and it is the same predicate the cdp backend uses to pick `trust_env`.
+    """
+    if not is_loopback_host(ws_url):
         yield
         return
     prev = os.environ.get("NO_PROXY", "")
