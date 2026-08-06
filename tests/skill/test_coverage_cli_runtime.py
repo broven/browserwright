@@ -821,7 +821,10 @@ def test_doctor_checks_surfaces_available_backend_ux_warning(monkeypatch):
     assert warning["fix"] == "reload extension"
 
 
-def test_session_create_run_returns_one_for_spawn_errors(monkeypatch):
+def test_session_create_run_returns_three_for_timeout(monkeypatch):
+    """A timed-out end-session subprocess is a failure (exit 3, matching the
+    CLI's own TimeoutError mapping), never a crash — the ledger row is kept
+    for retry, and the retry joins the daemon-side teardown (issue #32)."""
     from browserwright import session_create
 
     def timeout(*args, **kwargs):
@@ -829,7 +832,7 @@ def test_session_create_run_returns_one_for_spawn_errors(monkeypatch):
 
     monkeypatch.setattr(session_create.subprocess, "run", timeout)
 
-    assert session_create._run(["browserwright-daemon", "end-session"]) == 1
+    assert session_create._run(["browserwright-daemon", "end-session"]) == 3
 
 
 def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monkeypatch):
@@ -843,7 +846,7 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
     reg._with_entry(ext_sid, lambda e: e.update(last_seen=0.0))
     ended = []
 
-    def _run(cmd):
+    def _run(cmd, **kwargs):
         sid = cmd[cmd.index("--session") + 1]
         assert reg.get(sid) is not None
         ended.append(sid)
@@ -868,7 +871,7 @@ def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
 
     sid = reg.allocate(backend="rdp", owner="create", name="owned")
     record = reg.get(sid)
-    monkeypatch.setattr(session_create, "_run", lambda _cmd: 3)
+    monkeypatch.setattr(session_create, "_run", lambda _cmd, **kwargs: 3)
 
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
         session_create.end(record)
@@ -881,7 +884,7 @@ def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: calls.append(["ensure"]))
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
     message = session_create.reset_executor(reg.get(sid))
 
@@ -936,7 +939,7 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
     sid = reg.allocate(backend="extension", owner="attach", name="shared")
     reg.update(sid, runtime={"group_id": 12})
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
     message = session_create.end(reg.get(sid))
 
@@ -980,7 +983,7 @@ def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):
 
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
     message = session_create.end(reg.get(sid))
 
     assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
@@ -997,7 +1000,7 @@ def test_session_create_end_create_rdp_does_not_double_reap(tmp_bs_home, monkeyp
     sid = reg.allocate(backend="rdp", owner="create", name="owned",
                        workspace={"port": 12345})
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
     message = session_create.end(reg.get(sid))
 
@@ -1124,7 +1127,7 @@ def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch
 
     sid = reg.allocate(backend="env", owner="attach", name="cloak")
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
     message = session_create.end(reg.get(sid))
 
     assert calls == [["browserwright-daemon", "end-session", "--session", sid]]

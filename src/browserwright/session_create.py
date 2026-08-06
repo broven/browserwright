@@ -50,12 +50,21 @@ def _spawn_detached(cmd: list[str]) -> int:
     return proc.pid
 
 
-def _run(cmd: list[str]) -> int:
-    """Run a short-lived command; return its exit code (best-effort)."""
+def _run(cmd: list[str], timeout: float = 10.0) -> int:
+    """Run a short-lived command; return its exit code (best-effort).
+    A timed-out child is reported as failure (exit 3), never a crash — the
+    caller keeps the ledger row for retry, and the retry joins the daemon-side
+    teardown (issue #32 initiate contract)."""
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=10).returncode
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return subprocess.run(cmd, capture_output=True, timeout=timeout).returncode
+    except FileNotFoundError:
+        # The daemon CLI binary is missing from PATH — an environment problem.
         return 1
+    except subprocess.TimeoutExpired:
+        # The CLI was still working (end-session now legitimately covers
+        # initiate + join, issue #32). Report failure so the ledger row is
+        # kept for retry — the retry joins the daemon-side teardown.
+        return 3
 
 
 def _running_daemon_backend() -> str | None:
@@ -117,6 +126,13 @@ def _ensure_daemon_running() -> None:
     _spawn_detached(["browserwright-daemon", "serve"])
 
 
+#: How long `session end` may take end-to-end. The CLI under it implements
+#: the issue #32 initiate-then-join contract: initiate is fast, the join
+#: covers the daemon-side teardown worst case, and progress is printed while
+#: waiting. Must be >= the CLI's own total wait budget.
+_END_SESSION_CLI_TIMEOUT = 120.0
+
+
 def _end_daemon_session(record: dict) -> bool:
     """End every session through the daemon's atomic terminal lifecycle.
 
@@ -134,7 +150,7 @@ def _end_daemon_session(record: dict) -> bool:
         gid = runtime.get("group_id")
         if isinstance(gid, int) and gid >= 0:
             cmd += ["--group-id", str(gid)]
-    return _run(cmd) == 0
+    return _run(cmd, timeout=_END_SESSION_CLI_TIMEOUT) == 0
 
 
 def reset_executor(record: dict) -> str:
