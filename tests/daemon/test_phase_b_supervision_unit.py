@@ -197,7 +197,7 @@ async def test_kill_isolated_per_session(stub_terminate):
 
 
 def test_idle_seconds_reads_discovery_mtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(_ipc, "_runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(_ipc, "runtime_dir", lambda: tmp_path)
     sid = "sess-mtime"
     fp = _ipc.executor_file_path(sid)
     fp.write_text(json.dumps({"sock": "x", "pid": 1, "session": sid}))
@@ -210,7 +210,7 @@ def test_idle_seconds_reads_discovery_mtime(tmp_path, monkeypatch):
 
 
 def test_idle_seconds_floors_on_missing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(_ipc, "_runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(_ipc, "runtime_dir", lambda: tmp_path)
     # No discovery file → fall back to spawn time (just spawned → ~0 idle).
     h = ExecutorHandle(session_id="nope", proc=_FakeProc(), sock_path="x")
     assert h.idle_seconds() < 5.0
@@ -220,7 +220,7 @@ def test_idle_seconds_floors_on_missing_file(tmp_path, monkeypatch):
 
 
 def test_cleanup_orphan_executors_unlinks_stale_files(tmp_path, monkeypatch):
-    monkeypatch.setattr(_ipc, "_runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(_ipc, "runtime_dir", lambda: tmp_path)
     # A stale discovery file + socket from a prior daemon crash, pid that no
     # longer exists.
     sock = tmp_path / "bw-exec-deadbeef.sock"
@@ -237,7 +237,7 @@ def test_cleanup_orphan_executors_unlinks_stale_files(tmp_path, monkeypatch):
 
 def test_cleanup_orphan_executors_no_runtime_dir(tmp_path, monkeypatch):
     missing = tmp_path / "does-not-exist"
-    monkeypatch.setattr(_ipc, "_runtime_dir", lambda: missing)
+    monkeypatch.setattr(_ipc, "runtime_dir", lambda: missing)
     er.cleanup_orphan_executors()  # must not raise
 
 

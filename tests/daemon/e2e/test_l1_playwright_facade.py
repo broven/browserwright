@@ -22,10 +22,12 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import TEST_RDP_PORT, _isolated_runtime_dir, _kill_chrome  # noqa: F401
-
-# A test facade port distinct from production (19990) and the e2e relay (29989).
-TEST_FACADE_PORT = 29991
+from .conftest import (  # noqa: F401
+    TEST_FACADE_L1_PORT as TEST_FACADE_PORT,
+    TEST_RDP_PORT,
+    _isolated_runtime_dir,
+    _kill_chrome,
+)
 
 
 @pytest.fixture

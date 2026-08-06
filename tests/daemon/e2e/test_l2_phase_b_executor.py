@@ -282,12 +282,14 @@ def test_daemon_restart_cold_starts_fresh_executor_rdp(
         # facade resolves Chrome through the SAME cfg port. Omitting it makes the
         # restarted daemon default to 9222 (no Chrome there) so the facade 404s
         # and the executor cold-start fails — a test-env regression, not a code
-        # bug. Mirror every fixture env key here.
-        from .conftest import TEST_RDP_PORT
+        # bug. Mirror every fixture env key here, including BD_FACADE_PORT (the
+        # fixture's isolated auto-facade port — issue #44 B).
+        from .conftest import TEST_AUTOFACADE_PORT, TEST_RDP_PORT
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = runtime_dir
         env["TMPDIR"] = runtime_dir
         env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+        env["BD_FACADE_PORT"] = str(TEST_AUTOFACADE_PORT)
         env["BS_HOME"] = str(_BS_HOME_RDP)
         env["BD_CONFIG"] = ""
         subprocess.run(["browserwright-daemon", "stop"],

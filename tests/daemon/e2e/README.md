@@ -33,7 +33,7 @@ so BOTH packages must resolve to the *current* checkout. The installed scripts
 separate uv projects (no workspace), so plain `uv run` would test
 worktree-daemon + stale-skill. `run.sh` layers the sibling worktree's
 browserwright into the daemon env with `--with ../browserwright` (all relative
-paths) and clears any stale test daemon on port 29989 first.
+paths) and clears any stale test daemon left on this worktree's ports first.
 
 If you're NOT in a worktree (main checkout, browserwright installed on PATH),
 plain `uv run pytest tests/e2e/` / `uv run pytest -m real_chrome` also works.
@@ -41,20 +41,46 @@ plain `uv run pytest tests/e2e/` / `uv run pytest -m real_chrome` also works.
 The default `uv run pytest tests/` does NOT run these -- they require a head
 of display and a few seconds per case, which we keep out of the inner loop.
 
+## Ports: per-worktree, not fixed (issue #44)
+
+Every port the suite binds is **derived from this worktree's path** by
+`_e2e_ports.py` — a stable sha256 of the checkout root mapped into
+30000-48999 — so sibling worktrees can run e2e **concurrently** on one
+machine. `run.sh` and the pytest fixtures both read that module, so they can
+never disagree about which ports this worktree owns.
+
+| Port (old fixed) | Used for |
+|---|---|
+| 29989 | extension relay (`TEST_EXT_PORT`) |
+| 29990 | rdp Chrome `--remote-debugging-port` (`TEST_RDP_PORT`) |
+| 29991 | L1 rdp facade daemon (`TEST_FACADE_L1_PORT`) |
+| 29992 | L1 extension facade daemon (`TEST_FACADE_L1_EXT_PORT`) |
+| 29993 | session extension daemon facade (`TEST_FACADE_EXT_PORT`) |
+| 29994 | session rdp daemon facade (`TEST_FACADE_RDP_PORT`) |
+| (new) | rdp auto-facade daemon facade (`TEST_FACADE_AUTOFACADE_PORT`) |
+
+Collisions are still possible in principle (two worktrees hashing to the same
+block); they fail loudly — `run.sh` REFUSES with the holder's pid and cwd, and
+the fixtures' `_port_free` guard names the port — never silently.
+
 ## Isolation matrix
 
 | Dimension | Production (your daily) | Test (these E2Es) |
 |---|---|---|
-| daemon extension port | 19989 | 29989 |
-| daemon RDP port | default | 29990 |
-| daemon `BD_NAME` | `default` | `bd-e2e` |
+| daemon extension port | 19989 | per-worktree derived (see above) |
+| daemon RDP port | default | per-worktree derived |
+| daemon facade port | 19990 (auto-enable) | per-worktree derived (each daemon) |
 | Chrome `user-data-dir` | your daily profile | per-test tmpdir |
 | Chrome binary (ext tests) | Google Chrome | Chrome for Testing |
-| extension `RELAY_URL` | `:19989` (hardcoded) | `:29989` (patched copy) |
+| extension `RELAY_URL` | `:19989` (hardcoded) | derived port (patched copy) |
 | daemon config path | `~/.config/browserwright-daemon` | `tmp_path` per session |
 
 Nothing escapes the test boundary. You can have your daily Chrome + extension
-running while these tests run.
+running while these tests run — including the machine-global daemon: the
+harness isolates every test daemon behind its own XDG_RUNTIME_DIR (distinct
+socket) and its own derived ports, and the daemon itself refuses to reclaim
+ports held by a daemon from a different runtime dir (issue #44 B), so a test
+run never signals the global daemon.
 
 ## Headless
 
@@ -136,12 +162,15 @@ This directory is gitignored.
 
 ## When this fails
 
-- "port 29989 already in use" -> `lsof -i :29989`, kill the stale daemon.
-- "run.sh: REFUSING to start -- port 29989 is held by a process that is NOT
-  from this worktree" -> exactly what it says. :29989 is a fixed port shared by
-  every worktree, so that is very likely a **sibling worktree's e2e run in
-  progress**; run.sh used to kill it unconditionally, which voided both runs.
-  Wait for it to finish, or kill it by hand if you know it is dead weight.
+- "port N already in use" -> `lsof -i :N`, kill the stale daemon. The port is
+  derived from this worktree's path (see above); a holder from a *different*
+  worktree means the hash collided — `run.sh` will name the holder.
+- "run.sh: REFUSING to start — this worktree's e2e ports are held by
+  processes NOT from this worktree" -> exactly what it says: a **sibling
+  worktree's e2e run in progress** (or a leftover from an older checkout's
+  fixed 29989 block). run.sh used to kill unconditionally, which voided both
+  runs. Wait for it to finish, or kill it by hand if you know it is dead
+  weight.
 - "extension never connected within 10s" -> check `_artifacts/daemon.log`;
   most likely the patched `RELAY_URL` is wrong or Chrome failed to load the
   extension dir.

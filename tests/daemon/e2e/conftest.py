@@ -1,7 +1,8 @@
 """pytest configuration for real-Chrome E2E tests.
 
 These tests:
-- launch a real Chrome with the patched extension (port 29989)
+- launch a real Chrome with the patched extension (per-worktree derived port,
+  see _e2e_ports.py — issue #44 A)
 - spawn a real `browserwright-daemon serve`
 - drive everything through the `browserwright` CLI
 
@@ -27,24 +28,34 @@ from pathlib import Path
 
 import pytest
 
-# Test-only ports. Chosen to be distinct from production (19989) and far enough
-# from common dev ports to reduce collisions.
-TEST_EXT_PORT = 29989
-TEST_RDP_PORT = 29990
+# Test-only ports, derived per-worktree from this checkout's path (issue #44 A):
+# concurrent e2e runs in sibling worktrees get disjoint blocks instead of
+# fighting over fixed literals. Values are a stable sha256 of the worktree root
+# mapped into 30000-48999; `run.sh` computes the same numbers by executing
+# _e2e_ports.py, so the runner and these fixtures can never disagree.
+from ._e2e_ports import e2e_ports
+
+_PORTS = e2e_ports()
+TEST_EXT_PORT = _PORTS["ext"]
+TEST_RDP_PORT = _PORTS["rdp"]
 # Phase C: the Playwright facade is auto-enabled on a fixed default port
-# (DEFAULT_FACADE_PORT = 19990). Both the extension and the rdp e2e daemons are
-# session-scoped and run concurrently, so they MUST bind the facade on distinct
-# ports — otherwise the second daemon's facade bind silently fails (logged
-# non-fatal) and its heredoc `page` raises FacadeUnavailable. Give each its own,
-# and keep them clear of the dedicated facade-test daemons' ports (29991 in
-# test_l1_playwright_facade.py, 29992 in test_l1_playwright_facade_extension.py)
-# and the default 19990 used by the heredoc tests' own daemons.
-TEST_EXT_FACADE_PORT = 29993
-TEST_RDP_FACADE_PORT = 29994
+# (DEFAULT_FACADE_PORT = 19990) — but every e2e daemon MUST override it: the
+# default is the machine-global daemon's facade port (issue #44 B), and the
+# extension + rdp session daemons run concurrently, so they also need distinct
+# ports from each other. Each daemon binds its own derived port; the L1
+# facade-test daemons and the rdp auto-facade daemon get theirs below.
+TEST_EXT_FACADE_PORT = _PORTS["facade_ext"]
+TEST_RDP_FACADE_PORT = _PORTS["facade_rdp"]
+# The remaining facade ports: L1 rdp facade (test_l1_playwright_facade.py), L1
+# extension facade (test_l1_playwright_facade_extension.py), and the rdp
+# auto-facade daemon (test_l2_heredoc_playwright_page.py, via BD_FACADE_PORT).
+TEST_FACADE_L1_PORT = _PORTS["facade_l1"]
+TEST_FACADE_L1_EXT_PORT = _PORTS["facade_l1_ext"]
+TEST_AUTOFACADE_PORT = _PORTS["facade_autofacade"]
 # Single-global-daemon model: BD_NAME / `--name` are gone. The e2e harness now
 # isolates the test daemon from the developer's real daemon by pointing
 # XDG_RUNTIME_DIR at a throwaway temp dir (→ a distinct fixed socket path) and
-# overriding the relay port (BD_EXTENSION_PORT=29989). One daemon serves both
+# overriding the relay port (BD_EXTENSION_PORT=<derived>). One daemon serves both
 # backends, routing per session by the ledger's immutable per-session backend.
 
 
@@ -89,7 +100,10 @@ def pytest_collection_modifyitems(config, items):
         parts = rel.parts
         if (len(parts) >= 3 and parts[0] == "tests"
                 and parts[1] == "daemon" and parts[2] == "e2e"):
-            if item.path.name == "test_patch_extension.py":
+            # Unit tests that need no browser stay discoverable in the inner
+            # loop (the fast gate runs `pytest tests/daemon`).
+            if item.path.name in ("test_patch_extension.py",
+                                  "test_e2e_ports_unit.py"):
                 continue
             item.add_marker(pytest.mark.real_chrome)
 
@@ -210,7 +224,9 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     if not _port_free(TEST_EXT_PORT):
         pytest.fail(
             f"port {TEST_EXT_PORT} already in use; another test daemon? "
-            "Use `lsof -i :29989` to find it."
+            f"Use `lsof -i :{TEST_EXT_PORT}` to find it. (A holder from a "
+            "different worktree means the per-worktree port hash collided — "
+            "see _e2e_ports.py.)"
         )
 
     log_path = e2e_artifacts_dir / "daemon.log"
@@ -226,8 +242,8 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     # Keep the daemon's session ledger aligned with helpers.run_skill(), which
     # seeds extension sessions under this isolated test home.
     env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "extension")
-    # Relay-port override (the harness already pins 29989) keeps the test relay
-    # off the production 19989.
+    # Relay-port override keeps the test relay on this worktree's derived port
+    # (away from the production 19989 and the global daemon).
     env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
     # Neutralise any externally-set BD_CONFIG so the test daemon doesn't
     # inherit the user's toml (which may set relay_url, ports, etc.).
