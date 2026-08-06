@@ -76,6 +76,13 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
     else:  # rdp
         # The rdp daemon resolves its upstream against this port.
         env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+        # Isolation wall for ANY daemon this skill process might spawn
+        # (session_create._ensure_daemon_running / coherence respawn): without
+        # BD_EXTENSION_PORT the spawned `serve` binds the PRODUCTION relay port
+        # 19989 — the user's real Chrome extension dials that, and sibling
+        # test daemons' startup reclaim then fight/kill it. Pin the test relay
+        # port for rdp skills too (the rdp daemon simply never binds it).
+        env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
     if extra_env:
         env.update(extra_env)
 

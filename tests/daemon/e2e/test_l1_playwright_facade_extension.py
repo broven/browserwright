@@ -80,7 +80,7 @@ def ext_facade_ready(e2e_ext_facade_daemon, e2e_chrome):
     serves. Returns (ext_port, facade_port, runtime_dir).
     """
     ext_port, facade_port, runtime_dir = e2e_ext_facade_daemon
-    deadline = time.monotonic() + 15.0
+    deadline = time.monotonic() + 25.0
     last = None
     while time.monotonic() < deadline:
         try:
@@ -94,7 +94,7 @@ def ext_facade_ready(e2e_ext_facade_daemon, e2e_chrome):
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             pass
         time.sleep(0.2)
-    pytest.fail(f"extension never connected within 15s; last status={last}")
+    pytest.fail(f"extension never connected within 25s; last status={last}")
 
 
 def test_connect_over_cdp_handshake_against_extension(ext_facade_ready):

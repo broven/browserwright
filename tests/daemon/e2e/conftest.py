@@ -268,10 +268,25 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
     # Wait until /__status__ responds.
     deadline = time.monotonic() + 10.0
     last_err: Exception | None = None
+
+    def _fail(msg: str):
+        log_fh.flush()
+        # Leak guard: teardown only runs after ``yield``; reap a live-but-
+        # hung daemon before failing setup (mirrors e2e_rdp_daemon).
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception:
+            pass
+        pytest.fail(msg)
+
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            log_fh.flush()
-            pytest.fail(
+            _fail(
                 f"daemon exited early with code {proc.returncode}; "
                 f"see {log_path}"
             )
@@ -285,8 +300,7 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
             last_err = e
             time.sleep(0.2)
     else:
-        log_fh.flush()
-        pytest.fail(
+        _fail(
             f"daemon /__status__ never came up within 10s; last err={last_err}; "
             f"see {log_path}"
         )
@@ -572,10 +586,14 @@ def pytest_runtest_makereport(item, call):
 def ext_ready(e2e_daemon, e2e_chrome):
     """Block until the extension SW has connected to the daemon's relay.
 
-    Polls `/__status__` and asserts `extensions >= 1` within 10s.
+    Polls `/__status__` and asserts `extensions >= 1` within 25s. The budget
+    is generous on purpose: each test launches a FRESH Chrome for Testing, and
+    under load the MV3 service worker cold-start (extension load → SW boot →
+    ws dial) can take well past 10s — a tighter deadline turned into flaky
+    "extension never connected" errors on otherwise healthy runs.
     On timeout, fails the test with the daemon log location.
     """
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + 25.0
     last_status: dict | None = None
     while time.monotonic() < deadline:
         try:
@@ -590,7 +608,7 @@ def ext_ready(e2e_daemon, e2e_chrome):
             pass
         time.sleep(0.2)
     pytest.fail(
-        f"extension never connected within 10s; last status={last_status}; "
+        f"extension never connected within 25s; last status={last_status}; "
         f"daemon log: {e2e_daemon.log_path}"
     )
 
@@ -741,12 +759,27 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     )
 
     # Wait until the daemon's socket answers `status` (alive).
+    # NOTE: on ANY setup failure below we must reap ``proc`` before raising —
+    # the teardown section only runs after ``yield``, so a live-but-hung
+    # daemon would otherwise leak for the whole pytest session (and beyond).
+    def _fail(msg: str):
+        log_fh.flush()
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception:
+            pass
+        pytest.fail(msg)
+
     deadline = time.monotonic() + 10.0
     last = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            log_fh.flush()
-            pytest.fail(
+            _fail(
                 f"rdp daemon exited early with code {proc.returncode}; "
                 f"see {log_path}"
             )
@@ -763,8 +796,7 @@ def e2e_rdp_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
         last = status.stdout or status.stderr
         time.sleep(0.2)
     else:
-        log_fh.flush()
-        pytest.fail(
+        _fail(
             f"rdp daemon never came up within 10s; last status={last!r}; "
             f"see {log_path}"
         )

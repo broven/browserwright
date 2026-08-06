@@ -373,14 +373,23 @@ def eval_js(sess, expression: str, *, await_promise: bool = False) -> Any:
 
 
 def wait_for_ready(sess, timeout: float = 15.0) -> bool:
-    """Block until ``document.readyState === 'complete'`` or timeout."""
+    """Block until the tab's REAL document is loaded, or timeout.
+
+    ``readyState === 'complete'`` alone is not enough: a freshly-opened tab
+    (``tabs.create`` / ``Target.createTarget``) starts on the initial
+    ``about:blank`` document, which reports ``complete`` immediately while the
+    real navigation is still in flight — the caller would then eval against an
+    empty document and see missing DOM (e2e: parity/multisession textContent
+    null under load). Wait for a complete document on a non-initial URL
+    instead."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             state = eval_js(sess, "document.readyState")
+            href = eval_js(sess, "location.href")
         except Exception:
-            state = None
-        if state == "complete":
+            state = href = None
+        if state == "complete" and href not in (None, "", "about:blank"):
             return True
         time.sleep(0.3)
     return False
