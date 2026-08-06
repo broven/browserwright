@@ -1,6 +1,7 @@
 """File-locked session ledger: short id → session record (P1 isolation key)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -18,6 +19,11 @@ def _home() -> Path:
 def _dir() -> Path:
     d = _home() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
+    # A session record can hold a CDP endpoint with an embedded bearer token,
+    # so the directory is owner-only. Re-applying on every call is cheap and
+    # repairs a directory created by an older version under a looser umask.
+    with contextlib.suppress(OSError):
+        d.chmod(0o700)
     return d
 
 
@@ -27,12 +33,33 @@ def _ledger_path() -> Path:
 
 @contextmanager
 def _locked() -> Iterator[dict]:
-    """Exclusive flock around a read-modify-write of the ledger."""
+    """Exclusive flock around a read-modify-write of the ledger.
+
+    The write is temp-file-and-rename. Readers (`get`, `list_all`, `stale`)
+    deliberately bypass the lock for speed, so a plain in-place write left a
+    window where a crash — or just a slow write — exposed a truncated file to
+    them. `os.replace` is atomic, so a reader sees either the old ledger or the
+    new one, never half of one.
+
+    **Load-bearing: the write happens after the `yield`.** An exception raised
+    by the caller's body propagates before anything touches the file, which is
+    how every validation guard in this module leaves the ledger untouched on
+    rejection. Do not move the write into a `finally`.
+    """
     with FileLock(_dir() / ".lock"):
         p = _ledger_path()
         data = json.loads(p.read_text()) if p.exists() else {"next_id": 1, "sessions": {}}
         yield data
-        p.write_text(json.dumps(data))
+        tmp = p.with_name(p.name + ".tmp")
+        # The mode argument to `os.open` only applies when the file is created,
+        # so a stale tmp left by a crashed write could keep looser permissions;
+        # the explicit chmod repairs that case.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
 
 
 def allocate(*, backend: str, owner: str,
