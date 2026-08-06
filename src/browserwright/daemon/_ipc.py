@@ -33,7 +33,7 @@ _PREFIX = "browserwright-daemon"
 # ---- file paths ------------------------------------------------------------
 
 
-def _runtime_dir() -> Path:
+def runtime_dir() -> Path:
     """Where sock + pid files live.
 
     AF_UNIX sun_path has a hard 104-byte budget on macOS. `tempfile.gettempdir()`
@@ -53,7 +53,7 @@ def _tmp_dir() -> Path:
 
 
 def sock_path() -> Path:
-    return _runtime_dir() / f"{_PREFIX}.sock"
+    return runtime_dir() / f"{_PREFIX}.sock"
 
 
 def log_path() -> Path:
@@ -61,7 +61,7 @@ def log_path() -> Path:
 
 
 def pid_path() -> Path:
-    return _runtime_dir() / f"{_PREFIX}.pid"
+    return runtime_dir() / f"{_PREFIX}.pid"
 
 
 def facade_path() -> Path:
@@ -72,7 +72,7 @@ def facade_path() -> Path:
     ``connect_over_cdp`` without parsing daemon logs or guessing the port. Lives
     beside the socket/pid under XDG_RUNTIME_DIR so e2e isolation (a throwaway
     XDG_RUNTIME_DIR) gives each test daemon its own discovery file."""
-    return _runtime_dir() / f"{_PREFIX}.facade"
+    return runtime_dir() / f"{_PREFIX}.facade"
 
 
 def write_facade_file(ws_url: str, port: int) -> None:
@@ -101,7 +101,7 @@ def read_facade_file() -> tuple[str | None, int | None]:
 # unix socket (the data plane — Fork 2) and writes a discovery file the thin
 # heredoc client reads after the daemon `ensureExecutor` verb spawns it. The
 # socket NAME must be short: AF_UNIX `sun_path` has a hard 104-byte budget on
-# macOS (see `_runtime_dir`), and `_runtime_dir()` is already `/tmp` for that
+# macOS (see `runtime_dir`), and `runtime_dir()` is already `/tmp` for that
 # reason — so we key the per-session socket on a SHORT id digest, not the raw
 # session id (which can be long, e.g. `e2e-phasec-<uuid4hex>`).
 
@@ -119,14 +119,14 @@ def _exec_shortid(session_id: str) -> str:
 
 def executor_sock_path(session_id: str) -> Path:
     """Unix socket the per-session executor binds (`bw-exec-<shortid>.sock`)."""
-    return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.sock"
+    return runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.sock"
 
 
 def executor_file_path(session_id: str) -> Path:
     """Discovery file the executor writes when its socket is bound + ready.
 
     Holds JSON ``{"sock": "<path>", "pid": N, "session": "<id>"}``."""
-    return _runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.json"
+    return runtime_dir() / f"bw-exec-{_exec_shortid(session_id)}.json"
 
 
 def executor_inflight_path(session_id: str) -> Path:
@@ -147,7 +147,7 @@ def executor_inflight_path(session_id: str) -> Path:
 
 def _executor_inflight_dir() -> Path:
     """Per-user private home for executor observability sidecars."""
-    return _runtime_dir() / f"browserwright-{os.geteuid()}"
+    return runtime_dir() / f"browserwright-{os.geteuid()}"
 
 
 def _ensure_executor_inflight_dir() -> Path:

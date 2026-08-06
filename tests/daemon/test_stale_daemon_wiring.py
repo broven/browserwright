@@ -147,11 +147,30 @@ def test_reclaim_kills_confirmed_stale_daemon(monkeypatch):
     reclaimed = []
     monkeypatch.setattr(_stale, "reclaim_ports",
                         lambda pid, ports: reclaimed.append((pid, ports)) or True)
+    # The holder must be in OUR runtime dir — a stale daemon is one that
+    # crashed on the same control socket we are about to bind.
+    monkeypatch.setattr(_stale, "same_runtime_dir_as_us", lambda pid: True)
 
     listener._reclaim_stale_daemon_ports(
         Config(), probe=_PortProbe(ports=[29971, 29972], holder=999))
 
     assert reclaimed == [(999, [29971, 29972])]
+
+
+def test_reclaim_refuses_holder_from_different_runtime_dir(monkeypatch):
+    """issue #44 B: a confirmed browserwright daemon from a DIFFERENT runtime
+    dir is someone else's live daemon (the machine-global one, or a sibling
+    worktree's e2e daemon) — never SIGTERM it, however stale it looks."""
+    signalled = []
+    monkeypatch.setattr(_stale, "reclaim_ports",
+                        lambda pid, ports: signalled.append(pid) or True)
+    monkeypatch.setattr(_stale, "same_runtime_dir_as_us", lambda pid: False)
+    monkeypatch.setattr(_stale, "pid_runtime_dir", lambda pid: "/tmp")
+
+    listener._reclaim_stale_daemon_ports(
+        Config(), probe=_PortProbe(ports=[29971, 29972], holder=999))
+
+    assert signalled == []  # nothing was ever signalled
 
 
 def test_reclaim_never_kills_unconfirmed_holder(monkeypatch):

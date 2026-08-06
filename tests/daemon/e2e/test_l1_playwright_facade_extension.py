@@ -11,7 +11,8 @@ page-domain CDP through `chrome.debugger` WITH the per-page sessionId so
 flat-session routing stays consistent.
 
 This is the extension sibling of `test_l1_playwright_facade.py` (rdp). It uses
-the isolated CfT harness (port 29989) — NOT the developer's daily Chrome.
+the isolated CfT harness (the per-worktree relay port, see _e2e_ports.py) —
+NOT the developer's daily Chrome.
 
 What this proves (all via a real `chromium.connect_over_cdp`):
   1. The handshake completes against the extension backend (Browser.getVersion,
@@ -46,23 +47,24 @@ import pytest
 from .conftest import (  # noqa: F401
     TEST_EXT_FACADE_PORT as _CONFTEST_FACADE_PORT,
     TEST_EXT_PORT,
+    TEST_FACADE_L1_EXT_PORT as TEST_EXT_FACADE_PORT,
     _isolated_runtime_dir,
 )
 
-# A test facade port distinct from production (19990), the rdp-facade test
-# (29991), and the relay (29989).
-TEST_EXT_FACADE_PORT = 29992
+# NOTE: TEST_EXT_FACADE_PORT here is the L1 extension-facade daemon's port
+# (distinct from `_CONFTEST_FACADE_PORT`, the session `e2e_daemon`'s facade
+# port). Both are per-worktree derived (see _e2e_ports.py, issue #44 A).
 
 
 @pytest.fixture
 def e2e_ext_facade_daemon(e2e_daemon, ext_ready):
     """Reuse the session-scoped extension daemon.
 
-    The CfT extension is patched to dial ONE fixed relay port (TEST_EXT_PORT =
-    29989), so only one extension daemon can own it per pytest session — a
-    second daemon on 29989 would collide (this fixture used to spawn one and
+    The CfT extension is patched to dial ONE relay port (the per-worktree
+    TEST_EXT_PORT), so only one extension daemon can own it per pytest session — a
+    second daemon on that port would collide (this fixture used to spawn one and
     failed `_port_free` whenever `e2e_daemon` was alive in a full-suite run).
-    `e2e_daemon` already serves 29989 WITH a facade on
+    `e2e_daemon` already serves TEST_EXT_PORT WITH a facade on
     `conftest.TEST_EXT_FACADE_PORT`, and `ext_ready` blocks until the extension
     SW has connected. Yields (ext_port, facade_port, runtime_dir).
     """

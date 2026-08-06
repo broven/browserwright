@@ -680,7 +680,7 @@ def cleanup_orphan_executors() -> None:
     Conservative: we ONLY signal a pid we read from one of OUR discovery files —
     we never scan the system process table. Every step is wrapped so a
     permission error / race never crashes serve."""
-    runtime_dir = _ipc._runtime_dir()
+    runtime_dir = _ipc.runtime_dir()
     if not runtime_dir.is_dir():
         return
     # C1: in-flight sidecars belong to processes we are about to signal below;
