@@ -23,6 +23,7 @@ observations it cares about, and patches nothing.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 
@@ -99,6 +100,18 @@ class DaemonProbe:
         from . import _ipc
         return _ipc.ping_status_sync(timeout=timeout)
 
+    async def ping_async(self, timeout: float) -> tuple[int | None, str | None]:
+        """``(pid, version)`` for async drivers (``daemon doctor``).
+
+        The sync :meth:`ping` runs ``asyncio.run`` internally, which raises
+        inside a running event loop — so async callers must not call it
+        directly. Default: the sync observation in a worker thread, safe both
+        outside a loop (``asyncio.run`` happens inside the worker) and inside
+        one. Subclasses that override ``ping`` keep working from async drivers
+        unchanged.
+        """
+        return await asyncio.to_thread(self.ping, timeout)
+
     def socket_present(self) -> bool:
         """Whether the control socket *file* exists (it outlives a crashed daemon)."""
         from . import _ipc
@@ -145,11 +158,17 @@ class DaemonProbe:
         time.sleep(seconds)
 
 
-def daemon_status(cfg, *, probe: DaemonProbe | None = None) -> DaemonStatus:
-    """Probe the daemon and classify it. Pure state machine over ``probe``."""
+async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> DaemonStatus:
+    """Probe the daemon and classify it. Pure state machine over ``probe``.
+
+    Async driver for callers that already own an event loop (``daemon doctor``,
+    issue #28) — the sync ``DaemonProbe.ping`` would raise inside one. The
+    retry backoff still uses the probe's sync ``sleep``: this is only ever
+    driven from CLI paths where nothing else runs concurrently.
+    """
     p = probe if probe is not None else DaemonProbe(cfg)
 
-    pid, version = p.ping(1.0)
+    pid, version = await p.ping_async(1.0)
     probe_state = OK if pid is not None else NOT_RUNNING
     port_holder_pid = None
 
@@ -177,6 +196,17 @@ def daemon_status(cfg, *, probe: DaemonProbe | None = None) -> DaemonStatus:
         facade=({"ws": facade_ws, "port": facade_port}
                 if (pid is not None and facade_ws) else None),
     )
+
+
+def daemon_status(cfg, *, probe: DaemonProbe | None = None) -> DaemonStatus:
+    """Probe the daemon and classify it. Sync driver for CLI paths (``status``).
+
+    Delegates to :func:`daemon_status_async` so ``status`` and ``doctor`` read
+    the world through one state machine and can never drift into disagreeing
+    about what "half-alive" means — the module's reason for existing. Must be
+    called with no asyncio loop running (CLI paths).
+    """
+    return asyncio.run(daemon_status_async(cfg, probe=probe))
 
 
 def _retry_then_classify(p: DaemonProbe):

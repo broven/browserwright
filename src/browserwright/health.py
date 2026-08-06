@@ -6,16 +6,30 @@ This is **not** a CDP driving path — it shells out to the daemon's standalone
 It lived on the old Mode A ``DaemonClient`` historically; it has no dependency
 on Mode A and stays after Mode A's removal. Consumed by ``browserwright doctor``
 (``cli.py``) and the install wizard's option-availability probe (``install.py``).
+
+Daemon health is two separate checks (issue #28): ``daemon_cli`` — is the
+``browserwright-daemon`` **binary** reachable and did it answer doctor — and
+``daemon_running`` — is the daemon **process** actually up, read from the
+liveness probe the doctor blob has carried since schema v3
+(``alive`` / ``probe_state`` / ``pid``). Before v3 the blob only proved the
+CLI worked, which it does with no daemon running, so ``doctor`` reported
+``✓ daemon`` on a machine whose daemon was down.
 """
 from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 # Doctor blobs this browserwright build knows how to read. The daemon's current
-# contract is v2 (bumped in daemon v0.5.3); v1 is still parseable for the fields
-# we use. Anything else = real version skew.
-_SUPPORTED_DOCTOR_SCHEMAS = (1, 2)
+# contract is v3 (liveness fields added for issue #28, daemon v0.5.x); v1/v2 are
+# still parseable for the fields we use. Anything else = real version skew.
+_SUPPORTED_DOCTOR_SCHEMAS = (1, 2, 3)
+
+#: LaunchAgent plist path (macOS autostart). When it exists, a down daemon is
+#: a *restart*, not a first start — `serve` would fight launchd over the socket.
+_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" \
+    / "com.browserwright-daemon.plist"
 
 
 def daemon_doctor() -> dict:
@@ -50,6 +64,32 @@ def daemon_doctor() -> dict:
         }
 
 
+def _launchagent_installed() -> bool:
+    """Whether the macOS LaunchAgent plist exists (daemon autostarts on login).
+
+    When it does, a down daemon is a restart, not a first start: a bare
+    ``serve`` from a LaunchAgent-managed install fights launchd over the
+    socket. Kept as its own probe so tests can pin it either way.
+    """
+    return _LAUNCHAGENT_PLIST.exists()
+
+
+def _daemon_fix(info: dict) -> str:
+    """Recovery action for a down daemon (issue #28).
+
+    A half-alive daemon (``port_held_by_unresponsive_process``) always needs
+    ``restart`` to reclaim its ports. Otherwise: ``restart`` when a LaunchAgent
+    is installed (launchd owns the socket), plain ``serve`` when not.
+    """
+    from .daemon.probe import PORT_HELD
+
+    if info.get("probe_state") == PORT_HELD:
+        return "reclaim the daemon's ports: `browserwright-daemon restart`"
+    if _launchagent_installed():
+        return "restart the LaunchAgent daemon: `browserwright-daemon restart`"
+    return "start the daemon: `browserwright-daemon serve`"
+
+
 def doctor_checks() -> dict:
     """Derive an actionable ``{status, message, fix}`` check table from the raw
     ``daemon_doctor()`` blob (A4).
@@ -66,6 +106,7 @@ def doctor_checks() -> dict:
     """
     info = daemon_doctor()
     checks: list[dict] = []
+    synthetic = bool(info.get("skill_synthetic"))
 
     def add(name, status, message, fix=""):
         # Invariant: a fail must always ship a recovery action.
@@ -74,21 +115,46 @@ def doctor_checks() -> dict:
         checks.append({"name": name, "status": status,
                        "message": message, "fix": fix})
 
-    # 1. daemon reachable (did `browserwright-daemon doctor` actually answer?)
-    if info.get("skill_synthetic"):
+    # 1. daemon_cli — binary reachability: did `browserwright-daemon doctor`
+    #    actually answer? (issue #28: this used to be the *only* daemon check
+    #    and was misnamed `daemon`, so a down daemon read as `✓ daemon`.)
+    if synthetic:
         add(
-            "daemon",
+            "daemon_cli",
             "fail",
             info.get("error") or "browserwright-daemon did not respond",
             "install/start the daemon: ensure `browserwright-daemon` is on PATH "
             "then `browserwright-daemon serve`",
         )
     else:
-        add("daemon", "pass", "browserwright-daemon responded to doctor", "")
+        add("daemon_cli", "pass", "browserwright-daemon CLI answered doctor", "")
 
-    # 2. schema version sanity (catches a daemon too old to speak the blob)
+    # 2. daemon_running — is the daemon *process* up? Read from the liveness
+    #    probe the doctor blob has carried since schema v3 (issue #28). A v1/v2
+    #    blob lacks it: we can't verify, so warn instead of asserting health.
+    if not synthetic:
+        if info.get("alive") is False:
+            add(
+                "daemon_running",
+                "fail",
+                f"daemon is not running (probe_state={info.get('probe_state')})",
+                _daemon_fix(info),
+            )
+        elif info.get("alive") is True:
+            add("daemon_running", "pass",
+                f"daemon alive (pid {info.get('pid')})", "")
+        else:
+            add(
+                "daemon_running",
+                "warn",
+                "cannot verify daemon liveness (doctor schema_version="
+                f"{info.get('schema_version')} predates v3 liveness fields)",
+                "update browserwright-daemon to match browserwright",
+            )
+
+    # 3. schema version sanity (catches a daemon too old to speak the blob)
     sv = info.get("schema_version")
-    if not info.get("skill_synthetic"):
+    if not synthetic:
         if sv in _SUPPORTED_DOCTOR_SCHEMAS:
             add("daemon_schema", "pass", f"doctor schema_version={sv}", "")
         else:
@@ -99,11 +165,20 @@ def doctor_checks() -> dict:
                 "update browserwright-daemon and browserwright to matching versions",
             )
 
-    # 3. at least one usable backend (relay/extension/rdp connection probe)
+    # 4. at least one usable backend (relay/extension/rdp connection probe)
     backends = info.get("backends") or []
     usable = [b for b in backends if b.get("available")]
-    if not info.get("skill_synthetic"):
-        if usable:
+    daemon_down = info.get("alive") is False
+    if not synthetic:
+        if daemon_down:
+            # With no daemon running, every backend is unavailable *as a
+            # consequence*. Surface a deferral, not independent failures —
+            # reporting them independently is what misdirected users away
+            # from the daemon (issue #28). The daemon_running check above is
+            # the one root-cause failure.
+            add("backend", "warn",
+                "backend checks deferred: no daemon is running", "")
+        elif usable:
             names = ", ".join(b.get("name", "?") for b in usable)
             add("backend", "pass", f"available backend(s): {names}", "")
         elif backends:
@@ -128,13 +203,20 @@ def doctor_checks() -> dict:
                 "create an rdp session after `browserwright-daemon serve`",
             )
 
-    # 4. extension/relay specific: if an extension backend exists but is
+    # 5. extension/relay specific: if an extension backend exists but is
     #    unavailable, call it out as its own actionable check.
     ext = next((b for b in backends if b.get("name") == "extension"), None)
     if ext is not None:
         if ext.get("available"):
             add("extension", "pass",
                 f"extension connected (ws={ext.get('ws_url', '')})", "")
+        elif daemon_down:
+            add(
+                "extension",
+                "warn",
+                "extension backend present but not connected (daemon not running)",
+                _daemon_fix(info),
+            )
         else:
             add(
                 "extension",

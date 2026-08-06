@@ -158,7 +158,8 @@ def reset_executor(record: dict) -> str:
         raise DaemonUnavailable(
             "session reset could not confirm that the old executor exited",
             fix=(
-                "run `browserwright doctor`, then retry "
+                "check the global daemon is up with `browserwright-daemon status` "
+                "(start it with `browserwright-daemon serve` if not), then retry "
                 f"`browserwright session reset {sid}`"
             ),
         )

@@ -1128,6 +1128,12 @@ def _pretty_ps(p: dict) -> None:
 
 
 def _pretty_doctor(out: dict) -> None:
+    # v3 (issue #28): lead with daemon liveness so a down daemon — the one
+    # condition that makes every backend unavailable — is never buried.
+    if out.get("alive"):
+        print(f"daemon: alive (pid {out.get('pid')})")
+    else:
+        print(f"daemon: not running (probe_state={out.get('probe_state')})")
     rec = out.get("recommended")
     print(f"recommended: {rec or '(none available)'}")
     print()
