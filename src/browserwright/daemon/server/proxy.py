@@ -193,12 +193,25 @@ class Router(SessionVerbsMixin):
         ``DaemonState.release_client`` only mutates bookkeeping. The router owns
         the wire side effects, so a client websocket disappearing still sends
         real ``Target.detachFromTarget`` frames for its sessions.
+
+        EXTENSION BACKEND EXCEPTION (issue #30): the extension backend's
+        "upstream session" IS the shared ``chrome.debugger`` attachment to a
+        tab of the session's tab group — owned by the SESSION, not by any one
+        client. Detaching it when a client (e.g. a killed executor) disappears
+        tears the debugger off the tab and drops the relay's ghost target, and
+        nothing ever re-announces the tab — the next executor cold-start's
+        facade replay sees an empty ghost table and ``context.pages`` stays
+        empty (PageBindTimeout) even though the tab is alive and in the
+        session's group. The rdp backend detaches because its targets are
+        client-scoped; the extension backend must leave the attachment alone
+        (re-attach is idempotent in the relay if the session really ended).
         """
         client = self.state.clients.get(client_id)
         if client is None:
             return None
-        for binding in list(client.sessions.values()):
-            await self._detach_upstream_best_effort(binding.upstream_session_id)
+        if self._raw_cdp_backend:
+            for binding in list(client.sessions.values()):
+                await self._detach_upstream_best_effort(binding.upstream_session_id)
         return self.state.release_client(client_id)
 
     async def _detach_upstream_best_effort(self, upstream_session_id: str) -> None:
