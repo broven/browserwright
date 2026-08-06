@@ -220,6 +220,14 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
         # agent-surface Playwright equivalent); driven here via the internal
         # session_runtime helpers to navigate a real tab so the userscript
         # injects on load.
+        #
+        # The probes run under the SAME session as the userscript verbs
+        # (us_sid), never a fresh one: run_skill would otherwise seed its own
+        # session by OVERWRITING the shared ledger file, deleting us_sid
+        # mid-test — the next `userscript logs` then fails at the daemon
+        # boundary with 1008 "unknown browserwright session" (first CI run,
+        # 2026-08). The probe is part of this scenario; it should drive the
+        # same session it shares the workspace with.
         probe = run_skill(
             script=(
                 "import json\n"
@@ -233,6 +241,7 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
             backend="extension",
             timeout=60,
             runtime_dir=rd,
+            extra_env={"BD_SESSION": us_sid},
         )
         assert probe.returncode == 0, probe.stderr
         assert _last_json(probe.stdout)["sentinel"] == "ok"
@@ -264,6 +273,7 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
             backend="extension",
             timeout=60,
             runtime_dir=rd,
+            extra_env={"BD_SESSION": us_sid},
         )
         assert disabled_probe.returncode == 0, disabled_probe.stderr
         assert _last_json(disabled_probe.stdout)["sentinel"] is None
