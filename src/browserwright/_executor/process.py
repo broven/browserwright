@@ -52,7 +52,7 @@ from .protocol import (
 )
 
 # Cold-start facade-connect retry (Failure #4): a daemon-restart cold-start can
-# race the lazily-launched rdp Chrome. ~13 attempts × 0.75s ≈ 10s of backoff
+# race the lazily-launched cdp Chrome. ~13 attempts × 0.75s ≈ 10s of backoff
 # absorbs the startup window without wedging cold-start forever (the spawn-ready
 # timeout in the registry is 35s, comfortably above this).
 _COLD_START_CONNECT_ATTEMPTS = 13
@@ -337,7 +337,7 @@ class _Worker:
         from ..repl.snapshot import make_snapshot
         from ..session import current_session
 
-        # Failure #4 defense-in-depth: a daemon-restart cold-start races the rdp
+        # Failure #4 defense-in-depth: a daemon-restart cold-start races the cdp
         # Chrome that `ensureExecutor` is bringing up lazily — the facade can
         # 404/403 for a brief window while Chrome binds its CDP port. Retry a few
         # times over ~10s so the startup race doesn't hard-fail the executor.

@@ -697,7 +697,7 @@ def _router_with_client():
     from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
     captured: dict[int, list] = {}
-    state = DaemonState(backend_name="rdp")
+    state = DaemonState(backend_name="cdp")
     state.upstream_phase = UpstreamPhase.CONNECTED
     router = Router(state)
 
@@ -815,19 +815,19 @@ async def test_ensure_executor_verb_surfaces_registry_failure():
 def _router_disconnected():
     """Like `_router_with_client` but upstream is DISCONNECTED, with an
     `_ensure_upstream` callback that records its call ordering vs the registry
-    and (mimicking the rdp holder) flips the phase to CONNECTED."""
+    and (mimicking the cdp holder) flips the phase to CONNECTED."""
     from browserwright.daemon.server.proxy import Router
     from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
     captured: dict[int, list] = {}
     order: list[str] = []
-    state = DaemonState(backend_name="rdp")
+    state = DaemonState(backend_name="cdp")
     state.upstream_phase = UpstreamPhase.DISCONNECTED
     router = Router(state)
 
     async def _ensure():
         order.append("ensure_upstream")
-        # The rdp holder's ensure_open launches Chrome + marks connected.
+        # The cdp holder's ensure_open launches Chrome + marks connected.
         state.upstream_phase = UpstreamPhase.CONNECTED
 
     async def _disc(_reason):
@@ -848,8 +848,8 @@ def _router_disconnected():
 @pytest.mark.asyncio
 async def test_ensure_executor_launches_upstream_before_registry():
     """Failure #4: the executor's cold-start `connect_over_cdp(facade)` needs a
-    LIVE rdp Chrome (its dynamic port pinned). So `ensureExecutor` must call
-    `_ensure_upstream` (→ `_launch_rdp_chrome`) BEFORE `registry.ensure`, or the
+    LIVE cdp Chrome (its dynamic port pinned). So `ensureExecutor` must call
+    `_ensure_upstream` (→ `_launch_cdp_chrome`) BEFORE `registry.ensure`, or the
     facade resolves the stale default port and the executor exits during
     cold-start. Assert the ordering."""
     router, client, captured, order = _router_disconnected()
@@ -869,7 +869,7 @@ async def test_ensure_executor_launches_upstream_before_registry():
         "params": {"session": "sess"},
     }))
     assert order == ["ensure_upstream", "registry.ensure"], (
-        "ensureExecutor must launch the upstream (rdp Chrome) BEFORE spawning "
+        "ensureExecutor must launch the upstream (cdp Chrome) BEFORE spawning "
         "the executor")
     assert captured[client.client_id][-1]["result"] == {
         "exec_sock": "/tmp/bw-exec-sess.sock"}
@@ -884,7 +884,7 @@ async def test_ensure_executor_skips_upstream_when_already_connected():
 
     captured: dict[int, list] = {}
     order: list[str] = []
-    state = DaemonState(backend_name="rdp")
+    state = DaemonState(backend_name="cdp")
     state.upstream_phase = UpstreamPhase.CONNECTED
     router = Router(state)
 

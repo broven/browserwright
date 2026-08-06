@@ -87,7 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Long-lived local CDP proxy daemon: one global `serve` process "
             "that routes browserwright sessions to any local Chrome "
-            "(extension relay, rdp, or an env-supplied CDP endpoint)."
+            "(extension relay, cdp, or an env-supplied CDP endpoint)."
         ),
     )
     sub = p.add_subparsers(dest="cmd", metavar="<subcommand>")
@@ -339,8 +339,28 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _backend_name(value: str) -> str:
+    """`--backend` value, rejecting the retired names with a migration hint.
+
+    A `type=` callable rather than `choices=`, because argparse's own
+    "invalid choice: 'rdp' (choose from 'cdp', 'extension')" tells a user with
+    `--backend=rdp` in a script that they are wrong without telling them what
+    to write — and for `env` the answer isn't even a rename, it's a per-session
+    `--attach` (#38).
+    """
+    if value in names():
+        return value
+    from .config import retired_backend_message
+
+    retired = retired_backend_message(value)
+    if retired is not None:
+        raise argparse.ArgumentTypeError(retired)
+    raise argparse.ArgumentTypeError(
+        f"invalid backend {value!r} (choose from {', '.join(names())})")
+
+
 def _add_common(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("--backend", choices=names(),
+    sp.add_argument("--backend", type=_backend_name, metavar="NAME",
                     help=("pin backend for this command; for `serve`, this only "
                           "chooses the shared upstream while session backends "
                           "still route per session"))
@@ -352,7 +372,7 @@ def _add_common(sp: argparse.ArgumentParser) -> None:
 
 def _add_port(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--port", type=int, default=None,
-                    help="rdp backend port (default 9222 / config-backends.rdp.port)")
+                    help="cdp backend port (default 9222 / config-backends.cdp.port)")
 
 
 # ---- shared config building ------------------------------------------------
@@ -387,9 +407,9 @@ def _cmd_serve(args, cfg: Config) -> int:
     daemon and it serves BOTH backends simultaneously, routing per session. So
     `serve` no longer requires an explicit backend — a missing backend defaults
     to `extension`, which becomes the daemon's shared (real-browser) upstream
-    with the always-on relay. rdp sessions get their own per-session upstream
+    with the always-on relay. cdp sessions get their own per-session upstream
     on top, dispatched by the ledger's immutable per-session backend. The old
-    "fail loud on missing backend (to avoid a silent rdp fallback)" guard is
+    "fail loud on missing backend (to avoid a silent cdp fallback)" guard is
     gone: there is no single-backend lifetime to protect anymore.
     """
     from .server.listener import run_serve

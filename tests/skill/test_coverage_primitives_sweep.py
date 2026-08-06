@@ -302,12 +302,12 @@ def test_site_memory_host_resolution_confirm_and_reads(tmp_bs_home, fake_session
     with pytest.raises(ValueError, match="no host given"):
         site._resolve_host(None)
     with pytest.raises(NeedsUserConfirm) as exc:
-        site.remember_preference("daemon.preferred_backend", "rdp")
-    assert exc.value.proposal == {"key": "daemon.preferred_backend", "value": "rdp"}
+        site.remember_preference("daemon.preferred_backend", "cdp")
+    assert exc.value.proposal == {"key": "daemon.preferred_backend", "value": "cdp"}
     assert "commit=True" in exc.value.fix
-    assert site.remember_preference("daemon.preferred_backend", "rdp", confirm=False) == {
+    assert site.remember_preference("daemon.preferred_backend", "cdp", confirm=False) == {
         "key": "daemon.preferred_backend",
-        "value": "rdp",
+        "value": "cdp",
         "previous": None,
     }
     before_body = site.memory_read()["global"]["body"]
@@ -317,7 +317,7 @@ def test_site_memory_host_resolution_confirm_and_reads(tmp_bs_home, fake_session
         "previous": None,
     }
     assert site.memory_read()["global"]["body"] == before_body
-    assert site.memory_read()["global"]["frontmatter"]["daemon"]["preferred_backend"] == "rdp"
+    assert site.memory_read()["global"]["frontmatter"]["daemon"]["preferred_backend"] == "cdp"
 
     site.remember("https://docs.example.test/path", "offline dense note")
     out = site.memory_read("docs.example.test")

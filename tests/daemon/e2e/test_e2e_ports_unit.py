@@ -63,7 +63,7 @@ def test_env_override_pins_the_base(monkeypatch):
     monkeypatch.setenv("BW_E2E_PORT_BASE", "30123")
     ports = e2e_ports(Path("/worktrees/example"))
     assert ports["ext"] == 30123
-    assert ports["rdp"] == 30124
+    assert ports["cdp"] == 30124
 
 
 def test_cli_output_matches_import(monkeypatch):

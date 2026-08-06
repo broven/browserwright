@@ -34,7 +34,7 @@ class ResolveResult:
     """Successful `resolve` return value.
 
     `extras` mirrors §5.1's `--json` extras block. `isolated_profile` is only
-    meaningful for rdp; other backends leave it None.
+    meaningful for cdp; other backends leave it None.
     """
     ws_url: str
     backend: str

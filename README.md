@@ -4,14 +4,14 @@ Let an AI/code agent drive a real (or isolated) Chrome from the terminal over CD
 
 One installable package, two CLIs that work together:
 
-- **`browserwright-daemon`** (Layer 1) — resolves a Chrome CDP WebSocket URL and proxies it. Backends: `env / rdp / extension`. Also `launch-chrome` to spawn an isolated Chrome.
+- **`browserwright-daemon`** (Layer 1) — resolves a Chrome CDP WebSocket URL and proxies it. Backends: `env / cdp / extension`. Also `launch-chrome` to spawn an isolated Chrome.
 - **`browserwright`** (Layer 2) — the agent-facing surface: sessions, heredoc scripting with pre-imported primitives, reusable site tasks, memory, and userscript management.
 
 ```
 .
 ├── src/browserwright/        the package
 │   ├── …                     Layer 2 — sessions / primitives / site skills / memory / userscripts
-│   └── daemon/               Layer 1 — CDP URL resolver + proxy (env/rdp/extension backends)
+│   └── daemon/               Layer 1 — CDP URL resolver + proxy (env/cdp/extension backends)
 ├── chrome-extension/         unpacked relay extension for the `extension` backend
 ├── skill/                    Agent skill bundle (symlinked into Claude Code, Codex, and Pi)
 ├── tests/{skill,daemon}/     test suites
@@ -115,7 +115,7 @@ documented in **[RELEASING.md](RELEASING.md)** and **[ONBOARD.md](ONBOARD.md)**.
 browserwright-daemon launch-chrome --port 9333 --profile bs-smoke --persistent --json
 
 # Drive it
-BD_PORT=9333 BD_BACKEND=rdp browserwright <<'PY'
+BD_PORT=9333 BD_BACKEND=cdp browserwright <<'PY'
 page.goto("https://example.com", wait_until="load")
 print(f"URL:   {page.url}")
 print(f"Title: {page.title()}")
@@ -145,7 +145,7 @@ browserwright session end --session=$sid
 
 A bare heredoc with no session/`BD_PORT` context exits 2 with guidance — the daemon is never silently shared.
 
-One global daemon serves every session (fixed socket `browserwright-daemon.sock`; no per-instance name). The session's backend is fixed at `session new` and never changes. On `extension` the session's "browser" is a Chrome **tab group** (named after the session) inside the user's real Chrome; `session end` closes the whole group. On `rdp` the daemon launches and owns a dedicated, isolated Chrome (profile `bs-s<id>`) that dies with the session. **Isolation caveat:** rdp sessions get isolated profiles (separate cookies/storage), but extension tab groups isolate only the *tab set* — all extension sessions share the user's one profile, so they share cookies/login/origin storage with each other and with the user.
+One global daemon serves every session (fixed socket `browserwright-daemon.sock`; no per-instance name). The session's backend is fixed at `session new` and never changes. On `extension` the session's "browser" is a Chrome **tab group** (named after the session) inside the user's real Chrome; `session end` closes the whole group. On `cdp` the daemon launches and owns a dedicated, isolated Chrome (profile `bs-s<id>`) that dies with the session. **Isolation caveat:** cdp sessions get isolated profiles (separate cookies/storage), but extension tab groups isolate only the *tab set* — all extension sessions share the user's one profile, so they share cookies/login/origin storage with each other and with the user.
 
 ### Two invocation forms
 
@@ -168,9 +168,9 @@ browserwright task wikipedia.org/lookup --title="Wikipedia"
 | Scenario | Backend | How |
 |---|---|---|
 | Your daily Chrome (logged-in / personal) *(default for "use my browser")* | `extension` | `browserwright session new --backend=extension …` — load `chrome-extension/` once, connect via the daemon's relay; zero popups |
-| Scripts / iterative work in throwaway profiles | `rdp` + isolated Chrome | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=rdp` |
-| Fingerprint browser (AdsPower / MultiLogin / 比特浏览器) | `rdp` | point `BD_PORT` at the tool's exposed port |
-| Externally-owned CDP endpoint (anti-detect profile, e.g. CloakBrowser) | `env` | `BD_CDP_WS=ws://… browserwright-daemon serve --backend env`, then `browserwright session new --backend=env --name=…` (attach-owned — never closed on `session end`) |
+| Scripts / iterative work in throwaway profiles | `cdp` + isolated Chrome | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=cdp` |
+| Fingerprint browser (AdsPower / MultiLogin / 比特浏览器) | `cdp` | point `BD_PORT` at the tool's exposed port |
+| Externally-owned CDP endpoint (anti-detect / cloud browser) | `cdp` attach | `browserwright session new --backend=cdp --attach=ws://… --name=…` (attach-owned — never closed on `session end`). Repeat for as many profiles as you need; one daemon serves them all |
 
 Interactive wizard: `browserwright install` — walks the decision tree and writes your pick.
 

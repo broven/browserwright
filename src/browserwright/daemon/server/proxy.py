@@ -147,7 +147,7 @@ class Router(SessionVerbsMixin):
     def __init__(self, state: DaemonState):
         self.state = state
         # Phase 2: back-reference to the global Daemon, set by Daemon.__init__
-        # / _ensure_rdp_context. Lets session verbs reach global services such
+        # / _ensure_cdp_context. Lets session verbs reach global services such
         # as the executor registry. None in unit tests
         # that build a bare Router — those handlers degrade gracefully.
         self.daemon: object | None = None

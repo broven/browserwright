@@ -31,6 +31,23 @@ it and the code disagree, one of them is a bug — don't invent a third word.
 Before changing session routing, backend semantics, tab creation, Playwright
 facade behavior, or teardown semantics, read `docs/session-workspaces.md`.
 
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `broven/browserwright`, driven by the `gh` CLI.
+See [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md).
+
+### Triage labels
+
+The five canonical roles, each label string equal to its name.
+See [docs/agents/triage-labels.md](docs/agents/triage-labels.md).
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root.
+See [docs/agents/domain.md](docs/agents/domain.md).
+
 ## Related projects (prior art)
 
 Two adjacent open-source projects browserwright deliberately borrows from. Read

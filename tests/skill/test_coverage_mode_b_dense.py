@@ -128,7 +128,7 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
 
     outputs = deque(
         [
-            _Proc(stdout=json.dumps({"backend": "rdp"})),
+            _Proc(stdout=json.dumps({"backend": "cdp"})),
             _Proc(stdout=json.dumps({"version": "1.2.3"})),
             _Proc(stdout="browserwright-daemon 9.8.7\n"),
         ]
@@ -143,7 +143,7 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     client = ModeBClient()
     client._session_id = "s-1"
 
-    assert client.get_backend_info() == {"backend": "rdp"}
+    assert client.get_backend_info() == {"backend": "cdp"}
     assert client.running_daemon_version() == "1.2.3"
     assert client.installed_daemon_version() == "9.8.7"
     assert commands[0][0] == [
@@ -275,7 +275,7 @@ def test_resolve_session_empty_explicit_arg_refuses_even_with_env(tmp_bs_home, m
     from browserwright import session_registry as reg
     from browserwright.errors import NoSession
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
 
     with pytest.raises(NoSession):
@@ -287,7 +287,7 @@ def test_resolve_session_requires_explicit_arg_even_with_env(tmp_bs_home, monkey
     from browserwright import session_registry as reg
     from browserwright.errors import NoSession
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
 
     with pytest.raises(NoSession):

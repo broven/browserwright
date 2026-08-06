@@ -27,7 +27,7 @@ def test_extension_available_true_when_doctor_reports_available(monkeypatch):
     _stub_doctor(monkeypatch, {
         "schema_version": 1,
         "backends": [
-            {"name": "rdp", "available": True, "ux_cost": "none"},
+            {"name": "cdp", "available": True, "ux_cost": "none"},
             {"name": "extension", "available": True, "ux_cost": "none",
              "ws_url": "ws+unix:///tmp/relay.sock"},
         ],
@@ -52,7 +52,7 @@ def test_extension_available_false_when_entry_missing(monkeypatch):
     _stub_doctor(monkeypatch, {
         "schema_version": 1,
         "backends": [
-            {"name": "rdp", "available": True, "ux_cost": "none"},
+            {"name": "cdp", "available": True, "ux_cost": "none"},
         ],
     })
     from browserwright import install

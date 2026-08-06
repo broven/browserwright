@@ -1,30 +1,33 @@
-"""Real-CDP backends — ONE implementation, two URL sources.
+"""Real-CDP backend — ONE implementation, two URL sources.
 
-`rdp` and `env` are the same conceptual backend: real browser-level CDP over a
-ws URL, `kind=UPSTREAM_WS`, handled identically downstream (the Router treats
-both as a raw-CDP upstream). They differ ONLY in how the ws URL is acquired,
-so `RealCdpBackend` carries everything shared — the class attributes, the
-DoctorResult/ResolveResult plumbing, and the single `/json/version` discovery
-(`_discover_ws_url`) — and each backend id is a thin URL-source subclass:
+Real browser-level CDP over a ws URL, `kind=UPSTREAM_WS`, treated by the Router
+as a raw-CDP upstream. `RealCdpBackend` carries everything shared — the class
+attributes, the DoctorResult/ResolveResult plumbing, and the single
+`/json/version` discovery (`_discover_ws_url`). The two URL sources are:
 
-- `rdp` (spec §8.2): Chrome launched with `--remote-debugging-port=NNNN`.
-  Discovery is `/json/version` on `127.0.0.1:port`. The interesting part is
-  the Chrome 136/147+ default-profile lockdown: those builds disable HTTP
-  discovery when the user-data-dir is the *real* user profile (privacy
-  hardening), returning a 404. The websocket path still works, and Chrome
-  still writes it into `DevToolsActivePort`. So the fallback is: HTTP 404 →
-  walk PROFILES, match the port number on line 1, read the ws path from
-  line 2. This mirrors browser-harness `daemon.py:83-101`
-  `_ws_from_devtools_active_port` — which has already eaten the
-  IPv6-host-bracket and stale-port edges.
+- **a local port** (spec §8.2): Chrome launched with
+  `--remote-debugging-port=NNNN`, discovered via `/json/version` on
+  `127.0.0.1:port`. The interesting part is the Chrome 136/147+
+  default-profile lockdown: those builds disable HTTP discovery when the
+  user-data-dir is the *real* user profile (privacy hardening), returning a
+  404. The websocket path still works, and Chrome still writes it into
+  `DevToolsActivePort`. So the fallback is: HTTP 404 → walk PROFILES, match
+  the port number on line 1, read the ws path from line 2. This mirrors
+  browser-harness `daemon.py:83-101` `_ws_from_devtools_active_port` — which
+  has already eaten the IPv6-host-bracket and stale-port edges. That file is
+  on *this* machine's disk, so the fallback is local-only by construction.
 
-- `env` (spec §8.1 + §8.1.1): caller injects the ws URL out-of-band.
-  BD_CDP_WS is trusted verbatim (no parsing, no rewriting — that's the whole
-  point of the env path for cloud / fingerprint browsers with URL-embedded
-  tokens). BD_CDP_URL goes through `/json/version` — the same shared
-  discovery as rdp — pointed at an arbitrary host. BU_CDP_WS / BU_CDP_URL are
-  compat aliases honored at the Config layer (config.py records
-  `cdp_ws_source`); doctor surfaces a "please migrate" hint when those fired.
+- **an injected endpoint** (spec §8.1 + §8.1.1): a URL supplied per session via
+  `--attach=<url>`. `ws(s)://` is trusted verbatim — no parsing, no rewriting,
+  which is the whole point for cloud / fingerprint browsers with URL-embedded
+  tokens. `http(s)://` goes through the same `/json/version` discovery pointed
+  at an arbitrary host.
+
+Until #38 these were two backends, `cdp` and `env`, and the endpoint came from
+the process-global `BD_CDP_WS` / `BD_CDP_URL` — which is why one daemon could
+only ever reach one external browser. The endpoint is now per-session ledger
+state, and the two backends collapsed into this one; see `CdpBackend` for what
+replaced the two name checks they differed by.
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .._net import is_loopback_host, redact_url
 from ..config import Config
 from ..errors import Unavailable
 from ..platforms import profile_paths
@@ -42,7 +46,7 @@ from .base import DoctorResult, ResolveResult
 class _JsonVersion404(Unavailable):
     """`/json/version` answered HTTP 404 — the Chrome 136/147+ default-profile
     lockdown signature. Raised by `_discover_ws_url` so a URL source can catch
-    it and try a fallback (rdp does); uncaught, it is a plain Unavailable."""
+    it and try a fallback (cdp does); uncaught, it is a plain Unavailable."""
 
 
 class RealCdpBackend:
@@ -58,7 +62,7 @@ class RealCdpBackend:
     kind = "UPSTREAM_WS"
     recommended_mode: str = "A"
     ux_cost = "none"
-    # rdp overrides to False: the user's HTTP(S)_PROXY / ALL_PROXY must not be
+    # cdp overrides to False: the user's HTTP(S)_PROXY / ALL_PROXY must not be
     # applied to localhost probes — proxying to your own loopback is never what
     # anyone wants and triggers httpx[socks] import errors when
     # ALL_PROXY=socks5://... env keeps the default: its target may be a remote
@@ -105,53 +109,104 @@ class RealCdpBackend:
         never diverge on edge handling (timeout / non-200 / missing key).
         """
         url = f"{base_url.rstrip('/')}/json/version"
+        # `base_url` may be a per-session endpoint carrying a token in its
+        # userinfo or query. Every string below reaches the client AND the
+        # daemon log, so the URL is redacted for reporting while the real one
+        # is what we actually GET.
+        shown = redact_url(url)
         try:
             resp = await self._get(url, timeout)
         except (httpx.HTTPError, OSError) as e:
             raise Unavailable(
-                f"{self.name}: cannot reach {url}: {e}",
-                attempts={self.name: f"GET {url} -> {type(e).__name__}: {e}"},
+                f"{self.name}: cannot reach {shown}: {e}",
+                attempts={self.name: f"GET {shown} -> {type(e).__name__}: {e}"},
             ) from e
         if resp.status_code == 404:
             raise _JsonVersion404(
-                f"{self.name}: {url} returned HTTP 404",
-                attempts={self.name: f"GET {url} -> HTTP 404"},
+                f"{self.name}: {shown} returned HTTP 404",
+                attempts={self.name: f"GET {shown} -> HTTP 404"},
             )
         if resp.status_code != 200:
             raise Unavailable(
-                f"{self.name}: {url} returned HTTP {resp.status_code}",
-                attempts={self.name: f"GET {url} -> HTTP {resp.status_code}"},
+                f"{self.name}: {shown} returned HTTP {resp.status_code}",
+                attempts={self.name: f"GET {shown} -> HTTP {resp.status_code}"},
             )
         try:
             body = resp.json()
         except ValueError as e:
             raise Unavailable(
-                f"{self.name}: {url} returned non-JSON: {e}",
-                attempts={self.name: f"GET {url} -> non-JSON"},
+                f"{self.name}: {shown} returned non-JSON: {e}",
+                attempts={self.name: f"GET {shown} -> non-JSON"},
             ) from e
         ws = body.get("webSocketDebuggerUrl") if isinstance(body, dict) else None
         if not isinstance(ws, str) or not ws:
             raise Unavailable(
-                f"{self.name}: {url} JSON has no webSocketDebuggerUrl",
-                attempts={self.name: f"GET {url} -> missing webSocketDebuggerUrl"},
+                f"{self.name}: {shown} JSON has no webSocketDebuggerUrl",
+                attempts={self.name: f"GET {shown} -> missing webSocketDebuggerUrl"},
             )
         return ws
 
 
-# ---- rdp: local Chrome on --remote-debugging-port ---------------------------
+# ---- the one real-CDP backend -----------------------------------------------
 
 
-class RdpBackend(RealCdpBackend):
-    name = "rdp"
-    _trust_env = False  # localhost-only; see RealCdpBackend._trust_env
+class CdpBackend(RealCdpBackend):
+    """Real browser-level CDP. Two URL sources, one class.
+
+    - **no endpoint** — a browser on this machine at `backends.cdp.port`,
+      discovered via `http://127.0.0.1:<port>/json/version`. Either one we
+      launched (`--create`) or a local one we were pointed at (`--attach=9222`).
+    - **endpoint set** — a URL handed to us for this session (`--attach=<url>`).
+      `ws(s)://` is the endpoint itself; `http(s)://` is a discovery URL.
+
+    Both used to be separate backends (`cdp` and `env`) whose only real
+    difference was two `if self.name == ...`-shaped decisions. Both decisions
+    are the same physical question — *is this browser on my machine?* — so the
+    merge replaces two name checks with one predicate, `_loopback`:
+
+    | | old | new |
+    |---|---|---|
+    | apply the user's `ALL_PROXY` | `cdp` no, `env` yes | `not _loopback` |
+    | DevToolsActivePort 404 fallback | `cdp` yes, `env` never | `_loopback` |
+
+    That is strictly more correct than the names were: `--attach=http://127.0.0.1:9222`
+    now gets the proxy bypass and the Chrome-136 lockdown fallback, which the
+    old `env` path denied it for no reason other than what it was called.
+    """
+    name = "cdp"
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
-        self.port = cfg.backends.rdp.port
+        self.port = cfg.backends.cdp.port
+        self.endpoint = cfg.backends.cdp.endpoint
+
+    # ---- the one predicate the two old backends disagreed about -------------
+
+    @property
+    def _loopback(self) -> bool:
+        """Is the target browser on this machine?"""
+        if self.endpoint is None:
+            return True  # port mode is always 127.0.0.1
+        return is_loopback_host(self.endpoint)
+
+    @property
+    def _trust_env(self) -> bool:  # overrides RealCdpBackend's class attribute
+        """Apply the user's HTTP(S)_PROXY / ALL_PROXY?
+
+        Never for a local browser: proxying to your own loopback is never what
+        anyone wants, and it trips httpx[socks] import errors under
+        `ALL_PROXY=socks5://...`. Always for a remote endpoint, where reaching
+        it through the proxy is usually the whole point.
+        """
+        return not self._loopback
+
+    # ---- URL sources --------------------------------------------------------
 
     async def _probe_source(self) -> tuple[bool, str]:
-        """Does HTTP discovery succeed, OR (404-case) does some profile's
-        DevToolsActivePort point at this port?"""
+        if self.endpoint is not None:
+            # Cheap by contract (spec §5.2): report that an endpoint is
+            # configured without dialling it.
+            return True, f"endpoint configured: {redact_url(self.endpoint)}"
         port = self.port
         url = f"http://127.0.0.1:{port}/json/version"
         try:
@@ -178,18 +233,43 @@ class RdpBackend(RealCdpBackend):
         return False, f"HTTP {resp.status_code} from {url}"
 
     async def _resolve_source(self, timeout: float) -> tuple[str, dict]:
-        url = f"http://127.0.0.1:{self.port}/json/version"
+        ep = self.endpoint
+        if ep is None:
+            return await self._resolve_http(f"http://127.0.0.1:{self.port}", timeout)
+        scheme = urlparse(ep).scheme.lower()
+        if scheme in ("ws", "wss"):
+            # Verbatim — no parsing, no rewriting. This is the whole point of
+            # accepting a URL: cloud and anti-detect browsers embed tokens in
+            # it, and any "helpful" normalisation would invalidate them.
+            return ep, {"isolated_profile": None, "profile_path": None}
+        if scheme in ("http", "https"):
+            ws, extras = await self._resolve_http(ep, timeout)
+            return ws, {**extras, "discovery_url": redact_url(ep)}
+        raise Unavailable(
+            f"{self.name}: unsupported endpoint scheme {scheme!r} — expected "
+            f"ws, wss, http or https",
+            attempts={self.name: f"endpoint scheme {scheme!r}"},
+        )
+
+    async def _resolve_http(self, base_url: str, timeout: float) -> tuple[str, dict]:
+        """`/json/version` discovery, with the local-only 404 fallback."""
+        url = f"{base_url.rstrip('/')}/json/version"
         try:
-            ws = await self._discover_ws_url(f"http://127.0.0.1:{self.port}", timeout)
+            ws = await self._discover_ws_url(base_url, timeout)
         except _JsonVersion404:
+            # The DevToolsActivePort file is on THIS machine's disk, so it can
+            # only speak for a local browser. A remote 404 is just a 404.
+            port = urlparse(base_url).port
+            if not self._loopback or port is None:
+                raise
             ws = _ws_from_devtools_active_port(url)
             if ws is None:
                 raise Unavailable(
-                    f"rdp: HTTP 404 on {url} (Chrome 136/147+ default-profile lockdown) "
-                    f"and no matching DevToolsActivePort file in known profiles",
+                    f"{self.name}: HTTP 404 on {url} (Chrome 136/147+ default-profile "
+                    f"lockdown) and no matching DevToolsActivePort file in known profiles",
                     attempts={self.name: f"GET {url} -> 404, fallback no match"},
                 ) from None
-            matched_profile = _find_matching_profile(self.port)
+            matched_profile = _find_matching_profile(port)
             return ws, {
                 "isolated_profile": False,  # default-profile lockdown ⇒ user is on default
                 "profile_path": str(matched_profile) if matched_profile else None,
@@ -197,42 +277,7 @@ class RdpBackend(RealCdpBackend):
         return ws, {"isolated_profile": None, "profile_path": None}
 
 
-# ---- env: caller-injected URL (BD_CDP_WS / BD_CDP_URL) -----------------------
-
-
-class EnvBackend(RealCdpBackend):
-    name = "env"
-
-    async def _probe_source(self) -> tuple[bool, str]:
-        cfg = self._cfg
-        if cfg.cdp_ws:
-            return True, _origin_detail(
-                "BD_CDP_WS" if cfg.cdp_ws_source == "BD_CDP_WS" else "BU_CDP_WS")
-        if cfg.cdp_url:
-            return True, _origin_detail(
-                "BD_CDP_URL" if cfg.cdp_url_source == "BD_CDP_URL" else "BU_CDP_URL")
-        return False, "BD_CDP_WS not set, BD_CDP_URL not set"
-
-    async def _resolve_source(self, timeout: float) -> tuple[str, dict]:
-        cfg = self._cfg
-        if cfg.cdp_ws:
-            return cfg.cdp_ws, {}  # trusted verbatim — see module docstring
-        if cfg.cdp_url:
-            ws = await self._discover_ws_url(cfg.cdp_url, timeout)
-            return ws, {"discovery_url": cfg.cdp_url}
-        raise Unavailable(
-            "env backend: neither BD_CDP_WS nor BD_CDP_URL is set",
-            attempts={self.name: "BD_CDP_WS not set, BD_CDP_URL not set"},
-        )
-
-
-def _origin_detail(source: str) -> str:
-    if source.startswith("BU_"):
-        return f"{source} set (deprecated, please rename to BD_{source[3:]})"
-    return f"{source} set"
-
-
-# ---- DevToolsActivePort helpers (rdp 404-fallback) ---------------------------
+# ---- DevToolsActivePort helpers (local 404-fallback) -------------------------
 
 
 def _find_matching_profile(want_port: int) -> Path | None:

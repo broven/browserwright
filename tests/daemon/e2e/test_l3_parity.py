@@ -19,8 +19,8 @@ def _extract_payload(stdout: str) -> dict:
     return json.loads(line)
 
 
-def _rdp_bs_home() -> Path:
-    return Path(__file__).resolve().parent / "_bs_home" / "rdp"
+def _cdp_bs_home() -> Path:
+    return Path(__file__).resolve().parent / "_bs_home" / "cdp"
 
 
 def _free_port() -> int:
@@ -29,8 +29,8 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _seed_rdp_create_session(session_id: str, name: str) -> Path:
-    sessions = _rdp_bs_home() / "sessions"
+def _seed_cdp_create_session(session_id: str, name: str) -> Path:
+    sessions = _cdp_bs_home() / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
     ledger = sessions / "ledger.json"
     data = json.loads(ledger.read_text()) if ledger.exists() else {
@@ -40,7 +40,7 @@ def _seed_rdp_create_session(session_id: str, name: str) -> Path:
     now = time.time()
     data["sessions"][session_id] = {
         "id": session_id,
-        "backend": "rdp",
+        "backend": "cdp",
         "workspace": {"port": _free_port()},
         "owner": "create",
         "name": name,
@@ -102,12 +102,12 @@ PARITY_SCRIPT = (
 
 @pytest.mark.parametrize("case", [
     "extension",
-    "rdp_attach",
-    "rdp_create",
+    "cdp_attach",
+    "cdp_create",
 ])
 def test_usage_layer_parity_after_backend_selection(case, request):
     """After session creation, the same skill primitives work on every backend."""
-    backend = "extension" if case == "extension" else "rdp"
+    backend = "extension" if case == "extension" else "cdp"
     extra_env = None
     ledger = None
     session_id = None
@@ -115,10 +115,10 @@ def test_usage_layer_parity_after_backend_selection(case, request):
         request.getfixturevalue("ext_ready")
         runtime_dir = request.getfixturevalue("e2e_daemon").runtime_dir
     else:
-        runtime_dir = request.getfixturevalue("e2e_rdp_daemon")
-        if case == "rdp_create":
-            session_id = "e2e-rdp-create-parity"
-            ledger = _seed_rdp_create_session(session_id, "rdp-create-parity")
+        runtime_dir = request.getfixturevalue("e2e_cdp_daemon")
+        if case == "cdp_create":
+            session_id = "e2e-cdp-create-parity"
+            ledger = _seed_cdp_create_session(session_id, "cdp-create-parity")
             extra_env = {"BD_SESSION": session_id}
     try:
         result = run_skill(
@@ -151,5 +151,5 @@ def test_usage_layer_parity_after_backend_selection(case, request):
     else:
         assert payload["tab"]["groupId"] == -1
         assert payload["tab"]["tabId"] is None
-    if case == "rdp_create":
+    if case == "cdp_create":
         assert "browser it launched was closed" in payload["end"]

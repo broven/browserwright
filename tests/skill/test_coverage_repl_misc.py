@@ -110,14 +110,14 @@ def test_executor_control_plane_uses_browserwright_session_param():
             calls.append((method, kwargs))
             return {
                 "exec_sock": "/tmp/bw-exec.sock",
-                "executor_id": "executor-rdp-7",
+                "executor_id": "executor-cdp-7",
             }
 
     sess = type(
         "Sess",
         (),
         {
-            "session_record": {"id": "rdp-7", "backend": "rdp"},
+            "session_record": {"id": "cdp-7", "backend": "cdp"},
             "cdp": _CDP(),
         },
     )()
@@ -126,7 +126,7 @@ def test_executor_control_plane_uses_browserwright_session_param():
     assert calls == [
         (
             "BrowserwrightDaemon.ensureExecutor",
-            {"bsSession": "rdp-7"},
+            {"bsSession": "cdp-7"},
         )
     ]
 

@@ -6,7 +6,7 @@ had rewritten the same loop:
   1. ``cli stop``                       — SIGTERM the daemon we just pinged.
   2. ``_stale.reclaim_ports``           — SIGTERM a confirmed stale daemon.
   3. ``executor_registry._terminate``   — SIGTERM a session's executor.
-  4. ``listener._kill_rdp_chrome``      — SIGTERM a daemon-owned rdp Chrome.
+  4. ``listener._kill_cdp_chrome``      — SIGTERM a daemon-owned cdp Chrome.
 
 What they genuinely share is the *shape*: signal, poll a death predicate until
 a deadline, escalate to SIGKILL, poll again. That shape lives here as

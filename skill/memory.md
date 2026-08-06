@@ -9,9 +9,9 @@ The agent reads this file on every browserwright invocation. It carries two thin
 
 | Backend | Connects to | How to use |
 |---|---|---|
-| `rdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=rdp --create --name=task-label)` then run `browserwright -s "$sid" -e '...'` |
+| `cdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=cdp --create --name=task-label)` then run `browserwright -s "$sid" -e '...'` |
 | `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve` (one global daemon) then load the bundled `chrome-extension/` directory |
-| `env` | An externally-owned browser via a CDP URL you supply (e.g. an anti-detect / fingerprint profile) — attach-owned, never closed on `session end` | Start the daemon against it: `BD_CDP_WS=ws://... browserwright-daemon serve --backend env` (or `BD_CDP_URL=http://host:port` for `/json/version` discovery), then `sid=$(browserwright session new --backend=env --name=task-label)` and `browserwright -s "$sid" -e '...'` |
+| `cdp` attach | An externally-owned browser at a CDP endpoint you supply (anti-detect / fingerprint / cloud profile) — attach-owned, never closed on `session end` | `sid=$(browserwright session new --backend=cdp --attach=ws://... --name=task-label)` then `browserwright -s "$sid" -e '...'`. An `http://host:port` endpoint is resolved via `/json/version`. One daemon holds as many of these as you like, each on its own browser |
 
 ## User preference
 
@@ -38,18 +38,18 @@ scenarios:
 
   - name: public
     when: 公共页面、无需 cookie 的一次性抓取、UI 测试、文档/示例站、批量 http_get
-    backend: rdp
-    launch_command: browserwright session new --backend=rdp --create --name=<task-label>
+    backend: cdp
+    launch_command: browserwright session new --backend=cdp --create --name=<task-label>
     env: {}
     notes: |
       Zero popups, safe for iterative inline `-s/-e` calls.
 
   - name: fingerprint
     when: 批量注册、反爬严重的站点、指纹浏览器场景 (AdsPower / MultiLogin / GoLogin / 比特浏览器)、需要独立账号身份的工作
-    backend: rdp
+    backend: cdp
     launch_command: 用户在指纹浏览器内启动目标账号并暴露 CDP 端口
     env:
-      session: browserwright session new --backend=rdp --attach=<port> --name=<profile>
+      session: browserwright session new --backend=cdp --attach=<port> --name=<profile>
     notes: |
       Ask the user which fingerprint browser + which port at the start of each session;
       never assume a default port. One isolated Chrome per account profile.

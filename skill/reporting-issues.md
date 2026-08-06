@@ -66,7 +66,7 @@ reproduce it against a neutral page (e.g. `data:text/html,...` or
    browserwright-daemon status --json
    ```
 
-   Note the backend you used (`extension` / `rdp` / `env`) and the OS.
+   Note the backend you used (`extension` / `cdp` / `env`) and the OS.
 
 4. **Capture the failure exactly:** the full error text / traceback, plus a clear
    *expected vs. actual*.
@@ -99,7 +99,7 @@ Body — use these sections verbatim:
 Minimal, runnable steps. A maintainer must be able to paste and run this.
 
 ```bash
-sid=$(browserwright session new --backend=rdp --create --name=repro)
+sid=$(browserwright session new --backend=cdp --create --name=repro)
 browserwright -s "$sid" -e $'
 page.goto("https://example.com")
 # ... the smallest sequence that triggers the bug ...
@@ -116,7 +116,7 @@ browserwright session end --session=$sid
 ## Environment
 <paste of `browserwright version check`>
 <paste of `browserwright-daemon status --json`>
-- Backend: extension | rdp | env
+- Backend: extension | cdp | env
 - OS: <e.g. macOS 15.1>
 
 ## Notes
@@ -126,7 +126,7 @@ browserwright session end --session=$sid
 Reported by a browserwright code agent on the user's behalf.
 ```
 
-Prefer `--backend=rdp --create` in the reproduction when the bug does not
+Prefer `--backend=cdp --create` in the reproduction when the bug does not
 require the user's own Chrome: an isolated Chrome is the environment a maintainer
 can reproduce most easily. Only use the `extension` backend in the repro if the
 bug is specific to it, and say so.
@@ -144,7 +144,7 @@ Write the body to a temp file (avoids shell-quoting mangling), then create it:
 ```bash
 gh issue create \
   --repo broven/browserwright \
-  --title "[agent-bug] page.goto hangs on cross-site iframe (rdp backend)" \
+  --title "[agent-bug] page.goto hangs on cross-site iframe (cdp backend)" \
   --body-file /tmp/browserwright-issue.md
 ```
 

@@ -131,12 +131,12 @@ async def test_upstream_holder_open_chrome_success_wires_router_and_internal_com
 
 @pytest.mark.asyncio
 async def test_trigger_close_sends_detach_and_closed_events_then_clears_callbacks(monkeypatch):
-    state = DaemonState(backend_name="rdp")
+    state = DaemonState(backend_name="cdp")
     client = state.allocate_client("c1")
     state.bind_session(client.client_id, "local-1", "up-1", "target-1")
     await state.set_connected("ws://chrome")
     router = _FakeRouter()
-    holder = listener_mod._UpstreamHolder(state, router, Config(backend="rdp"), session_id="s1")
+    holder = listener_mod._UpstreamHolder(state, router, Config(backend="cdp"), session_id="s1")
     closed: list[tuple[int, str]] = []
     detached_phases: list[UpstreamPhase] = []
 
@@ -153,9 +153,9 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
 
     holder.upstream = FakeUpstream()
     router.upstream = holder.upstream
-    holder.rdp_pid = 999
+    holder.cdp_pid = 999
     killed: list[int | None] = []
-    monkeypatch.setattr(holder, "_kill_rdp_chrome", lambda: killed.append(holder.rdp_pid))
+    monkeypatch.setattr(holder, "_kill_cdp_chrome", lambda: killed.append(holder.cdp_pid))
 
     await holder.trigger_close("skill_disconnect")
 
@@ -174,9 +174,9 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
 
 
 @pytest.mark.asyncio
-async def test_idle_watchdog_closes_idle_rdp_context_and_drops_it(monkeypatch):
-    state = DaemonState(backend_name="rdp")
-    await state.set_connected("ws://rdp")
+async def test_idle_watchdog_closes_idle_cdp_context_and_drops_it(monkeypatch):
+    state = DaemonState(backend_name="cdp")
+    await state.set_connected("ws://cdp")
     state.last_activity_at -= 99
     calls: list[str] = []
 
@@ -185,7 +185,7 @@ async def test_idle_watchdog_closes_idle_rdp_context_and_drops_it(monkeypatch):
         await state.set_disconnected()
 
     ctx = SimpleNamespace(
-        backend="rdp",
+        backend="cdp",
         session_id="s-id",
         state=state,
         holder=SimpleNamespace(trigger_close=trigger_close),
@@ -193,7 +193,7 @@ async def test_idle_watchdog_closes_idle_rdp_context_and_drops_it(monkeypatch):
     daemon = SimpleNamespace(
         all_contexts=lambda: [ctx],
         dropped=[],
-        drop_rdp_context=lambda sid: daemon.dropped.append(sid),
+        drop_cdp_context=lambda sid: daemon.dropped.append(sid),
     )
     sleeps = 0
 

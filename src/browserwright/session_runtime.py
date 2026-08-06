@@ -201,7 +201,7 @@ def session_tabs(sess, *, include_internal: bool = True) -> list[dict]:
     """The session's page targets ``[{targetId, url, title, attached}]``.
 
     Unified across backends: the daemon scopes ``Target.getTargets`` to the
-    session's browser (extension = the session's tab group; rdp/env = the
+    session's browser (extension = the session's tab group; cdp/env = the
     daemon-owned Chrome). ``[]`` when the session has no tabs — a legitimate
     state, not an error. ``include_internal=False`` filters chrome:// et al.
     """
@@ -253,7 +253,7 @@ def open_session_tab(
 
     The daemon dispatches ``BrowserwrightDaemon.openBackgroundTab`` by the
     session's (immutable) backend: extension opens inside the session's tab
-    group honoring ``background=`` (don't steal the user's focus); rdp/env use
+    group honoring ``background=`` (don't steal the user's focus); cdp/env use
     ``Target.createTarget``. Returns ``{targetId, tabId, url, title, groupId}``
     (``groupId`` is -1 on non-extension backends)."""
     rec = getattr(sess, "session_record", None)
@@ -296,7 +296,7 @@ def open_session_tab(
         "url": payload.get("url", url),
         "title": payload.get("title", ""),
         # groupId is the session's tab-group id on extension (the durable
-        # reconnect anchor), -1 on rdp/env (tab groups are an extension concept).
+        # reconnect anchor), -1 on cdp/env (tab groups are an extension concept).
         "groupId": payload.get("groupId", -1),
     }
 
@@ -305,7 +305,7 @@ def close_session_tab(
     sess, *, target_id: Optional[str] = None, session_id: Optional[str] = None,
 ) -> dict:
     """Close a tab via the daemon (``chrome.tabs.remove`` on extension,
-    ``Target.closeTarget`` on rdp/env). Defaults to the session's current tab.
+    ``Target.closeTarget`` on cdp/env). Defaults to the session's current tab.
 
     Returns ``{"ok": True, "tabId": N}``; clears any cached CDP state for the
     closed target."""
