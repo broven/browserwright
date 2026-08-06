@@ -43,6 +43,10 @@ does not appear. Never use `context.pages[0]` or `context.new_page()` as an
 implicit fallback, because that splits the ledger target from the executor's
 page and can create duplicate user-visible tabs.
 
+Expect to retry the first bind: on a fresh session the first browser call
+frequently returns `PageBindTimeout` (retryable) — retrying the same command
+succeeds.
+
 The executor request deadline is fail-stop. When it expires, Browserwright
 flushes a terminal response, terminates that exact executor instance (including
 its Playwright driver), and waits for daemon-confirmed process death before the
