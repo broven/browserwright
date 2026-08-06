@@ -166,6 +166,7 @@ const realm = vm.createContext({
   _detachAttachedTab: async (tabId, reason) => { detaches.push([tabId, reason]); },
 });
 vm.runInContext(input.ownershipRegion, realm);
+vm.runInContext(input.wrapperRegion, realm);
 vm.runInContext(input.onUpdatedHandler, realm);
 vm.runInContext(input.onRemovedHandler, realm);
 
@@ -460,6 +461,7 @@ const realm = vm.createContext({
   invalidateMarkerInstall: () => {},
 });
 vm.runInContext(input.ownershipRegion, realm);
+vm.runInContext(input.wrapperRegion, realm);
 vm.runInContext(input.doCloseTab, realm);
 
 (async () => {
