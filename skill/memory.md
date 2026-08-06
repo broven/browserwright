@@ -11,7 +11,7 @@ The agent reads this file on every browserwright invocation. It carries two thin
 |---|---|---|
 | `cdp` | Isolated Chrome on a known port — zero popups, safe for iterative work | `sid=$(browserwright session new --backend=cdp --create --name=task-label)` then run `browserwright -s "$sid" -e '...'` |
 | `extension` | The user's daily Chrome via unpacked relay extension — zero popups | `browserwright-daemon serve` (one global daemon) then load the bundled `chrome-extension/` directory |
-| `env` | An externally-owned browser via a CDP URL you supply (e.g. an anti-detect / fingerprint profile) — attach-owned, never closed on `session end` | Start the daemon against it: `BD_CDP_WS=ws://... browserwright-daemon serve --backend env` (or `BD_CDP_URL=http://host:port` for `/json/version` discovery), then `sid=$(browserwright session new --backend=env --name=task-label)` and `browserwright -s "$sid" -e '...'` |
+| `cdp` attach | An externally-owned browser at a CDP endpoint you supply (anti-detect / fingerprint / cloud profile) — attach-owned, never closed on `session end` | `sid=$(browserwright session new --backend=cdp --attach=ws://... --name=task-label)` then `browserwright -s "$sid" -e '...'`. An `http://host:port` endpoint is resolved via `/json/version`. One daemon holds as many of these as you like, each on its own browser |
 
 ## User preference
 

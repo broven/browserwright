@@ -342,10 +342,10 @@ Are you running scripted / iterative tests?
             ├── fingerprint browser (AdsPower / MultiLogin / GoLogin /
             │   比特浏览器) → cdp attach, supply the port your tool exposes
             └── an externally-owned browser exposing a browser-level CDP ws
-                (anti-detect profile, e.g. CloakBrowser) → env:
-                `BD_CDP_WS=ws://… browserwright-daemon serve --backend env`,
-                then `browserwright session new --backend=env`. Attach-owned —
-                `session end` never closes it. N profiles → N isolated daemons.
+                (anti-detect profile, cloud browser) → cdp attach:
+                `browserwright session new --backend=cdp --attach=ws://…`.
+                Attach-owned — `session end` never closes it. N profiles → N
+                sessions on the one daemon, each with its own endpoint.
 ```
 
 The install wizard codifies this same decision tree —

@@ -80,8 +80,7 @@ $ browserwright-daemon doctor
 
 | name | 说明 | 选择方式 |
 |---|---|---|
-| `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析），绑定一个外部持有的浏览器（如 anti-detect profile） | shared upstream 通过 `--backend env` / `BD_BACKEND` / `default_backend` 选择 |
-| `cdp` | 真实 browser-level CDP 端口。session `--create` 时 daemon 自己启动并持有隔离 Chrome；`--attach` 时连接外部暴露的端口 | 按 session ledger 分流（`browserwright session new --backend=cdp`） |
+| `cdp` | 真实 browser-level CDP。`--create` 时 daemon 自己启动并持有隔离 Chrome；`--attach=<port\|url>` 时连接别人持有的浏览器——本机端口，或 `ws(s)://` / `http(s)://` 端点（anti-detect / 指纹 / 云浏览器）。`ws` 原样使用不做任何改写（token 常嵌在 URL 里），`http` 走 `/json/version` 解析 | 按 session ledger 分流（`browserwright session new --backend=cdp`）。端点是**每会话**的，所以一个 daemon 可同时驱动多个外部浏览器 |
 | `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**驱动用户日常 Chrome 的唯一路径**。 | `browserwright-daemon serve` 默认启动这个 shared relay；具体 session 仍用 `browserwright session new --backend=extension` 选择 |
 
 ## v0.4 extension backend

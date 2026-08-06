@@ -170,7 +170,7 @@ browserwright task wikipedia.org/lookup --title="Wikipedia"
 | Your daily Chrome (logged-in / personal) *(default for "use my browser")* | `extension` | `browserwright session new --backend=extension …` — load `chrome-extension/` once, connect via the daemon's relay; zero popups |
 | Scripts / iterative work in throwaway profiles | `cdp` + isolated Chrome | `browserwright-daemon launch-chrome --port 9333 --profile bs-dev` + `BD_PORT=9333 BD_BACKEND=cdp` |
 | Fingerprint browser (AdsPower / MultiLogin / 比特浏览器) | `cdp` | point `BD_PORT` at the tool's exposed port |
-| Externally-owned CDP endpoint (anti-detect profile, e.g. CloakBrowser) | `env` | `BD_CDP_WS=ws://… browserwright-daemon serve --backend env`, then `browserwright session new --backend=env --name=…` (attach-owned — never closed on `session end`) |
+| Externally-owned CDP endpoint (anti-detect / cloud browser) | `cdp` attach | `browserwright session new --backend=cdp --attach=ws://… --name=…` (attach-owned — never closed on `session end`). Repeat for as many profiles as you need; one daemon serves them all |
 
 Interactive wizard: `browserwright install` — walks the decision tree and writes your pick.
 
