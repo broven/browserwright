@@ -67,12 +67,16 @@ def _service_worker_marker_sources() -> dict[str, str]:
     handler_end = source.index("// Shared attach sequence", handler_start)
     close_start = source.index("async function doCloseTab(")
     close_end = source.index("\n\nasync function doDetach(", close_start)
+    ownership_start = source.index("// ---- ownership markers:")
+    ownership_end = source.index(
+        "// ---- group-membership = session membership", ownership_start)
     return {
         **_marker_sources(),
         "workerMarkerRegion": source[marker_start:marker_end],
         "detachTab": source[detach_start:detach_end],
         "handleDaemonMessage": source[handler_start:handler_end],
         "doCloseTab": source[close_start:close_end],
+        "ownershipRegion": source[ownership_start:ownership_end],
     }
 
 
@@ -273,15 +277,27 @@ const chrome = {
   tabs: {
     async remove() { calls.push({ kind: "remove" }); throw new Error("close denied"); },
   },
+  storage: {
+    session: {
+      async get() { return {}; },
+      async set(value) { calls.push({ kind: "storageSet", value }); },
+    },
+  },
 };
 function errMessage(error) { return String(error.message || error); }
 function safeSend(message) { calls.push({ kind: "response", message }); }
-vm.runInThisContext(input.doCloseTab);
+const realm = vm.createContext({
+  chrome, console, errMessage, safeSend,
+  attachedTabs, markedTabs,
+});
+vm.runInContext(input.ownershipRegion, realm);
+vm.runInContext(input.doCloseTab, realm);
 (async () => {
-  await doCloseTab(9, 17);
+  await vm.runInContext("doCloseTab(9, 17)", realm);
   process.stdout.write(JSON.stringify({
     attached: attachedTabs.has(17),
     marked: markedTabs.has(17),
+    owned: vm.runInContext("ownedTabs.has(17)", realm),
     calls,
   }));
 })().catch((error) => {

@@ -651,7 +651,8 @@ async def test_open_background_restores_live_group_from_ledger_after_restart(
         async def create_background_tab(self, url, *, group_name, group_id,
                                         background,
                                         skip_post_attach_commands,
-                                        expected_generation=None):
+                                        expected_generation=None,
+                                        session_id=None):
             calls.append(("create", group_id))
             return SimpleNamespace(
                 tab_id=11, target_id="ext-tab-11", url=url, title="new",
@@ -698,7 +699,8 @@ async def test_stale_ledger_group_is_not_reused_for_new_tab(monkeypatch):
         async def create_background_tab(self, url, *, group_name, group_id,
                                         background,
                                         skip_post_attach_commands,
-                                        expected_generation=None):
+                                        expected_generation=None,
+                                        session_id=None):
             calls.append(("create", group_id))
             return SimpleNamespace(
                 tab_id=12, target_id="ext-tab-12", url=url, title="new",
@@ -774,7 +776,8 @@ async def test_other_group_sensitive_operations_restore_ledger_binding(
             }
 
         async def attach_active_tab(self, *, group_name, group_id, timeout,
-                                    expected_generation=None):
+                                    expected_generation=None,
+                                    session_id=None):
             calls.append(("attach", group_id))
             return SimpleNamespace(
                 tab_id=11, target_id="ext-tab-11", url="https://active/",
@@ -1037,7 +1040,8 @@ async def test_concurrent_first_opens_share_one_group_across_adapters(monkeypatc
         async def create_background_tab(self, url, *, group_name, group_id,
                                         background,
                                         skip_post_attach_commands,
-                                        expected_generation=None):
+                                        expected_generation=None,
+                                        session_id=None):
             calls.append(group_id)
             await asyncio.sleep(0)
             final_group = group_id if group_id is not None else 100 + len(calls)

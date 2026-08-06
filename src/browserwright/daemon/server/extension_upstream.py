@@ -53,6 +53,31 @@ _UNSUPPORTED_BROWSER_METHODS = frozenset({
 })
 
 
+class GroupOwnershipUnproven(RuntimeError):
+    """A live Chrome tab group exists at the candidate id, but ownership by
+    the session could not be proven (issue #29).
+
+    Distinct from transport/validation errors so the explicit adopt verb
+    (``attachActiveTab``) can treat it as "binding is stale — start fresh",
+    while every other group-sensitive operation (open, recover, teardown,
+    enumerate) fails closed. Adopting an unproven group risks attaching or
+    closing tabs that belong to the user or another session.
+    """
+
+    def __init__(self, session_id: str, group_id: int, reason: str):
+        super().__init__(
+            f"group ownership could not be proven for session {session_id!r} "
+            f"(group id {group_id}): {reason}. The group is never adopted — "
+            "opening a tab, recovery, or teardown would attach or close tabs "
+            "that may belong to the user or another session. This usually "
+            "means Chrome restarted: group/tab ids are recycled and the "
+            "extension's per-tab ownership markers were wiped. re-adopt "
+            "explicitly with attachActiveTab on a tab you want in the "
+            "session, or ungroup/close the stale group and retry.")
+        self.session_id = session_id
+        self.group_id = group_id
+
+
 def _build_requires_session_error(method: str) -> str:
     return (
         f"{method!r} requires a sessionId in extension backend — "
@@ -178,11 +203,13 @@ class ExtensionUpstream:
         # specify sessionId without our naming convention).
         self._sessions: dict[str, int] = {}
         # The session IS a tab group (docs "extension browser = tab group").
-        # We bind to the durable numeric Chrome groupId and key all ops on it;
-        # the group's live membership (chrome.tabs.query({groupId})) is the
-        # SINGLE source of truth for what's in the session — there is no
+        # We bind to the numeric Chrome groupId and key all ops on it; the
+        # group's live membership (chrome.tabs.query({groupId})) is the SINGLE
+        # source of truth for what's in the session — there is no
         # owned/borrowed bookkeeping. ``group_name`` (= session name) is only a
-        # human-visible title used when creating a new group.
+        # human-visible title used when creating a new group. Ownership of the
+        # group is proven by the extension's per-tab markers (issue #29); the
+        # ledger groupId is the candidate, never the proof.
         self._groups: dict[str, int] = (
             group_owner._groups if group_owner is not None else {})
         # All adapters over the same relay/binding owner (agent path + each
@@ -271,11 +298,13 @@ class ExtensionUpstream:
         errors deliberately propagate: a transient validation failure must not
         be mistaken for permission to create a second group.
 
-        Known extension-backend boundary: this recovery is necessarily best
-        effort. Chrome exposes no application-owned persistent group identity;
-        a user rename can make the title check reject the original group, and
-        recycled group/tab ids after a Chrome restart can collide with another
-        same-titled group. See ``binding`` in CONTEXT.md.
+        Known extension-backend boundary (issue #29): this recovery is
+        ownership-proven only while Chrome keeps running — the extension's
+        per-tab markers (chrome.storage.session) survive daemon and service-
+        worker restarts, but Chrome wipes them on browser restart, so after a
+        restart a recycled group id can at best be a coincidence. Recovery
+        therefore fails closed on unproven groups instead of adopting them.
+        See ``binding`` in CONTEXT.md.
         """
         deadline = (
             None if timeout is None else time.monotonic() + max(0.0, timeout))
@@ -361,29 +390,73 @@ class ExtensionUpstream:
     def _validate_recovered_group_ownership(
         self, session_id: str, group_id: int, info: dict,
     ) -> None:
-        """Fail closed using the best ownership evidence Chrome exposes.
+        """Prove the group is this session's before adopting it.
 
-        This is deliberately not a cryptographic ownership proof. Chrome gives
-        extensions no persistent application-owned group identity: titles are
-        editable/non-unique and group/tab ids may be recycled after restart.
-        A rename can therefore reject the right group, while recycled ids plus
-        a coincidentally matching title/member can accept the wrong one. This
-        known backend limitation is documented under ``binding`` in CONTEXT.md;
-        adding another cache would not create a stronger anchor.
+        Since issue #29 the anchor is the extension's per-tab ownership
+        markers (``chrome.storage.session``, written when the extension placed
+        the tab in a session group and wiped by Chrome on browser restart): a
+        group is owned iff a member tab carries THIS session's marker id. The
+        title and last-known-tab heuristics caused both failure directions — a
+        user rename wedged recovery and teardown forever, and recycled ids
+        after a browser restart could adopt an unrelated group whose tabs
+        ``endSession`` would then close — so they survive only as a legacy
+        fallback for extensions too old to report marker evidence.
+
+        Known backend limitation (issue #29, stated here because this is
+        where ownership is enforced): markers are wiped by Chrome on browser
+        restart, so an unproven group may be the session's own group from
+        before a restart. The caller fails closed and the user re-adopts
+        (``attachActiveTab``) or the session self-heals with a fresh group
+        when the stale id is genuinely gone. A lost marker fails safe, never
+        unsafe.
         """
         record = session_registry.get(session_id)
         name = record.get("name") if isinstance(record, dict) else None
-        group_title = info.get("groupTitle")
-        member_ids = {
-            tab.get("tabId") for tab in (info.get("tabs") or [])
-            if isinstance(tab, dict) and isinstance(tab.get("tabId"), int)
+        raw_tabs = info.get("tabs")
+        member_tabs = (
+            [t for t in raw_tabs if isinstance(t, dict)]
+            if isinstance(raw_tabs, list) else [])
+        marker_sessions = {
+            t.get("ownedSessionId") for t in member_tabs
+            if isinstance(t.get("ownedSessionId"), str)
+            and t["ownedSessionId"]
         }
-        known_tab_ids = (
-            self._runtime_tab_ids(record) if isinstance(record, dict) else set())
+        evidence_present = any(
+            "ownedSessionId" in t for t in member_tabs)
+
+        if evidence_present:
+            # New extension: markers are the anchor. The title is a
+            # user-editable label (never consulted — a rename must not wedge
+            # the session) and last-known tab ids are recycled after restart
+            # (never consulted — a coincidence must not adopt).
+            if session_id not in marker_sessions:
+                raise GroupOwnershipUnproven(
+                    session_id, group_id,
+                    "no member tab carries this session's ownership marker")
+            foreign = sorted(m for m in marker_sessions if m != session_id)
+            if foreign:
+                raise GroupOwnershipUnproven(
+                    session_id, group_id,
+                    f"member tabs are marked for other sessions: {foreign}")
+            return
+
+        # Legacy extension (reply carries no ownedSessionId fields): degrade
+        # to the old heuristic rather than bricking every persisted group of
+        # anyone whose daemon upgraded ahead of their browser — recovery,
+        # opening a tab and endSession all fail until they reload the
+        # extension. This path keeps both documented failure directions;
+        # only an extension update closes them.
         if not isinstance(name, str) or not name:
             raise RuntimeError(
                 f"group ownership could not be proven for session {session_id!r}: "
                 "ledger has no session name")
+        group_title = info.get("groupTitle")
+        member_ids = {
+            t.get("tabId") for t in member_tabs
+            if isinstance(t.get("tabId"), int)
+        }
+        known_tab_ids = (
+            self._runtime_tab_ids(record) if isinstance(record, dict) else set())
         # An extension from before this reply carried `groupTitle` omits it,
         # and it is still accepted at the door because the protocol constant did
         # not change. Rejecting on an absent title would break every persisted
@@ -977,11 +1050,21 @@ class ExtensionUpstream:
     async def _attach_active_tab_locked(
         self, *, session_id: str | None, group_name: str | None,
     ) -> dict:
-        gid, _info = await self._resolve_session_group(session_id)
+        try:
+            gid, _info = await self._resolve_session_group(session_id)
+        except GroupOwnershipUnproven:
+            # Issue #29: the candidate group exists but ownership cannot be
+            # proven (usually a browser restart wiped the markers and
+            # recycled the ids). attachActiveTab is the EXPLICIT re-adoption
+            # verb — the human is looking at the tab — so it falls back to a
+            # fresh group instead of joining the unproven (possibly
+            # user-owned) one. Every other group-sensitive operation fails
+            # closed on the same error.
+            gid = None
         validated_generation = self._relay_generation()
         ghost = await self._relay.attach_active_tab(
             group_name=group_name, group_id=gid, timeout=10.0,
-            expected_generation=validated_generation)
+            expected_generation=validated_generation, session_id=session_id)
         group_id = getattr(ghost, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
         if self._group_required(
@@ -1046,6 +1129,7 @@ class ExtensionUpstream:
             background=background,
             skip_post_attach_commands=skip_post_attach_commands,
             expected_generation=validated_generation,
+            session_id=session_id,
         )
         group_id = getattr(gt, "group_id", -1)
         group_id = int(group_id) if isinstance(group_id, int) else -1
@@ -1140,10 +1224,11 @@ class ExtensionUpstream:
         The persisted groupId comes from the skill's ledger ``runtime.group_id``
         (written on every open). If Chrome itself restarted the groupId is gone
         and nothing is recovered — by design (a closed Chrome needs no
-        recovery). Because Chrome has no stronger persistent group identity,
-        user renames may make recovery fail and id recycling after browser
-        restart may make the best-effort title/member evidence misidentify a
-        group; this is a documented backend tradeoff, not hidden by more cache.
+        recovery). Ownership of a surviving group is proven by the extension's
+        per-tab markers (issue #29): a user rename never breaks it, and after
+        a browser restart the wiped markers make the recycled group id
+        unprovable — recovery fails explicitly with a re-adoption hint rather
+        than adopting tabs it cannot prove (see ``binding`` in CONTEXT.md).
 
         Raises (proxy maps to a CDP error) when no group matches or it has no
         tabs."""
