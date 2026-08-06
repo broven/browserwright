@@ -61,6 +61,18 @@ jobs:
         # workers are exercised for real, so it needs a display.
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
+      - name: Enable unprivileged user namespaces (Chrome sandbox)
+        # CfT refuses to start on this runner: FATAL "No usable sandbox!" —
+        # Ubuntu 23.10+ ships kernel.apparmor_restrict_unprivileged_userns=1,
+        # so unprivileged user namespaces (the only sandbox a CfT zip has;
+        # it carries no setuid chrome-sandbox) are blocked. The image's
+        # preinstalled Google Chrome still works because its deb installs a
+        # setuid chrome-sandbox — which is exactly why the rdp half of the
+        # suite passed while every extension test errored at fixture setup.
+        # Re-enable namespaces for this job's VM (Chrome's own doc:
+        # docs/security/apparmor-userns-restrictions.md).
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Chrome smoke probe
         # The extension fixture launches CfT headful under xvfb and discards
         # stderr, so a Chrome that dies at startup has so far surfaced as 25
