@@ -22,7 +22,6 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import AsyncIterator
 
-import pytest
 import websockets
 
 from browserwright import session_registry as reg
@@ -1013,16 +1012,6 @@ async def test_main_frame_id_rewrite_round_trip_and_agent_path_isolation():
             f"inbound command frameId not rewritten back; got {captured}")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="KNOWN BUG (unfixed): the session's first tab is never announced to "
-           "a session-bound facade bridge. See the docstring for the exact "
-           "ordering. This is a real, deterministic defect found while "
-           "diagnosing PageBindTimeout; it is NOT the whole cause of the "
-           "extension e2e PageBindTimeout failures (fixing it alone leaves "
-           "context.pages empty because Playwright's CRPage init still never "
-           "completes), so it is recorded here rather than papered over.",
-)
 async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
     """Cold-bind regression: the session's FIRST tab must reach Playwright.
 
@@ -1034,6 +1023,11 @@ async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
     later event ever re-announces a tab. Playwright's ``context.pages`` stays
     empty and ``bind_current_page`` raises ``PageBindTimeout`` no matter how
     long it waits.
+
+    FIXED (issue #30): the bridge re-checks visibility for a short window
+    (``_retry_visibility_announce``) instead of skipping permanently, so the
+    announce lands as soon as the binding written from the createTab response
+    becomes visible.
     """
     from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 
@@ -1045,8 +1039,18 @@ async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
     await ext.connect(port)
     await relay.wait_ready(timeout=2.0)
 
+    async def _noop(_):
+        return None
+
+    # Production wiring: the facade bridge shares its group binding with the
+    # agent path's ExtensionUpstream (the daemon passes `ctx.router.upstream`
+    # as binding_owner), so the binding written from the createTab response is
+    # visible to the bridge's visibility re-check.
+    agent = ExtensionUpstream(relay, _noop, _noop)
     client = _FakeClient()
-    bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay, session_id=sid,
+        binding_owner=agent)
     run_task = asyncio.create_task(bridge.run())
     try:
         # Playwright completes its discovery handshake FIRST: the executor
@@ -1057,10 +1061,6 @@ async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
                                      and "result" in f)
 
         # Now the AGENT path opens the session's first tab.
-        async def _noop(_):
-            return None
-
-        agent = ExtensionUpstream(relay, _noop, _noop)
         opened = await agent.open_background_tab(
             "about:blank", group_name="Cold", session_id=sid,
             skip_post_attach_commands=True)

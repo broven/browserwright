@@ -68,6 +68,79 @@ def test_confirmed_stale_holder_skips_self(monkeypatch):
     assert _stale.confirmed_stale_holder([19989]) is None
 
 
+# ---- pid_env / runtime-dir identity (issue #44 B) --------------------------
+#
+# The reclaim must never SIGTERM a browserwright daemon from a DIFFERENT
+# runtime dir: that is someone else's live daemon (the machine-global one, or a
+# sibling worktree's isolated e2e daemon), not a stale daemon of ours.
+
+
+def test_pid_env_reads_proc_environ(monkeypatch, tmp_path):
+    environ = tmp_path / "environ"
+    environ.write_bytes(b"PATH=/usr/bin\0XDG_RUNTIME_DIR=/tmp/bd-e2e-x\0FOO=1\0")
+    real_path = _stale.Path
+
+    def _fake_path(*a):
+        return environ if a == ("/proc/42/environ",) else real_path(*a)
+
+    monkeypatch.setattr(_stale, "Path", _fake_path)
+    assert _stale.pid_env(42, "XDG_RUNTIME_DIR") == "/tmp/bd-e2e-x"
+    assert _stale.pid_env(42, "PATH") == "/usr/bin"
+    # A var that is not set in the file → None (unset, not "").
+    assert _stale.pid_env(42, "HOME") is None
+
+
+def test_pid_env_parses_bsd_ps_eww(monkeypatch):
+    env_col = "sleep 5 XDG_RUNTIME_DIR=/tmp/bd-e2e-y FOO=bar"
+    monkeypatch.setattr(_stale.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(stdout=env_col + "\n"))
+    assert _stale.pid_env(7, "XDG_RUNTIME_DIR") == "/tmp/bd-e2e-y"
+    assert _stale.pid_env(7, "FOO") == "bar"
+    assert _stale.pid_env(7, "MISSING") is None
+
+
+def test_pid_env_unreadable_returns_none(monkeypatch):
+    monkeypatch.setattr(_stale.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError))
+    assert _stale.pid_env(7, "XDG_RUNTIME_DIR") is None
+
+
+def test_pid_runtime_dir_defaults_to_tmp_when_unset(monkeypatch):
+    monkeypatch.setattr(_stale, "pid_env", lambda pid, name: None)
+    assert _stale.pid_runtime_dir(123) == "/tmp"
+
+
+def test_pid_runtime_dir_echoes_set_value(monkeypatch):
+    monkeypatch.setattr(_stale, "pid_env",
+                        lambda pid, name: "/tmp/bd-e2e-z")
+    assert _stale.pid_runtime_dir(123) == "/tmp/bd-e2e-z"
+
+
+def test_same_runtime_dir_matches_only_our_dir(monkeypatch):
+    # Ours: XDG_RUNTIME_DIR unset → /tmp. A holder WITHOUT the var (the
+    # machine-global daemon) lives at /tmp too → same dir → reclaimable.
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(_stale, "pid_env", lambda pid, name: None)
+    assert _stale.same_runtime_dir_as_us(1) is True
+    # A holder with a DIFFERENT XDG_RUNTIME_DIR (an isolated e2e daemon) is
+    # someone else's → must refuse.
+    monkeypatch.setattr(_stale, "pid_env",
+                        lambda pid, name: "/tmp/bd-e2e-other")
+    assert _stale.same_runtime_dir_as_us(1) is False
+
+
+def test_same_runtime_dir_compares_resolved_paths(monkeypatch, tmp_path):
+    # Same dir reachable through a symlink still matches (macOS /tmp →
+    # /private/tmp is the real-world case).
+    real = tmp_path / "runtime"
+    real.mkdir()
+    link = tmp_path / "runtime-link"
+    link.symlink_to(real)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(link))
+    monkeypatch.setattr(_stale, "pid_env", lambda pid, name: str(real))
+    assert _stale.same_runtime_dir_as_us(1) is True
+
+
 def test_reclaim_ports_sigterm_frees(monkeypatch):
     killed = []
     monkeypatch.setattr(supervise.os, "kill",

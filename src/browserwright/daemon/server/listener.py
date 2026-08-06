@@ -100,8 +100,10 @@ def make_context(*, backend: str, cfg: Config,
 
 def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
     """Reclaim the relay/facade ports from a *confirmed* stale browserwright
-    daemon (issue #15, 2.2). No-op when the ports are free or held by an
-    unconfirmed process (we never SIGTERM a stranger).
+    daemon (issue #15, 2.2). No-op when the ports are free, held by an
+    unconfirmed process, or held by a browserwright daemon from a DIFFERENT
+    runtime dir (issue #44 B — that is someone else's live daemon, e.g. the
+    machine-global one; we never SIGTERM a stranger).
 
     The write-side twin of `cli status`: both read the world through the same
     `probe.DaemonProbe` so they can never disagree about which ports matter or
@@ -121,6 +123,22 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
         logger.warning(
             "ports %s are in use but no confirmed browserwright daemon holds "
             "them; leaving them alone (bind will surface a clear error)", held)
+        return
+    # issue #44 B: a *stale* daemon is one that crashed on the SAME control
+    # socket we are about to bind — i.e. the same runtime dir. A confirmed
+    # browserwright daemon from a DIFFERENT runtime dir is someone else's live
+    # daemon: the machine-global daemon (default runtime dir /tmp) or a sibling
+    # worktree's isolated e2e daemon. SIGTERMing it would kill the user's daily
+    # daemon — never do that; refuse loudly and let the bind (if we actually
+    # need the port) fail with an actionable message instead.
+    if not _stale.same_runtime_dir_as_us(pid):
+        logger.warning(
+            "ports %s are held by browserwright daemon pid %d from a DIFFERENT "
+            "runtime dir (%s) — not a stale daemon of ours, so refusing to "
+            "signal it (issue #44 B). That is likely the machine-global daemon "
+            "or another worktree's e2e daemon; if these ports are needed, stop "
+            "that daemon yourself.",
+            held, pid, _stale.pid_runtime_dir(pid))
         return
     logger.warning(
         "reclaiming ports %s from stale browserwright daemon pid %d (issue #15)",

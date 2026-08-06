@@ -22,7 +22,8 @@ import time
 
 import pytest
 
-# Reuse the facade-over-extension fixtures (session daemon on :29989 + facade
+# Reuse the facade-over-extension fixtures (session daemon on the per-worktree
+# relay port + facade
 # on conftest.TEST_EXT_FACADE_PORT, CfT chrome with the patched extension).
 from .test_l1_playwright_facade_extension import (  # noqa: F401
     e2e_ext_facade_daemon,

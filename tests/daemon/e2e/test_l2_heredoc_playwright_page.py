@@ -33,6 +33,7 @@ import pytest
 from .conftest import (
     TEST_EXT_FACADE_PORT,
     TEST_EXT_PORT,
+    TEST_AUTOFACADE_PORT,
     TEST_CDP_PORT,
     _isolated_runtime_dir,
 )
@@ -52,6 +53,23 @@ def _port_free(port: int) -> bool:
             return True
         except OSError:
             return False
+
+
+def _describe_holders(port: int) -> str:
+    """Who listens on `port` (via lsof), for failure messages.
+
+    One line per holder. The common failure mode is the machine-global daemon
+    or a sibling worktree's run holding the port (issue #44 B) — naming the
+    holder turns a misleading "facade never advertised" into an actionable
+    "pid X (cmdline) is listening on the port"."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return out.stdout.strip() or "(nobody)"
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return "(lsof unavailable)"
 
 
 def _status_facade_ws(env: dict, deadline_s: float = 10.0) -> str | None:
@@ -83,7 +101,14 @@ def _status_facade_ws(env: dict, deadline_s: float = 10.0) -> str | None:
 def cdp_autofacade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
     """Spawn the cdp daemon WITHOUT --facade-port and prove the facade
     auto-enabled (advertised via `status --json`). Yields (runtime_dir,
-    facade_ws)."""
+    facade_ws).
+
+    Auto-enable is proven by the ABSENCE of the CLI flag, not by the default
+    port: the facade is steered to this worktree's derived port via
+    BD_FACADE_PORT so it can never collide with the machine-global daemon's
+    default facade port (19990) or a sibling worktree's run (issue #44 B).
+    The None->default-port mapping itself is unit-tested
+    (test_phase_c_foundation_unit.py)."""
     import shutil
 
     log_path = e2e_artifacts_dir / "daemon-cdp-autofacade.log"
@@ -94,6 +119,7 @@ def cdp_autofacade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
     env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
+    env["BD_FACADE_PORT"] = str(TEST_AUTOFACADE_PORT)
     env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "cdp")
     env["BD_CONFIG"] = ""
 
@@ -109,7 +135,11 @@ def cdp_autofacade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
     if facade_ws is None:
         log_fh.flush()
         proc.terminate()
-        pytest.fail(f"cdp daemon never advertised a facade ws; see {log_path}")
+        pytest.fail(
+            f"cdp daemon never advertised a facade ws on port "
+            f"{TEST_AUTOFACADE_PORT}; holders of that port: "
+            f"{_describe_holders(TEST_AUTOFACADE_PORT)}; see {log_path}"
+        )
 
     yield runtime_dir, facade_ws
 
@@ -578,13 +608,14 @@ def test_snapshot_ref_roundtrip_cdp(cdp_autofacade_daemon):
 def ext_autofacade_ready(e2e_daemon, ext_ready):
     """Reuse the session-scoped extension daemon. Yields (runtime_dir, facade_ws).
 
-    The CfT extension is patched to dial ONE fixed relay port (TEST_EXT_PORT =
-    29989), so only one extension daemon can own it per pytest session — a
-    second daemon on 29989 would collide (this fixture used to spawn one and
-    failed `_port_free` whenever the session-scoped `e2e_daemon` was alive in a
-    full-suite run). `e2e_daemon` already serves 29989 WITH a facade on
-    `conftest.TEST_EXT_FACADE_PORT`, and `ext_ready` blocks until the extension
-    SW has connected — exactly what these consumers need (a usable facade ws).
+    The CfT extension is patched to dial ONE relay port (the per-worktree
+    TEST_EXT_PORT), so only one extension daemon can own it per pytest session —
+    a second daemon on that port would collide (this fixture used to spawn one
+    and failed `_port_free` whenever the session-scoped `e2e_daemon` was alive
+    in a full-suite run). `e2e_daemon` already serves TEST_EXT_PORT WITH a
+    facade on `conftest.TEST_EXT_FACADE_PORT`, and `ext_ready` blocks until the
+    extension SW has connected — exactly what these consumers need (a usable
+    facade ws).
     """
     yield (e2e_daemon.runtime_dir,
            f"ws://127.0.0.1:{TEST_EXT_FACADE_PORT}/cdp")

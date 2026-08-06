@@ -290,7 +290,38 @@ def _wait_for_target_page(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
+        # Pump the sync event loop: ``context.pages`` is a Python-side cache
+        # fed by the "page" channel event, which playwright's sync API only
+        # delivers while a sync call is in flight (issue #30). Without the
+        # pump, an announce that lands mid-wait leaves the event queued, the
+        # cache empty, and this loop polling nothing until PageBindTimeout.
+        _pump_page_events(context, timeout=remaining)
         time.sleep(min(_PAGE_BIND_POLL_INTERVAL_S, remaining))
+
+
+def _pump_page_events(context: Any, *, timeout: float) -> None:
+    """Pump the sync API's event queue so ``context.pages`` sees new pages.
+
+    ``context.pages`` is populated by the "page" channel event, and the
+    playwright sync API only processes channel events while a sync call is in
+    flight — between calls they queue on the driver loop. A bind wait that
+    only polls ``context.pages`` therefore never sees the page the facade
+    announced: the driver completes CRPage init and dispatches the event, but
+    nothing pumps it, so the cache stays empty no matter how long the wait.
+
+    ``expect_page`` is the idiomatic pump: arming it registers an event
+    future, and reading its ``value`` switches the dispatcher fiber until the
+    event (or the budget) lands — draining every queued channel event on the
+    way. Unit-test doubles without ``expect_page`` fall back to plain polling
+    (the exception is swallowed; the caller re-checks ``context.pages`` and
+    retries).
+    """
+    try:
+        with context.expect_page(timeout=max(1.0, timeout * 1000)) as info:
+            pass
+        info.value
+    except Exception:  # noqa: BLE001 - see docstring: pump is best-effort
+        pass
 
 
 def _wait_for_session_announce(sess: Any, *, timeout: float) -> bool:

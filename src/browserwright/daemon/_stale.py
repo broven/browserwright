@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+from pathlib import Path
 
 from .supervise import Outcome, pid_alive as _pid_alive, terminate
 
@@ -104,6 +105,77 @@ def pid_is_browserwright_daemon(pid: int) -> bool:
     if not cmd:
         return False
     return "browserwright-daemon" in cmd or "browserwright.daemon" in cmd
+
+
+def pid_env(pid: int, name: str) -> str | None:
+    """Best-effort read of one environment variable from another process.
+
+    Linux: ``/proc/<pid>/environ``. macOS (BSD ps): ``ps eww -p <pid> -o
+    command=`` appends the environment to the command column. Returns None when
+    unreadable or unset — callers must treat None as "the daemon default",
+    never as a confirmed value."""
+    try:
+        environ = Path(f"/proc/{pid}/environ")
+        if environ.exists():
+            for kv in environ.read_bytes().split(b"\0"):
+                key, _sep, val = kv.partition(b"=")
+                if key.decode(errors="replace") == name:
+                    return val.decode(errors="replace")
+            return None
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    for tok in out.stdout.split():
+        key, _sep, val = tok.partition("=")
+        if key == name:
+            return val
+    return None
+
+
+def pid_runtime_dir(pid: int) -> str:
+    """The runtime dir ``pid`` derives its control socket from (issue #44 B).
+
+    Mirrors ``_ipc``'s rule ``{XDG_RUNTIME_DIR | /tmp}``: a daemon with no
+    XDG_RUNTIME_DIR set lives at /tmp. Returns "(unknown)" when the env is
+    genuinely unreadable — callers must treat that as unverifiable, and
+    :func:`same_runtime_dir_as_us` falls back to the /tmp default for it, which
+    is the conservative direction for the reclaim (see its docstring)."""
+    val = pid_env(pid, "XDG_RUNTIME_DIR")
+    if val is None:
+        # Unset OR unreadable. The daemon default is /tmp; report that, since
+        # a daemon without XDG_RUNTIME_DIR genuinely lives there.
+        return str(Path("/tmp"))
+    return val
+
+
+def same_runtime_dir_as_us(pid: int) -> bool:
+    """True iff ``pid``'s control-socket runtime dir matches ours.
+
+    The reclaim safety rule (issue #44 B): a *stale* daemon — the only
+    legitimate SIGTERM target — is one that crashed on the SAME control socket
+    we are about to bind, i.e. the same runtime dir. A browserwright daemon
+    from a DIFFERENT runtime dir (the machine-global daemon at /tmp, or a
+    sibling worktree's isolated e2e daemon) is someone else's live daemon:
+    signalling it would kill the user's daily daemon, so callers must refuse.
+
+    ``pid_env`` returning None is treated as the daemon default /tmp; if the
+    holder's env is genuinely unreadable this may misjudge, but only toward
+    reclaiming a same-/tmp-dir holder — and a live same-dir daemon is already
+    caught by ``serve``'s control-socket ping before the reclaim ever runs."""
+    from . import _ipc
+
+    theirs = Path(pid_runtime_dir(pid))
+    ours = _ipc.runtime_dir()
+    try:
+        return theirs.resolve() == ours.resolve()
+    except OSError:
+        return False
 
 
 #: Re-exported from `supervise` so this module keeps its self-contained

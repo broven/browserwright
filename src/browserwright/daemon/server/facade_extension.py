@@ -86,6 +86,17 @@ _RUNTIME_ENABLE_BARRIER_TIMEOUT = 3.0
 # dance: cdp-relay.ts:792-829).
 _RUNTIME_REENABLE_PAUSE = 0.05
 
+# Cold-session announce retry (KNOWN BUG, issue #30): the extension announces
+# a freshly-created tab (`attached`) BEFORE the createTab response lands, and
+# the session→group binding is written from that response. For a session's
+# FIRST tab the facade's visibility check therefore races the binding and can
+# answer "not in my group" even though the tab was created for this session.
+# Instead of skipping the announce permanently we re-check for a short window
+# (the binding lands milliseconds later); a tab that never becomes visible
+# (a foreign tab) expires without an announce — the scope check still gates.
+_VISIBILITY_RETRY_COUNT = 5
+_VISIBILITY_RETRY_INTERVAL = 0.1
+
 
 # Synthetic browserContextId for synthesized page targets. The extension backend
 # has no real CDP browser contexts (P4 — sessions isolate via tab groups), but
@@ -779,6 +790,22 @@ class ExtensionFacadeBridge:
             }))
             self._relay.set_session_announce(self._session_id)
 
+    async def _retry_visibility_announce(self, tab_id: int) -> None:
+        """Re-check session visibility for a tab whose `attached` raced the
+        createTab response (cold-session first tab, issue #30). Announces as
+        soon as the tab is a member of this session's group; expires silently.
+        Idempotent — a concurrent announce (replay, later fan-out) marks the
+        tab announced and stops the retries."""
+        for _ in range(_VISIBILITY_RETRY_COUNT):
+            await asyncio.sleep(_VISIBILITY_RETRY_INTERVAL)
+            if self._closed:
+                return
+            if tab_id in self._tab_sessions:
+                return  # already announced by another path
+            if await self._tab_visible_to_session(tab_id):
+                await self._announce_target(tab_id, send_created=True)
+                return
+
     async def _tab_visible_to_session(self, tab_id: int) -> bool:
         if self._session_id is None:
             return True
@@ -854,9 +881,20 @@ class ExtensionFacadeBridge:
             # avoids emitting attachedToTarget before the response.
             if self._creating > 0:
                 return
-            if not await self._tab_visible_to_session(tab_id):
+            visible = await self._tab_visible_to_session(tab_id)
+            if visible:
+                await self._announce_target(tab_id, send_created=True)
                 return
-            await self._announce_target(tab_id, send_created=True)
+            # Not visible (yet). For the session's FIRST tab this is normally
+            # the announce-before-createTab-response race: the extension emits
+            # `attached` before the response that carries the group binding, so
+            # the check above queried a session with no group at all. Defer a
+            # bounded re-check instead of skipping permanently — the binding
+            # lands milliseconds later and the retry announces the tab. A tab
+            # that never becomes a member of this session's group expires with
+            # nothing announced (same outcome as the old unconditional skip).
+            asyncio.get_running_loop().create_task(
+                self._retry_visibility_announce(tab_id))
             return
 
         if kind == "detached":
