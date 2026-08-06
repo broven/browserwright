@@ -125,6 +125,15 @@ class _Worker:
         self._browser: Any = None
         self._context: Any = None
         self._page: Any = None
+        # The targetId the live ``page`` is bound to (recorded at bind time).
+        # When the session's current target moves (switch_tab-equivalent
+        # ``bind_target`` / open / close-of-current), the page must follow.
+        self._page_target_id: str | None = None
+        # Re-entrancy guard for target-changed rebinds (issue #21).
+        self._rebinding_page = False
+        # The globals dict of the CURRENTLY executing heredoc, so a mid-call
+        # rebind can swap its ``page`` name (issue #21 same-call visibility).
+        self._active_globals: dict[str, Any] | None = None
         # The currently-armed facade-death handler (Fork 4).
         self._facade_death_handler: Any = None
         # Persistent per-session state, injected by reference each call (Fork 5).
@@ -341,9 +350,97 @@ class _Worker:
             backoff_s=_COLD_START_CONNECT_BACKOFF_S)
         self._context = ph.context_for_browser(self._browser)
         self._page = ph.bind_current_page(self._context, sess)
+        self._page_target_id = sess.current_target_id
         self._snapshot_holder.page = self._page
         self._snapshot = make_snapshot(self._snapshot_holder)
         self._arm_facade_death()
+        # Issue #21: the live page must follow the session's current target
+        # (``session_runtime.bind_target`` / ``open_session_tab`` /
+        # close-of-current). Register the executor's rebind hook AFTER the
+        # cold-start bind so the hook never fires mid-bind.
+        from ..session_runtime import set_target_changed_hook
+        set_target_changed_hook(self._on_target_changed)
+
+    # ---- issue #21: live page follows the session's current target ---------
+
+    def _on_target_changed(self, sess) -> None:
+        """Target-changed hook (``session_runtime``): re-resolve + rebind the
+        live page when the session's current tab moved.
+
+        Fired by ``bind_target`` (switch_tab), ``register_recovered``
+        (open_session_tab / recovery), and close-of-current. Runs on the worker
+        thread (agent code calls those functions there), so touching the live
+        Playwright objects is thread-safe."""
+        if not self._connected or self._context is None or self._page is None:
+            return
+        if self._rebinding_page:
+            return
+        # Same target already bound — nothing to do (idempotent switch_tab).
+        target_id = getattr(sess, "current_target_id", None)
+        if target_id == self._page_target_id:
+            return
+        self._rebinding_page = True
+        try:
+            self._rebind_page(sess)
+        finally:
+            self._rebinding_page = False
+
+    def _rebind_page(self, sess=None) -> None:
+        """Rebind ``self._page`` (and the running heredoc's ``page`` name) to
+        the session's current target, re-resolving through the same
+        reuse/recover/adopt/open discipline the cold-start bind uses.
+
+        ``sess`` is the session whose binding changed (the hook passes the
+        one ``bind_target`` / ``open_session_tab`` / ``close_session_tab``
+        received); falls back to ``current_session()`` for the pre-execute
+        reconcile path."""
+        from ..repl import playwright_handle as ph
+        from ..repl.snapshot import make_snapshot
+
+        if sess is None:
+            from ..session import current_session
+            sess = current_session()
+        try:
+            page = ph.bind_current_page(self._context, sess)
+        except Exception as e:  # noqa: BLE001 - keep the old page + warn
+            self._call_warnings.append(
+                f"page rebind to the session's current tab failed: {e}")
+            return
+        self._page = page
+        self._page_target_id = sess.current_target_id
+        self._snapshot_holder.page = page
+        self._snapshot = make_snapshot(self._snapshot_holder)
+        # Same-call visibility: swap `page` inside the RUNNING heredoc's
+        # globals so statements after switch_tab() see the new page.
+        if self._active_globals is not None:
+            self._active_globals["page"] = page
+
+    def _reconcile_page_binding(self) -> None:
+        """Before each execute, rebind the live page if the session's DURABLE
+        current target (ledger) moved — e.g. an in-process CLI heredoc called
+        ``bind_target`` / ``close_session_tab`` without touching the page
+        surface, or a previous call left the ledger ahead of this executor."""
+        if not self._connected or self._context is None or self._page is None:
+            return
+        if self._rebinding_page:
+            return
+        try:
+            from .. import session_registry as reg
+            rec = reg.get(self._session_id)
+            ledger_target = ((rec.get("runtime") or {}).get("current_target_id")
+                             if isinstance(rec, dict) else None)
+        except Exception:  # noqa: BLE001 - best-effort reconcile
+            return
+        if not isinstance(ledger_target, str) or ledger_target == self._page_target_id:
+            return
+        from ..session import current_session
+        sess = current_session()
+        sess.current_target_id = ledger_target
+        self._rebinding_page = True
+        try:
+            self._rebind_page(sess)
+        finally:
+            self._rebinding_page = False
 
     def _reset(self) -> None:
         """Request terminal executor recycle without touching browser tabs.
@@ -423,60 +520,70 @@ class _Worker:
                     "traceback": traceback.format_exc(),
                 },
                 exit_code=3)
-        globals_ = self._build_globals()
+        # Issue #21: a mid-call target change (switch_tab) must swap the
+        # running heredoc's `page` name too, not just the next call's.
+        # Also reconcile the live page against the session's DURABLE current
+        # target before running this call (a separate process may have moved
+        # the ledger binding without this executor noticing).
+        self._reconcile_page_binding()
+        self._active_globals = globals_ = self._build_globals()
         buf = io.StringIO()
         return_value: str | None = None
         task_result_json: str | None = None
-        with _request_environment(req.env):
-            try:
-                with redirect_stdout(buf):
-                    if req.task is None:
-                        return_value = self._exec_with_return(req.code, globals_)
-                    else:
-                        result = self._run_task_on_live_surface(
-                            req.task.site,
-                            req.task.name,
-                            isolated=req.task.isolated,
-                            **req.task.args,
-                        )
-                        try:
-                            return_value = repr(result)
-                        except Exception:  # noqa: BLE001
-                            return_value = (
-                                f"<{type(result).__name__} (repr failed)>"
+        try:
+            with _request_environment(req.env):
+                try:
+                    with redirect_stdout(buf):
+                        if req.task is None:
+                            return_value = self._exec_with_return(req.code, globals_)
+                        else:
+                            result = self._run_task_on_live_surface(
+                                req.task.site,
+                                req.task.name,
+                                isolated=req.task.isolated,
+                                **req.task.args,
                             )
-                        task_result_json = json.dumps(result, default=str)
-            except _ResetRequested:
-                return self._finish(
-                    buf,
-                    warnings=[
-                        (
-                            "executor reset requested; statements after "
-                            "reset() were not run"
-                        )
-                    ],
-                    terminal_reason=TERMINAL_RESET_REQUESTED,
-                )
-            except BrowserwrightError as e:
-                return self._finish(buf, error=serialize(e), exit_code=e.exit_code)
-            except SystemExit as e:
-                code = int(e.code) if isinstance(e.code, int) else 0
-                return self._finish(buf, exit_code=code)
-            except BaseException as e:  # noqa: BLE001 - surface to the client
-                # Restore traceback fidelity: the in-process path writes
-                # `traceback.format_exc()` to stderr; a shipped heredoc must
-                # show the SAME traceback. We carry it on the serialized error.
-                from ..errors import playwright_error_fix
+                            try:
+                                return_value = repr(result)
+                            except Exception:  # noqa: BLE001
+                                return_value = (
+                                    f"<{type(result).__name__} (repr failed)>"
+                                )
+                            task_result_json = json.dumps(result, default=str)
+                except _ResetRequested:
+                    return self._finish(
+                        buf,
+                        warnings=[
+                            (
+                                "executor reset requested; statements after "
+                                "reset() were not run"
+                            )
+                        ],
+                        terminal_reason=TERMINAL_RESET_REQUESTED,
+                    )
+                except BrowserwrightError as e:
+                    return self._finish(
+                        buf, error=serialize(e), exit_code=e.exit_code)
+                except SystemExit as e:
+                    code = int(e.code) if isinstance(e.code, int) else 0
+                    return self._finish(buf, exit_code=code)
+                except BaseException as e:  # noqa: BLE001 - surface to the client
+                    # Restore traceback fidelity: the in-process path writes
+                    # `traceback.format_exc()` to stderr; a shipped heredoc must
+                    # show the SAME traceback. We carry it on the serialized error.
+                    from ..errors import playwright_error_fix
 
-                error = {
-                    "type": type(e).__name__,
-                    "msg": str(e),
-                    "traceback": traceback.format_exc(),
-                }
-                fix = playwright_error_fix(e)
-                if fix:
-                    error["fix"] = fix
-                return self._finish(buf, error=error, exit_code=3)
+                    error = {
+                        "type": type(e).__name__,
+                        "msg": str(e),
+                        "traceback": traceback.format_exc(),
+                    }
+                    fix = playwright_error_fix(e)
+                    if fix:
+                        error["fix"] = fix
+                    return self._finish(buf, error=error, exit_code=3)
+        finally:
+            self._active_globals = None
         return self._finish(
             buf,
             return_value=return_value,
@@ -625,6 +732,11 @@ class _Worker:
         self._browser = None
         self._context = None
         self._page = None
+        # Issue #21: clear the target-changed hook so a recycled executor's
+        # hook can never fire against another executor's (or a CLI process's)
+        # live objects.
+        from ..session_runtime import set_target_changed_hook
+        set_target_changed_hook(None)
         if self._pw_cm is not None:
             with _suppress():
                 self._pw_cm.__exit__(None, None, None)
