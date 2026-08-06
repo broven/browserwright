@@ -427,12 +427,27 @@ def _launch_cft_with_extension(
         f"--load-extension={ext_dir}",
         "about:blank",
     ]
+    # stderr goes to a file, never DEVNULL: a Chrome that dies at startup is
+    # undiagnosable without its message, and every extension test would error
+    # identically at fixture setup (CI 2026-08: 25 errors, one cause, zero
+    # evidence). The file lives inside the profile dir, which failure paths
+    # rmtree, so read the tail BEFORE that cleanup.
+    stderr_path = profile_dir / "_cft_stderr.log"
+    stderr_fh = open(stderr_path, "w")
     proc = subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_fh,
         start_new_session=True,
     )
+
+    def _stderr_tail() -> str:
+        stderr_fh.flush()
+        try:
+            return stderr_path.read_text(
+                encoding="utf-8", errors="replace")[-2000:]
+        except OSError:
+            return ""
 
     # Wait for DevToolsActivePort. On ANY failure path, kill Chrome and
     # remove the profile dir so we don't leak processes or tmpdir space.
@@ -446,6 +461,7 @@ def _launch_cft_with_extension(
                     port = int(lines[0].strip())
                     ws_path = lines[1].strip()
                     ws_url = f"ws://127.0.0.1:{port}{ws_path}"
+                    stderr_fh.close()
                     return ChromeHandle(
                         ws_url=ws_url,
                         profile_path=profile_dir,
@@ -456,15 +472,17 @@ def _launch_cft_with_extension(
                 pass
             if proc.poll() is not None:
                 raise RuntimeError(
-                    f"Chrome for Testing exited with code {proc.returncode}"
+                    f"Chrome for Testing exited with code {proc.returncode}; "
+                    f"stderr tail:\n{_stderr_tail()}"
                 )
             time.sleep(0.2)
 
         raise RuntimeError(
             f"Chrome for Testing did not write DevToolsActivePort within 15s; "
-            f"profile={profile_dir}"
+            f"profile={profile_dir}; stderr tail:\n{_stderr_tail()}"
         )
     except BaseException:
+        stderr_fh.close()
         _kill_chrome(proc.pid)
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise

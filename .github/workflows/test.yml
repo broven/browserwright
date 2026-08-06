@@ -61,6 +61,36 @@ jobs:
         # workers are exercised for real, so it needs a display.
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
+      - name: Chrome smoke probe
+        # The extension fixture launches CfT headful under xvfb and discards
+        # stderr, so a Chrome that dies at startup has so far surfaced as 25
+        # identical fixture errors with zero evidence. Probe the exact launch
+        # shapes up front (headless + headful, sandboxed) so the real failure
+        # message lands in the job log instead.
+        run: |
+          CHROME=$(ls -d /tmp/chrome-for-testing/chrome/*/chrome-linux64/chrome | sort | tail -1)
+          echo "probe binary: $CHROME"
+          "$CHROME" --version
+          for mode in headless headful; do
+            if [ "$mode" = headful ]; then
+              LAUNCH="xvfb-run -a"; EXTRA=""
+            else
+              LAUNCH=""; EXTRA="--headless=new"
+            fi
+            P=$(mktemp -d)
+            if timeout 45 $LAUNCH "$CHROME" $EXTRA --user-data-dir="$P" \
+                 --no-first-run --remote-debugging-port=0 about:blank \
+                 >"/tmp/probe-$mode.out" 2>"/tmp/probe-$mode.err"; then
+              echo "$mode probe: OK (Chrome stayed up)"
+            else
+              echo "$mode probe: FAILED rc=$? (124 = alive, killed by timeout)"
+            fi
+            echo "--- stderr ($mode) ---"
+            head -c 2000 "/tmp/probe-$mode.err" || true
+            echo
+            rm -rf "$P"
+          done
+
       - name: Run the real-Chrome E2E suite
         run: xvfb-run -a mise run test:e2e
 
