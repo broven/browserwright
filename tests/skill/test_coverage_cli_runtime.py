@@ -758,12 +758,17 @@ def test_cmd_doctor_no_daemon_reports_daemon_running_as_headline(monkeypatch, ca
 def test_session_create_reset_fix_no_longer_loops_through_doctor(monkeypatch):
     """Secondary (issue #28): `session reset`'s fix text used to say 'run
     `browserwright doctor`' — which reported `✓ daemon` on a down daemon, so
-    the advice looped. It now names the actual check/start commands."""
+    the advice looped. It now names the actual check/start commands. (Issue
+    #40: with the daemon down the executor is reaped locally when provably
+    gone — so this exercise pins the failure path to the un-reapeable case,
+    where the fix text is what the agent actually sees.)"""
     from browserwright import session_create
 
     sid = "deadbeef"
     monkeypatch.setattr(session_create, "_run", lambda cmd: 1)
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
+    monkeypatch.setattr(session_create, "_reap_executor_locally", lambda _sid: None)
     from browserwright.errors import DaemonUnavailable
 
     with pytest.raises(DaemonUnavailable) as excinfo:
@@ -871,12 +876,15 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
 def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
     tmp_bs_home, monkeypatch,
 ):
+    """The daemon is UP (so #40's daemon-down force-drop does not apply) but
+    its teardown comes back partial: the row is kept for the #32 retry."""
     from browserwright import session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
     sid = reg.allocate(backend="cdp", owner="create", name="owned")
     record = reg.get(sid)
     monkeypatch.setattr(session_create, "_run", lambda _cmd, **kwargs: 3)
+    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: True)
 
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
         session_create.end(record)
@@ -901,12 +909,17 @@ def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
 def test_session_create_reset_executor_refuses_unconfirmed_reap(
     tmp_bs_home, monkeypatch,
 ):
+    """A reset that cannot confirm the executor is gone still refuses — with
+    the daemon down this is now the un-reapeable-orphan case (issue #40): the
+    local reap came back empty-handed, so the row is kept for retry."""
     from browserwright import session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
     sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
     monkeypatch.setattr(session_create, "_run", lambda _cmd: 1)
+    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
+    monkeypatch.setattr(session_create, "_reap_executor_locally", lambda _sid: None)
 
     with pytest.raises(DaemonUnavailable, match="could not confirm"):
         session_create.reset_executor(reg.get(sid))
@@ -1014,7 +1027,9 @@ def test_session_create_end_create_cdp_does_not_double_reap(tmp_bs_home, monkeyp
 def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
     tmp_bs_home, monkeypatch,
 ):
-    """An unreachable daemon cannot prove that attach clients were revoked."""
+    """An unreachable daemon cannot prove that attach clients were revoked —
+    and the #40 local reap could not prove the executor gone either — so the
+    row is kept for retry instead of being dropped on a guess."""
     from browserwright import session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
@@ -1024,6 +1039,8 @@ def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
         raise subprocess.TimeoutExpired("browserwright-daemon", timeout=10)
 
     monkeypatch.setattr(session_create.subprocess, "run", boom)
+    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
+    monkeypatch.setattr(session_create, "_reap_executor_locally", lambda _sid: None)
 
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
         session_create.end(reg.get(sid))

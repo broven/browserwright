@@ -80,6 +80,42 @@ def _daemon_is_running() -> bool:
         return False
 
 
+def _reap_executor_locally(session_id: str) -> dict | None:
+    """Daemon-independent executor reap for the "daemon is gone" case (issue
+    #40). Used ONLY when the daemon is unreachable — the daemon is the
+    executor's owner while it is alive, and this path must never race it.
+
+    Reads the session's on-disk executor discovery record (written by the
+    executor itself) and:
+
+    - no record        → nothing to reap; the executor is provably gone.
+    - record, pid dead → stale files only; purge them, provably gone.
+    - record, pid live → fingerprint-guarded TERM→KILL reap, the same graded
+      discipline as the daemon's startup orphan sweep (a start-time mismatch
+      means the pid was recycled and is NOT signalled).
+
+    Returns a short dict describing what was done (``state`` is ``"absent"`` /
+    ``"gone"`` / ``"reaped"``, ``pid`` the executor pid or None), or ``None``
+    when the executor could not be provably reaped — the caller keeps the
+    existing "kept for retry" semantics in that case.
+    """
+    from .daemon import _ipc
+    from .daemon.server.executor_registry import _terminate_orphan_and_wait
+    from .daemon.supervise import pid_alive
+
+    record = _ipc.read_executor_record(session_id)
+    if record is None:
+        return {"state": "absent", "pid": None}
+    pid = int(record["pid"])
+    if not pid_alive(pid):
+        _ipc.cleanup_executor(session_id)
+        return {"state": "gone", "pid": pid}
+    if not _terminate_orphan_and_wait(pid, record.get("start_time")):
+        return None
+    _ipc.cleanup_executor(session_id)
+    return {"state": "reaped", "pid": pid}
+
+
 def _ensure_daemon_running() -> None:
     """Make sure the ONE global daemon is up; spawn ``serve`` detached if not.
 
@@ -144,6 +180,21 @@ def reset_executor(record: dict) -> str:
         str(sid),
     ])
     if rc != 0:
+        # Issue #40: when the daemon is unreachable, the executor cannot be
+        # reaped through it and the session is stuck — the orphan blocks the
+        # next bind with a CDP attach conflict and no retry can clear it.
+        # Reap it locally from the discovery record instead. (When the daemon
+        # IS up, the daemon path is authoritative and a failed confirm keeps
+        # the existing retry semantics.)
+        if not _daemon_is_running():
+            outcome = _reap_executor_locally(sid)
+            if outcome is not None:
+                return (
+                    f"session {sid} reset; the executor was recycled locally "
+                    f"({outcome['state']}, pid={outcome['pid']}) because the "
+                    "daemon was unreachable. The browser and tabs were left "
+                    "untouched."
+                )
         from .errors import DaemonUnavailable
 
         raise DaemonUnavailable(
@@ -309,6 +360,25 @@ def end(record: dict) -> str:
     if not _end_daemon_session(record):
         from .errors import DaemonUnavailable
 
+        # Issue #40: when the daemon is unreachable, "kept for retry" is a
+        # dead end — the retry hits the same wall, the orphaned executor
+        # blocks the next bind with a CDP attach conflict, and the row leaks
+        # forever. If the executor is provably gone (or was reaped locally),
+        # force-drop the ledger entry instead. The workspace could not be
+        # torn down without the daemon, so say so honestly. When the daemon
+        # IS up, its teardown is authoritative and a failed confirm keeps the
+        # retry semantics (issue #32).
+        if not _daemon_is_running():
+            outcome = _reap_executor_locally(sid)
+            if outcome is not None:
+                reg.remove(sid)
+                return (
+                    f"session {sid} ended (daemon was down): the executor was "
+                    f"{outcome['state']} (pid={outcome['pid']}) and the ledger "
+                    "entry was removed. The workspace was left as-is — no "
+                    "daemon was reachable to close it; close any leftover "
+                    "browser tabs/windows manually."
+                )
         # The row stays. An unreachable daemon cannot prove clients were
         # revoked, and dropping the row for a session whose external browser
         # may still have live clients driving it is worse than leaving one that

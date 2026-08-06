@@ -154,6 +154,78 @@ async def test_kill_and_wait_confirms_matching_process_death(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_kill_and_wait_reaps_live_record_without_handle(monkeypatch, tmp_path):
+    """Issue #40: after a daemon restart the registry has no Popen handle for
+    an executor that survived the startup orphan sweep, but the discovery
+    record names a live pid. `kill_and_wait` must reap it with the same
+    fingerprint-guarded orphan reap as the sweep (instead of refusing), so
+    `session reset` / `endSession` recover instead of deadlocking."""
+    from browserwright.daemon import _ipc
+    from browserwright.daemon.server import executor_registry as er
+
+    monkeypatch.setattr(_ipc, "runtime_dir", lambda: tmp_path)
+    # A live executor, recorded by itself (start_time fingerprint included).
+    executor = _FakeProc(alive=True)
+    monkeypatch.setattr(er, "_pid_alive", lambda pid: executor._alive)
+    _ipc.write_executor_file(
+        "sess-orphan", str(_ipc.executor_sock_path("sess-orphan")),
+        executor.pid, executor_id="executor-orphan")
+    # The record is on disk but the registry has no handle (fresh daemon).
+    reaped: list[int] = []
+
+    def fake_orphan_reap(pid, start_time=None):
+        reaped.append(pid)
+        executor._alive = False  # the executor dies; init reaps it
+        return True
+
+    monkeypatch.setattr(er, "_terminate_orphan_and_wait", fake_orphan_reap)
+
+    reg = ExecutorRegistry()
+    result = await reg.kill_and_wait("sess-orphan")
+
+    assert reaped == [executor.pid]
+    assert result == {
+        "killed": True,
+        "reaped": True,
+        "matched": True,
+        "executor_id": None,
+    }
+    assert _ipc.read_executor_record("sess-orphan") is None, \
+        "the stale discovery record must be cleaned up after the reap"
+
+
+@pytest.mark.asyncio
+async def test_kill_and_wait_refuses_when_orphan_reap_cannot_confirm(
+    monkeypatch, tmp_path,
+):
+    """Issue #40: when the fingerprint-guarded orphan reap cannot confirm
+    death (still alive after TERM→KILL), the daemon keeps refusing — the
+    caller keeps the retry semantics instead of a false success."""
+    from browserwright.daemon import _ipc
+    from browserwright.daemon.server import executor_registry as er
+
+    monkeypatch.setattr(_ipc, "runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(er, "_pid_alive", lambda pid: True)
+    _ipc.write_executor_file(
+        "sess-orphan", str(_ipc.executor_sock_path("sess-orphan")),
+        4242, executor_id="executor-orphan")
+    monkeypatch.setattr(er, "_terminate_orphan_and_wait",
+                        lambda pid, start_time=None: False)
+
+    reg = ExecutorRegistry()
+    result = await reg.kill_and_wait("sess-orphan")
+
+    assert result == {
+        "killed": False,
+        "reaped": False,
+        "matched": True,
+        "executor_id": None,
+    }
+    assert _ipc.read_executor_record("sess-orphan") is not None, \
+        "files are retained for the retry when death is not confirmed"
+
+
+@pytest.mark.asyncio
 async def test_kill_blocks_replacement_until_exact_instance_is_dead(monkeypatch):
     reg = ExecutorRegistry()
     old = _handle("sess-race", "/tmp/old.sock", executor_id="executor-old")

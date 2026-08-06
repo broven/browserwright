@@ -232,6 +232,23 @@ tombstone. A failed/partial teardown flips the phase back to `active` and
 installs no tombstone, so `endSession` retries resume (extension retry anchors
 are written before the first destructive browser write).
 
+**Daemon-death recovery (issue #40):** the daemon is the executor's owner, so
+all of the above assumes a reachable daemon. When the daemon is unreachable,
+`session end`/`session reset` fall back to a daemon-independent local reap:
+Layer 2 reads the executor's on-disk discovery record (pid + start-time
+fingerprint — the same graded TERM→KILL discipline as the daemon's startup
+orphan sweep) and reaps the executor itself. `session end` then force-drops
+the ledger entry when the executor is provably gone (reaped locally, dead, or
+absent) instead of keeping it "for retry" forever — a retry against an
+unreachable daemon can never succeed, and the orphan otherwise blocks the
+next bind with a CDP attach conflict. The workspace is NOT torn down on this
+path (no daemon to close tabs/Chrome), which the CLI's success message says
+explicitly. When the daemon IS up, its teardown stays authoritative and the
+#32 retry/join semantics are unchanged. A restarted daemon additionally
+reaps a live record it has no `Popen` handle for (fingerprint-guarded, same
+as the sweep) instead of refusing, so `kill-executor`/`endSession` heal the
+session even when the executor survived the startup sweep.
+
 ## Common Mistakes To Avoid
 
 - Treating tab groups as the universal session workspace. They are extension
