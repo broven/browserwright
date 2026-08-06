@@ -1030,19 +1030,6 @@ def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
     assert reg.get(sid) is not None
 
 
-def test_session_registry_unique_name_conflict_does_not_advance_ledger(tmp_bs_home):
-    from browserwright import session_registry as reg
-
-    first = reg.allocate(backend="cdp", owner="create", name="job", unique_name=True)
-    with pytest.raises(ValueError):
-        reg.allocate(backend="extension", owner="attach", name="job", unique_name=True)
-    second = reg.allocate(backend="extension", owner="attach", name="other", unique_name=True)
-
-    assert first == "1"
-    assert second == "2"
-    assert [row["name"] for row in reg.list_all()] == ["job", "other"]
-
-
 def test_session_registry_backend_immutability_leaves_record_unchanged(tmp_bs_home):
     from browserwright import session_registry as reg
 

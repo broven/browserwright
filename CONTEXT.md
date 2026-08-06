@@ -100,9 +100,9 @@ Four jobs, all load-bearing:
   record that doesn't match this daemon, fails closed — never a silent
   fallback to the shared context.
 - **admission control** — the guards that must be atomic live inside the
-  ledger's lock, because check-and-allocate has to be one step: today that is
-  the opt-in unique-`name` guard (**dormant** — only tests enable it; names are
-  not unique, see `session`).
+  ledger's lock, because check-and-mutate has to be one step: today that is
+  `update()`'s backend-immutability guard (`backend` is fixed at creation, see
+  `session`).
   A rejected write leaves the ledger byte-identical.
 - **idle clock** — `last_seen` advances when a new instruction arrives,
   *deliberately not* with executor liveness (a stuck executor must not keep a
