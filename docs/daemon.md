@@ -1,6 +1,6 @@
 # browserwright-daemon
 
-**一个长驻的全局 daemon**，把 Chrome 的多种"远程调试入口"统一抽象成一个本地 CDP 代理。它监听固定的 unix socket（`${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`），同时服务多个 session：extension session 共享一条 relay upstream（用户日常 Chrome），rdp session 各自拿到 daemon 启动并持有的隔离 Chrome。上层（`browserwright` skill CLI、固化脚本等）只连 daemon socket，不关心底层是 `--remote-debugging-port` 还是浏览器插件 relay。
+**一个长驻的全局 daemon**，把 Chrome 的多种"远程调试入口"统一抽象成一个本地 CDP 代理。它监听固定的 unix socket（`${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`），同时服务多个 session：extension session 共享一条 relay upstream（用户日常 Chrome），cdp session 各自拿到 daemon 启动并持有的隔离 Chrome。上层（`browserwright` skill CLI、固化脚本等）只连 daemon socket，不关心底层是 `--remote-debugging-port` 还是浏览器插件 relay。
 
 daemon 只有长驻的 `serve` 模式：所有调用方（skill、固化脚本）都连 daemon socket，daemon 代理 CDP 流量。（旧的一次性 resolver 用法 `browserwright-daemon url`（Mode A）已移除；需要外部脚本直连时用 Playwright facade `ws://127.0.0.1:19990/cdp`。）
 
@@ -31,7 +31,7 @@ $ browserwright-daemon extension-path --json    # prints the absolute path
 
 # 2. Start the relay (typically as a LaunchAgent / systemd unit).
 #    One global daemon, fixed socket — `serve` needs no --backend (it serves
-#    the shared extension upstream plus per-session rdp) and no --name.
+#    the shared extension upstream plus per-session cdp) and no --name.
 $ browserwright-daemon serve
 ```
 
@@ -59,7 +59,7 @@ $ browserwright-daemon doctor
 
 | 命令 | 作用 |
 |---|---|
-| `browserwright-daemon serve` | 运行单全局 daemon（shared extension relay + per-session rdp） |
+| `browserwright-daemon serve` | 运行单全局 daemon（shared extension relay + per-session cdp） |
 | `browserwright-daemon status [--json]` | 报告 daemon 存活状态、socket endpoint、facade 端口 |
 | `browserwright-daemon stop` / `restart` | 停止 / 重启 daemon（restart 走 LaunchAgent） |
 | `browserwright-daemon doctor` | 详细诊断每个 backend 状态（端口、文件路径、HTTP 响应等） |
@@ -81,7 +81,7 @@ $ browserwright-daemon doctor
 | name | 说明 | 选择方式 |
 |---|---|---|
 | `env` | 直接读环境变量 `BD_CDP_WS`（完整 ws URL）或 `BD_CDP_URL`（`http://host:port`，再走 `/json/version` 解析），绑定一个外部持有的浏览器（如 anti-detect profile） | shared upstream 通过 `--backend env` / `BD_BACKEND` / `default_backend` 选择 |
-| `rdp` | 真实 browser-level CDP 端口。session `--create` 时 daemon 自己启动并持有隔离 Chrome；`--attach` 时连接外部暴露的端口 | 按 session ledger 分流（`browserwright session new --backend=rdp`） |
+| `cdp` | 真实 browser-level CDP 端口。session `--create` 时 daemon 自己启动并持有隔离 Chrome；`--attach` 时连接外部暴露的端口 | 按 session ledger 分流（`browserwright session new --backend=cdp`） |
 | `extension` | 用户安装的 Chrome 扩展走 `chrome.debugger` API；daemon 在 `127.0.0.1:19989` 起 relay ws server，扩展连过来后 daemon 把标准 CDP 流量翻译成 `chrome.debugger.sendCommand` 调用。**驱动用户日常 Chrome 的唯一路径**。 | `browserwright-daemon serve` 默认启动这个 shared relay；具体 session 仍用 `browserwright session new --backend=extension` 选择 |
 
 ## v0.4 extension backend
@@ -126,7 +126,7 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 正确用法：**Agent / Skill 在需要操作 tab 时主动 attach**。三个入口：
 
 - `attach_active()` — 把 Chrome focused window 的 active tab **adopt 进本 session 的 tab group**（黄条出现，因为这正是你想看到 Agent 操作的 tab）；该 tab 已属于另一个 session 的 group 时拒绝、不抢
-- `open(url, background=True)` — 统一开页动词，开新 tab 进本 session 的 group（`background=True` 在 extension 下 `active:false` 不抢焦点，rdp 下无人争焦点故为 no-op）。黄条出现在那个 tab 上但你看不见。`open_background`/`new_tab` 仍作为 deprecated 别名保留
+- `open(url, background=True)` — 统一开页动词，开新 tab 进本 session 的 group（`background=True` 在 extension 下 `active:false` 不抢焦点，cdp 下无人争焦点故为 no-op）。黄条出现在那个 tab 上但你看不见。`open_background`/`new_tab` 仍作为 deprecated 别名保留
 - `close_tab(target_id=...)` — Agent 操作完后显式关闭
 
 对应 CLI：`browserwright-daemon attach-active` / `open-background --url X` / `close-tab --target-id ext-tab-N`。
@@ -159,7 +159,7 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 
 字段：`ts`（ISO-8601 UTC）、`level`、`logger`、`msg`，可选 `extra`（来自 `logger.info(..., extra={...})`）、可选 `exc_info`。
 
-`browserwright-daemon serve` 是单全局 daemon：无 `--backend` 时启动默认 shared `extension` relay，rdp sessions 根据 session ledger 懒创建自己的 upstream context。`--backend` 只用于覆盖 shared upstream（例如 env 调试），不是安装或启动一个“只服务某 backend”的 daemon。
+`browserwright-daemon serve` 是单全局 daemon：无 `--backend` 时启动默认 shared `extension` relay，cdp sessions 根据 session ledger 懒创建自己的 upstream context。`--backend` 只用于覆盖 shared upstream（例如 env 调试），不是安装或启动一个“只服务某 backend”的 daemon。
 
 ## 配置（可选）
 
@@ -167,10 +167,10 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重�
 
 ```toml
 # 覆盖 daemon shared upstream（与 `BD_BACKEND` 等价；
-# CLI `--backend` 仍最高优先级）。不影响 rdp session 按 ledger 分流。
+# CLI `--backend` 仍最高优先级）。不影响 cdp session 按 ledger 分流。
 default_backend = "extension"
 
-[backends.rdp]
+[backends.cdp]
 port = 9222
 
 [backends.extension]
@@ -199,12 +199,12 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_CDP_WS` | 直接指定 ws URL，`env` backend 读取这个 |
 | `BD_CDP_URL` | 指定 HTTP discovery URL（如 `http://127.0.0.1:9222`），`env` backend 通过 `/json/version` 取 ws URL |
 | `BD_BACKEND` | 等同于 `--backend`，命令行参数优先 |
-| `BD_RDP_PORT` | `rdp` backend 的端口（v0.4.1 起）。优先级：CLI `--port` > `BD_RDP_PORT` > toml > 9222 默认。**配合 `BD_BACKEND=rdp` 锁定到隔离 Chrome 时务必同时设这个**——否则 daemon 用 9222 默认值撞上用户日常 Chrome，Allow 弹窗连发 |
+| `BD_CDP_PORT` | `cdp` backend 的端口（v0.4.1 起）。优先级：CLI `--port` > `BD_CDP_PORT` > toml > 9222 默认。**配合 `BD_BACKEND=cdp` 锁定到隔离 Chrome 时务必同时设这个**——否则 daemon 用 9222 默认值撞上用户日常 Chrome，Allow 弹窗连发 |
 | `BD_TIMEOUT` | 单 backend resolve 超时秒数 |
 | `BD_CHROME_BINARY` | 指定 Chrome 可执行文件路径（`launch-chrome` 用） |
 | `BD_IDLE_CLOSE_AFTER` | Mode B serve idle 关 upstream 的秒数；不设/≤0 = 永不 |
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
-| `BD_PORT` | `BD_RDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 rdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_RDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
+| `BD_PORT` | `BD_CDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 cdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_CDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
 | `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988；e2e 测试用它隔离（29989）|
 | `BD_FACADE_PORT` | Playwright facade 的绑定端口。优先级：CLI `--facade-port` > `BD_FACADE_PORT` > toml `facade_port` > 默认 19990。`0` = 显式关闭 facade |
 | `BD_FACADE_HOST` | Playwright facade 的绑定 host（默认 `127.0.0.1`，loopback）。优先级：CLI `--facade-host` > `BD_FACADE_HOST` > toml `facade_host` > 默认。设成 Tailscale/LAN IP 或 `0.0.0.0` 让别的机器 `connect_over_cdp` 进来；facade 的 `/json/version` 会按请求的 `Host` 头回填 `webSocketDebuggerUrl`，远端拿到的就是它自己用的地址 |

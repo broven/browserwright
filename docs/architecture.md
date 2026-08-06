@@ -16,18 +16,18 @@ src/browserwright/        Layer 2: agent CLI, sessions, primitives, site skills,
         ↓
 src/browserwright/daemon/ Layer 1: the global daemon — CDP proxy, backends, extension relay,
         ↓                 Playwright facade
-Chrome (daily via extension relay / daemon-owned isolated via rdp / external via env)
+Chrome (daily via extension relay / daemon-owned isolated via cdp / external via env)
 ```
 
 - **One long-lived global daemon** on the fixed socket
   `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`. It serves all sessions
   at once: extension sessions share one relay upstream (the user's real
-  Chrome), each rdp session gets its own daemon-owned Chrome, env sessions
+  Chrome), each cdp session gets its own daemon-owned Chrome, env sessions
   bind to an externally-owned CDP endpoint.
 - **A session is the isolation key.** Its backend is chosen at
   `browserwright session new` and immutable afterwards; the daemon routes each
   client by reading the session ledger. On extension the session's workspace is
-  a Chrome tab group; on rdp/env it is the browser instance.
+  a Chrome tab group; on cdp/env it is the browser instance.
 - **One session, one resident executor, one Playwright controller.** Browser
   code and tasks for a session run FIFO in that executor and reuse its live
   page/context. A request deadline or reset recycles that exact executor and
@@ -87,7 +87,7 @@ touching any of the above.
 | CLI binary | `~/.local/bin/browserwright{,-daemon}` | invoking `browserwright …` runs the global one against your code |
 | Daemon socket | `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock` (single fixed name) | two daemons cannot share it — the second refuses to start |
 | Extension relay port | `127.0.0.1:19989` | starting a second relay there steals connections from the global extension |
-| RDP port | `9222` (Chrome's default) | a stray `--remote-debugging-port=9222` collides with your daily Chrome and pops Allow dialogs |
+| CDP port | `9222` (Chrome's default) | a stray `--remote-debugging-port=9222` collides with your daily Chrome and pops Allow dialogs |
 | Daemon TOML config | `~/.config/browserwright-daemon/config.toml` (override with `BD_CONFIG`) | inherited backend / port settings leak into your dev daemon |
 | Skill home | `~/.browserwright/` (override with `BS_HOME`) | site-skill writes and memory leak across instances |
 | Chrome profile | the user's daily profile | `--load-extension` / `--remote-debugging-port` ruin it on Chrome 144+ |
@@ -123,8 +123,8 @@ which port is which:
 | Knob | Production (global) | Isolated dev | Env / flag |
 |---|---|---|---|
 | extension relay port | 19989 | 29989 | `BD_EXTENSION_PORT` / `--extension-port` |
-| rdp port | 9222 | 29990 | `BD_RDP_PORT` / `--port` |
-| Playwright facade port | 19990 | 29993 (extension) / 29994 (rdp) | `--facade-port` / `BD_FACADE_PORT` |
+| cdp port | 9222 | 29990 | `BD_CDP_PORT` / `--port` |
+| Playwright facade port | 19990 | 29993 (extension) / 29994 (cdp) | `--facade-port` / `BD_FACADE_PORT` |
 | Playwright facade host | `127.0.0.1` (loopback) | tailnet/LAN IP or `0.0.0.0` to reach off-box | `--facade-host` / `BD_FACADE_HOST` |
 | daemon socket dir | `${XDG_RUNTIME_DIR:-/tmp}` | `$(mktemp -d)` | `XDG_RUNTIME_DIR` |
 | daemon TOML config | `~/.config/browserwright-daemon/config.toml` | none | `BD_CONFIG=""` |
@@ -146,9 +146,9 @@ Both run entirely in-process with mocks. They bind nothing, launch no
 Chrome, and do not touch the global daemon or extension. Safe to run
 concurrently with the user's daily browsing.
 
-### Step 4: run the `rdp` backend manually (isolated Chrome, no extension needed)
+### Step 4: run the `cdp` backend manually (isolated Chrome, no extension needed)
 
-The `rdp` backend launches its own Chrome with `--remote-debugging-port`
+The `cdp` backend launches its own Chrome with `--remote-debugging-port`
 and a fresh `--user-data-dir`. No extension involved, no daily-Chrome
 collision.
 
@@ -162,7 +162,7 @@ uv run browserwright-daemon launch-chrome \
 #   → {"ws_url":"ws://127.0.0.1:29990/devtools/browser/...","pid":12345,...}
 
 # 3. Drive it through the LOCAL CLI (note `uv run`).
-BD_PORT=29990 BD_BACKEND=rdp uv run browserwright <<'PY'
+BD_PORT=29990 BD_BACKEND=cdp uv run browserwright <<'PY'
 page.goto("https://example.com", wait_until="load")
 print(page.title())
 PY
@@ -173,8 +173,8 @@ rm -rf "$XDG_RUNTIME_DIR"
 unset XDG_RUNTIME_DIR
 ```
 
-Common pitfall: `BD_BACKEND=rdp` without an explicit `BD_PORT` /
-`BD_RDP_PORT` falls back to `9222`, which is your daily Chrome's
+Common pitfall: `BD_BACKEND=cdp` without an explicit `BD_PORT` /
+`BD_CDP_PORT` falls back to `9222`, which is your daily Chrome's
 discovery port whenever that Chrome is running. Always pin the port.
 
 ### Step 5: run the extension backend against a real Chrome — use the e2e harness
@@ -226,7 +226,7 @@ End-to-end isolation matrix (kept in sync with `tests/daemon/e2e/README.md`):
 | Dimension | Production (daily) | Test (this harness) |
 |---|---|---|
 | daemon extension port | 19989 | 29989 |
-| daemon RDP port | default (9222) | 29990 |
+| daemon CDP port | default (9222) | 29990 |
 | daemon socket dir | `${XDG_RUNTIME_DIR:-/tmp}` | throwaway tmpdir |
 | Chrome `user-data-dir` | the user's daily profile | per-test tmpdir |
 | Chrome binary | Google Chrome | Chrome for Testing |
@@ -316,7 +316,7 @@ If `lsof :19989` and `lsof :29989` print **different** PIDs (or
 | `port 29989 already in use` from `run.sh` | a previous interrupted e2e run left a daemon | `lsof -ti :29989 \| xargs kill` and rerun |
 | extension never connects within 10s | the patched `RELAY_URL` doesn't match the daemon's `--extension-port`, or Chrome failed to load the patched dir | check `tests/daemon/e2e/_artifacts/daemon.log` and confirm both numbers match |
 | "Chrome for Testing not found" | CfT not installed | `npx @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing` |
-| your daily Chrome starts popping Allow dialogs | a stray client opened a ws on 9222 against the daily profile | check that every dev invocation sets `BD_PORT` / `BD_RDP_PORT` to 29990, never 9222 |
+| your daily Chrome starts popping Allow dialogs | a stray client opened a ws on 9222 against the daily profile | check that every dev invocation sets `BD_PORT` / `BD_CDP_PORT` to 29990, never 9222 |
 | `browserwright` resolves to the global binary | you dropped the `uv run` prefix | reinstate it; `uv run which browserwright` must point at `.venv/` |
 
 For deeper context on the e2e harness, see
@@ -333,14 +333,14 @@ this machine." Here's how to choose:
 Are you running scripted / iterative tests?
 ├── yes → use the isolated profile (wizard option 1 — recommended).
 │         `browserwright-daemon launch-chrome --port 9333 --profile /tmp/bs-dev`
-│         then `BD_PORT=9333 BD_BACKEND=rdp browserwright ...`
+│         then `BD_PORT=9333 BD_BACKEND=cdp browserwright ...`
 └── no → are you driving the user's daily Chrome?
         ├── yes → extension backend — load the unpacked relay
         │         extension once; subsequent calls reuse the same ws,
         │         zero popups.
         └── do you have a special browser source?
             ├── fingerprint browser (AdsPower / MultiLogin / GoLogin /
-            │   比特浏览器) → rdp attach, supply the port your tool exposes
+            │   比特浏览器) → cdp attach, supply the port your tool exposes
             └── an externally-owned browser exposing a browser-level CDP ws
                 (anti-detect profile, e.g. CloakBrowser) → env:
                 `BD_CDP_WS=ws://… browserwright-daemon serve --backend env`,

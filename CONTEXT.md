@@ -52,38 +52,89 @@ What a session's browser *is*, materially. Backend-specific:
 | backend | workspace | isolation boundary |
 |---|---|---|
 | `extension` | one Chrome tab group inside the user's real Chrome | the tabs in that group |
-| `rdp` create | a daemon-owned Chrome instance + profile | the browser instance |
-| `rdp` attach | an externally-owned browser on a recorded port | the browser instance |
-| `env` | an externally-owned browser resolved from `BD_CDP_WS` / `BD_CDP_URL` | the browser instance |
+| `cdp` create | a daemon-owned Chrome instance + profile | the browser instance |
+| `cdp` attach | an externally-owned browser at that session's recorded port or URL | the browser instance |
 
 **Trap:** tab groups are the extension workspace **only**. Never create or
-simulate them for `rdp` / `env`. And a tab group isolates tab membership — not
+simulate them for `cdp`. And a tab group isolates tab membership — not
 cookies, localStorage, or login state. All extension sessions share the user's
 one Chrome profile.
 
 ### backend
-`extension` | `rdp` | `env`. Chosen at `browserwright session new` and
+`extension` | `cdp`. Chosen at `browserwright session new` and
 **immutable for the life of the session**. The daemon reads it from the ledger,
 never from the client's environment.
 
 ### raw-CDP backend
-`rdp` and `env` together — the backends that speak real browser-level CDP.
+`cdp` — the backend that speaks real browser-level CDP, whether we launched
+the browser (`--create`) or were handed an endpoint (`--attach=<port|url>`).
 The discriminator is `Router._raw_cdp_backend`, defined as
 `backend != "extension"`, because extension is the sole relay backend.
 
-**Trap:** never write `backend == "rdp"` to mean this. `env` joined the family
-later (issue #20) and a name check silently excludes it.
+**Trap:** never write a name check to mean this. The family had two members
+(`rdp`, `env`) until #38 merged them, and `backend == "rdp"` silently excluded
+the other one for a whole release. It has one member today, so the predicate
+looks redundant — keep it anyway: it says *"the browser connection is the
+workspace boundary"*, which is the property every caller actually depends on.
 
 ### ledger
-The durable session registry: a flock'd read-modify-write JSON file at
-`$BS_HOME/sessions/ledger.json` (`BS_HOME` defaults to `~/.browserwright`).
-Holds each session's immutable backend plus its runtime state (current target,
-extension `group_id`).
+The durable session registry — one lock-serialized JSON file per `BS_HOME`
+(`$BS_HOME/sessions/ledger.json`, `BS_HOME` defaults to `~/.browserwright`).
+It is the **only** thing here that outlives every process: daemons restart,
+executors are fail-stopped, Chrome closes, and each agent command is a fresh
+shell — the session survives all of it because the ledger does.
 
-**Trap:** `runtime.group_id` is load-bearing durable state, not a cosmetic
-label — it is how the daemon finds the same tab group again after a restart.
-It is a *candidate*, never proof: ownership of a group is proven by the
-extension's per-tab markers (see `binding`).
+A record has two tiers, and conflating them is the recurring bug:
+
+| tier | fields | authority |
+|---|---|---|
+| durable fact | `id` · `backend` · `owner` · `workspace` · `name` · `created_at` · `last_seen` | authoritative — the daemon obeys these |
+| runtime cache | `runtime.{current_target_id, group_id, owned_tab_ids, updated_at}` | a *candidate* — written best-effort, re-proven against the live browser |
+
+Four jobs, all load-bearing:
+
+- **identity** — `next_id` mints session ids. There is no other allocator.
+- **routing authority** — the daemon resolves a session's backend and upstream
+  context by reading its record, never from a client param or the client's
+  environment; `backend` is immutable for the session's life. No record, or a
+  record that doesn't match this daemon, fails closed — never a silent
+  fallback to the shared context.
+- **admission control** — the guards that must be atomic live inside the
+  ledger's lock, because check-and-allocate has to be one step: today that is
+  the opt-in unique-`name` guard (**dormant** — only tests enable it; names are
+  not unique, see `session`).
+  A rejected write leaves the ledger byte-identical.
+- **idle clock** — `last_seen` advances when a new instruction arrives,
+  *deliberately not* with executor liveness (a stuck executor must not keep a
+  session alive forever). Auto-prune measures it, and removes a row only after
+  that session's workspace teardown is confirmed.
+
+**Trap — `runtime` is a cache, not the record.** `runtime.group_id` is
+load-bearing durable state, not a cosmetic label: it is how the daemon finds
+the same tab group again after a restart. But it is a *candidate*, never proof
+— ownership is proven by the extension's per-tab markers (see `binding`).
+
+**Trap — readers bypass the lock.** Reads are unlocked for speed (which is why
+writes are atomic: a reader sees the old ledger or the new one, never half of
+one). So any check-then-act is a race unless the whole sequence runs inside the
+lock — and why the retired-backend sweep runs inside `_locked` rather than as
+a read followed by `update()`.
+
+**Trap — it is a credential store.** A record can carry a CDP endpoint with an
+embedded bearer token, which is what justifies the owner-only file and
+directory. Don't add a field, log line, or debug dump that leaks one.
+
+### owner
+`create` | `attach`, fixed at session creation. The single thing that decides
+whether teardown **closes a browser**: `create` means the daemon launched it
+and will close it; `attach` means someone else owns it and teardown leaves it
+running. Only `cdp --create` is create-owned. `extension` and `cdp --attach`
+are always `attach` — the user's Chrome and someone else's browser are never
+ours to kill.
+
+**Trap:** owner governs the *browser*, nothing else. An attach-owned extension
+session still closes its own tab group, and the executor is reaped on every
+backend regardless of owner.
 
 ### daemon
 The single global process listening on
@@ -101,7 +152,7 @@ The daemon's connection **out toward the browser**. The mirror of downstream.
 Two implementations exist today, playing the same role:
 
 - `UpstreamConnection` (`daemon/server/upstream.py`) — a raw websocket to a real
-  browser-level CDP endpoint. Used by `rdp` and `env`.
+  browser-level CDP endpoint. Used by `cdp`.
 - `ExtensionUpstream` (`daemon/server/extension_upstream.py`) — the relay plus
   the Chrome extension's `chrome.debugger`, adapted to look like the above.
 
@@ -110,8 +161,8 @@ declared interface — `Router` is wired to whichever one by assigning twelve
 mutable attributes in a required order. See *Being introduced* below.
 
 ### UpstreamContext
-One bundle per live upstream: `{ state, router, holder }`. `extension` and `env`
-sessions share the daemon's one context; each `rdp` session gets its own,
+One bundle per live upstream: `{ state, router, holder }`. `extension` sessions
+share the daemon's one context; each `cdp` session gets its own,
 created lazily from its ledger record.
 
 ### relay
@@ -134,7 +185,7 @@ executor `state` does not, and `finally` blocks are not guaranteed.
 
 ### facade
 The CDP-speaking server (default port **19990**) that Playwright's
-`connect_over_cdp` connects to. For `rdp` / `env` it is a byte-for-byte
+`connect_over_cdp` connects to. For `cdp` it is a byte-for-byte
 passthrough. For `extension` it is a *synthesis* layer that maps browser-level
 CDP concepts onto the session's tab group.
 
@@ -158,7 +209,7 @@ nearest honest equivalent — never a fabricated value, and **never `-32601`**.
 
 ### binding
 The link from a session to its live browser handle: the numeric `group_id` on
-`extension`, the attached target on `rdp` / `env`. Live binding lives in
+`extension`, the attached target on `cdp`. Live binding lives in
 process; the ledger holds the durable copy used to recover after a restart.
 
 **Extension anchor (issue #29):** ownership is *derived*, not asserted. The
@@ -200,10 +251,10 @@ The declared interface both upstream implementations will satisfy, replacing
 `Router`'s twelve mutable callback slots. Session-shaped, not transport-shaped:
 `open_tab` · `close_tab` · `list_tabs` · `current_page` · `attach_active` ·
 `end_session` · `recover` · `send_cdp`. Its two adapters are
-`ExtensionUpstream` and `CdpUpstream` (the latter covering `rdp` **and** `env`).
+`ExtensionUpstream` and `CdpUpstream`.
 
 The adapter also becomes the **owner of the live binding** — the tab group is an
-implementation detail of `ExtensionUpstream`; `rdp` has no such concept.
+implementation detail of `ExtensionUpstream`; `cdp` has no such concept.
 
 ### in-flight registry
 One place holding every in-flight request with a start time, readable through a
@@ -220,4 +271,7 @@ table with no timestamp, so a hung daemon is indistinguishable from an idle one.
 | `--name` as an identity key | It is a human label only. Use session id, or `group_id` for extension recovery. |
 | `_owned` / `_borrowed` tab sets | Being deleted — group membership (`chrome.tabs.query({groupId})`) is the single source of truth. |
 | Querying a tab group by title | Gone from `background.js`. Titles are user-editable and not unique; key on numeric `groupId`. |
-| `backend == "rdp"` as "speaks raw CDP" | Use `_raw_cdp_backend` (`!= "extension"`) — `env` is in the family too. |
+| `backend == "rdp"` as "speaks raw CDP" | Use `_raw_cdp_backend` (`!= "extension"`). A name check excluded `env` for a whole release. |
+| `rdp` / `env` as backend values | Both are `cdp` (#38). `--remote-debugging-port` named a launch flag, not the protocol — and a cloud browser hands you a URL, never a port. |
+| `BD_CDP_WS` / `BD_CDP_URL` / `BU_*` | Gone. A CDP endpoint is per-session ledger state (`workspace.url`), not process-global. |
+| one `env` session per daemon socket | Gone with `daemon_scope`. One daemon holds N attached browsers. |

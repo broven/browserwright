@@ -38,8 +38,8 @@ in Chinese; an English ADR will be rewritten. Three things stay in English:
 - the **filename slug** (`0004-agent-chooses-backend.md`) — it is a path and a
   numbering anchor;
 - **code identifiers** verbatim — `backend != "extension"`, `_raw_cdp_backend`,
-  `Target.setAutoAttach`, `daemon.preferred_backend`, file paths, `rdp` / `env`
-  / `extension` as literal backend values;
+  `Target.setAutoAttach`, `daemon.preferred_backend`, file paths, `cdp` /
+  `extension` as literal backend values;
 - **links and citations** to code and external projects.
 
 This applies to ADRs only. `CONTEXT.md` and the rest of `docs/` stay in English.

@@ -14,8 +14,10 @@ Choices (order matters — the default is option 1):
      popups or banners. Requires loading the unpacked extension from
      ``browserwright-daemon/chrome-extension/``. Surfaced as live when the
      daemon's ``doctor`` reports the extension backend available.
-  4. External CDP endpoint (env) — a browser the user started themselves
-     that exposes a browser-level CDP ws; daemon connects via BD_CDP_WS.
+  4. External CDP endpoint — a browser the user started themselves (cloud,
+     anti-detect, fingerprint) that exposes a browser-level CDP ws or http
+     URL. Recorded per session via ``--attach=<url>``, so one daemon can hold
+     several at once.
 
 Detection is minimal — we ask the user.
 """
@@ -41,10 +43,11 @@ _OPTIONS: list[Tuple[str, str, str, str]] = [
     ("3", "extension",
      "Browser extension relay (drives your daily Chrome, no popup)",
      "通过加载到 Chrome 的扩展中继 CDP，零 popup、零横幅；连接日常 Chrome 的唯一路径。"),
-    ("4", "env",
-     "External CDP endpoint (anti-detect / fingerprint profile, e.g. CloakBrowser)",
-     "你自己起好的浏览器，暴露一个 browser-level CDP ws；daemon 用 BD_CDP_WS 连它。\n"
-     "     attach 语义：session end 不会关这个浏览器。多 profile 请起多个隔离 daemon。"),
+    ("4", "cdp",
+     "External CDP endpoint (anti-detect / fingerprint / cloud browser)",
+     "你自己起好的浏览器，暴露一个 browser-level CDP ws 或 http 地址。\n"
+     "     attach 语义：session end 不会关这个浏览器。多 profile 直接开多个会话，\n"
+     "     一个 daemon 就够——每个会话各带各的 endpoint。"),
 ]
 
 
@@ -183,25 +186,23 @@ def run() -> int:
             return 1
 
     if choice == "4":
-        # env has no config.toml section — the daemon reads BD_CDP_WS /
-        # BD_CDP_URL from its environment at serve time, so the wizard just
-        # echoes the ready-to-run command.
+        # The endpoint is per-session ledger state now (#38), so there is
+        # nothing for the wizard to write into config.toml or an env var — it
+        # just shows the command that records it.
         cdp = _prompt(
-            "External CDP ws or http URL "
-            "(BD_CDP_WS / BD_CDP_URL; blank to set it later)",
+            "External CDP ws or http URL (blank to fill in later)",
             default="",
         ).strip()
-        var = "BD_CDP_URL" if cdp.startswith("http") else "BD_CDP_WS"
         example = cdp or "ws://127.0.0.1:8080/api/profiles/<id>/cdp"
         print()
-        print("env is driven by an env var at daemon-serve time. Start the "
-              "daemon against your browser:")
-        print(f"    {var}={example} browserwright-daemon serve --backend env")
-        print("then bind an agent session:")
-        print("    browserwright session new --backend=env --name=<label>")
-        print("For N profiles run N isolated daemons (each its own "
-              "XDG_RUNTIME_DIR + --facade-port + BD_CDP_WS) — see "
-              "docs/session-workspaces.md §\"Env Backend\".")
+        print("The endpoint belongs to the session, not the daemon. Bind one:")
+        print(f"    browserwright session new --backend=cdp --attach={example} "
+              "--name=<label>")
+        print("Repeat for as many profiles as you need — one daemon serves them")
+        print("all, each session on its own browser.")
+        print()
+        print("The URL is stored in the ledger (0600) and redacted wherever it "
+              "is printed, so a token embedded in it is safe to pass here.")
 
     print()
     print(f"Selected: {label}")

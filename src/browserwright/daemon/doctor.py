@@ -163,9 +163,11 @@ def _needs_action(backend_name: str) -> str | None:
       - `extension` row updated from the stale "planned v0.4" placeholder
         to the v0.4-shipped install path.
     """
-    if backend_name == "env":
-        return "set BD_CDP_WS or BD_CDP_URL to your CDP endpoint"
     if backend_name == "cdp":
+        # Doctor probes the daemon-wide config, where `endpoint` is always None
+        # (it is per-session), so this row can only ever speak for a local
+        # browser. `--attach=<url>` reachability is checked when the session
+        # opens, not here.
         return "launch Chrome with --remote-debugging-port=9222 (or use launch-chrome)"
     if backend_name == "extension":
         return ("load the unpacked extension from browserwright-daemon/chrome-extension/ "

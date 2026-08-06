@@ -16,8 +16,8 @@ agent 直接继承用户已有的登录，完全跳过认证环节。extension b
 不是「**身份**」。
 
 隔离身份会直接摧毁这个 backend 的目的，所以我们不做。真正需要隔离的任务应该走
-raw-CDP 家族（`backend != "extension"`）—— 那里一个 `rdp` 会话拥有自己的浏览器和
-profile，因而也拥有自己独立的 cookie 与登录态。谁来做这个选择见
+raw-CDP 家族（`backend != "extension"`）—— 那里一个 `cdp --create` 会话拥有自己的
+浏览器和 profile，因而也拥有自己独立的 cookie 与登录态。谁来做这个选择见
 [ADR-0004](0004-agent-chooses-backend.md)。
 
-tab group **只属于** extension backend。绝不要为 `rdp` / `env` 创建或模拟它。
+tab group **只属于** extension backend。绝不要为 `cdp` 会话创建或模拟它。
