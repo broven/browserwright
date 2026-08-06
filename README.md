@@ -262,4 +262,4 @@ rm -rf ~/.cache/browserwright-daemon ~/.browserwright
 
 ## License
 
-TBD — currently un-licensed source-available. Add a `LICENSE` file before publishing.
+[GNU AGPL-3.0](LICENSE) — copyleft: modifications must stay open source, including when offered as a network service. If you build on this code, your derivative must be AGPL too. See [LICENSE](LICENSE) for the full terms.
