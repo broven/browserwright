@@ -176,6 +176,30 @@ def remove(session_id: str) -> Optional[dict]:
         return data["sessions"].pop(session_id, None)
 
 
+def redacted(record: Optional[dict]) -> Optional[dict]:
+    """A record safe to print, with any endpoint credential stripped.
+
+    `workspace["url"]` is the one field here that can carry a secret: a cloud
+    or anti-detect browser's CDP URL routinely embeds a reusable token in its
+    userinfo or query string. Before #38 that value lived in a daemon's
+    environment and never in this file, so dumping a record wholesale was safe;
+    it isn't any more.
+
+    Lives beside the record shape on purpose — knowing which field is a
+    credential is part of knowing what a record *is*, and a caller that has to
+    remember to redact will eventually be a caller that forgot.
+    """
+    if not isinstance(record, dict):
+        return record
+    workspace = record.get("workspace")
+    if not isinstance(workspace, dict) or "url" not in workspace:
+        return record
+    from .daemon._net import redact_url
+
+    return {**record,
+            "workspace": {**workspace, "url": redact_url(workspace["url"])}}
+
+
 def list_all() -> list[dict]:
     """All session records, ordered by id."""
     p = _ledger_path()
