@@ -499,17 +499,20 @@ class SessionVerbsMixin:
             attach_owned_raw = (
                 isinstance(record, dict)
                 and record.get("owner") == "attach"
-                and record_backend in ("rdp", "env")
+                and record_backend == "rdp"
             )
             if attach_owned_raw and self.upstream is None:
-                ended: bool | None = None
-                if record_backend == "rdp":
-                    ended = False
-                    teardown_rdp = getattr(
-                        daemon, "teardown_rdp_context", None)
-                    if callable(teardown_rdp):
-                        ended = await teardown_rdp(
-                            session, deadline=teardown_deadline)
+                # Every raw-CDP session has a per-session context now, so there
+                # is no longer a branch where teardown is skipped. `env` used to
+                # fall through here with `ended = None` — it routed to the
+                # shared context and had nothing of its own to drop — which also
+                # meant it could never report failure. It can now, and that is
+                # honest: a context that fails to close is a real partial.
+                ended: bool | None = False
+                teardown_rdp = getattr(daemon, "teardown_rdp_context", None)
+                if callable(teardown_rdp):
+                    ended = await teardown_rdp(
+                        session, deadline=teardown_deadline)
                 ok = ended is not False
                 return {
                     "ok": ok,

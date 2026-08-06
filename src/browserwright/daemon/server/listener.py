@@ -1109,8 +1109,8 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
         if callable(context_for_required):
             try:
                 # Use the same ledger/backend/scope boundary as every live
-                # client. An isolated env daemon must never prune another
-                # daemon's slot.
+                # client, and a legacy/unknown-backend row is skipped rather
+                # than pruned blind.
                 context_for_required(sid)
             except UnknownSessionError:
                 continue

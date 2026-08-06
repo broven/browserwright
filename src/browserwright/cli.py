@@ -588,13 +588,21 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
 
     if sub == "new":
         backend = kw.get("backend")
-        if backend not in ("extension", "rdp", "env"):
-            print("usage: browserwright session new --backend=<extension|rdp|env> "
-                  "--name=SESSION_LABEL [--create | --attach=PORT]", file=sys.stderr)
+        if backend not in ("extension", "rdp"):
+            if backend == "env":
+                # Name the replacement, not just the rejection: `env` was the
+                # same real-CDP backend with the endpoint coming from a
+                # process-global env var instead of the session (#38).
+                print(session_create._unknown_backend_message("env"), file=sys.stderr)
+                return 1
+            print("usage: browserwright session new --backend=<extension|rdp> "
+                  "--name=SESSION_LABEL [--create | --attach=<port|url>]",
+                  file=sys.stderr)
             print("--name is a short task-specific session label. Extension sessions "
-                  "use it as the Chrome tab group title; RDP and env sessions use it "
-                  "only to label the browser session. env binds the agent surface to "
-                  "the daemon's externally-owned upstream (BD_CDP_WS + --backend env).",
+                  "use it as the Chrome tab group title; rdp sessions use it only to "
+                  "label the browser session. --create launches an isolated browser "
+                  "we own; --attach borrows one we don't — a local port (9222) or a "
+                  "CDP URL (ws://…, or https://… for a cloud/anti-detect browser).",
                   file=sys.stderr)
             return 1
         try:

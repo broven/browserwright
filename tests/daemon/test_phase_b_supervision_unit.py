@@ -513,50 +513,6 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_auto_prune_env_respects_daemon_scope(tmp_path, monkeypatch):
-    from browserwright import session_registry as reg
-    from browserwright.daemon.config import Config
-    from browserwright.daemon.server import listener
-    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
-    from browserwright.daemon.server.state import DaemonState
-
-    runtime_dir = tmp_path / "runtime"
-    monkeypatch.setenv("BS_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
-    local_scope = str((runtime_dir / "browserwright-daemon.sock").resolve())
-    local = reg.allocate(
-        backend="env", owner="attach", name="local",
-        env_daemon_scope=local_scope)
-    foreign = reg.allocate(
-        backend="env", owner="attach", name="foreign",
-        env_daemon_scope="/tmp/foreign/browserwright-daemon.sock")
-    for sid in (local, foreign):
-        reg._with_entry(sid, lambda e: e.update(last_seen=0.0))
-
-    class _Router:
-        daemon = None
-
-    class _Registry:
-        async def terminate_session(self, session_id, teardown, *, budget=None):
-            return {"reaped": True}, await teardown()
-
-    shared = UpstreamContext(
-        backend="env", state=DaemonState("env"),
-        router=_Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(backend="env", session_idle_prune=1.0),
-        shared_context=shared,
-        make_context=lambda **_kw: pytest.fail("should not create"))
-    daemon.executors = _Registry()
-
-    pruned = await listener._auto_prune_sessions(daemon, reason="test")
-
-    assert [rec["id"] for rec in pruned] == [local]
-    assert reg.get(local) is None
-    assert reg.get(foreign) is not None
-
-
-@pytest.mark.asyncio
 async def test_idle_watchdog_periodically_prunes_sessions(monkeypatch):
     import asyncio
 

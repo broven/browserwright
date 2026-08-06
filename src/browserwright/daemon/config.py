@@ -47,9 +47,87 @@ def check_name(name: str) -> str:
     return name
 
 
+#: Schemes a `--attach` URL may use. `ws`/`wss` are the endpoint itself and are
+#: passed to Chrome verbatim; `http`/`https` are a discovery URL we GET
+#: `/json/version` from.
+_ATTACH_SCHEMES = ("ws", "wss", "http", "https")
+
+_ATTACH_USAGE = (
+    "--attach takes either a port (--attach=9222) or a CDP URL "
+    "(--attach=ws://host:9222/devtools/browser/<id>, or "
+    "--attach=https://cloud.example/?token=... for a hosted browser)"
+)
+
+
+def check_cdp_attach(value: object) -> tuple[int | None, str | None]:
+    """Validate an `--attach` target; return `(port, endpoint)`, one of them set.
+
+    Runs at session-create time, which is the only moment a human supplies this
+    value — and the ledger is durable, so a bad value written there is a
+    permanently stuck row. The daemon deliberately does *not* re-validate: its
+    job on a malformed record is to fail closed onto the default port, not to
+    produce a friendly message.
+
+    Deliberately **not** rejected: userinfo, query strings, non-loopback hosts,
+    odd ports. Those are exactly the shapes cloud and anti-detect browsers hand
+    out, and refusing them would defeat the point of accepting a URL at all.
+    """
+    from .errors import UserError
+
+    # MUST precede the int check: `bool` is a subclass of `int`, and a bare
+    # `--attach` with no value parses to True — which used to sail through
+    # `int(attach)` and pin the session to port 1.
+    if isinstance(value, bool):
+        raise UserError(f"--attach needs a value. {_ATTACH_USAGE}")
+    if isinstance(value, int):
+        return _check_port(value), None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return _check_port(int(text)), None
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(text)
+            scheme, host = parts.scheme.lower(), parts.hostname
+        except ValueError:
+            scheme, host = "", None
+        if scheme not in _ATTACH_SCHEMES or not host:
+            hint = ""
+            if ":" in text and "//" not in text:
+                hint = f" For a bare host:port, write http://{text} instead."
+            raise UserError(f"invalid --attach target {value!r}. {_ATTACH_USAGE}.{hint}")
+        return None, text
+    raise UserError(f"invalid --attach target {value!r}. {_ATTACH_USAGE}")
+
+
+def _check_port(port: int) -> int:
+    if not 1 <= port <= 65535:
+        from .errors import UserError
+
+        raise UserError(f"--attach port {port} is out of range (1-65535)")
+    return port
+
+
 @dataclass
 class RdpConfig:
+    """Where the raw-CDP browser for one session is.
+
+    Exactly one of the two is in play:
+
+    - `port` — a browser on this machine, discovered via
+      `http://127.0.0.1:<port>/json/version`. Either one we launched
+      (`--create`) or a local one we were pointed at (`--attach=9222`).
+    - `endpoint` — a `ws(s)://` or `http(s)://` URL someone handed us
+      (`--attach=<url>`): a cloud browser, an anti-detect profile, anything we
+      did not start. Takes precedence when set.
+
+    `endpoint` is **per-session only** — it is set by `Daemon._rdp_cfg_for`
+    from that session's ledger record and never by `load()`. There is no env
+    var and no toml key for it, deliberately: one process-global endpoint is
+    exactly what stopped N sessions from driving N browsers (#38).
+    """
     port: int = 9222
+    endpoint: str | None = None
 
 
 @dataclass
@@ -107,8 +185,6 @@ class Config:
 
     backend: str | None = None             # explicit --backend / BD_BACKEND
     timeout: float = 5.0                   # per-backend resolve timeout, seconds
-    cdp_ws: str | None = None              # BD_CDP_WS / BU_CDP_WS — env backend uses this
-    cdp_url: str | None = None             # BD_CDP_URL / BU_CDP_URL — env backend uses this
     chrome_binary: str | None = None       # BD_CHROME_BINARY — launch-chrome
     idle_close_after: float | None = None  # seconds; None = never (default)
     session_idle_prune: float | None = 24 * 3600  # ledger prune threshold
@@ -128,9 +204,6 @@ class Config:
     # > toml `facade_host` > DEFAULT_FACADE_HOST.
     facade_host: str = DEFAULT_FACADE_HOST
     backends: BackendsConfig = field(default_factory=BackendsConfig)
-    # Provenance for `env`: which alias key actually fired. Diagnostic-only.
-    cdp_ws_source: str | None = None       # "BD_CDP_WS" | "BU_CDP_WS" | None
-    cdp_url_source: str | None = None      # "BD_CDP_URL" | "BU_CDP_URL" | None
 
     def resolved_facade_port(self) -> int | None:
         """Collapse the tri-state ``facade_port`` to a bind decision.
@@ -256,18 +329,11 @@ def load(
             raise UserError(
                 f"BD_SESSION_IDLE_PRUNE must be a number, got "
                 f"{e['BD_SESSION_IDLE_PRUNE']!r}")
-    if "BD_CDP_WS" in e:
-        cfg.cdp_ws = e["BD_CDP_WS"]
-        cfg.cdp_ws_source = "BD_CDP_WS"
-    elif "BU_CDP_WS" in e:
-        cfg.cdp_ws = e["BU_CDP_WS"]
-        cfg.cdp_ws_source = "BU_CDP_WS"
-    if "BD_CDP_URL" in e:
-        cfg.cdp_url = e["BD_CDP_URL"]
-        cfg.cdp_url_source = "BD_CDP_URL"
-    elif "BU_CDP_URL" in e:
-        cfg.cdp_url = e["BU_CDP_URL"]
-        cfg.cdp_url_source = "BU_CDP_URL"
+    # BD_CDP_WS / BD_CDP_URL / BU_* are gone (#38). A CDP endpoint is now a
+    # per-session value carried in the ledger and reaching the resolver as
+    # `backends.rdp.endpoint`; `load()` must never populate it. One
+    # process-global endpoint is precisely what forced the "run N isolated
+    # daemons to drive N profiles" workaround this replaced.
     if "BD_CHROME_BINARY" in e:
         cfg.chrome_binary = e["BD_CHROME_BINARY"]
     # `BD_RDP_PORT` env override for the rdp backend's port (v0.4.1).

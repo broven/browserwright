@@ -22,7 +22,6 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 """
 from __future__ import annotations
 
-import json
 import socket
 import subprocess
 from typing import Optional
@@ -65,30 +64,6 @@ def _run(cmd: list[str], timeout: float = 10.0) -> int:
         # initiate + join, issue #32). Report failure so the ledger row is
         # kept for retry — the retry joins the daemon-side teardown.
         return 3
-
-
-def _running_daemon_backend() -> str | None:
-    """The shared backend of the daemon on this socket, or None if unknown.
-
-    None means "could not establish", never "mismatch" — callers must not
-    block a legitimate action on a probe they could not read.
-    """
-    try:
-        out = subprocess.run(
-            ["browserwright-daemon", "backend-info", "--json"],
-            capture_output=True, timeout=10, text=True)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None
-    if out.returncode != 0:
-        return None
-    try:
-        data = json.loads(out.stdout or "{}")
-    except ValueError:
-        return None
-    if not isinstance(data, dict) or not data.get("running"):
-        return None
-    name = data.get("backend") or data.get("name")
-    return name if isinstance(name, str) and name else None
 
 
 def _daemon_is_running() -> bool:
@@ -137,8 +112,8 @@ def _end_daemon_session(record: dict) -> bool:
     """End every session through the daemon's atomic terminal lifecycle.
 
     The daemon, not Layer 2, applies workspace ownership: extension closes its
-    group, rdp create closes its Chrome, while rdp attach/env keep the external
-    browser.  All four still revoke live control/facade clients and reap the
+    group, rdp create closes its Chrome, while rdp attach keeps the external
+    browser.  All three still revoke live control/facade clients and reap the
     executor before this function confirms success.
     """
     sid = record.get("id")
@@ -209,8 +184,10 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     - ``rdp --create`` → owns an isolated browser the daemon launches on
       ``ensureSession``. We pick a free port now and record it in ``workspace``
       so the daemon pins the per-session Chrome to it.
-    - ``rdp --attach <target>`` → attaches to an already-running browser; the
-      target (port) is recorded and the browser is left alone on end.
+    - ``rdp --attach <port|url>`` → attaches to a browser someone else owns; the
+      endpoint is recorded and the browser is left alone on end. A port means
+      "on this machine"; a ws/http URL means "wherever this points" — a cloud
+      or anti-detect browser (#38).
 
     In every case we only allocate the ledger entry + ensure the one daemon is
     running. The daemon does the Chrome launch on ``ensureSession``.
@@ -228,58 +205,61 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
                            owner="attach", name=name)
         _ensure_daemon_running()
         return sid
-    if backend == "env":
-        # env binds the agent surface to the daemon's shared upstream — the
-        # externally-owned browser the daemon was started against (BD_CDP_WS /
-        # BD_CDP_URL + `--backend env`). Like extension it is attach-owned, so
-        # end()/reap never close that external browser; unlike extension there
-        # is no tab group (env speaks real browser-level CDP, not the relay).
-        # workspace is None: env sessions route to the shared daemon context
-        # (docs/session-workspaces.md §"Routing And Facade"), not a per-session
-        # UpstreamContext. Driving N external profiles → one env-backed daemon
-        # (isolated XDG_RUNTIME_DIR + --facade-port + BD_CDP_WS) per profile.
-        from .daemon import _ipc
-
-        # The guard and allocation share the ledger's file lock, so concurrent
-        # creators cannot both observe an empty slot. Scope by the fixed daemon
-        # socket (XDG_RUNTIME_DIR) rather than by the global BS_HOME ledger;
-        # this preserves the documented N-isolated-daemon fleet pattern.
-        daemon_scope = str(_ipc.sock_path().resolve())
-        # Check the running daemon's backend BEFORE writing the row. The
-        # routing guard rejects every connection whose record does not match
-        # the shared context, so allocating first against, say, the default
-        # extension daemon reports success and leaves a row that nothing —
-        # not even endSession — can use, while it holds this daemon's only
-        # env slot. An unreadable probe returns None and is not treated as a
-        # mismatch: never block a legitimate create on a probe that failed.
-        running = _running_daemon_backend()
-        if running is not None and running != "env":
-            raise ValueError(
-                f"the daemon on this socket is serving backend {running!r}, "
-                "so an env session created here could never connect. Start an "
-                "env daemon with its own XDG_RUNTIME_DIR and BD_CDP_WS (see "
-                "docs/session-workspaces.md, 'Scaling env to N profiles').")
-        sid = reg.allocate(
-            backend="env", owner="attach", name=name,
-            env_daemon_scope=daemon_scope,
-        )
-        _ensure_daemon_running()
-        return sid
     if backend == "rdp":
+        if create and attach is not None:
+            raise ValueError(
+                "--create and --attach are mutually exclusive: --create launches "
+                "a browser we own, --attach borrows one we don't.")
+        if not create and attach is None:
+            raise ValueError(
+                "--backend=rdp needs either --create (launch an isolated browser) "
+                "or --attach=<port|url> (use one that is already running).")
         owner = "create" if create else "attach"
-        # workspace["port"]: for --create pick a free port the daemon launches
-        # Chrome on; for --attach record the target port the daemon resolves.
         if create:
+            # Pick a free port now so the daemon pins the Chrome it launches.
             workspace = {"port": _free_port()}
-        elif attach is not None:
-            workspace = {"port": int(attach), "target": attach}
         else:
-            workspace = None
+            port, endpoint = _checked_attach(attach)
+            workspace = {"port": port} if port is not None else {"url": endpoint}
         sid = reg.allocate(backend="rdp", owner=owner,
                            name=name, workspace=workspace)
         _ensure_daemon_running()
         return sid
-    raise ValueError(f"unknown backend {backend!r} (use extension|rdp|env)")
+    raise ValueError(_unknown_backend_message(backend))
+
+
+def _checked_attach(attach: object) -> tuple[Optional[int], Optional[str]]:
+    """Validate `--attach`, translating the daemon's error type to this layer's.
+
+    The validator lives beside `check_name` in `daemon/config.py` and raises
+    `UserError`; Layer 2's contract with the CLI is `ValueError`, which
+    `cli._cmd_session` catches for the clean exit-1 path. Without the
+    translation a bad `--attach` prints a traceback instead of the message.
+    """
+    from .daemon.config import check_cdp_attach
+    from .daemon.errors import UserError
+
+    try:
+        return check_cdp_attach(attach)
+    except UserError as e:
+        raise ValueError(str(e)) from e
+
+
+def _unknown_backend_message(backend: object) -> str:
+    """Name the replacement, not just the rejection (#38).
+
+    `rdp` and `env` were the same real-CDP backend differing only in where the
+    ws URL came from. Somebody with either in a script needs to be told what to
+    write instead, which argparse's bare "invalid choice" never says.
+    """
+    if backend == "env":
+        return (
+            "backend 'env' is gone. An external browser is now attached per "
+            "session: `session new --backend=rdp --attach=<ws-or-http-url>` "
+            "(what BD_CDP_WS / BD_CDP_URL used to set process-wide). "
+            "One daemon can now hold many of them at once."
+        )
+    return f"unknown backend {backend!r} (use extension|rdp)"
 
 
 def end(record: dict) -> str:
@@ -297,19 +277,18 @@ def end(record: dict) -> str:
     # fails, the entry is kept "for retry", and the retry takes this same path
     # to the same failure. A record that `session end` cannot clear.
     #
-    # Only `extension` may be recovered by starting one, because a bare
-    # `serve` IS the extension daemon. An env fleet's daemon carries per-profile
-    # configuration (its own XDG_RUNTIME_DIR, BD_CDP_WS, facade port — see
-    # docs/session-workspaces.md §"Scaling env to N profiles"); spawning a bare
-    # one would come up on the wrong backend and get the end-session rejected
-    # for a mismatch, leaving the record AND still holding the single env slot.
+    # Only `extension` is auto-recovered by starting one, because a bare
+    # `serve` IS the extension daemon.
+    #
+    # This restriction used to also protect `env`, whose daemon carried
+    # per-profile configuration a bare `serve` could not reproduce. That reason
+    # is gone with the backend (#38), and an `rdp` session now routes to its own
+    # context whatever the shared backend is — so a bare daemon *could* serve
+    # one. Broadening this is deliberately left alone: for `--create` the
+    # launched Chrome's pid died with the old daemon, so recovery really means
+    # the startup orphan sweep, which is a different mechanism with different
+    # failure modes than "spawn a daemon and retry the RPC".
     if record.get("backend") == "extension" and not _daemon_is_running():
-        # A bare `serve` IS the extension daemon, so starting one recovers this
-        # case. Never do this for env: that fleet's daemon carries per-profile
-        # configuration (its own XDG_RUNTIME_DIR, BD_CDP_WS, facade port — see
-        # docs/session-workspaces.md §"Scaling env to N profiles"), and a bare
-        # one would come up on the wrong backend and have end-session rejected
-        # for a mismatch — leaving the record AND still holding the env slot.
         _ensure_daemon_running()
     if not _end_daemon_session(record):
         from .errors import DaemonUnavailable
@@ -318,18 +297,12 @@ def end(record: dict) -> str:
         # revoked, and dropping the row for a session whose external browser
         # may still have live clients driving it is worse than leaving one that
         # needs another attempt.
-        #
-        # env cannot be auto-recovered the way extension can: its daemon
-        # carries per-profile configuration, so tell the user what to restart
-        # instead of guessing. Without this the failure is a dead end — the
-        # record also holds that daemon's single env slot.
         hint = ""
-        if record.get("backend") == "env" and not _daemon_is_running():
+        if not _daemon_is_running():
             hint = (
-                " No daemon is answering on this XDG_RUNTIME_DIR. Restart this "
-                "profile's daemon with the same XDG_RUNTIME_DIR and BD_CDP_WS "
-                "(see docs/session-workspaces.md, 'Scaling env to N profiles'), "
-                "then run `session end` again."
+                " No daemon is answering on this XDG_RUNTIME_DIR. Start one "
+                "(`browserwright-daemon serve`) — using the same "
+                "XDG_RUNTIME_DIR — then run `session end` again."
             )
         raise DaemonUnavailable(
             f"session {sid} termination was incomplete; its ledger entry was "

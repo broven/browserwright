@@ -486,19 +486,24 @@ def test_cmd_session_new_stderr_keeps_stdout_bare(monkeypatch, tmp_bs_home, caps
     assert streams.err == "OK: session 17 created\n"
 
 
-def test_cmd_session_new_accepts_env_backend(monkeypatch, tmp_bs_home, capsys):
-    """issue #20: `session new --backend=env` is accepted and routed to
-    session_create.new (previously rejected — the gate only allowed
-    extension|rdp)."""
+def test_cmd_session_new_rejects_env_backend_naming_its_replacement(
+    monkeypatch, tmp_bs_home, capsys,
+):
+    """#38: `env` is gone, and the rejection has to say what to write instead.
+
+    Anyone with `--backend=env` in a script also has BD_CDP_WS in their
+    environment; "invalid choice" would leave them with no path forward.
+    """
     from browserwright import cli, session_create
 
-    seen = {}
-    monkeypatch.setattr(session_create, "new",
-                        lambda **kw: seen.update(kw) or "7")
+    called = []
+    monkeypatch.setattr(session_create, "new", lambda **kw: called.append(kw) or "7")
 
-    assert cli._cmd_session(["new", "--backend=env", "--name=cloak"]) == 0
-    assert seen["backend"] == "env"
-    assert capsys.readouterr().out == "7\n"
+    assert cli._cmd_session(["new", "--backend=env", "--name=cloak"]) == 1
+    assert called == []  # rejected at the gate, never reaches allocation
+    err = capsys.readouterr().err
+    assert "--attach=" in err
+    assert "BD_CDP_WS" in err
 
 
 def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, capsys):
@@ -901,10 +906,6 @@ def test_session_create_reset_executor_refuses_unconfirmed_reap(
 
     sid = reg.allocate(backend="rdp", owner="attach", name="attached")
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    # Same reason as the line above: allocation-logic unit tests must not
-    # shell out to a real daemon. `None` means "could not establish", which
-    # the guard treats as "do not block".
-    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
     monkeypatch.setattr(session_create, "_run", lambda _cmd: 1)
 
     with pytest.raises(DaemonUnavailable, match="could not confirm"):
@@ -1027,112 +1028,6 @@ def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
         session_create.end(reg.get(sid))
     assert reg.get(sid) is not None
-
-
-def test_session_create_new_env_is_attach_shared_context(tmp_bs_home, monkeypatch):
-    """issue #20: `session new --backend=env` allocates an attach-owned,
-    workspace-less session. attach-owned so end()/reap never close the external
-    browser; workspace=None so it routes to the daemon's shared env upstream
-    (BD_CDP_WS), not a per-session UpstreamContext."""
-    from browserwright import session_create, session_registry as reg
-
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    # Same reason as the line above: allocation-logic unit tests must not
-    # shell out to a real daemon. `None` means "could not establish", which
-    # the guard treats as "do not block".
-    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
-
-    sid = session_create.new(backend="env", name="cloak")
-    rec = reg.get(sid)
-    assert rec["backend"] == "env"
-    assert rec["owner"] == "attach"
-    assert rec["workspace"] is None
-    assert rec["name"] == "cloak"
-
-
-def test_session_create_rejects_second_env_on_same_daemon(
-    tmp_bs_home, monkeypatch,
-):
-    from browserwright import session_create, session_registry as reg
-
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    # Same reason as the line above: allocation-logic unit tests must not
-    # shell out to a real daemon. `None` means "could not establish", which
-    # the guard treats as "do not block".
-    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
-
-    first = session_create.new(backend="env", name="profile-a")
-    with pytest.raises(ValueError, match="N isolated daemons"):
-        session_create.new(backend="env", name="profile-b")
-
-    assert [row["id"] for row in reg.list_all()] == [first]
-    rdp = reg.allocate(backend="rdp", owner="attach", name="rdp-still-allowed")
-    assert rdp == "2"
-
-
-def test_session_create_allows_one_env_per_isolated_daemon(
-    tmp_bs_home, monkeypatch, tmp_path,
-):
-    from browserwright import session_create, session_registry as reg
-
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    # Same reason as the line above: allocation-logic unit tests must not
-    # shell out to a real daemon. `None` means "could not establish", which
-    # the guard treats as "do not block".
-    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
-
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "daemon-a"))
-    first = session_create.new(backend="env", name="profile-a")
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "daemon-b"))
-    second = session_create.new(backend="env", name="profile-b")
-
-    assert [row["id"] for row in reg.list_all()] == [first, second]
-
-
-def test_session_create_treats_legacy_unscoped_env_as_conflict(
-    tmp_bs_home, monkeypatch,
-):
-    from browserwright import session_create, session_registry as reg
-
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    # Same reason as the line above: allocation-logic unit tests must not
-    # shell out to a real daemon. `None` means "could not establish", which
-    # the guard treats as "do not block".
-    monkeypatch.setattr(session_create, "_running_daemon_backend", lambda: None)
-    legacy = reg.allocate(backend="env", owner="attach", name="legacy")
-
-    with pytest.raises(ValueError, match=legacy):
-        session_create.new(backend="env", name="new")
-
-    assert [row["id"] for row in reg.list_all()] == [legacy]
-
-
-def test_session_registry_claims_legacy_env_scope_once(tmp_bs_home):
-    from browserwright import session_registry as reg
-
-    legacy = reg.allocate(backend="env", owner="attach", name="legacy")
-    non_env = reg.allocate(backend="rdp", owner="attach", name="rdp")
-
-    assert reg.claim_legacy_env_scope(legacy, "/tmp/daemon-a.sock") is True
-    assert reg.claim_legacy_env_scope(legacy, "/tmp/daemon-a.sock") is True
-    assert reg.claim_legacy_env_scope(legacy, "/tmp/daemon-b.sock") is False
-    assert reg.claim_legacy_env_scope(non_env, "/tmp/daemon-a.sock") is False
-    assert reg.claim_legacy_env_scope("missing", "/tmp/daemon-a.sock") is False
-    assert reg.get(legacy)["daemon_scope"] == "/tmp/daemon-a.sock"
-
-
-def test_session_create_end_env_leaves_external_browser(tmp_bs_home, monkeypatch):
-    """Env termination revokes clients but leaves the external browser."""
-    from browserwright import session_create, session_registry as reg
-
-    sid = reg.allocate(backend="env", owner="attach", name="cloak")
-    calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
-    message = session_create.end(reg.get(sid))
-
-    assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
-    assert "still running" in message
-    assert reg.get(sid) is None
 
 
 def test_session_registry_unique_name_conflict_does_not_advance_ledger(tmp_bs_home):

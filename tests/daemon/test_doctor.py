@@ -101,7 +101,7 @@ async def test_doctor_every_backend_has_full_key_set(monkeypatch):
     _patch_all_unavailable(monkeypatch)
     out = await doctor_mod.doctor(load(env={}))
     seen_names = {entry["name"] for entry in out["backends"]}
-    assert seen_names == {"env", "rdp", "extension"}
+    assert seen_names == {"rdp", "extension"}
     for entry in out["backends"]:
         assert set(entry.keys()) == EXPECTED_BACKEND_KEYS, (
             f"backend {entry['name']!r} schema drift: {set(entry.keys()) ^ EXPECTED_BACKEND_KEYS}"
@@ -114,7 +114,6 @@ async def test_doctor_recommended_picks_lowest_ux_cost(monkeypatch):
     """When both rdp (none) and extension (extension-permission) are
     available, rdp wins on ux-cost rank."""
     _patch_each(monkeypatch, {
-        "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
     })
@@ -167,14 +166,13 @@ async def test_doctor_probe_ws_flag_explicitly_rejects_in_v01(monkeypatch):
 @pytest.mark.asyncio
 async def test_doctor_backend_filter_keeps_full_shape(monkeypatch):
     _patch_each(monkeypatch, {
-        "env":         DoctorResult("env", available=True, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
         "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
     })
     out = await doctor_mod.doctor(load(env={}), backend="rdp")
     # all backends still appear, but the non-rdp ones say "skipped"
     names = {e["name"] for e in out["backends"]}
-    assert names == {"env", "rdp", "extension"}
+    assert names == {"rdp", "extension"}
     other_entries = [e for e in out["backends"] if e["name"] != "rdp"]
     for e in other_entries:
         assert e["available"] is False
@@ -186,7 +184,6 @@ async def test_doctor_backend_filter_keeps_full_shape(monkeypatch):
 
 def _patch_all_unavailable(monkeypatch):
     _patch_each(monkeypatch, {
-        "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=False, ux_cost="none"),
         "extension":   DoctorResult("extension", available=False, ux_cost="extension-permission"),
     })
@@ -211,7 +208,7 @@ def _patch_each(monkeypatch, probes: dict[str, DoctorResult]):
             raise AssertionError("doctor should never call resolve()")
 
     stubs = [_Stub(probes[name]) for name in
-             ["env", "rdp", "extension"]]
+             ["rdp", "extension"]]
     monkeypatch.setattr(doctor_mod, "all_backends", lambda cfg: stubs)
 
 
@@ -224,7 +221,6 @@ async def test_recommended_picks_extension_when_only_one_available(monkeypatch):
     v0.1-era 'hard-coded false' comment. v0.4+ extension is real; if it's
     the only available backend, it should be recommended."""
     _patch_each(monkeypatch, {
-        "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=False, ux_cost="none"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
     })
@@ -237,7 +233,6 @@ async def test_recommended_rdp_still_beats_extension_on_ux_cost(monkeypatch):
     """Sanity: even though extension is now recommendable, rdp (none)
     still wins over extension (extension-permission) on UX cost rank."""
     _patch_each(monkeypatch, {
-        "env":         DoctorResult("env", available=False, ux_cost="none"),
         "rdp":         DoctorResult("rdp", available=True, ux_cost="none"),
         "extension":   DoctorResult("extension", available=True, ux_cost="extension-permission"),
     })

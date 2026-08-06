@@ -67,10 +67,12 @@ DAEMON_VERBS: tuple[str, ...] = (
 )
 
 #: `extension` is the sole relay backend; `rdp` and `env` are the raw-CDP family
-#: (CONTEXT.md: the discriminator is `backend != "extension"`, never
-#: `backend == "rdp"` — `env` joined later and a name check silently drops it).
-BACKENDS: tuple[str, ...] = ("extension", "rdp", "env")
-RAW_CDP_BACKENDS: tuple[str, ...] = ("rdp", "env")
+#: (CONTEXT.md: the discriminator is `backend != "extension"`, never a name
+#: check. `env` folded into `rdp` in #38, so the raw-CDP family currently has
+#: one member — the tuple-of-one is kept deliberately: it documents that this
+#: is a *family*, and a future third raw backend joins by editing one line.)
+BACKENDS: tuple[str, ...] = ("extension", "rdp")
+RAW_CDP_BACKENDS: tuple[str, ...] = ("rdp",)
 
 #: Verbs that must never answer -32601 on ANY backend, even with no params and
 #: no upstream wired. These are exactly the verbs whose handlers validate params
@@ -235,24 +237,6 @@ async def test_raw_cdp_backends_never_answer_method_not_found(
     """
     reply, _ = await probe(backend, method)
     assert code_of(reply) != -32601, f"{backend}/{method}: {reply!r}"
-
-
-@pytest.mark.parametrize("method", DAEMON_VERBS)
-@pytest.mark.asyncio
-async def test_env_and_rdp_answer_identically(method: str):
-    """`env` and `rdp` are one family (`backend != "extension"`), so every verb
-    must answer them the same way.
-
-    CONTEXT.md flags this as a live trap: writing `backend == "rdp"` to mean
-    "speaks raw CDP" silently excludes `env`, and the failure is invisible until
-    an `env` user hits the verb. This test makes that class of regression loud.
-    """
-    rdp_reply, _ = await probe("rdp", method)
-    env_reply, _ = await probe("env", method)
-    assert code_of(rdp_reply) == code_of(env_reply), (
-        f"{method} diverges between rdp and env — the raw-CDP discriminator "
-        f"is probably a name check: rdp={rdp_reply!r} env={env_reply!r}"
-    )
 
 
 @pytest.mark.parametrize(

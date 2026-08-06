@@ -64,30 +64,9 @@ def _locked() -> Iterator[dict]:
 
 def allocate(*, backend: str, owner: str,
              workspace: Optional[object] = None, name: Optional[str] = None,
-             unique_name: bool = False,
-             env_daemon_scope: Optional[str] = None) -> str:
+             unique_name: bool = False) -> str:
     now = time.time()
     with _locked() as data:
-        if env_daemon_scope is not None:
-            if backend != "env":
-                raise ValueError("env_daemon_scope is valid only for env sessions")
-            for e in data["sessions"].values():
-                if e.get("backend") != backend:
-                    continue
-                existing_scope = e.get("daemon_scope")
-                # Records written before daemon_scope existed cannot safely be
-                # assigned to a different daemon. Treat them as conflicts until
-                # explicitly ended rather than opening an unknown shared scope.
-                if existing_scope not in (None, env_daemon_scope):
-                    continue
-                conflict = e.get("id")
-                raise ValueError(
-                    f"daemon {env_daemon_scope!r} already has env session "
-                    f"{conflict!r}. An env daemon has one shared upstream, so "
-                    "reuse or end that session first. To drive N profiles, run "
-                    "N isolated daemons as documented in "
-                    "docs/session-workspaces.md § 'Scaling env to N profiles'."
-                )
         if unique_name:
             # Globally-unique name guard. Raising here (after the `yield` in
             # _locked) aborts before `p.write_text`, so a rejected allocation
@@ -110,8 +89,6 @@ def allocate(*, backend: str, owner: str,
             "workspace": workspace, "owner": owner, "name": name,
             "created_at": now, "last_seen": now,
         }
-        if env_daemon_scope is not None:
-            record["daemon_scope"] = env_daemon_scope
         data["sessions"][sid] = record
         return sid
 
@@ -121,26 +98,6 @@ def get(session_id: str) -> Optional[dict]:
     if not p.exists():
         return None
     return json.loads(p.read_text())["sessions"].get(session_id)
-
-
-def claim_legacy_env_scope(session_id: str, daemon_scope: str) -> bool:
-    """Atomically bind one unscoped legacy env record to a daemon.
-
-    Records created before ``daemon_scope`` existed have no stronger ownership
-    evidence.  The first matching env daemon to route the record may migrate
-    it; an already-scoped, missing, or non-env record remains fail-closed.
-    """
-    if not isinstance(daemon_scope, str) or not daemon_scope:
-        return False
-    with _locked() as data:
-        entry = data["sessions"].get(session_id)
-        if not isinstance(entry, dict) or entry.get("backend") != "env":
-            return False
-        existing_scope = entry.get("daemon_scope")
-        if existing_scope is None:
-            entry["daemon_scope"] = daemon_scope
-            return True
-        return existing_scope == daemon_scope
 
 
 def _with_entry(session_id: str, fn: Callable[[dict], object]) -> Optional[dict]:

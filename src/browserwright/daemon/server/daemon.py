@@ -34,7 +34,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from ... import session_registry
-from .. import _ipc
+from .._net import redact_url
 from ..config import Config
 from .state import DaemonState
 from .proxy import Router
@@ -47,6 +47,37 @@ class UnknownSessionError(KeyError):
 
 
 # ---- per-upstream context --------------------------------------------------
+
+
+def _endpoint_from_workspace(workspace: object) -> tuple[int | None, str | None]:
+    """The ONE reader of a session's `workspace` endpoint. Returns `(port, url)`.
+
+    | workspace | result | meaning |
+    |---|---|---|
+    | `{"port": 9222}` | `(9222, None)` | a browser on this machine |
+    | `{"url": "ws://…"}` | `(None, "ws://…")` | an endpoint handed to us |
+    | anything else | `(None, None)` | fall back to the daemon's default port |
+
+    Total on purpose. The ledger is a JSON file a user can hand-edit, and a
+    malformed record must fail *safe* rather than open: falling back to the
+    operator-configured default port can never reach a browser they did not
+    configure, whereas trusting a half-parsed value could.
+
+    `{"port": ...}` and `{"url": ...}` are mutually exclusive by construction —
+    there is deliberately no `kind` discriminator, because a discriminator can
+    disagree with the value it describes. `int` vs `str` already carries it,
+    and the URL's own scheme already separates verbatim-ws from HTTP discovery.
+    """
+    if not isinstance(workspace, dict):
+        return None, None
+    url = workspace.get("url")
+    if isinstance(url, str) and url:
+        return None, url
+    port = workspace.get("port")
+    # `bool` is an `int` subclass and must not be read as a port number.
+    if isinstance(port, int) and not isinstance(port, bool):
+        return port, None
+    return None, None
 
 
 class UpstreamContext:
@@ -92,10 +123,10 @@ class Daemon:
                  make_context):
         self.cfg = cfg
         self.shared_context = shared_context
-        # An env record is authorized for exactly the daemon socket scope that
-        # allocated it.  Capture once at daemon construction so later ambient
-        # environment changes cannot move the boundary underneath live clients.
-        self.daemon_scope = str(_ipc.sock_path().resolve())
+        # Exactly one context per rdp session, no exceptions. `daemon_scope`
+        # lived here to authorize env records against the socket that allocated
+        # them; with the endpoint carried per session there is nothing left to
+        # arbitrate, and the uniformity is what makes teardown analyzable.
         self.contexts: dict[str, UpstreamContext] = {}
         # Phase B: per-session persistent executor subprocesses, keyed by
         # session id (mirrors `contexts`). Lazily spawned by the
@@ -134,15 +165,21 @@ class Daemon:
     def context_for(self, session_id: str | None, *, require_known: bool = False) -> UpstreamContext:
         """Resolve the `UpstreamContext` that should serve `session_id`.
 
-        - None / empty session       → the shared (real-browser) context.
-        - ledger backend == "rdp"     → a per-session context (created lazily).
-        - extension/env         → the shared context.
-        - unknown explicit session    → raises when `require_known=True`.
+        - None / empty session     → the shared (real-browser) context.
+        - ledger backend == "rdp"  → a per-session context (created lazily).
+        - extension                → the shared context, if it is the extension one.
+        - unknown explicit session → raises when `require_known=True`.
 
         The backend is the ledger's immutable `backend` field — never a client
         param (docs §RPCs). Sessionless clients keep the historical shared
         context; explicit session-bound clients can require the ledger record so
         a typo or stale id never silently falls into the extension backend.
+
+        Note what is NOT conditioned on the shared backend: an `rdp` session
+        gets its own context whatever the daemon was started with. That is what
+        lets one extension-backed daemon simultaneously host N sessions each
+        attached to a different external browser — the thing that used to
+        require running N isolated daemons (#38).
         """
         if not session_id:
             return self.shared_context
@@ -158,23 +195,9 @@ class Daemon:
             if self.shared_context.backend == "extension":
                 return self.shared_context
             raise UnknownSessionError(session_id)
-        if backend == "env":
-            if self.shared_context.backend != "env":
-                raise UnknownSessionError(session_id)
-            record_scope = record.get("daemon_scope")
-            if record_scope == self.daemon_scope:
-                return self.shared_context
-            # Upgrade records written before daemon scoping existed.  The
-            # compare-and-set is ledger-locked so two isolated env daemons
-            # cannot both claim the same legacy session.  Explicitly foreign
-            # scopes still fail closed.
-            if (record_scope is None
-                    and session_registry.claim_legacy_env_scope(
-                        session_id, self.daemon_scope)):
-                return self.shared_context
-            raise UnknownSessionError(session_id)
-        # A malformed/forward-version record must never inherit the shared
-        # browser merely because it is not named "rdp".
+        # A malformed/forward-version/legacy record must never inherit the
+        # shared browser merely because it is not named "rdp". Retired `env`
+        # records land here too, until `migrate_legacy_backends` clears them.
         raise UnknownSessionError(session_id)
 
     def context_for_required(self, session_id: str) -> UpstreamContext:
@@ -370,31 +393,36 @@ class Daemon:
         # context's RPC handlers can drop themselves on endSession.
         ctx.router.daemon = self  # type: ignore[attr-defined]
         self.contexts[session_id] = ctx
-        logger.info("created rdp upstream context for session %s (port=%s)",
-                    session_id, cfg.backends.rdp.port)
+        # Redacted: a per-session endpoint can carry a bearer token, and daemon
+        # logs get pasted into bug reports.
+        logger.info("created rdp upstream context for session %s (port=%s endpoint=%s)",
+                    session_id, cfg.backends.rdp.port,
+                    redact_url(cfg.backends.rdp.endpoint))
         return ctx
 
     def _rdp_cfg_for(self, record: dict) -> Config:
         """Derive a per-session rdp Config from the ledger record.
 
-        Pins `backend="rdp"` and, when the session's workspace carries a port,
-        `backends.rdp.port` so the holder's resolve path targets the right
-        per-session Chrome. Leaves the resolve path otherwise unchanged.
+        Pins `backend="rdp"` plus whichever endpoint the session's workspace
+        carries, so the holder's resolve path targets the right browser. This
+        is the ONLY place a per-session endpoint enters the system — and it
+        enters through the Config rather than as an attribute on the holder,
+        because that is the channel the Playwright facade already reads
+        (`facade._resolve_rdp_ws` takes `ctx.holder._cfg`). A second channel
+        would mean teaching the facade about it too.
         """
-        workspace = record.get("workspace")
-        port = None
-        if isinstance(workspace, dict):
-            raw = workspace.get("port")
-            if isinstance(raw, int):
-                port = raw
+        port, endpoint = _endpoint_from_workspace(record.get("workspace"))
         cfg = dataclasses.replace(self.cfg, backend="rdp")
-        if port is not None:
+        if port is not None or endpoint is not None:
             # `replace` shares the nested BackendsConfig instance; copy the rdp
-            # sub-config so per-session port pinning never mutates the shared
-            # cfg (or another session's context).
+            # sub-config so per-session pinning never mutates the shared cfg
+            # (or another session's context).
+            fields: dict = {"endpoint": endpoint}
+            if port is not None:
+                fields["port"] = port
             cfg.backends = dataclasses.replace(
                 cfg.backends,
-                rdp=dataclasses.replace(cfg.backends.rdp, port=port),
+                rdp=dataclasses.replace(cfg.backends.rdp, **fields),
             )
         return cfg
 

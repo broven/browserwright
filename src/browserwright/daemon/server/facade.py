@@ -277,15 +277,14 @@ class PlaywrightFacade:
 
         try:
             try:
+                # A sessionless client used to be refused when the shared
+                # context was `env`: that context had no session identity and
+                # the ledger allowed only one env session per daemon, so "whose
+                # browser is this?" had no answer. With the endpoint carried per
+                # session (#38) a sessionless client cannot reach anyone's
+                # session browser at all — it gets the operator-configured
+                # default port — so the ambiguity, and the refusal, are gone.
                 session_id = self._session_for_connection(conn)
-                shared = getattr(self._daemon, "shared_context", None)
-                if (not session_id and shared is not None
-                        and getattr(shared, "backend", None) == "env"):
-                    with contextlib.suppress(Exception):
-                        await conn.close(
-                            code=1008,
-                            reason="env facade requires browserwright session")
-                    return
                 acquire = getattr(self._daemon, "acquire_session_lease", None)
                 if session_id and callable(acquire):
                     lease_token = object()
@@ -356,6 +355,19 @@ class PlaywrightFacade:
         self, conn: ServerConnection, ctx: UpstreamContext | None = None,
     ) -> None:
         """rdp backend (PR1): transparent byte-for-byte passthrough."""
+        # Open the session's upstream first, exactly as the extension path does.
+        # For a `--create` session the browser is launched lazily by
+        # `ensure_open`, so resolving before it ran meant probing a port nothing
+        # was listening on yet and closing 1011. That was survivable while this
+        # path was the exception; per-session endpoints make it the common case.
+        if ctx is not None:
+            try:
+                await ctx.holder.ensure_open()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("facade: upstream unavailable: %r", e)
+                with contextlib.suppress(Exception):
+                    await conn.close(code=1011, reason="upstream unavailable")
+                return
         try:
             ws_url = await self._resolve_rdp_ws(ctx)
         except Unavailable as e:
@@ -379,9 +391,11 @@ class PlaywrightFacade:
     async def _resolve_rdp_ws(self, ctx: UpstreamContext | None = None) -> str:
         """Resolve the upstream Chrome CDP ws URL via the daemon resolver.
 
-        Phase A1 is rdp-only; the resolver's rdp backend reads
-        `/json/version` (or the DevToolsActivePort fallback) and returns the
-        browser-level ws the daemon-owned Chrome is listening on."""
+        Reads the *holder's* cfg, not the daemon-wide one. That is the whole
+        channel by which a per-session endpoint reaches the facade: the port or
+        URL from the session's ledger record was pinned into that Config by
+        `Daemon._rdp_cfg_for`. Anything that moves the endpoint out of the
+        Config has to teach this function a second way to find it."""
         cfg = getattr(ctx.holder, "_cfg", self._cfg) if ctx is not None else self._cfg
         rr = await resolve_upstream(cfg)
         return rr.ws_url

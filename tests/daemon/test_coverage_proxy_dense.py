@@ -884,11 +884,20 @@ async def test_end_session_cold_open_respects_budget_and_restores_phase(
     assert state.upstream_phase is UpstreamPhase.DISCONNECTED
 
 
-@pytest.mark.parametrize("backend", ["rdp", "env"])
 @pytest.mark.asyncio
 async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
-    monkeypatch, backend,
+    monkeypatch,
 ):
+    """Ending an attach-owned raw-CDP session must not start an upstream first.
+
+    The teardown assertion below **inverted** with #38. This used to be
+    parametrized over `["rdp", "env"]` and expect `0` teardown calls for `env`,
+    because an env session routed to the shared context and had no per-session
+    context of its own to drop. Every raw-CDP session has one now, so teardown
+    always runs — and it is still safe for attach, because the holder only
+    SIGTERMs a pid it launched itself and an attach-owned holder has none.
+    """
+    backend = "rdp"
     from browserwright import session_registry
 
     state, router, cap, (client,) = setup_router(
@@ -929,7 +938,7 @@ async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
     result = cap.per_client[client.client_id][-1]["result"]
     assert result["ok"] is True
     assert result["backend"] == backend
-    assert len(daemon.teardown_calls) == (1 if backend == "rdp" else 0)
+    assert len(daemon.teardown_calls) == 1
 
 
 @pytest.mark.asyncio

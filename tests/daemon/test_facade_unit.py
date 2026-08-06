@@ -196,12 +196,27 @@ async def test_facade_unknown_session_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_sessionless_env_facade_fails_closed():
-    daemon = SimpleNamespace(
-        shared_context=SimpleNamespace(backend="env"),
-    )
-    f = PlaywrightFacade(
-        cfg=Config(backend="env"), port=0, daemon=daemon)
+async def test_sessionless_facade_client_is_no_longer_refused(monkeypatch):
+    """The `env`-era 1008 refusal is gone (#38).
+
+    A sessionless client used to be closed with "env facade requires
+    browserwright session" whenever the shared context was `env`: that context
+    had no session identity, and the ledger allowed only one env session per
+    daemon, so "whose browser is this?" genuinely had no answer.
+
+    With endpoints carried per session, a sessionless client cannot reach any
+    session's browser at all — it gets the operator-configured default port. The
+    ambiguity is gone, so the refusal is too.
+    """
+    daemon = SimpleNamespace(shared_context=SimpleNamespace(backend="rdp"))
+    f = PlaywrightFacade(cfg=Config(backend="rdp"), port=0, daemon=daemon)
+
+    handled = []
+
+    async def _fake_rdp(conn, ctx=None):
+        handled.append(ctx)
+
+    monkeypatch.setattr(f, "_handle_rdp_client", _fake_rdp)
 
     class _Conn:
         request = SimpleNamespace(path="/cdp")
@@ -213,7 +228,8 @@ async def test_sessionless_env_facade_fails_closed():
     conn = _Conn()
     await f._handle_client(conn)
 
-    assert conn.closed == [(1008, "env facade requires browserwright session")]
+    assert conn.closed == []
+    assert handled == [None]  # served by the shared context, not refused
 
 
 @pytest.mark.asyncio

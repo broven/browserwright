@@ -434,9 +434,22 @@ def test_daemon_context_for_preserves_multi_extension_shared_context(monkeypatch
     assert daemon.context_for_required("extension-b") is shared
 
 
-def test_daemon_context_for_env_requires_matching_daemon_scope(
-    monkeypatch, tmp_path,
+def test_raw_cdp_sessions_get_own_contexts_whatever_the_shared_backend(
+    monkeypatch,
 ):
+    """#38's headline behavior: one daemon, N externally-attached browsers.
+
+    An `env` record used to be servable only by a daemon whose *shared* backend
+    was also `env`, and the ledger allowed one such session per daemon socket —
+    which is exactly why driving N external profiles meant running N isolated
+    daemons, each with its own XDG_RUNTIME_DIR, facade port and BD_CDP_WS.
+
+    A raw-CDP session now carries its own endpoint and gets its own context,
+    conditioned on nothing else. So an extension-backed daemon can hold several
+    at once, each pointed somewhere different.
+    """
+    from types import SimpleNamespace
+
     from browserwright.daemon.server.daemon import (
         Daemon,
         UnknownSessionError,
@@ -447,49 +460,50 @@ def test_daemon_context_for_env_requires_matching_daemon_scope(
     class Router:
         daemon = None
 
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    scope = str((tmp_path / "browserwright-daemon.sock").resolve())
     shared = UpstreamContext(
-        backend="env", state=DaemonState("env"),
+        backend="extension", state=DaemonState("extension"),
         router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(backend="env"), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
+
+    def make_context(*, backend, cfg, session_id=None):
+        return UpstreamContext(
+            backend=backend, state=DaemonState(backend), router=Router(),
+            holder=SimpleNamespace(_cfg=cfg), session_id=session_id)
+
+    daemon = Daemon(cfg=Config(backend="extension"), shared_context=shared,
+                    make_context=make_context)
     records = {
-        "matching": {
-            "id": "matching", "backend": "env", "daemon_scope": scope,
-        },
-        "foreign": {
-            "id": "foreign", "backend": "env",
-            "daemon_scope": "/tmp/another-daemon.sock",
-        },
-        "legacy": {"id": "legacy", "backend": "env"},
+        "a": {"id": "a", "backend": "rdp", "owner": "attach",
+              "workspace": {"url": "ws://cloud-a.example/cdp"}},
+        "b": {"id": "b", "backend": "rdp", "owner": "attach",
+              "workspace": {"url": "ws://cloud-b.example/cdp"}},
+        "local": {"id": "local", "backend": "rdp", "owner": "create",
+                  "workspace": {"port": 9444}},
+        "retired": {"id": "retired", "backend": "env"},
     }
     monkeypatch.setattr(
-        "browserwright.daemon.server.daemon.session_registry.get",
-        records.get,
-    )
+        "browserwright.daemon.server.daemon.session_registry.get", records.get)
 
-    def claim_legacy(session_id, daemon_scope):
-        record = records.get(session_id)
-        if not isinstance(record, dict) or record.get("backend") != "env":
-            return False
-        existing_scope = record.get("daemon_scope")
-        if existing_scope is None:
-            record["daemon_scope"] = daemon_scope
-            return True
-        return existing_scope == daemon_scope
+    ctx_a = daemon.context_for_required("a")
+    ctx_b = daemon.context_for_required("b")
+    ctx_local = daemon.context_for_required("local")
 
-    monkeypatch.setattr(
-        "browserwright.daemon.server.daemon.session_registry.claim_legacy_env_scope",
-        claim_legacy,
-    )
-
-    assert daemon.context_for_required("matching") is shared
+    # Each gets its own context, none of them the shared extension one.
+    assert {id(ctx_a), id(ctx_b), id(ctx_local)}.isdisjoint({id(shared)})
+    assert len({id(ctx_a), id(ctx_b), id(ctx_local)}) == 3
+    # ...pointed at its own endpoint, with no cross-talk.
+    assert ctx_a.holder._cfg.backends.rdp.endpoint == "ws://cloud-a.example/cdp"
+    assert ctx_b.holder._cfg.backends.rdp.endpoint == "ws://cloud-b.example/cdp"
+    assert ctx_local.holder._cfg.backends.rdp.endpoint is None
+    assert ctx_local.holder._cfg.backends.rdp.port == 9444
+    # The daemon-wide cfg is never mutated by any of that.
+    assert daemon.cfg.backends.rdp.endpoint is None
+    assert daemon.cfg.backends.rdp.port == 9222
+    # Ownership still crosses the ledger→context boundary.
+    assert ctx_a.holder.rdp_owns_browser is False
+    assert ctx_local.holder.rdp_owns_browser is True
+    # A retired backend value fails closed rather than inheriting anything.
     with pytest.raises(UnknownSessionError):
-        daemon.context_for_required("foreign")
-    assert daemon.context_for_required("legacy") is shared
-    assert records["legacy"]["daemon_scope"] == scope
+        daemon.context_for_required("retired")
 
 
 @pytest.mark.parametrize("shared_backend,record_backend", [
