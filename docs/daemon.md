@@ -61,7 +61,7 @@ $ browserwright-daemon doctor
 |---|---|
 | `browserwright-daemon serve` | 运行单全局 daemon（shared extension relay + per-session rdp） |
 | `browserwright-daemon status [--json]` | 报告 daemon 存活状态、socket endpoint、facade 端口 |
-| `browserwright-daemon stop` / `restart` | 停止 / 重启 daemon（restart 走 LaunchAgent） |
+| `browserwright-daemon stop` / `restart` | 停止 / 重启 daemon（已注册 LaunchAgent 时 launchd 会自动拉起；restart 走 LaunchAgent） |
 | `browserwright-daemon doctor` | 详细诊断每个 backend 状态（端口、文件路径、HTTP 响应等） |
 | `browserwright-daemon logs [-f]` | 打印 log 文件路径或 tail 之 |
 | `browserwright-daemon launch-chrome` | 启动隔离 profile 的 Chrome 并输出其 ws URL |
@@ -96,9 +96,11 @@ $ browserwright-daemon doctor
 
    写入 `~/Library/LaunchAgents/com.browserwright-daemon.plist` 并 `launchctl load`。daemon 会：
    - 每次登录自动启动（`RunAtLoad`）
-   - 崩了 launchd 自动重启（`KeepAlive`，`Crashed=true`）
+   - **任何退出都会被 launchd 自动重启**（`KeepAlive`，`SuccessfulExit=true` + `Crashed=true`）——正常退出（包括 `stop`、控制 socket watchdog 自退）和崩溃都算；这样优雅退出 0 不会被 launchd 当成“任务完成、永不复活”（issue #39）。防 crash-loop 在 `serve` 层（启动时回收 stale 端口，issue #15 2.2），launchd 侧只负责复活
    - 本地 unix socket 永远在 `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`（全局唯一、无 name 后缀；第二个 daemon 起不来——stale-detect 拒绝）
    - relay ws server 永远在 `ws://127.0.0.1:19989`（扩展通过此连）
+
+   注意：被 LaunchAgent 监管的 daemon，`stop` 只是临时停止——launchd 会在 ~10 秒后复活它。要**永久**停掉：`browserwright-daemon uninstall`（或 `launchctl unload ~/Library/LaunchAgents/com.browserwright-daemon.plist`）。前台 `serve`（未注册 LaunchAgent）不受影响，`stop` 照常永久停止。
 
    想换端口：`browserwright-daemon install --extension-port N`。  
    想卸：`browserwright-daemon uninstall`。  
