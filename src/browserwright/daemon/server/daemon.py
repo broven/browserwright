@@ -250,8 +250,20 @@ class Daemon:
         *,
         caller_token: object | None = None,
         budget: float | None = None,
+        wait: bool = True,
     ) -> tuple[dict[str, object], dict]:
-        """Atomically revoke clients, reap executor, and tear down workspace."""
+        """Atomically revoke clients, reap executor, and tear down workspace.
+
+        Issue #32 contract: the verb handler passes ``wait=False`` and gets
+        back at the initiate boundary — ``{initiated, phase: "terminating"}``
+        — with the unbounded workspace teardown continuing as a daemon-side
+        task. Every other caller (auto-prune, embedders, tests) keeps the
+        default ``wait=True`` blocking semantics: initiate, then join the
+        in-flight teardown and return its FINAL result. A retry of
+        ``endSession`` against an already-terminating session joins the
+        in-flight teardown either way, so it gets the final result, never a
+        second initiate.
+        """
         lock = self._termination_locks.setdefault(session_id, asyncio.Lock())
         revocations: list[asyncio.Task[None]] = []
         try:
@@ -288,7 +300,24 @@ class Daemon:
                 except BaseException:
                     self._session_phases[session_id] = "active"
                     raise
-                if (reap.get("reaped") is True
+                if result.get("initiated") is True:
+                    # The workspace teardown continues in the registry's
+                    # background task. Watch it so `ps` reports the real
+                    # terminal state even if no caller ever polls, and — for
+                    # the blocking callers — join it and return the final
+                    # result.
+                    asyncio.create_task(
+                        self._watch_termination(session_id))
+                    if wait:
+                        result = await self.executors.await_termination(
+                            session_id)
+                        if (isinstance(result, dict)
+                                and result.get("ok") is True):
+                            self._session_results[session_id] = dict(result)
+                            self._session_phases[session_id] = "ended"
+                        else:
+                            self._session_phases[session_id] = "active"
+                elif (reap.get("reaped") is True
                         and isinstance(result, dict)
                         and result.get("ok") is True):
                     self._session_results[session_id] = dict(result)
@@ -299,6 +328,22 @@ class Daemon:
         finally:
             if revocations:
                 await asyncio.gather(*revocations)
+
+    async def _watch_termination(self, session_id: str) -> None:
+        """Publish terminal state when an initiated background teardown
+        completes, so ``ps``/leases reflect reality even if no caller ever
+        polls or retries. Idempotent against the join path in
+        ``terminate_session`` (both write the same values)."""
+        try:
+            result = await self.executors.await_termination(session_id)
+        except BaseException:  # noqa: BLE001 - the watcher must not die loud
+            self._session_phases[session_id] = "active"
+            return
+        if isinstance(result, dict) and result.get("ok") is True:
+            self._session_results[session_id] = dict(result)
+            self._session_phases[session_id] = "ended"
+        else:
+            self._session_phases[session_id] = "active"
 
     def _ensure_rdp_context(self, session_id: str, record: dict) -> UpstreamContext:
         """Get or create the per-session rdp context.

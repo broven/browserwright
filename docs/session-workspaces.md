@@ -193,6 +193,25 @@ Ending a session follows ownership:
 
 Executor cleanup is separate from browser ownership and may run for any session.
 
+`endSession` is an **initiate-then-join** verb (issue #32), not a synchronous
+request/response verb: its worst case (serial tab closes over a cold extension
+reconnect window) outlives any caller's timeout, so the daemon returns at the
+**initiate boundary** — after the bounded fast phase (clients revoked,
+executor reaped and confirmed dead, phase `terminating`) — and the unbounded
+workspace teardown keeps running as a daemon-side task under the same
+per-session lock. The caller **joins** by re-issuing `endSession`, which
+blocks until the teardown finishes and returns the final result; the CLI
+(`session end`) does initiate → progress-printed join → final result, and
+`browserwright-daemon ps` exposes the per-session phase so a slow teardown is
+distinguishable from a hung daemon.
+
+The atomicity #33 bought is preserved: the `terminating` phase + a pending
+marker are published before the lock is released, so a queued/retried
+`ensureExecutor` is refused from the initiate moment, never between reap and
+tombstone. A failed/partial teardown flips the phase back to `active` and
+installs no tombstone, so `endSession` retries resume (extension retry anchors
+are written before the first destructive browser write).
+
 ## Common Mistakes To Avoid
 
 - Treating tab groups as the universal session workspace. They are extension

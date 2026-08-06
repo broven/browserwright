@@ -45,6 +45,22 @@ _SPAWN_READY_TIMEOUT_S = 15.0
 _KILL_GRACE_S = 3.0
 
 
+def _unfinished_teardown_result() -> dict:
+    """Honest partial-shaped answer for a teardown that never produced a
+    result (raised, or the session is not terminating at all). Mirrors
+    `verbs._teardown_budget_result`'s shape without importing it (Layer 1
+    registry must not depend on the verb mixin)."""
+    return {
+        "ok": False,
+        "partial": True,
+        "timedOut": False,
+        "closed": [],
+        "failed": ["workspace"],
+        "unknown": ["workspace"],
+        "kept": [],
+    }
+
+
 @dataclass
 class ExecutorHandle:
     """A live per-session executor subprocess. PR2 grows this with idle/crash
@@ -101,6 +117,12 @@ class ExecutorRegistry:
         # Session ids are durable/unique, so retaining the result is both the
         # tombstone that rejects a queued ensure and an idempotent end result.
         self._terminal_results: dict[str, dict] = {}
+        # In-flight workspace teardowns (issue #32 initiate contract). A
+        # session with an entry here is `terminating`: `ensure` is refused
+        # from the initiate moment, and a retried `terminate_session` JOINS
+        # the task instead of starting a second teardown. The entry is
+        # removed when the teardown task finishes.
+        self._pending_teardowns: dict[str, asyncio.Task[dict]] = {}
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         lock = self._locks.get(session_id)
@@ -140,6 +162,8 @@ class ExecutorRegistry:
             return await self._ensure_locked(session_id)
 
     def _raise_if_terminal(self, session_id: str) -> None:
+        if session_id in self._pending_teardowns:
+            raise RuntimeError(f"session {session_id!r} is terminating")
         if session_id in self._terminal_results:
             raise RuntimeError(f"session {session_id!r} has ended")
 
@@ -174,12 +198,20 @@ class ExecutorRegistry:
         *,
         budget: float | None = None,
     ) -> tuple[dict[str, object], dict]:
-        """Atomically reap the executor and tear down its browser workspace.
+        """Atomically reap the executor and INITIATE workspace teardown.
 
-        A successful result installs a terminal tombstone before releasing the
-        per-session lock, so an ensure that was already authorized and queued
-        cannot create a replacement. Failed/partial teardown is retryable and
-        deliberately does not install the tombstone.
+        Returns at the initiate boundary (issue #32): the executor is reaped
+        and confirmed dead, the workspace teardown keeps running as a
+        daemon-side task under the same session lock semantics, and the
+        returned result is ``{"initiated": true, "phase": "terminating"}``.
+        The FINAL teardown result is available through ``await_termination``;
+        a retry/concurrent ``terminate_session`` joins the in-flight task and
+        returns the final result instead of racing a second teardown.
+
+        ``ensure`` is refused from the initiate moment (the pending marker is
+        published before the lock is released), so an already-authorized
+        queued ensure cannot create a replacement mid-teardown. Failed/partial
+        teardown is retryable and deliberately does not install the tombstone.
         """
         async with self._lock_for(session_id):
             cached = self._terminal_results.get(session_id)
@@ -190,22 +222,74 @@ class ExecutorRegistry:
                     "matched": True,
                     "executor_id": None,
                 }, dict(cached))
+            pending = self._pending_teardowns.get(session_id)
+            if pending is not None:
+                # A teardown is already in flight. Join it: the pending task
+                # never takes this lock (it ran past it), so awaiting it here
+                # cannot deadlock, and a retried endSession gets the FINAL
+                # result rather than a second initiate.
+                result = await pending
+                if not isinstance(result, dict):
+                    result = _unfinished_teardown_result()
+                return ({
+                    "killed": False,
+                    "reaped": True,
+                    "matched": True,
+                    "executor_id": None,
+                }, dict(result))
             handle = self._handles.get(session_id)
             executor_id = handle.executor_id if handle is not None else None
             reap = await self._kill_and_wait_locked(
                 session_id, executor_id=executor_id)
             if reap.get("reaped") is not True:
                 return reap, {}
-            # Teardown adapters own their cooperative deadline. Hard-cancelling
-            # this callback can land between a browser mutation and its durable
-            # ledger checkpoint, creating the exact split-brain this lifecycle
-            # lock exists to prevent. ``budget`` remains part of the boundary
-            # for compatibility; Router supplies the deadline to its adapter.
+            # Teardown adapters own their cooperative deadline (the handler
+            # computed it before this call); hard-cancelling the callback can
+            # land between a browser mutation and its durable ledger
+            # checkpoint, creating the exact split-brain this lifecycle lock
+            # exists to prevent. ``budget`` remains part of the boundary for
+            # compatibility; Router supplies the deadline to its adapter.
             _ = budget
+            task = asyncio.create_task(
+                self._run_pending_teardown(session_id, teardown))
+            self._pending_teardowns[session_id] = task
+            return reap, {
+                "ok": True, "initiated": True, "phase": "terminating",
+            }
+
+    async def _run_pending_teardown(
+        self, session_id: str, teardown: Callable[[], Awaitable[dict]],
+    ) -> dict:
+        """Run an initiated workspace teardown to completion and publish its
+        outcome. Never raises: a teardown exception becomes an honest partial
+        result so a polling caller sees `active`, not a dead task."""
+        try:
             result = await teardown()
-            if isinstance(result, dict) and result.get("ok") is True:
-                self._terminal_results[session_id] = dict(result)
-            return reap, result
+        except BaseException as e:  # noqa: BLE001 - report every failure
+            logger.warning(
+                "endSession background teardown failed (session=%s): %r",
+                session_id, e)
+            result = _unfinished_teardown_result()
+        finally:
+            self._pending_teardowns.pop(session_id, None)
+        if isinstance(result, dict) and result.get("ok") is True:
+            self._terminal_results[session_id] = dict(result)
+        return result
+
+    async def await_termination(self, session_id: str) -> dict:
+        """Wait for an initiated teardown to finish; return its final result.
+
+        Returns immediately with the cached terminal result when the teardown
+        already completed. Never raises (see ``_run_pending_teardown``). A
+        session that is not terminating gets an honest partial-shaped answer."""
+        pending = self._pending_teardowns.get(session_id)
+        if pending is not None:
+            result = await pending
+        else:
+            result = self._terminal_results.get(session_id)
+        if not isinstance(result, dict):
+            return _unfinished_teardown_result()
+        return dict(result)
 
     async def _spawn(self, session_id: str) -> ExecutorHandle:
         """Spawn ``python -m browserwright._executor --session <id>`` detached

@@ -504,3 +504,42 @@ def test_sigusr1_handler_is_installable_and_writes_to_the_daemon_log(
         assert "armed SIGUSR1 stack dump" in log.read_text()
     finally:
         faulthandler.unregister(signal.SIGUSR1)
+
+
+# ---- issue #32 read side: per-session termination phase --------------------
+
+
+@pytest.mark.asyncio
+async def test_status_exposes_per_session_termination_phase():
+    """`ps` must be able to tell a slow teardown from a hung daemon: the
+    snapshot carries one `sessions` row per session with its lifecycle phase
+    and the final teardown result once `ended`."""
+    from types import SimpleNamespace
+
+    daemon = SimpleNamespace(
+        _session_phases={
+            "s-terminating": "terminating",
+            "s-ended": "ended",
+        },
+        _session_results={
+            "s-ended": {"ok": True, "closed": [1], "backend": "extension"},
+        },
+    )
+    state = fresh_state()
+    reply = await ask_status(state, daemon=daemon)
+    rows = reply["result"]["sessions"]
+    by_id = {row["session_id"]: row for row in rows}
+    assert set(by_id) == {"s-terminating", "s-ended"}
+    assert by_id["s-terminating"]["phase"] == "terminating"
+    assert by_id["s-terminating"]["result"] is None
+    assert by_id["s-ended"]["phase"] == "ended"
+    assert by_id["s-ended"]["result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_status_bare_router_sessions_is_honest_empty_list():
+    """A bare Router (no daemon back-reference) answers an empty `sessions`
+    list — same-shaped, never an error."""
+    state = fresh_state()
+    reply = await ask_status(state)
+    assert reply["result"]["sessions"] == []
