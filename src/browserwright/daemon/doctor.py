@@ -45,7 +45,7 @@ _UX_COST_RANK = {
 async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = False) -> dict:
     """Build the locked doctor JSON object.
 
-    `backend=None` → probe all backends. `backend="rdp"` → probe just that one
+    `backend=None` → probe all backends. `backend="cdp"` → probe just that one
     but still emit the full shape (other entries get the canonical 'unknown'
     record with available=false).
 
@@ -115,7 +115,7 @@ def _asdict(r) -> dict:
 
     `extras` (v0.5) is a per-backend free-form sub-dict. It's part of the
     serialized output so install-wizard contracts can read per-backend
-    details from skill code. Empty dict = no extras (e.g. env / rdp).
+    details from skill code. Empty dict = no extras (e.g. env / cdp).
     """
     return {
         "name": r.name,
@@ -132,7 +132,7 @@ def _asdict(r) -> dict:
 def _pick_recommended(entries: list[dict]) -> str | None:
     """Pick the available backend with the lowest UX cost.
 
-    Tie-break: registry order (env before rdp before extension)
+    Tie-break: registry order (env before cdp before extension)
     via Python's stable `min`.
 
     v0.5.3 REVIEW.md F-10: dropped the `!= "extension"` exclusion. v0.1 had
@@ -141,8 +141,8 @@ def _pick_recommended(entries: list[dict]) -> str | None:
     "this backend is never recommended even when it works" stale rule.
     `_UX_COST_RANK["extension-permission"]` = 2 — naturally ranks below
     "none" (0) and "banner" (1), above "popup-per-ws+banner" (3). So if
-    extension is the only available backend, it gets recommended; if rdp
-    is also available, rdp still wins on UX cost.
+    extension is the only available backend, it gets recommended; if cdp
+    is also available, cdp still wins on UX cost.
     """
     candidates = [e for e in entries if e["available"]]
     if not candidates:
@@ -165,7 +165,7 @@ def _needs_action(backend_name: str) -> str | None:
     """
     if backend_name == "env":
         return "set BD_CDP_WS or BD_CDP_URL to your CDP endpoint"
-    if backend_name == "rdp":
+    if backend_name == "cdp":
         return "launch Chrome with --remote-debugging-port=9222 (or use launch-chrome)"
     if backend_name == "extension":
         return ("load the unpacked extension from browserwright-daemon/chrome-extension/ "

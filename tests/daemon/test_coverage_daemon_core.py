@@ -37,14 +37,14 @@ def test_cli_main_maps_exceptions_to_exit_codes(
 
 def test_cli_main_unavailable_verbose_prints_attempts(monkeypatch, capsys):
     def boom(args, cfg):
-        raise Unavailable("nothing resolved", attempts={"env": "unset", "rdp": "closed"})
+        raise Unavailable("nothing resolved", attempts={"env": "unset", "cdp": "closed"})
 
     monkeypatch.setitem(cli_mod._DISPATCH, "doctor", boom)
     assert cli_mod.main(["doctor", "--verbose"]) == 2
     captured = capsys.readouterr()
     assert "error: nothing resolved" in captured.err
     assert "env: unset" in captured.err
-    assert "rdp: closed" in captured.err
+    assert "cdp: closed" in captured.err
 
 
 def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
@@ -316,7 +316,7 @@ def test_userscript_invalid_exclude_warns_but_keeps_valid_match():
 def test_state_bind_unbind_session_updates_lookup_tables():
     from browserwright.daemon.server.state import DaemonState
 
-    state = DaemonState("rdp")
+    state = DaemonState("cdp")
     client = state.allocate_client("c")
     binding = state.bind_session(client.client_id, "local", "upstream", "target")
     state.claim_attacher("target", client.client_id, "local", "upstream")
@@ -332,7 +332,7 @@ def test_state_bind_unbind_session_updates_lookup_tables():
 async def test_state_set_disconnected_clears_upstream_tied_tables():
     from browserwright.daemon.server.state import DaemonState
 
-    state = DaemonState("rdp")
+    state = DaemonState("cdp")
     client = state.allocate_client("c")
     state.bind_session(client.client_id, "local", "up", "target")
     state.claim_attacher("target", client.client_id, "local", "up")
@@ -347,12 +347,12 @@ async def test_state_set_disconnected_clears_upstream_tied_tables():
 def test_state_note_target_info_ignores_non_string_target_id():
     from browserwright.daemon.server.state import DaemonState
 
-    state = DaemonState("rdp")
+    state = DaemonState("cdp")
     state.note_target_info({"targetId": 123, "type": "page", "url": "https://x/"})
     assert state.targets == {}
 
 
-def test_daemon_context_for_rdp_lazily_creates_isolated_config(monkeypatch):
+def test_daemon_context_for_cdp_lazily_creates_isolated_config(monkeypatch):
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext
     from browserwright.daemon.server.state import DaemonState
 
@@ -364,32 +364,32 @@ def test_daemon_context_for_rdp_lazily_creates_isolated_config(monkeypatch):
 
     def make_context(backend, cfg, session_id):
         holder = type("Holder", (), {})()
-        made.append((backend, cfg.backends.rdp.port, session_id))
+        made.append((backend, cfg.backends.cdp.port, session_id))
         return UpstreamContext(backend=backend, state=DaemonState(backend), router=Router(), holder=holder, session_id=session_id)
 
     cfg = Config()
-    cfg.backends.rdp.port = 9222
+    cfg.backends.cdp.port = 9222
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
-        lambda sid: {"backend": "rdp", "owner": "attach", "workspace": {"port": 9444}},
+        lambda sid: {"backend": "cdp", "owner": "attach", "workspace": {"port": 9444}},
     )
     daemon = Daemon(cfg=cfg, shared_context=shared, make_context=make_context)
-    ctx = daemon.context_for("s-rdp")
-    assert ctx is daemon.context_for("s-rdp")
-    assert made == [("rdp", 9444, "s-rdp")]
-    assert cfg.backends.rdp.port == 9222
+    ctx = daemon.context_for("s-cdp")
+    assert ctx is daemon.context_for("s-cdp")
+    assert made == [("cdp", 9444, "s-cdp")]
+    assert cfg.backends.cdp.port == 9222
     assert ctx.router.daemon is daemon
-    assert ctx.holder.rdp_owns_browser is False
+    assert ctx.holder.cdp_owns_browser is False
 
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
-        lambda sid: {"backend": "rdp", "owner": "create", "workspace": {"port": 9555}},
+        lambda sid: {"backend": "cdp", "owner": "create", "workspace": {"port": 9555}},
     )
     ctx2 = daemon.context_for("s-create")
-    assert ctx2.holder.rdp_owns_browser is True
+    assert ctx2.holder.cdp_owns_browser is True
 
 
-def test_daemon_context_for_unknown_or_non_rdp_uses_shared(monkeypatch):
+def test_daemon_context_for_unknown_or_non_cdp_uses_shared(monkeypatch):
     from browserwright.daemon.server.daemon import (
         Daemon,
         UnknownSessionError,
@@ -472,11 +472,11 @@ def test_raw_cdp_sessions_get_own_contexts_whatever_the_shared_backend(
     daemon = Daemon(cfg=Config(backend="extension"), shared_context=shared,
                     make_context=make_context)
     records = {
-        "a": {"id": "a", "backend": "rdp", "owner": "attach",
+        "a": {"id": "a", "backend": "cdp", "owner": "attach",
               "workspace": {"url": "ws://cloud-a.example/cdp"}},
-        "b": {"id": "b", "backend": "rdp", "owner": "attach",
+        "b": {"id": "b", "backend": "cdp", "owner": "attach",
               "workspace": {"url": "ws://cloud-b.example/cdp"}},
-        "local": {"id": "local", "backend": "rdp", "owner": "create",
+        "local": {"id": "local", "backend": "cdp", "owner": "create",
                   "workspace": {"port": 9444}},
         "retired": {"id": "retired", "backend": "env"},
     }
@@ -491,16 +491,16 @@ def test_raw_cdp_sessions_get_own_contexts_whatever_the_shared_backend(
     assert {id(ctx_a), id(ctx_b), id(ctx_local)}.isdisjoint({id(shared)})
     assert len({id(ctx_a), id(ctx_b), id(ctx_local)}) == 3
     # ...pointed at its own endpoint, with no cross-talk.
-    assert ctx_a.holder._cfg.backends.rdp.endpoint == "ws://cloud-a.example/cdp"
-    assert ctx_b.holder._cfg.backends.rdp.endpoint == "ws://cloud-b.example/cdp"
-    assert ctx_local.holder._cfg.backends.rdp.endpoint is None
-    assert ctx_local.holder._cfg.backends.rdp.port == 9444
+    assert ctx_a.holder._cfg.backends.cdp.endpoint == "ws://cloud-a.example/cdp"
+    assert ctx_b.holder._cfg.backends.cdp.endpoint == "ws://cloud-b.example/cdp"
+    assert ctx_local.holder._cfg.backends.cdp.endpoint is None
+    assert ctx_local.holder._cfg.backends.cdp.port == 9444
     # The daemon-wide cfg is never mutated by any of that.
-    assert daemon.cfg.backends.rdp.endpoint is None
-    assert daemon.cfg.backends.rdp.port == 9222
+    assert daemon.cfg.backends.cdp.endpoint is None
+    assert daemon.cfg.backends.cdp.port == 9222
     # Ownership still crosses the ledger→context boundary.
-    assert ctx_a.holder.rdp_owns_browser is False
-    assert ctx_local.holder.rdp_owns_browser is True
+    assert ctx_a.holder.cdp_owns_browser is False
+    assert ctx_local.holder.cdp_owns_browser is True
     # A retired backend value fails closed rather than inheriting anything.
     with pytest.raises(UnknownSessionError):
         daemon.context_for_required("retired")
@@ -685,7 +685,7 @@ async def test_concurrent_session_terminators_do_not_deadlock_each_other(
 
 
 @pytest.mark.asyncio
-async def test_daemon_teardown_missing_rdp_context_returns_false():
+async def test_daemon_teardown_missing_cdp_context_returns_false():
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext
     from browserwright.daemon.server.state import DaemonState
 
@@ -694,11 +694,11 @@ async def test_daemon_teardown_missing_rdp_context_returns_false():
 
     shared = UpstreamContext(backend="extension", state=DaemonState("extension"), router=Router(), holder=object())
     daemon = Daemon(cfg=Config(), shared_context=shared, make_context=lambda **kw: pytest.fail("should not create"))
-    assert await daemon.teardown_rdp_context("missing") is False
+    assert await daemon.teardown_cdp_context("missing") is False
 
 
 @pytest.mark.asyncio
-async def test_daemon_teardown_failure_retains_rdp_context_for_retry():
+async def test_daemon_teardown_failure_retains_cdp_context_for_retry():
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext
     from browserwright.daemon.server.state import DaemonState
 
@@ -709,7 +709,7 @@ async def test_daemon_teardown_failure_retains_rdp_context_for_retry():
         def __init__(self):
             self.killed = False
 
-        def _kill_rdp_chrome(self):
+        def _kill_cdp_chrome(self):
             self.killed = True
             return True
 
@@ -717,7 +717,7 @@ async def test_daemon_teardown_failure_retains_rdp_context_for_retry():
             assert self.killed is True
             raise RuntimeError("Chrome refused to terminate")
 
-        async def abort_rdp_teardown(self):
+        async def abort_cdp_teardown(self):
             return None
 
     shared = UpstreamContext(
@@ -727,17 +727,17 @@ async def test_daemon_teardown_failure_retains_rdp_context_for_retry():
         cfg=Config(), shared_context=shared,
         make_context=lambda **kw: pytest.fail("should not create"))
     ctx = UpstreamContext(
-        backend="rdp", state=DaemonState("rdp"),
+        backend="cdp", state=DaemonState("cdp"),
         router=Router(), holder=Holder())
     daemon.contexts["sess"] = ctx
 
     with pytest.raises(RuntimeError, match="refused to terminate"):
-        await daemon.teardown_rdp_context("sess")
+        await daemon.teardown_cdp_context("sess")
     assert daemon.contexts["sess"] is ctx
 
 
 @pytest.mark.asyncio
-async def test_daemon_teardown_budget_restores_retryable_rdp_context():
+async def test_daemon_teardown_budget_restores_retryable_cdp_context():
     import time
 
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext
@@ -746,13 +746,13 @@ async def test_daemon_teardown_budget_restores_retryable_rdp_context():
     class Router:
         daemon = None
 
-    state = DaemonState("rdp")
+    state = DaemonState("cdp")
 
     class Holder:
         def __init__(self):
             self.killed = False
 
-        def _kill_rdp_chrome(self):
+        def _kill_cdp_chrome(self):
             self.killed = True
             return True
 
@@ -760,7 +760,7 @@ async def test_daemon_teardown_budget_restores_retryable_rdp_context():
             await state.begin_closing("skill_disconnect")
             await asyncio.Event().wait()
 
-        async def abort_rdp_teardown(self):
+        async def abort_cdp_teardown(self):
             await state.set_disconnected()
 
     shared = UpstreamContext(
@@ -771,10 +771,10 @@ async def test_daemon_teardown_budget_restores_retryable_rdp_context():
         make_context=lambda **kw: pytest.fail("should not create"))
     holder = Holder()
     ctx = UpstreamContext(
-        backend="rdp", state=state, router=Router(), holder=holder)
+        backend="cdp", state=state, router=Router(), holder=holder)
     daemon.contexts["sess"] = ctx
 
-    ended = await daemon.teardown_rdp_context(
+    ended = await daemon.teardown_cdp_context(
         "sess", deadline=time.monotonic() + 0.01)
 
     assert ended is False
@@ -803,7 +803,7 @@ async def test_router_release_client_detaches_sessions():
     from browserwright.daemon.server.proxy import Router
     from browserwright.daemon.server.state import DaemonState
 
-    state = DaemonState("rdp")
+    state = DaemonState("cdp")
     router = Router(state)
     sent = []
     router.update_upstream_send(lambda text: sent.append(json.loads(text)) or asyncio.sleep(0))

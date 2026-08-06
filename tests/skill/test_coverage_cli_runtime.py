@@ -184,7 +184,7 @@ def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys)
     from browserwright._executor import client as executor_client
     from browserwright._executor.protocol import ExecuteResponse
 
-    sid = reg.allocate(backend="rdp", owner="create", name="job")
+    sid = reg.allocate(backend="cdp", owner="create", name="job")
     calls = []
     monkeypatch.setattr(
         executor_client,
@@ -250,7 +250,7 @@ def test_cmd_task_reports_missing_task(monkeypatch, capsys, tmp_bs_home):
             exit_code=3,
         ),
     )
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
 
     assert cli._cmd_task(["--session", sid, "site/name"]) == 1
     assert "task not found" in capsys.readouterr().err
@@ -270,7 +270,7 @@ def test_cmd_task_reports_crash(monkeypatch, capsys, tmp_bs_home):
             exit_code=3,
         ),
     )
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
 
     assert cli._cmd_task(["--session", sid, "site/name"]) == 3
     assert "task crashed" in capsys.readouterr().err
@@ -282,7 +282,7 @@ def test_cmd_task_binds_session_and_outputs_json(monkeypatch, tmp_bs_home, capsy
     from browserwright._executor import client as executor_client
     from browserwright._executor.protocol import ExecuteResponse
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     captured = {}
     monkeypatch.setattr(
         executor_client,
@@ -337,7 +337,7 @@ def test_cmd_task_default_output_uses_executor_repr_and_isolated(
             )
         ),
     )
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
 
     assert cli._cmd_task(["--session", sid, "site/name", "--isolated"]) == 0
     assert capsys.readouterr().out == "<CustomResult exact-repr>\n"
@@ -397,7 +397,7 @@ def test_cmd_memory_replace_dry_run_then_confirm(tmp_bs_home, capsys):
 def test_cmd_session_reset_recycles_executor(tmp_bs_home, monkeypatch, capsys):
     from browserwright import cli, session_create, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(
         session_create,
@@ -413,7 +413,7 @@ def test_cmd_session_reset_recycles_executor(tmp_bs_home, monkeypatch, capsys):
 def test_global_session_prefix_dispatches_whoami(tmp_bs_home, capsys):
     from browserwright import cli, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
 
     with pytest.raises(SystemExit) as exc:
         cli.main(["-s", sid, "whoami"])
@@ -424,7 +424,7 @@ def test_global_session_prefix_dispatches_whoami(tmp_bs_home, capsys):
 def test_global_session_prefix_dispatches_session_end(tmp_bs_home, monkeypatch, capsys):
     from browserwright import cli, session_create, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(
         session_create,
@@ -442,8 +442,8 @@ def test_global_session_prefix_dispatches_session_end(tmp_bs_home, monkeypatch, 
 def test_session_inner_session_overrides_global_prefix(tmp_bs_home, monkeypatch, capsys):
     from browserwright import cli, session_create, session_registry as reg
 
-    outer = reg.allocate(backend="rdp", owner="attach", name="outer")
-    inner = reg.allocate(backend="rdp", owner="attach", name="inner")
+    outer = reg.allocate(backend="cdp", owner="attach", name="outer")
+    inner = reg.allocate(backend="cdp", owner="attach", name="inner")
     calls = []
     monkeypatch.setattr(
         session_create,
@@ -461,7 +461,7 @@ def test_session_inner_session_overrides_global_prefix(tmp_bs_home, monkeypatch,
 def test_session_reset_uses_bd_session_fallback(tmp_bs_home, monkeypatch, capsys):
     from browserwright import cli, session_create, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     monkeypatch.setenv("BD_SESSION", sid)
     calls = []
     monkeypatch.setattr(
@@ -480,7 +480,7 @@ def test_cmd_session_new_stderr_keeps_stdout_bare(monkeypatch, tmp_bs_home, caps
 
     monkeypatch.setattr(session_create, "new", lambda **kwargs: "17")
 
-    assert cli._cmd_session(["new", "--backend=rdp", "--name=job"]) == 0
+    assert cli._cmd_session(["new", "--backend=cdp", "--name=job"]) == 0
     streams = capsys.readouterr()
     assert streams.out == "17\n"
     assert streams.err == "OK: session 17 created\n"
@@ -526,7 +526,7 @@ def test_cmd_userscript_verify_binds_bd_session(monkeypatch, tmp_bs_home, capsys
     from browserwright import cli
     from browserwright import session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
     calls = []
 
@@ -567,7 +567,7 @@ def test_cmd_userscript_verify_failure_preserves_successful_push(
     from browserwright import cli
     from browserwright import session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="create")
+    sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
     monkeypatch.setattr(
         cli.subprocess,
@@ -667,7 +667,7 @@ def test_doctor_checks_no_daemon_is_single_root_cause_failure(monkeypatch):
         "recommended": None,
         "backends": [
             {"name": "env", "available": False},
-            {"name": "rdp", "available": False},
+            {"name": "cdp", "available": False},
             {"name": "extension", "available": False,
              "needs_user_action": "start the single global daemon, then load "
                                   "the Chrome extension from `chrome-extension/`"},
@@ -843,8 +843,8 @@ def test_session_create_run_returns_three_for_timeout(monkeypatch):
 def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monkeypatch):
     from browserwright import session_create, session_registry as reg
 
-    create_sid = reg.allocate(backend="rdp", owner="create", name="owned")
-    attach_sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    create_sid = reg.allocate(backend="cdp", owner="create", name="owned")
+    attach_sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     ext_sid = reg.allocate(backend="extension", owner="attach", name="ext")
     reg._with_entry(create_sid, lambda e: e.update(last_seen=0.0))
     reg._with_entry(attach_sid, lambda e: e.update(last_seen=0.0))
@@ -874,7 +874,7 @@ def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
     from browserwright import session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
-    sid = reg.allocate(backend="rdp", owner="create", name="owned")
+    sid = reg.allocate(backend="cdp", owner="create", name="owned")
     record = reg.get(sid)
     monkeypatch.setattr(session_create, "_run", lambda _cmd, **kwargs: 3)
 
@@ -886,7 +886,7 @@ def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
 def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
     from browserwright import session_create, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: calls.append(["ensure"]))
     monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
@@ -904,7 +904,7 @@ def test_session_create_reset_executor_refuses_unconfirmed_reap(
     from browserwright import session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
     monkeypatch.setattr(session_create, "_run", lambda _cmd: 1)
 
@@ -920,7 +920,7 @@ def test_cmd_session_reset_reports_unconfirmed_reap(
     from browserwright import cli, session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     monkeypatch.setattr(
         session_create,
         "reset_executor",
@@ -978,11 +978,11 @@ def test_cmd_session_end_reports_partial_extension_teardown(
     assert reg.get(sid) is not None
 
 
-def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):
-    """Attach rdp uses daemon termination but keeps its external browser."""
+def test_session_create_end_attach_cdp_reaps_executor(tmp_bs_home, monkeypatch):
+    """Attach cdp uses daemon termination but keeps its external browser."""
     from browserwright import session_create, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     calls = []
     monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
     message = session_create.end(reg.get(sid))
@@ -992,13 +992,13 @@ def test_session_create_end_attach_rdp_reaps_executor(tmp_bs_home, monkeypatch):
     assert reg.get(sid) is None
 
 
-def test_session_create_end_create_rdp_does_not_double_reap(tmp_bs_home, monkeypatch):
+def test_session_create_end_create_cdp_does_not_double_reap(tmp_bs_home, monkeypatch):
     """A create-owned session's `end()` drives `_close_browser` (→ daemon
     `endSession`, which ALSO kills the executor), so it must NOT additionally
     call `kill-executor` (no redundant reap)."""
     from browserwright import session_create, session_registry as reg
 
-    sid = reg.allocate(backend="rdp", owner="create", name="owned",
+    sid = reg.allocate(backend="cdp", owner="create", name="owned",
                        workspace={"port": 12345})
     calls = []
     monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
@@ -1018,7 +1018,7 @@ def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
     from browserwright import session_create, session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
-    sid = reg.allocate(backend="rdp", owner="attach", name="attached")
+    sid = reg.allocate(backend="cdp", owner="attach", name="attached")
 
     def boom(*_a, **_k):
         raise subprocess.TimeoutExpired("browserwright-daemon", timeout=10)
@@ -1033,7 +1033,7 @@ def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
 def test_session_registry_unique_name_conflict_does_not_advance_ledger(tmp_bs_home):
     from browserwright import session_registry as reg
 
-    first = reg.allocate(backend="rdp", owner="create", name="job", unique_name=True)
+    first = reg.allocate(backend="cdp", owner="create", name="job", unique_name=True)
     with pytest.raises(ValueError):
         reg.allocate(backend="extension", owner="attach", name="job", unique_name=True)
     second = reg.allocate(backend="extension", owner="attach", name="other", unique_name=True)
@@ -1050,7 +1050,7 @@ def test_session_registry_backend_immutability_leaves_record_unchanged(tmp_bs_ho
     assert reg.update(sid, backend="extension", runtime={"ok": True})["runtime"] == {"ok": True}
 
     with pytest.raises(ValueError):
-        reg.update(sid, backend="rdp", owner="create")
+        reg.update(sid, backend="cdp", owner="create")
 
     rec = reg.get(sid)
     assert rec["backend"] == "extension"

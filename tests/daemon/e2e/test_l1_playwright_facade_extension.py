@@ -10,7 +10,7 @@ tab (A3), runs the `Runtime.enable` settle barrier (A4), and forwards
 page-domain CDP through `chrome.debugger` WITH the per-page sessionId so
 flat-session routing stays consistent.
 
-This is the extension sibling of `test_l1_playwright_facade.py` (rdp). It uses
+This is the extension sibling of `test_l1_playwright_facade.py` (cdp). It uses
 the isolated CfT harness (port 29989) — NOT the developer's daily Chrome.
 
 What this proves (all via a real `chromium.connect_over_cdp`):
@@ -49,7 +49,7 @@ from .conftest import (  # noqa: F401
     _isolated_runtime_dir,
 )
 
-# A test facade port distinct from production (19990), the rdp-facade test
+# A test facade port distinct from production (19990), the cdp-facade test
 # (29991), and the relay (29989).
 TEST_EXT_FACADE_PORT = 29992
 

@@ -96,7 +96,7 @@ def _build_create_target_error() -> str:
         "it cannot open browser-level targets. Open a tab via the skill "
         "primitive open_background(url, group=\"Agent\") (or "
         "BrowserwrightDaemon.openBackgroundTab for a background tab) instead. "
-        "new_tab() works only on the rdp/env backend."
+        "new_tab() works only on the cdp/env backend."
     )
 
 

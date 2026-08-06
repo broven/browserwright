@@ -1,17 +1,17 @@
 """Session creation/teardown per backend.
 
-Creation is **explicit**: an agent picks ``extension`` / ``rdp --create`` /
-``rdp --attach``. This module allocates the ledger entry and makes sure the
+Creation is **explicit**: an agent picks ``extension`` / ``cdp --create`` /
+``cdp --attach``. This module allocates the ledger entry and makes sure the
 ONE global daemon is running.
 
 Single-daemon model (docs/refactor-single-daemon.md §P3): there is exactly one
 global daemon on a fixed socket (no ``--name`` / ``BD_NAME``). It serves both
-backends simultaneously, routing per session. For rdp the daemon itself launches
+backends simultaneously, routing per session. For cdp the daemon itself launches
 and owns the per-session Chrome on ``ensureSession`` and tears it down on
 ``endSession`` — this module no longer spawns a per-session daemon or launches
 Chrome directly. ``new()`` only:
   - allocates the ledger entry (recording the chosen port in ``workspace`` so
-    the daemon pins the rdp Chrome to it), and
+    the daemon pins the cdp Chrome to it), and
   - ensures the single daemon is up.
 
 Teardown talks to the single daemon via the ``browserwright-daemon`` CLI
@@ -112,7 +112,7 @@ def _end_daemon_session(record: dict) -> bool:
     """End every session through the daemon's atomic terminal lifecycle.
 
     The daemon, not Layer 2, applies workspace ownership: extension closes its
-    group, rdp create closes its Chrome, while rdp attach keeps the external
+    group, cdp create closes its Chrome, while cdp attach keeps the external
     browser.  All three still revoke live control/facade clients and reap the
     executor before this function confirms success.
     """
@@ -181,10 +181,10 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     - ``extension`` → an *attach* session sharing the one global daemon's
       relay-backed upstream; the tab group is created lazily on first use, so
       ``workspace`` is None.
-    - ``rdp --create`` → owns an isolated browser the daemon launches on
+    - ``cdp --create`` → owns an isolated browser the daemon launches on
       ``ensureSession``. We pick a free port now and record it in ``workspace``
       so the daemon pins the per-session Chrome to it.
-    - ``rdp --attach <port|url>`` → attaches to a browser someone else owns; the
+    - ``cdp --attach <port|url>`` → attaches to a browser someone else owns; the
       endpoint is recorded and the browser is left alone on end. A port means
       "on this machine"; a ws/http URL means "wherever this points" — a cloud
       or anti-detect browser (#38).
@@ -197,7 +197,7 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         raise ValueError(
             "session new requires --name=NAME — a short label (e.g. "
             "--name=cf-bots). For extension sessions this becomes the Chrome "
-            "tab group title; for RDP sessions it labels the isolated browser "
+            "tab group title; for CDP sessions it labels the isolated browser "
             "session. It need not be unique."
         )
     if backend == "extension":
@@ -205,14 +205,14 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
                            owner="attach", name=name)
         _ensure_daemon_running()
         return sid
-    if backend == "rdp":
+    if backend == "cdp":
         if create and attach is not None:
             raise ValueError(
                 "--create and --attach are mutually exclusive: --create launches "
                 "a browser we own, --attach borrows one we don't.")
         if not create and attach is None:
             raise ValueError(
-                "--backend=rdp needs either --create (launch an isolated browser) "
+                "--backend=cdp needs either --create (launch an isolated browser) "
                 "or --attach=<port|url> (use one that is already running).")
         owner = "create" if create else "attach"
         if create:
@@ -221,7 +221,7 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         else:
             port, endpoint = _checked_attach(attach)
             workspace = {"port": port} if port is not None else {"url": endpoint}
-        sid = reg.allocate(backend="rdp", owner=owner,
+        sid = reg.allocate(backend="cdp", owner=owner,
                            name=name, workspace=workspace)
         _ensure_daemon_running()
         return sid
@@ -248,18 +248,17 @@ def _checked_attach(attach: object) -> tuple[Optional[int], Optional[str]]:
 def _unknown_backend_message(backend: object) -> str:
     """Name the replacement, not just the rejection (#38).
 
-    `rdp` and `env` were the same real-CDP backend differing only in where the
-    ws URL came from. Somebody with either in a script needs to be told what to
-    write instead, which argparse's bare "invalid choice" never says.
+    `rdp` and `env` (the historical names) were one real-CDP backend differing
+    only in where the ws URL came from; they are now both `cdp`. Anyone with
+    either in a script needs to be told what to write instead, which a bare
+    "invalid choice" never says. The migration text itself lives in Layer 1
+    beside the rest of the backend vocabulary, so `browserwright-daemon` can
+    print the identical thing.
     """
-    if backend == "env":
-        return (
-            "backend 'env' is gone. An external browser is now attached per "
-            "session: `session new --backend=rdp --attach=<ws-or-http-url>` "
-            "(what BD_CDP_WS / BD_CDP_URL used to set process-wide). "
-            "One daemon can now hold many of them at once."
-        )
-    return f"unknown backend {backend!r} (use extension|rdp)"
+    from .daemon.config import retired_backend_message
+
+    return (retired_backend_message(backend)
+            or f"unknown backend {backend!r} (use extension|cdp)")
 
 
 def end(record: dict) -> str:
@@ -282,7 +281,7 @@ def end(record: dict) -> str:
     #
     # This restriction used to also protect `env`, whose daemon carried
     # per-profile configuration a bare `serve` could not reproduce. That reason
-    # is gone with the backend (#38), and an `rdp` session now routes to its own
+    # is gone with the backend (#38), and an `cdp` session now routes to its own
     # context whatever the shared backend is — so a bare daemon *could* serve
     # one. Broadening this is deliberately left alone: for `--create` the
     # launched Chrome's pid died with the old daemon, so recovery really means

@@ -335,7 +335,7 @@ class CdpUpstream:
         Raw-CDP is a compatibility boundary: unlike the high-level
         ``list_tabs`` helper, this path must preserve request filters, every
         target type, and every response field exactly as Chrome returned it.
-        ``session_id`` is intentionally unused. RDP scopes each session at its
+        ``session_id`` is intentionally unused. CDP scopes each session at its
         per-session browser connection. Env uses the daemon's shared browser
         connection, but session creation admits only one env session per
         daemon, so that connection is still the sole env session's workspace.
@@ -347,7 +347,7 @@ class CdpUpstream:
     ) -> bool:
         """Authorize at the raw-CDP browser-instance boundary.
 
-        RDP has a per-session connection. Env relies on the atomic
+        CDP has a per-session connection. Env relies on the atomic
         one-env-session-per-daemon creation invariant before using its shared
         connection as the same boundary.
         """
@@ -469,7 +469,7 @@ class CdpUpstream:
 
     async def end_session(self, session_id: str,
                           group_id: int | None = None) -> dict:
-        """End an rdp workspace; env/attach ownership remains external."""
+        """End an cdp workspace; env/attach ownership remains external."""
         ended: bool | None = None
         if self._on_end_session is not None:
             ended = await self._on_end_session(session_id)
@@ -668,7 +668,7 @@ class CdpUpstream:
             source = (script.get("source") or script.get("body")
                       or script.get("code") or "")
             script_id = script.get("id") or (
-                f"rdp-us-{len(self._userscripts) + 1}")
+                f"cdp-us-{len(self._userscripts) + 1}")
             identity = script.get("identity") or script_id
             if not isinstance(source, str) or not source:
                 raise ValueError("userscript install requires script.source")
@@ -887,5 +887,5 @@ def _localhost_bypass_proxy(ws_url: str):
 
 # Compatibility name for callers/tests that still import the old transport-
 # shaped class.  The concrete implementation is now the raw-CDP Upstream
-# adapter, covering both rdp and env.
+# adapter, covering both cdp and env.
 UpstreamConnection = CdpUpstream

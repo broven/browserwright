@@ -184,10 +184,10 @@ async def test_extension_ready_proceeds_to_spawn():
 
 
 @pytest.mark.asyncio
-async def test_rdp_skips_extension_fastfail():
-    """The fast-fail is extension-only: an rdp session never consults the relay
+async def test_cdp_skips_extension_fastfail():
+    """The fast-fail is extension-only: an cdp session never consults the relay
     (it has none) and proceeds through the normal upstream-open + spawn path."""
-    state, router, cap, client, registry = _build("rdp", relay=None)
+    state, router, cap, client, registry = _build("cdp", relay=None)
 
     await _ensure_executor(router, client)
 

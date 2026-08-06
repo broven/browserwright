@@ -535,7 +535,7 @@ def test_launchagent_install_uninstall_and_launchctl_sweep(monkeypatch, capsys, 
     assert "<string>serve</string>" in plist.read_text()
 
     plist.unlink()
-    assert cli._cmd_install(_ns(backend="rdp", extension_port=None, force=False), Config()) == 0
+    assert cli._cmd_install(_ns(backend="cdp", extension_port=None, force=False), Config()) == 0
     assert "--backend" not in plist.read_text()
     assert "install --backend` is ignored" in capsys.readouterr().err
 

@@ -1,7 +1,7 @@
 """Playwright facade ↔ extension backend bridge (Task #tab-handle-model, PR2).
 
 PR1's `facade.py` is a byte-for-byte CDP passthrough to a resolved upstream ws.
-That works for the rdp backend because the daemon-owned Chrome speaks real
+That works for the cdp backend because the daemon-owned Chrome speaks real
 browser-level CDP natively (it emits `Target.attachedToTarget`/`targetCreated`,
 handles `Target.*`/`Browser.*`). The **extension** backend has no resolvable
 upstream ws — the daemon IS the relay, and `extension_upstream.py` only *acks*

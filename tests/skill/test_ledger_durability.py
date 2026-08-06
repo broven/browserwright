@@ -96,7 +96,7 @@ def test_a_stale_temp_file_does_not_leak_loose_permissions(tmp_bs_home):
 
 def test_ledger_content_survives_the_atomic_write(tmp_bs_home):
     a = session_registry.allocate(backend="extension", owner="attach", name="a")
-    b = session_registry.allocate(backend="rdp", owner="create",
+    b = session_registry.allocate(backend="cdp", owner="create",
                                   workspace={"port": 9333}, name="b")
     raw = json.loads(session_registry._ledger_path().read_text())
     assert set(raw["sessions"]) == {a, b}

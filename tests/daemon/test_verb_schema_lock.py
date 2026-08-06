@@ -66,13 +66,13 @@ DAEMON_VERBS: tuple[str, ...] = (
     "BrowserwrightDaemon.userscript.logs",
 )
 
-#: `extension` is the sole relay backend; `rdp` and `env` are the raw-CDP family
+#: `extension` is the sole relay backend; `cdp` and `env` are the raw-CDP family
 #: (CONTEXT.md: the discriminator is `backend != "extension"`, never a name
-#: check. `env` folded into `rdp` in #38, so the raw-CDP family currently has
+#: check. `env` folded into `cdp` in #38, so the raw-CDP family currently has
 #: one member — the tuple-of-one is kept deliberately: it documents that this
 #: is a *family*, and a future third raw backend joins by editing one line.)
-BACKENDS: tuple[str, ...] = ("extension", "rdp")
-RAW_CDP_BACKENDS: tuple[str, ...] = ("rdp",)
+BACKENDS: tuple[str, ...] = ("extension", "cdp")
+RAW_CDP_BACKENDS: tuple[str, ...] = ("cdp",)
 
 #: Verbs that must never answer -32601 on ANY backend, even with no params and
 #: no upstream wired. These are exactly the verbs whose handlers validate params
@@ -229,7 +229,7 @@ async def test_param_validation_runs_before_backend_wiring(backend: str, method:
 @pytest.mark.asyncio
 async def test_raw_cdp_backends_never_answer_method_not_found(
         backend: str, method: str):
-    """The "never -32601" rule, enforced strictly on `rdp` and `env`.
+    """The "never -32601" rule, enforced strictly on `cdp` and `env`.
 
     Both are the raw-CDP family, so every session verb has a raw-CDP
     implementation and must reach it. An unimplemented divergence has to be an

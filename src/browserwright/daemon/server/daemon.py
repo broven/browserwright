@@ -9,7 +9,7 @@ logic. It:
   - bundles one `(state, router, holder)` triple per upstream into an
     `UpstreamContext` (the per-upstream unit of `docs §Decomposition`), and
   - adds the thin global `Daemon` that owns the shared (extension/real-browser)
-    context plus one lazily-created context per rdp session, and dispatches a
+    context plus one lazily-created context per cdp session, and dispatches a
     connecting client to the right context by reading the session's *immutable*
     backend from the ledger.
 
@@ -19,9 +19,9 @@ reaches that context's own clients (browser-level events stay scoped to the
 upstream that produced them).
 
 Phase boundaries (this file is Phase 2):
-  - The actual per-session rdp Chrome *launch* is Phase 3. Here we only create
+  - The actual per-session cdp Chrome *launch* is Phase 3. Here we only create
     the context object + its `(state, router, holder)` triple, wiring the
-    holder with a cfg whose rdp port comes from the session's workspace; the
+    holder with a cfg whose cdp port comes from the session's workspace; the
     holder's existing resolve/connect path is left untouched.
 """
 from __future__ import annotations
@@ -99,7 +99,7 @@ class UpstreamContext:
         # Typed as object to keep this module free of a listener import cycle
         # (_UpstreamHolder lives in listener.py and imports nothing from here).
         self.holder = holder
-        # None for the shared context; the rdp session id otherwise.
+        # None for the shared context; the cdp session id otherwise.
         self.session_id = session_id
 
 
@@ -107,14 +107,14 @@ class UpstreamContext:
 
 
 class Daemon:
-    """Global daemon: one shared context + one context per rdp session.
+    """Global daemon: one shared context + one context per cdp session.
 
     `shared_context` is the always-on, real-browser upstream (backend ==
     `cfg.backend`, default `extension`); for the extension backend its holder
     owns the always-on `RelayServer` started eagerly in `run_serve`. Every
     extension/env session routes here.
 
-    `contexts` holds one `UpstreamContext` per rdp session, created lazily on
+    `contexts` holds one `UpstreamContext` per cdp session, created lazily on
     first reference (Phase 3 makes the holder actually launch the per-session
     Chrome — here it is only wired with a port-pinned cfg).
     """
@@ -123,7 +123,7 @@ class Daemon:
                  make_context):
         self.cfg = cfg
         self.shared_context = shared_context
-        # Exactly one context per rdp session, no exceptions. `daemon_scope`
+        # Exactly one context per cdp session, no exceptions. `daemon_scope`
         # lived here to authorize env records against the socket that allocated
         # them; with the endpoint carried per session there is nothing left to
         # arbitrate, and the uniformity is what makes teardown analyzable.
@@ -154,11 +154,11 @@ class Daemon:
         self._termination_locks: dict[str, asyncio.Lock] = {}
         # Back-reference set on each context's router so RPC handlers
         # (endSession etc.) can reach the daemon to create/drop
-        # an rdp context.
+        # an cdp context.
         shared_context.router.daemon = self  # type: ignore[attr-defined]
 
     def all_contexts(self) -> list[UpstreamContext]:
-        """Shared context first, then every rdp context — used by shutdown /
+        """Shared context first, then every cdp context — used by shutdown /
         idle / signal paths that must iterate every live upstream."""
         return [self.shared_context, *self.contexts.values()]
 
@@ -166,7 +166,7 @@ class Daemon:
         """Resolve the `UpstreamContext` that should serve `session_id`.
 
         - None / empty session     → the shared (real-browser) context.
-        - ledger backend == "rdp"  → a per-session context (created lazily).
+        - ledger backend == "cdp"  → a per-session context (created lazily).
         - extension                → the shared context, if it is the extension one.
         - unknown explicit session → raises when `require_known=True`.
 
@@ -175,7 +175,7 @@ class Daemon:
         context; explicit session-bound clients can require the ledger record so
         a typo or stale id never silently falls into the extension backend.
 
-        Note what is NOT conditioned on the shared backend: an `rdp` session
+        Note what is NOT conditioned on the shared backend: an `cdp` session
         gets its own context whatever the daemon was started with. That is what
         lets one extension-backed daemon simultaneously host N sessions each
         attached to a different external browser — the thing that used to
@@ -189,14 +189,14 @@ class Daemon:
                 raise UnknownSessionError(session_id)
             return self.shared_context
         backend = record.get("backend")
-        if backend == "rdp":
-            return self._ensure_rdp_context(session_id, record)
+        if backend == "cdp":
+            return self._ensure_cdp_context(session_id, record)
         if backend == "extension":
             if self.shared_context.backend == "extension":
                 return self.shared_context
             raise UnknownSessionError(session_id)
         # A malformed/forward-version/legacy record must never inherit the
-        # shared browser merely because it is not named "rdp". Retired `env`
+        # shared browser merely because it is not named "cdp". Retired `env`
         # records land here too, until `migrate_legacy_backends` clears them.
         raise UnknownSessionError(session_id)
 
@@ -368,11 +368,11 @@ class Daemon:
         else:
             self._session_phases[session_id] = "active"
 
-    def _ensure_rdp_context(self, session_id: str, record: dict) -> UpstreamContext:
-        """Get or create the per-session rdp context.
+    def _ensure_cdp_context(self, session_id: str, record: dict) -> UpstreamContext:
+        """Get or create the per-session cdp context.
 
         Phase 2 scope: build the context object (its own state/router/holder)
-        and wire the holder with a cfg whose rdp port comes from the session's
+        and wire the holder with a cfg whose cdp port comes from the session's
         `workspace["port"]` when present (else the existing resolve path is
         left intact). The actual Chrome *launch* is Phase 3 — the holder's
         lazy-open will then resolve+connect to that port.
@@ -380,41 +380,41 @@ class Daemon:
         ctx = self.contexts.get(session_id)
         if ctx is not None:
             return ctx
-        cfg = self._rdp_cfg_for(record)
-        ctx = self._make_context(backend="rdp", cfg=cfg, session_id=session_id)
+        cfg = self._cdp_cfg_for(record)
+        ctx = self._make_context(backend="cdp", cfg=cfg, session_id=session_id)
         # Preserve ownership semantics past the ledger→context boundary:
         # create-owned sessions launch/kill daemon-owned Chrome; attach
         # sessions only connect to the caller-provided port.
         try:
-            ctx.holder.rdp_owns_browser = record.get("owner") == "create"  # type: ignore[attr-defined]
+            ctx.holder.cdp_owns_browser = record.get("owner") == "create"  # type: ignore[attr-defined]
         except Exception:
             pass
-        # Same daemon back-reference the shared context got, so the rdp
+        # Same daemon back-reference the shared context got, so the cdp
         # context's RPC handlers can drop themselves on endSession.
         ctx.router.daemon = self  # type: ignore[attr-defined]
         self.contexts[session_id] = ctx
         # Redacted: a per-session endpoint can carry a bearer token, and daemon
         # logs get pasted into bug reports.
-        logger.info("created rdp upstream context for session %s (port=%s endpoint=%s)",
-                    session_id, cfg.backends.rdp.port,
-                    redact_url(cfg.backends.rdp.endpoint))
+        logger.info("created cdp upstream context for session %s (port=%s endpoint=%s)",
+                    session_id, cfg.backends.cdp.port,
+                    redact_url(cfg.backends.cdp.endpoint))
         return ctx
 
-    def _rdp_cfg_for(self, record: dict) -> Config:
-        """Derive a per-session rdp Config from the ledger record.
+    def _cdp_cfg_for(self, record: dict) -> Config:
+        """Derive a per-session cdp Config from the ledger record.
 
-        Pins `backend="rdp"` plus whichever endpoint the session's workspace
+        Pins `backend="cdp"` plus whichever endpoint the session's workspace
         carries, so the holder's resolve path targets the right browser. This
         is the ONLY place a per-session endpoint enters the system — and it
         enters through the Config rather than as an attribute on the holder,
         because that is the channel the Playwright facade already reads
-        (`facade._resolve_rdp_ws` takes `ctx.holder._cfg`). A second channel
+        (`facade._resolve_cdp_ws` takes `ctx.holder._cfg`). A second channel
         would mean teaching the facade about it too.
         """
         port, endpoint = _endpoint_from_workspace(record.get("workspace"))
-        cfg = dataclasses.replace(self.cfg, backend="rdp")
+        cfg = dataclasses.replace(self.cfg, backend="cdp")
         if port is not None or endpoint is not None:
-            # `replace` shares the nested BackendsConfig instance; copy the rdp
+            # `replace` shares the nested BackendsConfig instance; copy the cdp
             # sub-config so per-session pinning never mutates the shared cfg
             # (or another session's context).
             fields: dict = {"endpoint": endpoint}
@@ -422,26 +422,26 @@ class Daemon:
                 fields["port"] = port
             cfg.backends = dataclasses.replace(
                 cfg.backends,
-                rdp=dataclasses.replace(cfg.backends.rdp, **fields),
+                cdp=dataclasses.replace(cfg.backends.cdp, **fields),
             )
         return cfg
 
-    def drop_rdp_context(self, session_id: str) -> UpstreamContext | None:
-        """Remove an rdp context from the registry. Returns the dropped
+    def drop_cdp_context(self, session_id: str) -> UpstreamContext | None:
+        """Remove an cdp context from the registry. Returns the dropped
         context, or None if absent.
 
         This only de-registers the context (sync, callable from `_on_upstream_
         closed` after teardown already ran). To also close the upstream + kill
-        the owned Chrome, use the async `teardown_rdp_context` instead — it runs
+        the owned Chrome, use the async `teardown_cdp_context` instead — it runs
         the holder's `trigger_close` (which SIGTERMs the Chrome) before
         dropping."""
         return self.contexts.pop(session_id, None)
 
-    async def teardown_rdp_context(
+    async def teardown_cdp_context(
         self, session_id: str, *, deadline: float | None = None,
     ) -> bool:
         """Phase 3 endSession teardown: close the per-session upstream, kill the
-        daemon-owned Chrome (the holder's `trigger_close` SIGTERMs `rdp_pid`),
+        daemon-owned Chrome (the holder's `trigger_close` SIGTERMs `cdp_pid`),
         and drop the context. Returns True if a context was found + torn down.
 
         Idempotent-ish: a missing context returns False so the caller can still
@@ -453,11 +453,11 @@ class Daemon:
         # Terminate the owned process before the first cancellable close-
         # etiquette await. A timeout can lose notifications, but cannot leak
         # the Chrome or leave the context stuck in CLOSING.
-        kill = getattr(holder, "_kill_rdp_chrome", None)
+        kill = getattr(holder, "_kill_cdp_chrome", None)
         if callable(kill):
             if kill() is False:
                 raise RuntimeError(
-                    f"could not terminate rdp Chrome for session {session_id!r}")
+                    f"could not terminate cdp Chrome for session {session_id!r}")
         try:
             # "skill_disconnect" is the closest honest CloseReason — the client
             # explicitly asked to end this session (vs chrome_exit / idle).
@@ -468,29 +468,29 @@ class Daemon:
                 remaining = max(0.0, deadline - time.monotonic())
                 if remaining <= 0:
                     close.close()
-                    abort = getattr(holder, "abort_rdp_teardown", None)
+                    abort = getattr(holder, "abort_cdp_teardown", None)
                     if callable(abort):
                         await abort()
                     return False
                 await asyncio.wait_for(close, timeout=remaining)
         except asyncio.TimeoutError:
-            abort = getattr(holder, "abort_rdp_teardown", None)
+            abort = getattr(holder, "abort_cdp_teardown", None)
             if callable(abort):
                 await abort()
-            logger.warning("teardown rdp context %s exceeded its budget", session_id)
+            logger.warning("teardown cdp context %s exceeded its budget", session_id)
             return False
         except asyncio.CancelledError:
-            abort = getattr(holder, "abort_rdp_teardown", None)
+            abort = getattr(holder, "abort_cdp_teardown", None)
             if callable(abort):
                 await asyncio.shield(abort())
             raise
         except Exception as e:
-            abort = getattr(holder, "abort_rdp_teardown", None)
+            abort = getattr(holder, "abort_cdp_teardown", None)
             if callable(abort):
                 await abort()
-            logger.warning("teardown rdp context %s close failed: %r",
+            logger.warning("teardown cdp context %s close failed: %r",
                            session_id, e)
             raise
         self.contexts.pop(session_id, None)
-        logger.info("tore down rdp context for session %s", session_id)
+        logger.info("tore down cdp context for session %s", session_id)
         return True

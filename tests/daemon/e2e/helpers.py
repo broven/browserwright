@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .conftest import (
     TEST_EXT_PORT,
-    TEST_RDP_PORT,
+    TEST_CDP_PORT,
     scrubbed_env,
 )
 
@@ -31,22 +31,22 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
     Single-global-daemon: the skill reaches the *test* daemon (not the
     developer's) via `XDG_RUNTIME_DIR` (the fixed socket lives there) — there is
     no `BD_NAME` anymore. The ledger record carries only the session's
-    `backend`; the daemon routes per session. Relay/rdp upstream isolation is
-    via `BD_EXTENSION_PORT` / `BD_RDP_PORT`.
+    `backend`; the daemon routes per session. Relay/cdp upstream isolation is
+    via `BD_EXTENSION_PORT` / `BD_CDP_PORT`.
 
     Args:
         script: Python source the skill REPL will execute (heredoc body).
-        backend: "extension" or "rdp".
+        backend: "extension" or "cdp".
         runtime_dir: XDG_RUNTIME_DIR of the test daemon (yielded by the
-            `e2e_daemon` / `e2e_rdp_daemon` fixtures). May also be supplied via
+            `e2e_daemon` / `e2e_cdp_daemon` fixtures). May also be supplied via
             `extra_env["XDG_RUNTIME_DIR"]`.
         extra_env: extra env merged on top.
         timeout: subprocess timeout in seconds.
 
     Returns SkillResult (does NOT raise on non-zero exit; caller asserts).
     """
-    if backend not in ("extension", "rdp"):
-        raise ValueError(f"backend must be 'extension' or 'rdp', got {backend!r}")
+    if backend not in ("extension", "cdp"):
+        raise ValueError(f"backend must be 'extension' or 'cdp', got {backend!r}")
 
     skill_bin = Path(sys.executable).with_name("browserwright")
     if not skill_bin.exists():
@@ -73,9 +73,9 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
         # Pin the relay port so the daemon (and any doctor probe) targets the
         # test relay, not DEFAULT_RELAY_PORT (19989) — the isolation wall.
         env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
-    else:  # rdp
-        # The rdp daemon resolves its upstream against this port.
-        env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
+    else:  # cdp
+        # The cdp daemon resolves its upstream against this port.
+        env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
     if extra_env:
         env.update(extra_env)
 

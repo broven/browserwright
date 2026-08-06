@@ -18,10 +18,10 @@ Why a new endpoint (not the existing unix-socket client path)?
 
 Two backends, two transports (the consumer is always a real Playwright client):
 
-  - **rdp** (PR1): the daemon owns the rdp Chrome, which already speaks real
+  - **cdp** (PR1): the daemon owns the cdp Chrome, which already speaks real
     browser-level CDP — so the facade is a transparent byte-for-byte
-    passthrough: on each ws client connect we resolve the rdp Chrome's real CDP
-    ws (via the daemon resolver / `backends/rdp.py`) and pump frames in both
+    passthrough: on each ws client connect we resolve the cdp Chrome's real CDP
+    ws (via the daemon resolver / `backends/cdp.py`) and pump frames in both
     directions. No `Target.*`/`Browser.*` synthesis is needed because the real
     Chrome answers them natively.
 
@@ -75,7 +75,7 @@ FACADE_WS_PATH = "/cdp"
 
 class PlaywrightFacade:
     """A TCP ws server that bridges a Playwright `connect_over_cdp` client to
-    the daemon-resolved (rdp) Chrome's real browser-level CDP.
+    the daemon-resolved (cdp) Chrome's real browser-level CDP.
 
     Lifecycle mirrors `RelayServer`: ``start()`` binds (returns the bound port,
     useful with ``port=0`` in tests); ``stop()`` closes everything cleanly.
@@ -261,7 +261,7 @@ class PlaywrightFacade:
     async def _handle_client(self, conn: ServerConnection) -> None:
         """One Playwright client connected. For the extension backend, bridge
         through the shared relay with target-event synthesis (PR2); otherwise
-        resolve the rdp Chrome's real CDP ws and pump frames byte-for-byte."""
+        resolve the cdp Chrome's real CDP ws and pump frames byte-for-byte."""
         task = asyncio.current_task()
         lease_token: object | None = None
         if task is not None:
@@ -301,7 +301,7 @@ class PlaywrightFacade:
             if backend == "extension":
                 await self._handle_extension_client(conn, ctx)
                 return
-            await self._handle_rdp_client(conn, ctx)
+            await self._handle_cdp_client(conn, ctx)
         finally:
             release = getattr(self._daemon, "release_session_lease", None)
             if lease_token is not None and callable(release):
@@ -351,10 +351,10 @@ class PlaywrightFacade:
             with contextlib.suppress(Exception):
                 await bridge.aclose()
 
-    async def _handle_rdp_client(
+    async def _handle_cdp_client(
         self, conn: ServerConnection, ctx: UpstreamContext | None = None,
     ) -> None:
-        """rdp backend (PR1): transparent byte-for-byte passthrough."""
+        """cdp backend (PR1): transparent byte-for-byte passthrough."""
         # Open the session's upstream first, exactly as the extension path does.
         # For a `--create` session the browser is launched lazily by
         # `ensure_open`, so resolving before it ran meant probing a port nothing
@@ -369,7 +369,7 @@ class PlaywrightFacade:
                     await conn.close(code=1011, reason="upstream unavailable")
                 return
         try:
-            ws_url = await self._resolve_rdp_ws(ctx)
+            ws_url = await self._resolve_cdp_ws(ctx)
         except Unavailable as e:
             logger.warning("facade: cannot resolve upstream Chrome: %s", e)
             with contextlib.suppress(Exception):
@@ -388,13 +388,13 @@ class PlaywrightFacade:
         except Exception as e:  # noqa: BLE001
             logger.warning("facade: bridge crashed: %r", e)
 
-    async def _resolve_rdp_ws(self, ctx: UpstreamContext | None = None) -> str:
+    async def _resolve_cdp_ws(self, ctx: UpstreamContext | None = None) -> str:
         """Resolve the upstream Chrome CDP ws URL via the daemon resolver.
 
         Reads the *holder's* cfg, not the daemon-wide one. That is the whole
         channel by which a per-session endpoint reaches the facade: the port or
         URL from the session's ledger record was pinned into that Config by
-        `Daemon._rdp_cfg_for`. Anything that moves the endpoint out of the
+        `Daemon._cdp_cfg_for`. Anything that moves the endpoint out of the
         Config has to teach this function a second way to find it."""
         cfg = getattr(ctx.holder, "_cfg", self._cfg) if ctx is not None else self._cfg
         rr = await resolve_upstream(cfg)

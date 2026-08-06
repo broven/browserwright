@@ -1,9 +1,9 @@
-"""L1 -- Playwright `connect_over_cdp` against the daemon's CDP facade (rdp).
+"""L1 -- Playwright `connect_over_cdp` against the daemon's CDP facade (cdp).
 
 Phase A1 acceptance (task 05-24-tab-handle-model-for-code-agents, PR1):
 a real Playwright client connects to the daemon's NEW Playwright-facing CDP
 facade ws endpoint, opens a page, navigates, and reads the title — proving
-`chromium.connect_over_cdp(daemon_ws)` drives the rdp backend end to end.
+`chromium.connect_over_cdp(daemon_ws)` drives the cdp backend end to end.
 
 The facade is an additive TCP ws+HTTP endpoint (`/json/version` discovery + a
 transparent CDP passthrough) layered beside the agent unix socket; it does not
@@ -22,28 +22,28 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import TEST_RDP_PORT, _isolated_runtime_dir, _kill_chrome  # noqa: F401
+from .conftest import TEST_CDP_PORT, _isolated_runtime_dir, _kill_chrome  # noqa: F401
 
 # A test facade port distinct from production (19990) and the e2e relay (29989).
 TEST_FACADE_PORT = 29991
 
 
 @pytest.fixture
-def e2e_rdp_facade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
-    """Spawn the single daemon with `--facade-port N` against the rdp Chrome,
+def e2e_cdp_facade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
+    """Spawn the single daemon with `--facade-port N` against the cdp Chrome,
     isolated via a throwaway XDG_RUNTIME_DIR. Yields the facade
     port once the facade's `/json/version` answers."""
     import shutil
 
-    log_path = e2e_artifacts_dir / "daemon-rdp-facade.log"
+    log_path = e2e_artifacts_dir / "daemon-cdp-facade.log"
     log_fh = open(log_path, "wb")  # noqa: SIM115 — closed in teardown
 
     runtime_dir = _isolated_runtime_dir()
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
-    env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "rdp")
+    env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "cdp")
     env["BD_CONFIG"] = ""
 
     subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
@@ -51,7 +51,7 @@ def e2e_rdp_facade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "browserwright.daemon.cli", "serve",
-            "--backend", "rdp",
+            "--backend", "cdp",
             "--facade-port", str(TEST_FACADE_PORT),
             "-v",
         ],
@@ -68,7 +68,7 @@ def e2e_rdp_facade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             log_fh.flush()
-            pytest.fail(f"rdp facade daemon exited early ({proc.returncode}); "
+            pytest.fail(f"cdp facade daemon exited early ({proc.returncode}); "
                         f"see {log_path}")
         try:
             with urllib.request.urlopen(version_url, timeout=0.5) as resp:
@@ -95,10 +95,10 @@ def e2e_rdp_facade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
-def test_facade_json_version_advertises_ws(e2e_rdp_facade_daemon):
+def test_facade_json_version_advertises_ws(e2e_cdp_facade_daemon):
     """The CDP discovery route returns a valid bootstrap payload with a
     reachable webSocketDebuggerUrl pointing back at the facade."""
-    port = e2e_rdp_facade_daemon
+    port = e2e_cdp_facade_daemon
     with urllib.request.urlopen(
         f"http://127.0.0.1:{port}/json/version", timeout=2
     ) as resp:
@@ -108,20 +108,20 @@ def test_facade_json_version_advertises_ws(e2e_rdp_facade_daemon):
     assert ws == f"ws://127.0.0.1:{port}/cdp"
 
 
-def test_connect_over_cdp_drives_rdp_backend(e2e_rdp_facade_daemon):
+def test_connect_over_cdp_drives_cdp_backend(e2e_cdp_facade_daemon):
     """ACCEPTANCE: `chromium.connect_over_cdp(facade_ws)` connects, opens a
-    page, navigates, and reads the title — proving the facade drives the rdp
+    page, navigates, and reads the title — proving the facade drives the cdp
     Chrome with a real Playwright client."""
     playwright_api = pytest.importorskip("playwright.sync_api")
     sync_playwright = playwright_api.sync_playwright
 
-    port = e2e_rdp_facade_daemon
+    port = e2e_cdp_facade_daemon
     facade_ws = f"ws://127.0.0.1:{port}/cdp"
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(facade_ws)
         try:
-            # context.pages() should enumerate the rdp Chrome's existing tab(s).
+            # context.pages() should enumerate the cdp Chrome's existing tab(s).
             context = (browser.contexts[0] if browser.contexts
                        else browser.new_context())
             page = context.pages[0] if context.pages else context.new_page()

@@ -74,7 +74,7 @@ async def test_launch_chrome_end_to_end(monkeypatch, tmp_path, fake_chrome):
         timeout=10.0,
     )
     assert out["schema_version"] == 1
-    assert out["backend"] == "rdp"
+    assert out["backend"] == "cdp"
     assert out["ws_url"] == "ws://127.0.0.1:51234/devtools/browser/fake-uuid-1234"
     assert out["extras"]["isolated_profile"] is True
     pid = out["extras"]["pid"]
@@ -584,7 +584,7 @@ async def test_launch_chrome_passes_extra_args(monkeypatch, tmp_path, fake_chrom
 # ---- E2E harness: BD_CHROME_EXTRA_ARGS env hook ---------------------------
 #
 # The env twin of `extra_args`. It exists for the launcher you cannot pass an
-# argument to: for a create-owned rdp session the *daemon* calls launch_chrome()
+# argument to: for a create-owned cdp session the *daemon* calls launch_chrome()
 # itself, in its own process, so only an inherited env var reaches it. The E2E
 # harness uses this to make those Chromes `--headless=new`.
 

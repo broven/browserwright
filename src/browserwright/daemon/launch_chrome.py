@@ -35,12 +35,12 @@ DEFAULT_TIMEOUT = 30.0
 #: default) changes nothing.
 #:
 #: Why an *env* var when `extra_args=` already exists: the caller that spawns
-#: most of the Chromes is not a caller you can pass arguments to. For an rdp
+#: most of the Chromes is not a caller you can pass arguments to. For an cdp
 #: session the daemon owns the browser and calls `launch_chrome()` itself
-#: (`server/listener.py::_launch_rdp_chrome`), out of process from whoever
+#: (`server/listener.py::_launch_cdp_chrome`), out of process from whoever
 #: started the daemon — so an in-process argument can't reach it, while an env
 #: var inherited by the daemon can. The E2E harness uses exactly that to run the
-#: rdp Chromes with `--headless=new` (see `tests/daemon/e2e/conftest.py`).
+#: cdp Chromes with `--headless=new` (see `tests/daemon/e2e/conftest.py`).
 #:
 #: Deliberately a generic "append this argv", not a `headless` boolean: the flag
 #: this needs today is `--headless=new`, but the mechanism is the same one you
@@ -112,7 +112,7 @@ async def launch_chrome(
     """Launch Chrome detached with --remote-debugging-port + isolated profile.
 
     Returns the same shape as `url --json`:
-        {schema_version: 1, ws_url, backend: "rdp", extras: {isolated_profile, profile_path, pid}}
+        {schema_version: 1, ws_url, backend: "cdp", extras: {isolated_profile, profile_path, pid}}
 
     `allow_default_profile=True` (or env `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE=1`)
     is the expert escape hatch for the §11 guard — see `_check_not_default_profile`.
@@ -122,7 +122,7 @@ async def launch_chrome(
     `--load-extension=...`. Profile and remote-debugging switches are rejected.
 
     The `BD_CHROME_EXTRA_ARGS` env var appends argv the same way for callers we
-    can't pass arguments to (notably the daemon launching an rdp session's own
+    can't pass arguments to (notably the daemon launching an cdp session's own
     Chrome) — see `CHROME_EXTRA_ARGS_ENV`.
     """
     check_name(profile)
@@ -239,7 +239,7 @@ async def launch_chrome(
     return {
         "schema_version": 1,
         "ws_url": ws_url,
-        "backend": "rdp",
+        "backend": "cdp",
         "extras": {
             "isolated_profile": True,
             "profile_path": str(user_data_dir),
@@ -270,7 +270,7 @@ async def _wait_for_chrome_ready(
       is already running, sometimes never writes the file (the new instance
       gets bootstrapped through a different code path). It DOES answer
       `/json/version` on the requested port — so when --port was explicit,
-      we can resolve via the HTTP discovery shape that rdp already uses.
+      we can resolve via the HTTP discovery shape that cdp already uses.
 
     We poll both in the same loop instead of waiting full `timeout` on one
     then the other. Whichever wins first answers; the other never runs.

@@ -13,7 +13,7 @@ stable (148+) blocks `--load-extension`; Chrome for Testing does not.
     npx @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing
 
 The fixture discovers the binary automatically from `/tmp/chrome-for-testing`
-or `~/.cache/puppeteer`. RDP-backend tests use your regular Chrome.
+or `~/.cache/puppeteer`. CDP-backend tests use your regular Chrome.
 
 ## Running
 
@@ -46,7 +46,7 @@ of display and a few seconds per case, which we keep out of the inner loop.
 | Dimension | Production (your daily) | Test (these E2Es) |
 |---|---|---|
 | daemon extension port | 19989 | 29989 |
-| daemon RDP port | default | 29990 |
+| daemon CDP port | default | 29990 |
 | daemon `BD_NAME` | `default` | `bd-e2e` |
 | Chrome `user-data-dir` | your daily profile | per-test tmpdir |
 | Chrome binary (ext tests) | Google Chrome | Chrome for Testing |
@@ -65,7 +65,7 @@ hostile to run on the machine you're working on. The two backends have
 | Chrome | Launched by | Default | Flag |
 |---|---|---|---|
 | extension (Chrome for Testing) | `_launch_cft_with_extension` | **headful** | `BW_E2E_HEADLESS=1` → headless |
-| rdp (fixture + daemon-owned) | `launch_chrome()` | **headless** | `BW_E2E_RDP_HEADFUL=1` → headful |
+| cdp (fixture + daemon-owned) | `launch_chrome()` | **headless** | `BW_E2E_CDP_HEADFUL=1` → headful |
 
 **Extension headful by default** because these tests exist to pin what a real
 browser does. `test_l2_background_render.py` **must** run headful -- both cases
@@ -76,7 +76,7 @@ pass without exercising `keepTabRendered()` at all. They skip themselves under
 visibility, focus, or frame timing should do the same via
 `conftest.requires_headful`.
 
-**RDP headless by default** because nothing on the rdp side asserts any of
+**CDP headless by default** because nothing on the cdp side asserts any of
 that. Those tests cover executor lifecycle, state persistence, page binding, tab
 reuse and timeout reclamation -- all headless-clean. Their windows were pure
 collateral damage: measured on a full run, they were 18 of the 44 Chrome windows
@@ -84,20 +84,20 @@ the suite popped, every one of them stealing the active window from whoever was
 using the machine. Measured before/after on the same tree, making them headless
 changed the failure set by **zero** tests.
 
-How it reaches the daemon-owned Chromes: for a create-owned rdp session the
+How it reaches the daemon-owned Chromes: for a create-owned cdp session the
 *daemon* calls `launch_chrome()` itself, in its own process, so no fixture
-argument can reach it. `conftest._rdp_chrome_headless_env` (session-scoped,
+argument can reach it. `conftest._cdp_chrome_headless_env` (session-scoped,
 autouse) instead sets `BD_CHROME_EXTRA_ARGS=--headless=new` on the pytest
 process, and every daemon spawned from `os.environ.copy()` inherits it.
 `BD_CHROME_EXTRA_ARGS` is a general "append this argv to every Chrome we launch"
 hook in `daemon/launch_chrome.py`, default-off in production.
 
-### Why `e2e_chrome_rdp` is not session-scoped
+### Why `e2e_chrome_cdp` is not session-scoped
 
-It looks like free money -- it already serialises on the fixed `TEST_RDP_PORT`,
+It looks like free money -- it already serialises on the fixed `TEST_CDP_PORT`,
 and 15 tests each pay a Chrome launch. It was tried and it fails:
-`test_cross_heredoc_tab_reuse_rdp` dies with `PageBindTimeout` on the first run
-in the default order. For an rdp session the workspace *is* the browser instance
+`test_cross_heredoc_tab_reuse_cdp` dies with `PageBindTimeout` on the first run
+in the default order. For an cdp session the workspace *is* the browser instance
 (see `CONTEXT.md`), so one shared Chrome is one shared workspace and a
 neighbour's leftover targets are visible to whoever binds next. Since the
 Chromes are headless now, sharing them would save no windows at all -- only
@@ -108,10 +108,10 @@ flakiness. See the fixture docstring.
 When a test fails, `_artifacts/<test-name>/` contains:
 
 - `env.txt` -- relevant `BD_*` / `BS_*` env vars at run time
-- `daemon.log` / `daemon-rdp.log` -- the daemon's own log, copied out of the
+- `daemon.log` / `daemon-cdp.log` -- the daemon's own log, copied out of the
   live daemon at the moment that test failed
 
-Session-level `_artifacts/daemon.log` and `_artifacts/daemon-rdp.log` hold the
+Session-level `_artifacts/daemon.log` and `_artifacts/daemon-cdp.log` hold the
 daemon's stdout/stderr plus its full log, appended at session teardown.
 
 Why the copying: the daemon routes its logger to `$TMPDIR/browserwright-daemon.log`
@@ -129,7 +129,7 @@ This directory is gitignored.
 1. Pick the right level (L0=smoke, L1=single round-trip, L2=user flow,
    L3=cross-backend parity).
 2. If you need Chrome, depend on `ext_ready` (extension backend) or
-   `e2e_chrome_rdp` (RDP backend).
+   `e2e_chrome_cdp` (CDP backend).
 3. To drive the skill, use `helpers.run_skill(script, backend=...)`.
 4. Keep assertions at the observable level (page_info, DOM, screenshot),
    not at daemon-internal state -- so v2's sub-agent harness can reuse them.

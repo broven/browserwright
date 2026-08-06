@@ -165,7 +165,7 @@ def doctor_checks() -> dict:
                 "update browserwright-daemon and browserwright to matching versions",
             )
 
-    # 4. at least one usable backend (relay/extension/rdp connection probe)
+    # 4. at least one usable backend (relay/extension/cdp connection probe)
     backends = info.get("backends") or []
     usable = [b for b in backends if b.get("available")]
     daemon_down = info.get("alive") is False
@@ -191,7 +191,7 @@ def doctor_checks() -> dict:
                 "no backend is available "
                 f"(saw: {', '.join(b.get('name', '?') for b in backends)})",
                 "; ".join(hints) if hints else
-                "connect the extension (load unpacked) or start an rdp Chrome, "
+                "connect the extension (load unpacked) or start an cdp Chrome, "
                 "then re-run doctor",
             )
         else:
@@ -200,7 +200,7 @@ def doctor_checks() -> dict:
                 "fail",
                 "daemon reported no backends",
                 "start a backend: load the extension or "
-                "create an rdp session after `browserwright-daemon serve`",
+                "create an cdp session after `browserwright-daemon serve`",
             )
 
     # 5. extension/relay specific: if an extension backend exists but is

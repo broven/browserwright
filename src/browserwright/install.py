@@ -5,10 +5,10 @@ supports and print the exact next-step commands for the chosen backend.
 
 Choices (order matters — the default is option 1):
 
-  1. 隔离 profile (rdp + browserwright-daemon launch-chrome) — **Recommended for
+  1. 隔离 profile (cdp + browserwright-daemon launch-chrome) — **Recommended for
      scraping / dev work**. Zero popups, zero banner, doesn't touch the
      user's daily Chrome.
-  2. 指纹浏览器 (rdp + custom port) — AdsPower / MultiLogin / GoLogin /
+  2. 指纹浏览器 (cdp + custom port) — AdsPower / MultiLogin / GoLogin /
      比特浏览器, etc. User supplies the port number.
   3. Browser extension relay — drive the user's daily Chrome without any
      popups or banners. Requires loading the unpacked extension from
@@ -32,11 +32,11 @@ from typing import Optional, Tuple
 
 # (key, backend, label, description). The order here is the order shown.
 _OPTIONS: list[Tuple[str, str, str, str]] = [
-    ("1", "rdp",
-     "隔离 profile (rdp + browserwright-daemon launch-chrome)  [Recommended]",
+    ("1", "cdp",
+     "隔离 profile (cdp + browserwright-daemon launch-chrome)  [Recommended]",
      "Skill 起一个独立 user-data-dir 的后台 Chrome；零打扰、零 popup。"),
-    ("2", "rdp",
-     "指纹浏览器 (rdp + 自定义端口)",
+    ("2", "cdp",
+     "指纹浏览器 (cdp + 自定义端口)",
      "AdsPower / MultiLogin / GoLogin / 比特浏览器 等；你已开好对应 profile。"),
     ("3", "extension",
      "Browser extension relay (drives your daily Chrome, no popup)",
@@ -209,11 +209,11 @@ def run() -> int:
     print("Next steps:")
     if choice == "1":
         print("  - Run `browserwright-daemon launch-chrome` to start the isolated profile.")
-        print("  - Then create a session: `browserwright session new --backend=rdp --create --name=TASK`.")
+        print("  - Then create a session: `browserwright session new --backend=cdp --create --name=TASK`.")
         print("    (`--name` labels the isolated browser session; choose a short task label.)")
     elif choice == "2":
         print("  - Make sure your fingerprint browser is open on the chosen port.")
-        print("  - Then attach a session: `browserwright session new --backend=rdp --attach=PORT --name=TASK`.")
+        print("  - Then attach a session: `browserwright session new --backend=cdp --attach=PORT --name=TASK`.")
         print("    (`--name` labels the attached browser session; choose a short task label.)")
     elif choice == "3":
         ext_dir = chrome_extension_path()

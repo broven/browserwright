@@ -33,17 +33,17 @@ def test_extension_backend_page_info(ext_ready, e2e_daemon):
     assert "url" in info and "title" in info
 
 
-def test_rdp_backend_page_info(e2e_rdp_daemon):
-    """RDP backend: the skill drives Chrome *through* the rdp Mode B daemon.
-    ``e2e_rdp_daemon`` yields the daemon's XDG_RUNTIME_DIR (its fixed socket)."""
+def test_cdp_backend_page_info(e2e_cdp_daemon):
+    """CDP backend: the skill drives Chrome *through* the cdp Mode B daemon.
+    ``e2e_cdp_daemon`` yields the daemon's XDG_RUNTIME_DIR (its fixed socket)."""
     result = run_skill(
         script=(
             "import json\n"
             "info = {'url': page.url, 'title': page.title()}\n"
             "print(json.dumps(info))\n"
         ),
-        backend="rdp",
-        runtime_dir=e2e_rdp_daemon,
+        backend="cdp",
+        runtime_dir=e2e_cdp_daemon,
     )
     assert result.returncode == 0, (
         f"skill exited {result.returncode}; "

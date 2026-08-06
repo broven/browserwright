@@ -23,10 +23,10 @@ attributes, the DoctorResult/ResolveResult plumbing, and the single
   tokens. `http(s)://` goes through the same `/json/version` discovery pointed
   at an arbitrary host.
 
-Until #38 these were two backends, `rdp` and `env`, and the endpoint came from
+Until #38 these were two backends, `cdp` and `env`, and the endpoint came from
 the process-global `BD_CDP_WS` / `BD_CDP_URL` — which is why one daemon could
 only ever reach one external browser. The endpoint is now per-session ledger
-state, and the two backends collapsed into this one; see `RdpBackend` for what
+state, and the two backends collapsed into this one; see `CdpBackend` for what
 replaced the two name checks they differed by.
 """
 from __future__ import annotations
@@ -46,7 +46,7 @@ from .base import DoctorResult, ResolveResult
 class _JsonVersion404(Unavailable):
     """`/json/version` answered HTTP 404 — the Chrome 136/147+ default-profile
     lockdown signature. Raised by `_discover_ws_url` so a URL source can catch
-    it and try a fallback (rdp does); uncaught, it is a plain Unavailable."""
+    it and try a fallback (cdp does); uncaught, it is a plain Unavailable."""
 
 
 class RealCdpBackend:
@@ -62,7 +62,7 @@ class RealCdpBackend:
     kind = "UPSTREAM_WS"
     recommended_mode: str = "A"
     ux_cost = "none"
-    # rdp overrides to False: the user's HTTP(S)_PROXY / ALL_PROXY must not be
+    # cdp overrides to False: the user's HTTP(S)_PROXY / ALL_PROXY must not be
     # applied to localhost probes — proxying to your own loopback is never what
     # anyone wants and triggers httpx[socks] import errors when
     # ALL_PROXY=socks5://... env keeps the default: its target may be a remote
@@ -150,35 +150,35 @@ class RealCdpBackend:
 # ---- the one real-CDP backend -----------------------------------------------
 
 
-class RdpBackend(RealCdpBackend):
+class CdpBackend(RealCdpBackend):
     """Real browser-level CDP. Two URL sources, one class.
 
-    - **no endpoint** — a browser on this machine at `backends.rdp.port`,
+    - **no endpoint** — a browser on this machine at `backends.cdp.port`,
       discovered via `http://127.0.0.1:<port>/json/version`. Either one we
       launched (`--create`) or a local one we were pointed at (`--attach=9222`).
     - **endpoint set** — a URL handed to us for this session (`--attach=<url>`).
       `ws(s)://` is the endpoint itself; `http(s)://` is a discovery URL.
 
-    Both used to be separate backends (`rdp` and `env`) whose only real
+    Both used to be separate backends (`cdp` and `env`) whose only real
     difference was two `if self.name == ...`-shaped decisions. Both decisions
     are the same physical question — *is this browser on my machine?* — so the
     merge replaces two name checks with one predicate, `_loopback`:
 
     | | old | new |
     |---|---|---|
-    | apply the user's `ALL_PROXY` | `rdp` no, `env` yes | `not _loopback` |
-    | DevToolsActivePort 404 fallback | `rdp` yes, `env` never | `_loopback` |
+    | apply the user's `ALL_PROXY` | `cdp` no, `env` yes | `not _loopback` |
+    | DevToolsActivePort 404 fallback | `cdp` yes, `env` never | `_loopback` |
 
     That is strictly more correct than the names were: `--attach=http://127.0.0.1:9222`
     now gets the proxy bypass and the Chrome-136 lockdown fallback, which the
     old `env` path denied it for no reason other than what it was called.
     """
-    name = "rdp"
+    name = "cdp"
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
-        self.port = cfg.backends.rdp.port
-        self.endpoint = cfg.backends.rdp.endpoint
+        self.port = cfg.backends.cdp.port
+        self.endpoint = cfg.backends.cdp.endpoint
 
     # ---- the one predicate the two old backends disagreed about -------------
 

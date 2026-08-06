@@ -10,7 +10,7 @@ heredoc CLI (NOT a direct Playwright client):
   2. lazy: a memory-only heredoc that never touches `page`/`context` opens NO
      browser connection (the facade sees no client).
 
-Run on BOTH backends: rdp (cheapest) + the extension CfT harness.
+Run on BOTH backends: cdp (cheapest) + the extension CfT harness.
 
 The daemon AUTO-ENABLES the facade now (Phase C) — these fixtures spawn it
 WITHOUT `--facade-port`, then read the advertised ws from
@@ -33,7 +33,7 @@ import pytest
 from .conftest import (
     TEST_EXT_FACADE_PORT,
     TEST_EXT_PORT,
-    TEST_RDP_PORT,
+    TEST_CDP_PORT,
     _isolated_runtime_dir,
 )
 from .helpers import run_skill
@@ -75,33 +75,33 @@ def _status_facade_ws(env: dict, deadline_s: float = 10.0) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-#   rdp backend (auto-facade, no --facade-port)
+#   cdp backend (auto-facade, no --facade-port)
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def rdp_autofacade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
-    """Spawn the rdp daemon WITHOUT --facade-port and prove the facade
+def cdp_autofacade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
+    """Spawn the cdp daemon WITHOUT --facade-port and prove the facade
     auto-enabled (advertised via `status --json`). Yields (runtime_dir,
     facade_ws)."""
     import shutil
 
-    log_path = e2e_artifacts_dir / "daemon-rdp-autofacade.log"
+    log_path = e2e_artifacts_dir / "daemon-cdp-autofacade.log"
     log_fh = open(log_path, "wb")  # noqa: SIM115
 
     runtime_dir = _isolated_runtime_dir()
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
-    env["BD_RDP_PORT"] = str(TEST_RDP_PORT)
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "rdp")
+    env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
+    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "cdp")
     env["BD_CONFIG"] = ""
 
     subprocess.run(["browserwright-daemon", "stop"], capture_output=True, env=env)
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "browserwright.daemon.cli", "serve",
-         "--backend", "rdp", "-v"],
+         "--backend", "cdp", "-v"],
         stdout=log_fh, stderr=subprocess.STDOUT, env=env,
     )
 
@@ -109,7 +109,7 @@ def rdp_autofacade_daemon(e2e_chrome_rdp, e2e_artifacts_dir):
     if facade_ws is None:
         log_fh.flush()
         proc.terminate()
-        pytest.fail(f"rdp daemon never advertised a facade ws; see {log_path}")
+        pytest.fail(f"cdp daemon never advertised a facade ws; see {log_path}")
 
     yield runtime_dir, facade_ws
 
@@ -172,7 +172,7 @@ def _cleanup_session(backend: str, sid: str) -> None:
 # targetId because a per-page CDP session collides with the page's primary
 # session over the extension facade and crashes the driver — the production
 # handle maps via a browser-level Target.getTargets for the same reason.
-# rdp backend drives `data:` navigations fine (only the extension backend
+# cdp backend drives `data:` navigations fine (only the extension backend
 # aborts them over chrome.debugger — see the facade spec).
 _REUSE_SCRIPT_1 = (
     "page.goto('data:text/html,<title>one</title>', wait_until='load')\n"
@@ -445,24 +445,24 @@ def test_one_group_after_recover_extension(ext_autofacade_ready, e2e_chrome,
         _cleanup_session("extension", sid)
 
 
-def test_cross_heredoc_tab_reuse_rdp(rdp_autofacade_daemon):
-    """ACCEPTANCE (rdp): two SEPARATE heredocs reuse the same tab; new_page()
+def test_cross_heredoc_tab_reuse_cdp(cdp_autofacade_daemon):
+    """ACCEPTANCE (cdp): two SEPARATE heredocs reuse the same tab; new_page()
     explicitly opens a second one."""
     pytest.importorskip("playwright.sync_api")
-    runtime_dir, _facade_ws = rdp_autofacade_daemon
-    sid = _seed_session(runtime_dir, "rdp")
+    runtime_dir, _facade_ws = cdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "cdp")
     extra = {"BD_SESSION": sid}
     try:
         r1 = run_skill(_REUSE_SCRIPT_1,
-                       backend="rdp", runtime_dir=runtime_dir, extra_env=extra)
+                       backend="cdp", runtime_dir=runtime_dir, extra_env=extra)
         assert r1.returncode == 0, f"heredoc#1 failed: {r1.stderr}"
-        tid1 = _bound_target("rdp", sid)
+        tid1 = _bound_target("cdp", sid)
         assert tid1, "heredoc#1 did not bind/persist a target"
 
         r2 = run_skill(_REUSE_SCRIPT_2,
-                       backend="rdp", runtime_dir=runtime_dir, extra_env=extra)
+                       backend="cdp", runtime_dir=runtime_dir, extra_env=extra)
         assert r2.returncode == 0, f"heredoc#2 failed: {r2.stderr}"
-        tid2 = _bound_target("rdp", sid)
+        tid2 = _bound_target("cdp", sid)
         assert _grep(r2.stdout, "TITLE2") == "two"
         npages2 = int(_grep(r2.stdout, "NPAGES2"))
         npages3 = int(_grep(r2.stdout, "NPAGES3"))
@@ -474,15 +474,15 @@ def test_cross_heredoc_tab_reuse_rdp(rdp_autofacade_daemon):
         assert npages3 == npages2 + 1, (
             f"new_page() did not open a second tab: {npages2} -> {npages3}")
     finally:
-        _cleanup_session("rdp", sid)
+        _cleanup_session("cdp", sid)
 
 
-def test_memory_only_heredoc_does_not_connect_rdp(rdp_autofacade_daemon):
+def test_memory_only_heredoc_does_not_connect_cdp(cdp_autofacade_daemon):
     """ACCEPTANCE (lazy): a heredoc that never touches page/context opens no
     browser connection. We assert the script runs green WITHOUT requiring a
     page bind, and (belt + suspenders) that no extra tab was created."""
-    runtime_dir, _facade_ws = rdp_autofacade_daemon
-    sid = _seed_session(runtime_dir, "rdp")
+    runtime_dir, _facade_ws = cdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "cdp")
     # Count tabs WITHOUT binding a `page`. Unlike touching `context`/`page`
     # (which connects the facade and auto-binds/opens the session's tab via
     # resolve_current_target), the internal `session_tabs` helper is a pure
@@ -495,34 +495,34 @@ def test_memory_only_heredoc_does_not_connect_rdp(rdp_autofacade_daemon):
     )
     try:
         before = run_skill(count_probe,
-                           backend="rdp", runtime_dir=runtime_dir,
+                           backend="cdp", runtime_dir=runtime_dir,
                            extra_env={"BD_SESSION": sid})
         # A pure-Python heredoc: no page/context/snapshot access at all.
         r = run_skill("print('answer=' + str(6 * 7))",
-                      backend="rdp", runtime_dir=runtime_dir,
+                      backend="cdp", runtime_dir=runtime_dir,
                       extra_env={"BD_SESSION": sid})
         assert r.returncode == 0, f"memory heredoc failed: {r.stderr}"
         assert "answer=42" in r.stdout
         after = run_skill(count_probe,
-                          backend="rdp", runtime_dir=runtime_dir,
+                          backend="cdp", runtime_dir=runtime_dir,
                           extra_env={"BD_SESSION": sid})
         assert _grep(before.stdout, "NTABS") == _grep(after.stdout, "NTABS"), (
             "memory-only heredoc opened a tab (not lazy)")
     finally:
-        _cleanup_session("rdp", sid)
+        _cleanup_session("cdp", sid)
 
 
 # ---------------------------------------------------------------------------
-#   PR2: snapshot() ref → locator round-trip (rdp)
+#   PR2: snapshot() ref → locator round-trip (cdp)
 # ---------------------------------------------------------------------------
 
 
 # A page with known interactive elements; click the snapshot's ref for the
 # button, then assert the click handler ran (sets <title>). Proves the
 # snapshot -> page.locator("aria-ref=eN") round-trip end to end through the
-# real heredoc CLI. rdp drives data: navigations fine (the extension backend
+# real heredoc CLI. cdp drives data: navigations fine (the extension backend
 # does not — see the facade spec).
-_SNAPSHOT_SCRIPT_RDP = (
+_SNAPSHOT_SCRIPT_CDP = (
     "import re\n"
     "page.goto('data:text/html,"
     "<button onclick=%22document.title=%27clicked%27%22>Press me</button>"
@@ -543,15 +543,15 @@ _SNAPSHOT_SCRIPT_RDP = (
 )
 
 
-def test_snapshot_ref_roundtrip_rdp(rdp_autofacade_daemon):
-    """PR2 ACCEPTANCE (rdp): snapshot() yields [ref=eN] lines for the page's
+def test_snapshot_ref_roundtrip_cdp(cdp_autofacade_daemon):
+    """PR2 ACCEPTANCE (cdp): snapshot() yields [ref=eN] lines for the page's
     interactive elements, and page.locator("aria-ref=eN") resolves each ref to
     a clickable / fillable locator."""
     pytest.importorskip("playwright.sync_api")
-    runtime_dir, _facade_ws = rdp_autofacade_daemon
-    sid = _seed_session(runtime_dir, "rdp")
+    runtime_dir, _facade_ws = cdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "cdp")
     try:
-        r = run_skill(_SNAPSHOT_SCRIPT_RDP, backend="rdp",
+        r = run_skill(_SNAPSHOT_SCRIPT_CDP, backend="cdp",
                       runtime_dir=runtime_dir, extra_env={"BD_SESSION": sid})
         assert r.returncode == 0, f"snapshot heredoc failed: {r.stderr}"
         snap = r.stdout.split("SNAP_START\n", 1)[1].split("\nSNAP_END", 1)[0]
@@ -566,7 +566,7 @@ def test_snapshot_ref_roundtrip_rdp(rdp_autofacade_daemon):
         assert _grep(r.stdout, "INPUT") == "hello", (
             f"aria-ref fill did not take:\n{r.stdout}")
     finally:
-        _cleanup_session("rdp", sid)
+        _cleanup_session("cdp", sid)
 
 
 # ---------------------------------------------------------------------------

@@ -106,7 +106,7 @@ async def test_failed_upstream_open_unblocks_buffered_requests():
     async def ensure_upstream() -> None:
         raise RuntimeError("chrome refused to launch")
 
-    router, client, replies = _cold_router("rdp", ensure_upstream)
+    router, client, replies = _cold_router("cdp", ensure_upstream)
 
     async with within(BUDGET_S, "buffered request after a failed upstream open"):
         await router.route_from_client(client, json.dumps({
@@ -129,7 +129,7 @@ async def test_pre_open_buffer_overflow_answers_instead_of_growing():
     async def ensure_upstream() -> None:
         return None  # "opens" without ever becoming CONNECTED
 
-    router, client, replies = _cold_router("rdp", ensure_upstream)
+    router, client, replies = _cold_router("cdp", ensure_upstream)
 
     async with within(BUDGET_S, f"{PRE_OPEN_BUFFER_LIMIT + 1} buffered frames"):
         for i in range(PRE_OPEN_BUFFER_LIMIT):

@@ -1,7 +1,7 @@
 """Phase B: daemon-side per-session executor registry + lazy spawn.
 
 The daemon is ALREADY a per-session child-process manager (it spawns + tracks +
-SIGTERMs per-session rdp Chrome). The executor is "rdp Chrome v2": same
+SIGTERMs per-session cdp Chrome). The executor is "cdp Chrome v2": same
 supervision contract, a different child binary. PR1 builds only what
 ``ensureExecutor`` needs — a registry keyed by ``session_id`` + a single-flight
 spawn guard so two concurrent first-heredocs can't double-spawn. FULL
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 _SPAWN_READY_TIMEOUT_S = 15.0
 
 # Grace window between SIGTERM and SIGKILL when reaping an executor (mirrors the
-# rdp-Chrome teardown discipline — terminate, then escalate if it won't die).
+# cdp-Chrome teardown discipline — terminate, then escalate if it won't die).
 _KILL_GRACE_S = 3.0
 
 
@@ -110,7 +110,7 @@ class ExecutorRegistry:
 
     def __init__(self) -> None:
         self._handles: dict[str, ExecutorHandle] = {}
-        # One lock per session id guards its spawn (the rdp `_open_lock`
+        # One lock per session id guards its spawn (the cdp `_open_lock`
         # equivalent — prevents the double-spawn race, Fork 1 risk).
         self._locks: dict[str, asyncio.Lock] = {}
         # Successful workspace teardown is terminal for this daemon lifetime.
@@ -521,7 +521,7 @@ class ExecutorRegistry:
         own — e.g. the Fork-4 facade-death self-exit, or a segfault). Returns
         the session ids dropped. The next `ensure()` for those sessions
         cold-starts a fresh executor — mirrors `_on_upstream_closed` →
-        `drop_rdp_context`."""
+        `drop_cdp_context`."""
         dead: list[str] = []
         for session_id, handle in list(self._handles.items()):
             if not handle.is_alive():
@@ -580,7 +580,7 @@ def _spawn_kwargs() -> dict:
 
 def _terminate(handle: ExecutorHandle) -> None:
     """SIGTERM the executor's whole process group, escalate to SIGKILL after a
-    grace window. Mirrors `listener._kill_rdp_chrome` but signals the GROUP
+    grace window. Mirrors `listener._kill_cdp_chrome` but signals the GROUP
     (the spawn used `start_new_session=True`, so the executor is a session
     leader — `killpg` reaps any grandchildren too). Best-effort + never raises.
 
@@ -588,7 +588,7 @@ def _terminate(handle: ExecutorHandle) -> None:
     zombie reap run on a short-lived BACKGROUND daemon thread so we NEVER block
     the daemon's asyncio event loop (this is called from `_handle_end_session`,
     `_idle_watchdog`, and `_graceful_shutdown`, all on the loop — unlike
-    `_kill_rdp_chrome` which only fire-and-forgets a SIGTERM, we additionally
+    `_kill_cdp_chrome` which only fire-and-forgets a SIGTERM, we additionally
     guarantee escalation without stalling the loop for the grace window)."""
     proc = handle.proc
     if proc.poll() is not None:
@@ -669,7 +669,7 @@ class _quiet:
 
 
 def cleanup_orphan_executors() -> None:
-    """Startup orphan-sweep (mirrors `listener._cleanup_orphan_rdp_chrome`).
+    """Startup orphan-sweep (mirrors `listener._cleanup_orphan_cdp_chrome`).
 
     A hard daemon crash / SIGKILL leaves executor subprocesses running + their
     `bw-exec-*.json` discovery files + `bw-exec-*.sock` sockets on disk. On the

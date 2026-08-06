@@ -127,7 +127,7 @@ def _context_row(ctx: object) -> dict:
     now_wall = time.time()
     row: dict[str, Any] = {
         "backend": getattr(ctx, "backend", None) or _attr(state, "backend_name"),
-        # None on the shared context, the rdp session id otherwise.
+        # None on the shared context, the cdp session id otherwise.
         "session_id": getattr(ctx, "session_id", None),
         "upstream_phase": _enum_value(_attr(state, "upstream_phase")),
         "upstream_ws_url": _redact_ws_url(_attr(state, "upstream_ws_url")),

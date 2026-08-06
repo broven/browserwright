@@ -21,7 +21,7 @@ from browserwright.session import Session
 from browserwright.session_ctx import resolve_session
 from browserwright.session_runtime import close_session_tab, session_tabs
 
-from .conftest import TEST_RDP_PORT
+from .conftest import TEST_CDP_PORT
 from .helpers import run_skill
 from .test_l2_heredoc_playwright_page import (
     _bound_target,
@@ -30,20 +30,20 @@ from .test_l2_heredoc_playwright_page import (
     _seed_session,
 )
 from .test_l2_heredoc_playwright_page import (
-    rdp_autofacade_daemon as _rdp_autofacade_daemon,  # noqa: F401 - fixture
+    cdp_autofacade_daemon as _cdp_autofacade_daemon,  # noqa: F401 - fixture
 )
 
-_BS_HOME_RDP = Path(__file__).resolve().parent / "_bs_home" / "rdp"
+_BS_HOME_CDP = Path(__file__).resolve().parent / "_bs_home" / "cdp"
 
 
-def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
-    _rdp_autofacade_daemon,  # noqa: F811 - imported pytest fixture
+def test_action_timeout_survives_but_outer_deadline_recycles_executor_cdp(
+    _cdp_autofacade_daemon,  # noqa: F811 - imported pytest fixture
     monkeypatch,
 ):
     """Only the terminal outer deadline replaces the resident executor."""
     pytest.importorskip("playwright.sync_api")
-    runtime_dir, _facade_ws = _rdp_autofacade_daemon
-    sid = _seed_session(runtime_dir, "rdp")
+    runtime_dir, _facade_ws = _cdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "cdp")
     extra = {"BD_SESSION": sid}
     sess: Session | None = None
     target_id: str | None = None
@@ -52,8 +52,8 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
     # must use the same isolated daemon/ledger configuration as run_skill().
     monkeypatch.setenv("XDG_RUNTIME_DIR", runtime_dir)
     monkeypatch.setenv("TMPDIR", runtime_dir)
-    monkeypatch.setenv("BS_HOME", str(_BS_HOME_RDP))
-    monkeypatch.setenv("BD_RDP_PORT", str(TEST_RDP_PORT))
+    monkeypatch.setenv("BS_HOME", str(_BS_HOME_CDP))
+    monkeypatch.setenv("BD_CDP_PORT", str(TEST_CDP_PORT))
     monkeypatch.setenv("BD_CONFIG", "")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
@@ -70,7 +70,7 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
                 "print('URL=' + page.url)\n"
                 "print('TITLE=' + page.title())\n"
             ),
-            backend="rdp",
+            backend="cdp",
             runtime_dir=runtime_dir,
             extra_env=extra,
             timeout=60,
@@ -80,7 +80,7 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
         )
         warm_url = _grep(warm.stdout, "URL")
         assert _grep(warm.stdout, "TITLE") == "deadline-preserved"
-        target_id = _bound_target("rdp", sid)
+        target_id = _bound_target("cdp", sid)
         assert target_id, "warm-up did not persist the bound target"
 
         old_record = _ipc.read_executor_record(sid)
@@ -102,7 +102,7 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
                 "print('CAUGHT=' + str(caught))\n"
                 "print('STATE=' + repr(state.get('sentinel')))\n"
             ),
-            backend="rdp",
+            backend="cdp",
             runtime_dir=runtime_dir,
             extra_env=extra,
             timeout=30,
@@ -140,7 +140,7 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
             os.kill(old_pid, 0)
 
         # The executor died, but its authoritative target and live URL did not.
-        assert _bound_target("rdp", sid) == target_id
+        assert _bound_target("cdp", sid) == target_id
         preserved = next(
             (tab for tab in session_tabs(sess) if tab["targetId"] == target_id),
             None,
@@ -156,7 +156,7 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
                 "print('URL=' + page.url)\n"
                 "print('TITLE=' + page.title())\n"
             ),
-            backend="rdp",
+            backend="cdp",
             runtime_dir=runtime_dir,
             extra_env=extra,
             timeout=60,
@@ -173,7 +173,7 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
         assert int(_grep(cold.stdout, "PID")) == new_record["pid"]
         assert new_record["pid"] != old_pid
         assert new_record["executor_id"] != old_executor_id
-        assert _bound_target("rdp", sid) == target_id
+        assert _bound_target("cdp", sid) == target_id
     finally:
         if target_id is not None:
             cleanup_sess = sess
@@ -185,4 +185,4 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_rdp(
                     close_session_tab(cleanup_sess, target_id=target_id)
         if sess is not None:
             sess.close()
-        _cleanup_session("rdp", sid)
+        _cleanup_session("cdp", sid)
