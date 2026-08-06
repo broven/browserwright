@@ -63,25 +63,9 @@ def _locked() -> Iterator[dict]:
 
 
 def allocate(*, backend: str, owner: str,
-             workspace: Optional[object] = None, name: Optional[str] = None,
-             unique_name: bool = False) -> str:
+             workspace: Optional[object] = None, name: Optional[str] = None) -> str:
     now = time.time()
     with _locked() as data:
-        if unique_name:
-            # Globally-unique name guard. Raising here (after the `yield` in
-            # _locked) aborts before `p.write_text`, so a rejected allocation
-            # leaves the ledger untouched.
-            for e in data["sessions"].values():
-                if e.get("name") == name:
-                    conflict = e.get("id")
-                    raise ValueError(
-                        f"session name {name!r} is already taken by session "
-                        f"{conflict!r}. Names must be globally unique. Either "
-                        f"pick a different --name, reuse the existing session "
-                        f"with `browserwright -s {conflict} -e ...`, or "
-                        f"end it first: browserwright session end "
-                        f"--session={conflict}"
-                    )
         sid = str(data["next_id"])
         data["next_id"] += 1
         record = {

@@ -64,17 +64,23 @@ def test_raising_inside_the_lock_leaves_the_ledger_byte_identical(tmp_bs_home):
     assert session_registry.get("999") is None
 
 
-def test_rejected_allocation_leaves_the_ledger_untouched(tmp_bs_home):
-    """Same contract, exercised through a real guard rather than a raw raise."""
-    session_registry.allocate(
-        backend="extension", owner="attach", name="taken", unique_name=True)
+def test_rejected_update_leaves_the_ledger_untouched(tmp_bs_home):
+    """The abort contract, exercised through a real (live) guard.
+
+    The unique-name guard was deleted (issue #42); ``update()``'s
+    backend-immutability guard is the live admission guard today. A rejected
+    patch must leave the ledger byte-identical — the write happens after the
+    ``yield`` in ``_locked()``.
+    """
+    sid = session_registry.allocate(
+        backend="extension", owner="attach", name="keep")
     before = session_registry._ledger_path().read_bytes()
 
-    with pytest.raises(ValueError, match="already taken"):
-        session_registry.allocate(
-            backend="extension", owner="attach", name="taken", unique_name=True)
+    with pytest.raises(ValueError, match="backend is immutable"):
+        session_registry.update(sid, backend="cdp")
 
     assert session_registry._ledger_path().read_bytes() == before
+    assert session_registry.get(sid)["backend"] == "extension"
 
 
 def test_a_stale_temp_file_does_not_leak_loose_permissions(tmp_bs_home):
