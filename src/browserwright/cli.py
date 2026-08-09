@@ -38,6 +38,11 @@ Usage:
   browserwright whoami --session=ID
   browserwright userscript {push|list|remove|toggle|logs} ...
 
+  browserwright markdown <url> [--mode=auto|article|full] [--backend=extension|cdp]
+                               [--out=PATH] [--max-chars=N]
+      One page as Markdown. Creates and tears down its own session, so it takes
+      no -s. Absolute links, shadow DOM flattened in, HTML only.
+
   browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
 
@@ -416,6 +421,149 @@ def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
         sys.stdout.write(response.return_value)
     sys.stdout.write("\n")
     return 0
+
+
+MARKDOWN_HELP = """Usage:
+  browserwright markdown <url> [--mode=auto|article|full] [--backend=extension|cdp]
+                              [--out=PATH] [--max-chars=N] [--name=LABEL]
+
+Fetch one page and print it as Markdown. Owns its whole lifecycle: it creates a
+throwaway session, navigates, converts, and tears the session down again — so
+unlike every other browser-driving command it takes no -s/--session.
+
+Links come out absolute, open shadow roots are flattened in, and same-origin
+iframes are inlined. Only HTML is converted; anything else is refused with its
+Content-Type rather than silently returning an empty-looking result.
+
+Flags:
+  --mode=auto      (default) extract the main content; if extraction collapses,
+                   fall back to the page with nav/aside/footer/forms removed
+  --mode=article   force extraction
+  --mode=full      the page verbatim — use it when you want the navigation,
+                   a form, or every link
+  --backend        extension (default, the user's real Chrome) | cdp
+  --out=PATH       write the full Markdown here instead of a temp file
+  --max-chars=N    cap what is printed (default 8000; 0 prints everything).
+                   The FULL text is always written to the file either way.
+  --name=LABEL     session label; shows as the Chrome tab group title
+"""
+
+# Runs inside the session's executor, which is the only place a live `page`
+# exists. Values arrive through the request environment (names only cross the
+# CLI boundary, never values — same discipline as `--env`), and the markdown
+# rides back on disk rather than through the executor's 10000-char console cap.
+_MARKDOWN_CODE = """
+import os
+from browserwright.repl.markdown import render_page_markdown
+
+page.goto(os.environ["BW_MD_URL"])
+_r = render_page_markdown(page, mode=os.environ["BW_MD_MODE"])
+with open(os.environ["BW_MD_OUT"], "w", encoding="utf-8") as _f:
+    _f.write(_r.markdown)
+_bw_warn("markdown: rendered as %s (%d chars)" % (_r.mode_used, len(_r.markdown)))
+for _n in _r.notes:
+    _bw_warn("markdown: " + _n)
+"""
+
+
+def _cmd_markdown(args: list[str]) -> int:
+    """``browserwright markdown <url>`` — one page, as Markdown (ADR-0006).
+
+    The one browser-driving command with no session argument: it mints a
+    throwaway one, uses it, and ends it. Teardown runs in a `finally` because a
+    leaked session leaves a tab group behind in the user's real Chrome (see
+    issue #53 for why that path is worth watching).
+    """
+    if not args or args[0] in {"-h", "--help"}:
+        sys.stdout.write(MARKDOWN_HELP)
+        return 0 if args else 1
+
+    url = args[0]
+    if url.startswith("-"):
+        print(f"usage error: expected a URL, got {url!r}", file=sys.stderr)
+        print(MARKDOWN_HELP, file=sys.stderr)
+        return 1
+    kw = _parse_kv_args(args[1:])
+
+    mode = str(kw.get("mode", "auto"))
+    from .repl.markdown import DEFAULT_MAX_CHARS, MODES, spill_path
+
+    if mode not in MODES:
+        print(f"usage error: --mode must be one of {'|'.join(MODES)}, "
+              f"got {mode!r}", file=sys.stderr)
+        return 1
+    backend = str(kw.get("backend", "extension"))
+    if backend not in ("extension", "cdp"):
+        print(f"usage error: --backend must be extension or cdp, got "
+              f"{backend!r}", file=sys.stderr)
+        return 1
+    try:
+        max_chars = int(kw.get("max-chars", DEFAULT_MAX_CHARS))
+    except (TypeError, ValueError):
+        print("usage error: --max-chars must be an integer (0 = no cap)",
+              file=sys.stderr)
+        return 1
+
+    out = kw.get("out")
+    keep_file = out is not None
+    out_path = str(out) if keep_file else spill_path(url)
+
+    import contextlib
+
+    from . import session_create
+    from .errors import BrowserwrightError
+    from .repl import inline
+    from .session_ctx import resolve_session_or_env
+
+    try:
+        sid = session_create.new(
+            backend=backend,
+            # `cdp` has no meaning without an owner: it must either launch a
+            # browser or attach to one, and a throwaway session has nobody to
+            # attach to. NOTE this launches a real Chrome, which on macOS takes
+            # the active window — the default backend is `extension` precisely
+            # so the common path never does that.
+            create=(backend == "cdp"),
+            attach=None,
+            name=str(kw.get("name", "markdown")),
+        )
+    except (ValueError, BrowserwrightError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    try:
+        rc = inline.run_code(
+            _MARKDOWN_CODE,
+            session_id=sid,
+            env={"BW_MD_URL": url, "BW_MD_OUT": out_path, "BW_MD_MODE": mode},
+        )
+        if rc != 0:
+            return rc
+        try:
+            text = Path(out_path).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"markdown: could not read rendered output: {e}",
+                  file=sys.stderr)
+            return 3
+        if max_chars > 0 and len(text) > max_chars:
+            from .repl.snapshot import _truncate_lines
+
+            print(f"[markdown] truncated to {max_chars} of {len(text)} chars; "
+                  f"full text: {out_path}", file=sys.stderr)
+            sys.stdout.write(_truncate_lines(text, max_chars) + "\n")
+            keep_file = True  # the caller needs it to see the rest
+        else:
+            sys.stdout.write(text if text.endswith("\n") else text + "\n")
+        return 0
+    finally:
+        if not keep_file:
+            with contextlib.suppress(OSError):
+                Path(out_path).unlink()
+        try:
+            session_create.end(resolve_session_or_env(sid))
+        except Exception as e:  # noqa: BLE001 — never mask the real result
+            print(f"[markdown] warning: could not end throwaway session {sid}: "
+                  f"{e}", file=sys.stderr)
 
 
 def _cmd_doctor(args: list[str]) -> int:
@@ -890,6 +1038,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_index(rest))
     if cmd == "memory":
         sys.exit(_cmd_memory(rest))
+    # Deliberately NOT under the -s branch: this is the one browser-driving
+    # command that owns its own throwaway session (ADR-0006).
+    if cmd == "markdown":
+        sys.exit(_cmd_markdown(rest))
     if cmd == "session":
         sys.exit(_cmd_session(rest, session_id=global_session))
     if cmd == "whoami":

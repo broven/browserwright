@@ -101,6 +101,15 @@ def build_globals() -> dict[str, Any]:
     # to override.
     from .snapshot import make_snapshot
     g["snapshot"] = make_snapshot(handle)
+    # The second view (ADR-0006): `snapshot()` is the action view, this is the
+    # content view. Same rules — injected per heredoc, read-only, never in
+    # EXPORTS (a view needs the live `page`, which a module-level function
+    # cannot have). `g` is passed so the closure can find the executor's
+    # `_bw_warn` channel, which is injected into this same dict *after* we
+    # return; its notes (extraction path taken, iframes excluded, spill file
+    # path) go out-of-band and never into the markdown body.
+    from .markdown import make_read_markdown
+    g["read_markdown"] = make_read_markdown(handle, g)
     # Agent-editable layer last, so helpers can call core primitives.
     _load_agent_helpers(g)
     return g

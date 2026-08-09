@@ -197,6 +197,34 @@ The frame-routing engine (`daemon/server/proxy.py`). Owns request-id rewriting,
 local↔upstream sessionId translation, the single-attacher rule, and the
 pre-open frame buffer. Its state lives in `DaemonState` (`state.py`).
 
+### view
+A **per-heredoc injected, read-only** function that renders the session's
+current `page` into text for the agent. Two members today:
+
+| view | answers | used for |
+|---|---|---|
+| `snapshot()` | what can I **do** here | an a11y tree; every actionable node carries `[ref=eN]` |
+| `read_markdown()` | what does it **say** | the page as Markdown, links absolute |
+
+"Read-only" is the class invariant, not a coincidence: a view never navigates,
+never opens a tab, never mutates the page. That is why `read_markdown()` takes
+no `url` — navigating would move the working tab and invalidate every `[ref=eN]`
+the agent is holding, from a call that reads like a read. See
+[ADR-0006](docs/adr/0006-markdown-is-the-content-view.md).
+
+**Trap — a view can never be in `EXPORTS`.** `EXPORTS` holds module-level
+functions, which cannot have a live `page`. Views are built by a
+`make_*(handle)` factory in `repl/` and injected by
+`repl/_namespace.build_globals`. Consequently **`--print-skill`'s generated
+section cannot list them** (`skill_doc.py` walks `EXPORTS`), so a view only
+exists to the agent if `skill_runtime.md` says so in prose. Adding a third view
+without editing that file ships it invisible.
+
+**Trap — the word is also loose English elsewhere.** "the ledger view", "the
+in-process view", "the relay's ghost view" in various docstrings predate this
+entry and mean nothing in particular. Only the injected-function sense is the
+defined term.
+
 ### verb
 A `BrowserwrightDaemon.*` JSON-RPC method the daemon answers itself rather than
 forwarding upstream — `openBackgroundTab`, `closeTab`, `endSession`,
