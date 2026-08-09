@@ -12,6 +12,7 @@ browser) are covered by `tests/daemon/e2e/test_l2_phase_b_executor.py`.
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 
@@ -692,12 +693,103 @@ def test_playwright_like_timeout_error_carries_fix():
 
 def test_console_truncation():
     w, _page = _fake_worker_with_objects()
-    # Print well over MAX_TEXT_CHARS.
+    # Print well over MAX_TEXT_CHARS, as ONE line: the runaway case the bound
+    # exists for, and the case a whole-line truncator cannot serve alone.
     code = f"print('x' * {protocol.MAX_TEXT_CHARS + 5000})"
     r = w._execute(protocol.ExecuteRequest(code, 2000))
     assert r.truncated is True
-    assert len(r.console) <= protocol.MAX_TEXT_CHARS + 64
-    assert r.console.endswith("[truncated]")
+    assert len(r.console) <= protocol.MAX_TEXT_CHARS
+    # A mid-line cut is announced as such — the tail is NOT a whole line, and
+    # a token at its end must not be trusted.
+    assert r.console.endswith("[truncated mid-line]")
+
+
+def test_console_truncation_is_whole_line_and_never_severs_a_ref():
+    """#55: the transport must not undo a producer's line-integrity promise.
+
+    A raw offset slice can turn `[ref=e291]` into `[ref=e2` — not merely a
+    corrupt token but a VALID ref for a different live element, so acting on it
+    fails silently instead of loudly.
+    """
+    w, _page = _fake_worker_with_objects()
+    lines = "\n".join(
+        f'  - button "Item number {i}" [ref=e{i}]' for i in range(1, 900)
+    )
+    assert len(lines) > protocol.MAX_TEXT_CHARS
+    r = w._execute(protocol.ExecuteRequest(f"print({lines!r})", 5000))
+
+    assert r.truncated is True
+    assert len(r.console) <= protocol.MAX_TEXT_CHARS
+    assert r.console.endswith("[truncated]")  # whole-line cut, not mid-line
+    body = r.console.rsplit("\n… [truncated]", 1)[0]
+    for ln in body.splitlines():
+        if "[ref=" in ln:
+            assert ln.rstrip().endswith("]"), f"severed ref in {ln!r}"
+
+
+def test_return_value_is_bounded_and_reports_the_cut():
+    """#54: `MAX_TEXT_CHARS` must bound the return value too.
+
+    An expression-valued last statement is ordinary agent code, and an uncapped
+    return value large enough to exceed `_MAX_FRAME` is read by the client as a
+    transport error — which REAPS this executor and loses the session's `state`.
+    """
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 5000
+    r = w._execute(protocol.ExecuteRequest(f"'x' * {n}", 5000))
+
+    assert r.return_value is not None
+    assert len(r.return_value) <= protocol.MAX_TEXT_CHARS
+    assert r.truncated is True
+    # Reported out-of-band, so a shortened repr is never mistaken for the whole.
+    assert any("[return value] truncated" in w_ for w_ in r.warnings)
+
+
+def test_print_and_bare_expression_agree_on_the_bound():
+    """The two spellings of the same payload must not differ by 5000 chars."""
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 5000
+    printed = w._execute(protocol.ExecuteRequest(f"print('x' * {n})", 5000))
+    returned = w._execute(protocol.ExecuteRequest(f"'x' * {n}", 5000))
+
+    assert printed.truncated is returned.truncated is True
+    assert len(printed.console) <= protocol.MAX_TEXT_CHARS
+    assert len(returned.return_value) <= protocol.MAX_TEXT_CHARS
+
+
+def test_warnings_are_bounded_in_count_and_length():
+    w, _page = _fake_worker_with_objects()
+    from browserwright._executor.process import MAX_WARNINGS
+
+    code = f"""
+for _i in range({MAX_WARNINGS + 50}):
+    _bw_warn('w' * {protocol.MAX_TEXT_CHARS + 100})
+"""
+    r = w._execute(protocol.ExecuteRequest(code, 5000))
+    assert r.truncated is True
+    assert len(r.warnings) <= MAX_WARNINGS + 1  # + the "N suppressed" notice
+    assert all(len(w_) <= protocol.MAX_TEXT_CHARS for w_ in r.warnings)
+    assert "suppressed" in r.warnings[-1]
+
+
+def test_oversized_task_result_json_stays_valid_json():
+    """A truncated JSON document would fail `ExecuteResponse.from_dict`'s own
+    validation, which the client answers by reaping the executor — worse than
+    the oversized payload. So it degrades to a valid marker object instead."""
+    from browserwright._executor.process import _cap_task_result_json
+
+    raw = json.dumps({"blob": "x" * (protocol.MAX_TEXT_CHARS * 2)})
+    capped, was_cut = _cap_task_result_json(raw)
+
+    assert was_cut is True
+    assert len(capped) <= protocol.MAX_TEXT_CHARS
+    decoded = json.loads(capped)  # must not raise
+    assert decoded["_browserwright_truncated"] is True
+    assert decoded["original_size"] == len(raw)
+    # And the whole response must survive a round-trip through the wire format.
+    protocol.ExecuteResponse.from_dict(
+        protocol.ExecuteResponse(task_result_json=capped).to_dict()
+    )
 
 
 def test_warnings_and_screenshots_surface():

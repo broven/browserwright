@@ -118,15 +118,29 @@ markdown —— 这正是本文档要禁止的静默空结果。
 
 ### 5. 截断必须配全文，且标记走带外
 
-executor 响应的 console 在 10,000 字符处被裸切（`_executor/protocol.py` 的
-`MAX_TEXT_CHARS`），而一个文档页的 markdown 轻松三五万字符。所以：**截断后的正文之外，
-完整内容写入一个临时文件，把路径交给调用方，由它决定读不读。**
+executor 响应的每一条文本通道都被 `MAX_TEXT_CHARS`（10,000）兜住，而一个文档页的
+markdown 轻松三五万字符。所以：**截断后的正文之外，完整内容写入一个临时文件，把路径交给
+调用方，由它决定读不读。**
 
-截断本身按**行边界**做，不按字节 —— 理由与 `repl/snapshot.py` 的 `_truncate_lines` 一致：
-切断 `[文字](http://…` 会造出一个坏链接，正如切断 `[ref=eN]` 会造出一个能点错元素的残
-ref。（那道 10,000 的墙自身的两个既有缺陷见
+截断本身按**行边界**做，不按字节 —— 切断 `[文字](http://…` 会造出一个坏链接，正如切断
+`[ref=eN]` 会造出一个**能点错元素**的残 ref（`[ref=e291]` 被切成 `[ref=e2]` 不是坏 token，
+而是另一个真实元素的合法 ref，所以是静默失败）。
+
+两个截断器都住在 `_text.py`，因为这里有一个真实的张力，两边的解法相反：
+
+- **生产端**（`snapshot()` / `read_markdown()`）用 `truncate_lines`：软预算，宁可让首行整行
+  溢出预算，也不吐半个 ref。
+- **传输层**（`_finish`）用 `truncate_hard`：硬上限，绝不越预算。它必须如此 —— 挡的就是
+  `print('x' * 5_000_000)` 这种**单行** runaway，而软截断器对单行会返回 500 倍预算。它能按
+  整行切就按整行切，实在切不动才行中切，并换一个 `… [truncated mid-line]` 标记**说出来**。
+
+所以本文档的不变量要带上第二句：**上层承诺了行完整性之后，下层不得按字节裸切 —— 除非它
+是硬上限，那它必须切，并且必须声明自己切了。**
+
+（原先只有 console 被兜住、且是裸切，即
 [#54](https://github.com/broven/browserwright/issues/54) 与
-[#55](https://github.com/broven/browserwright/issues/55)。）
+[#55](https://github.com/broven/browserwright/issues/55)；两者已修复，生产端默认值现在也从
+`MAX_TEXT_CHARS` 推导为 `PRODUCER_BUDGET`，不再靠运气不撞车。）
 
 「这次走的是哪条路」（提取 / 全页、有无跨源 frame 被排除、是否截断及全文路径）**走带外**
 —— stdout 是内容，stderr 与响应元数据是元信息，这个划分在 `repl/inline.py` 对 warnings

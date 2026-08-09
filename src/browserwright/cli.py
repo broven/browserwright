@@ -418,6 +418,11 @@ def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
         if response.return_value is None:
             print("task crashed: executor returned no repr result", file=sys.stderr)
             return 3
+        if response.truncated:
+            # This path prints the repr as DATA, so a silent cut would corrupt
+            # the caller's result rather than merely shorten a display string.
+            print("[task] result was truncated by the response bound; use "
+                  "--output json for the structured result", file=sys.stderr)
         sys.stdout.write(response.return_value)
     sys.stdout.write("\n")
     return 0
@@ -546,7 +551,7 @@ def _cmd_markdown(args: list[str]) -> int:
                   file=sys.stderr)
             return 3
         if max_chars > 0 and len(text) > max_chars:
-            from .repl.snapshot import _truncate_lines
+            from ._text import truncate_lines as _truncate_lines
 
             print(f"[markdown] truncated to {max_chars} of {len(text)} chars; "
                   f"full text: {out_path}", file=sys.stderr)

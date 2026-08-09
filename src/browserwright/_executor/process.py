@@ -40,6 +40,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
 from typing import Any
 
+from .._text import truncate_hard
 from ..errors import BrowserwrightError, serialize
 from .protocol import (
     MAX_TEXT_CHARS,
@@ -57,6 +58,59 @@ from .protocol import (
 # timeout in the registry is 35s, comfortably above this).
 _COLD_START_CONNECT_ATTEMPTS = 13
 _COLD_START_CONNECT_BACKOFF_S = 0.75
+
+# `_bw_warn` is callable from a loop, so the warnings LIST needs a bound as much
+# as each entry does. The overflow is folded into one final notice rather than
+# dropped silently.
+MAX_WARNINGS = 100
+
+
+def _cap_text(value: str) -> tuple[str, bool]:
+    """Bound one text channel of the response. Returns (value, was_truncated).
+
+    Whole-line aware (``truncate_hard``): the transport must never be the layer
+    that severs a `[ref=eN]` a producer took care to keep intact, because the
+    severed token is not merely corrupt — `[ref=e2` cut from `[ref=e291]` is a
+    VALID ref for a different live element, so acting on it fails silently.
+    """
+    if len(value) <= MAX_TEXT_CHARS:
+        return value, False
+    return truncate_hard(value, MAX_TEXT_CHARS), True
+
+
+def _cap_warnings(warnings: list[str]) -> tuple[list[str], bool]:
+    """Bound both the number of warnings and the length of each one."""
+    capped = [_cap_text(str(w))[0] for w in warnings[:MAX_WARNINGS]]
+    dropped = len(warnings) - len(capped)
+    if dropped > 0:
+        capped.append(f"… {dropped} further warning(s) suppressed")
+    return capped, dropped > 0
+
+
+def _cap_task_result_json(raw: str | None) -> tuple[str | None, bool]:
+    """Bound the task result JSON WITHOUT ever emitting invalid JSON.
+
+    Truncating a JSON document yields one that fails
+    ``ExecuteResponse.from_dict``'s own ``json.loads`` validation, which the
+    client reports as a malformed response and answers by REAPING the executor
+    — losing the session's persistent ``state`` over an oversized payload, a
+    strictly worse outcome than the payload itself. So an over-budget result is
+    replaced by a valid marker object that says exactly what happened, and the
+    caller is pointed at the channel that can still carry it.
+    """
+    if raw is None or len(raw) <= MAX_TEXT_CHARS:
+        return raw, False
+    return json.dumps(
+        {
+            "_browserwright_truncated": True,
+            "original_size": len(raw),
+            "reason": (
+                f"task result exceeded the {MAX_TEXT_CHARS}-char response "
+                f"bound; return a smaller result, or have the task write the "
+                f"full payload to a file and return its path"
+            ),
+        }
+    ), True
 
 
 @contextmanager
@@ -628,23 +682,49 @@ class _Worker:
         terminal_reason: str | None = None,
         task_result_json: str | None = None,
     ) -> ExecuteResponse:
-        """Assemble the response: cap the console at ``MAX_TEXT_CHARS`` and
-        attach the warnings/screenshots collected during the call."""
-        console = buf.getvalue()
-        truncated = False
-        if len(console) > MAX_TEXT_CHARS:
-            console = console[:MAX_TEXT_CHARS] + "\n… [truncated]"
-            truncated = True
+        """Assemble the response with EVERY text channel bounded, and attach the
+        warnings/screenshots collected during the call.
+
+        All four text channels are capped here, not just ``console``. An
+        expression-valued last statement is an entirely ordinary thing for an
+        agent to write, and an uncapped ``return_value`` big enough to exceed
+        ``protocol._MAX_FRAME`` does not merely ship megabytes: the client reads
+        it as a transport error and reaps this executor, taking the session's
+        live ``page`` and persistent ``state`` with it. Bounding the response by
+        construction is what makes that unreachable.
+        """
+        console, console_cut = _cap_text(buf.getvalue())
+        rv_cut = False
+        if return_value is not None:
+            return_value, rv_cut = _cap_text(return_value)
+        task_result_json, task_cut = _cap_task_result_json(task_result_json)
+
+        raw_warnings = (
+            list(self._call_warnings) if warnings is None else list(warnings)
+        )
+        # The cut is reported out-of-band (ADR-0007 §5): stdout is content,
+        # warnings are metadata. Without this the agent sees a short repr and
+        # has no way to tell it was ever longer.
+        if rv_cut:
+            raw_warnings.append(
+                f"[return value] truncated to {MAX_TEXT_CHARS} chars; print it "
+                f"in pieces, or write it to a file and return the path"
+            )
+        if task_cut:
+            raw_warnings.append(
+                f"task result exceeded the {MAX_TEXT_CHARS}-char response bound "
+                f"and was replaced by a truncation marker"
+            )
+        capped_warnings, warn_cut = _cap_warnings(raw_warnings)
+
         return ExecuteResponse(
             console=console,
             return_value=return_value,
             error=error,
             exit_code=exit_code,
-            warnings=(
-                list(self._call_warnings) if warnings is None else list(warnings)
-            ),
+            warnings=capped_warnings,
             screenshots=list(self._call_screenshots),
-            truncated=truncated,
+            truncated=console_cut or rv_cut or warn_cut or task_cut,
             terminal_reason=terminal_reason,
             task_result_json=task_result_json,
         )

@@ -86,8 +86,25 @@ def test_namespace_skips_same_object_shadow_without_warning(tmp_bs_home, capsys)
     assert capsys.readouterr().err == ""
 
 
-def test_snapshot_default_max_chars_is_less_aggressive():
+def test_snapshot_default_fits_under_the_transport_bound():
+    """#55: assert the RELATION, not a literal.
+
+    The old form pinned 20000 — a number that sat ABOVE the transport's own
+    10000 bound, so every snapshot in between was re-cut downstream at a raw
+    offset. What matters is that a producer's default leaves headroom under the
+    channel bound, not what either number happens to be today.
+    """
+    from browserwright._text import (
+        MAX_TEXT_CHARS,
+        PRODUCER_BUDGET,
+        TRUNC_MARKER,
+    )
     from browserwright.repl import snapshot as snapshot_mod
+
+    assert PRODUCER_BUDGET < MAX_TEXT_CHARS, (
+        "a producer default at or above the transport bound gets re-cut "
+        "downstream, which is exactly issue #55"
+    )
 
     class _Page:
         def aria_snapshot(self, *, mode):
@@ -95,9 +112,15 @@ def test_snapshot_default_max_chars_is_less_aggressive():
             return "- root\n" + ("  - button \"Save\" [ref=e1]\n" * 700)
 
     snap = snapshot_mod.make_snapshot(type("Handle", (), {"page": _Page()})())
+    out = snap()
 
-    assert len(snap()) > 6000
-    assert len(snap()) <= 20000 + len(snapshot_mod._TRUNC_MARKER) + 2
+    # Still generous enough to be useful, and inside the budget it declares.
+    assert len(out) > 6000
+    assert len(out) <= PRODUCER_BUDGET + len(TRUNC_MARKER) + 2
+    # Whole-line cut: no snapshot line, hence no ref, is ever severed.
+    for ln in out.rsplit("\n… [truncated]", 1)[0].splitlines():
+        if "[ref=" in ln:
+            assert ln.rstrip().endswith("]")
 
 
 def test_executor_control_plane_uses_browserwright_session_param():
