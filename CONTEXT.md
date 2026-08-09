@@ -220,6 +220,16 @@ section cannot list them** (`skill_doc.py` walks `EXPORTS`), so a view only
 exists to the agent if `skill_runtime.md` says so in prose. Adding a third view
 without editing that file ships it invisible.
 
+**Trap — every view is bound TWICE, and the second binding is easy to skip.**
+`build_globals` binds each `make_*(handle)` against a *lazy* `PlaywrightHandle`,
+which is correct only in-process. The resident **executor** already owns a live
+driver on its worker thread, so it re-binds the whole surface through
+`_Worker._bind_live_surface` against its shared `_LivePageHolder`. Miss that
+second binding and the view resolves the lazy handle inside a running asyncio
+loop — `Playwright Sync API inside the asyncio loop`, on every call, on every
+page. That is issue #59, and it is why the executor's rebind list must grow
+whenever `build_globals` binds a new name to `handle`.
+
 **Trap — the word is also loose English elsewhere.** "the ledger view", "the
 in-process view", "the relay's ghost view" in various docstrings predate this
 entry and mean nothing in particular. Only the injected-function sense is the

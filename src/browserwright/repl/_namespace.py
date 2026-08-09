@@ -8,8 +8,10 @@ constantly — saves a ``import`` line per heredoc.
 
 Finally we hot-load ``$BS_HOME/agent_helpers.py`` — the agent-editable
 primitive layer (see SKILL.md "Extending the primitive surface"). It loads
-*after* the core surface so helpers can call core primitives, and a conflict
-guard refuses any helper that would shadow a core name.
+*after* the core surface (so helpers can call core primitives) and after the
+resident executor's live-surface swap (so a helper that touches ``page`` gets
+the live one, not the lazy proxy), and a conflict guard refuses any helper that
+would shadow a core name.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import json
 import re
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 import browserwright
@@ -71,7 +74,23 @@ def _load_agent_helpers(g: dict[str, Any]) -> None:
         g[name] = value
 
 
-def build_globals() -> dict[str, Any]:
+def build_globals(
+    bind_live_surface: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Assemble the exec globals. ``bind_live_surface`` is the resident
+    executor's hook (issue #59).
+
+    The lazy ``PlaywrightHandle`` below is right for the in-process heredoc and
+    WRONG for the executor, which already owns a live driver on its worker
+    thread — resolving the lazy handle there re-enters ``sync_playwright()``
+    inside a running asyncio loop and raises. The executor therefore passes a
+    callback that swaps every handle-derived name for its live equivalent.
+
+    It runs HERE — after the core surface, before ``_load_agent_helpers`` — and
+    that ordering is the contract, not an implementation detail:
+    ``_load_agent_helpers`` seeds each helper module's own ``__dict__`` from
+    ``g``, so any name replaced *after* it runs stays lazy inside every helper.
+    """
     g: dict[str, Any] = {}
     # Every primitive + every error class.
     for name in browserwright.EXPORTS:
@@ -105,11 +124,16 @@ def build_globals() -> dict[str, Any]:
     # content view. Same rules — injected per heredoc, read-only, never in
     # EXPORTS (a view needs the live `page`, which a module-level function
     # cannot have). `g` is passed so the closure can find the executor's
-    # `_bw_warn` channel, which is injected into this same dict *after* we
-    # return; its notes (extraction path taken, iframes excluded, spill file
-    # path) go out-of-band and never into the markdown body.
+    # `_bw_warn` channel, which lands in this same dict only LATER; its notes
+    # (extraction path taken, iframes excluded, spill file path) go out-of-band
+    # and never into the markdown body.
     from .markdown import make_read_markdown
     g["read_markdown"] = make_read_markdown(handle, g)
+    # The resident executor replaces every name above that closes over `handle`
+    # with one bound to its live page. Must precede the agent layer — see the
+    # docstring; the helper modules copy `g` and never see a later swap.
+    if bind_live_surface is not None:
+        bind_live_surface(g)
     # Agent-editable layer last, so helpers can call core primitives.
     _load_agent_helpers(g)
     return g

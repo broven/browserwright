@@ -13,6 +13,15 @@ from browserwright.repl._namespace import build_globals
 
 
 def test_read_markdown_is_injected_next_to_snapshot():
+    """Presence only — this is the IN-PROCESS namespace, where the lazy handle
+    is the correct binding.
+
+    It says nothing about the resident executor, which rebuilds the surface
+    against its live page; issue #59 shipped with this test green and every
+    `-s <sid> -e` call raising. That binding is pinned by
+    `tests/daemon/test_phase_b_executor_unit.py::
+    test_read_markdown_in_executor_globals_reads_the_live_page`.
+    """
     g = build_globals()
     assert callable(g["read_markdown"])
     assert callable(g["snapshot"]), "the other view should still be there"

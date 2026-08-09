@@ -445,11 +445,26 @@ def _fake_worker_with_objects():
     w = _Worker("sess-test")
 
     class _FakePage:
-        def __init__(self):
+        def __init__(self, marker="live-page-marker"):
             self.url = "about:blank"
+            self.marker = marker
 
         def aria_snapshot(self, *, mode):
             return "- root [ref=e1]"
+
+        def evaluate(self, _script, _arg=None):
+            """What `_md_normalize`'s script returns, minimally shaped.
+
+            `render_page_markdown` reaches the page through exactly this call,
+            so a view bound to the WRONG page cannot produce this marker."""
+            return {
+                "contentType": "text/html",
+                "url": f"https://{self.marker}.test/",
+                "title": self.marker,
+                "fullHtml": f"<h1>{self.marker}</h1>",
+                "articleHtml": "",
+                "stats": {},
+            }
 
     class _FakeContext:
         def __init__(self):
@@ -458,9 +473,9 @@ def _fake_worker_with_objects():
     page = _FakePage()
     w._page = page
     w._context = _FakeContext()
-    w._snapshot_holder.page = page
+    w._live_page_holder.page = page
     from browserwright.repl.snapshot import make_snapshot
-    w._snapshot = make_snapshot(w._snapshot_holder)
+    w._snapshot = make_snapshot(w._live_page_holder)
     # Model a worker whose lazy cold-start ALREADY completed (these tests assert
     # post-connect execute behavior). Without this, `_execute`'s lazy
     # `_ensure_cold_started` would try a real facade connect and short-circuit
@@ -584,6 +599,96 @@ def test_namespace_injects_live_objects_and_state():
     assert "__bw_playwright_handle__" not in g
     # Core EXPORTS / stdlib still present (superset of the heredoc surface).
     assert "remember" in g and "http_get" in g and "json" in g
+
+
+def _forbid_lazy_handle(monkeypatch):
+    """Make resolving the LAZY `PlaywrightHandle` fail loudly.
+
+    In the real executor that resolution re-enters `sync_playwright()` inside
+    the worker's running asyncio loop and raises "Sync API inside the asyncio
+    loop". Under test it would silently try to reach a facade instead, so we
+    turn it into the assertion it actually is."""
+    from browserwright.repl import playwright_handle as ph
+
+    def _explode(_self):
+        raise AssertionError(
+            "a namespace entry resolved the lazy PlaywrightHandle; in the "
+            "resident executor that is the 'Playwright Sync API inside the "
+            "asyncio loop' crash (issue #59)"
+        )
+
+    monkeypatch.setattr(ph.PlaywrightHandle, "_ensure_connected", _explode)
+
+
+def test_read_markdown_in_executor_globals_reads_the_live_page(monkeypatch):
+    """Regression, issue #59.
+
+    `read_markdown` was the one handle-derived name `_build_globals` forgot to
+    rebind, so it stayed closed over `_namespace`'s LAZY `PlaywrightHandle` —
+    which the executor then dropped. Every `browserwright -s <sid> -e '...
+    read_markdown() ...'` raised, on any page.
+
+    The class of bug is a WRONG BINDING, so neither `callable(g["read_markdown"])`
+    (the wiring test in tests/skill/test_markdown_wiring.py) nor calling
+    `make_read_markdown` with a fake handle can see it — both are true of the
+    broken build. The assertion has to start from the EXECUTOR's globals and end
+    at the EXECUTOR's live page, which is what this does.
+    """
+    _forbid_lazy_handle(monkeypatch)
+    w, page = _fake_worker_with_objects()
+
+    g = w._build_globals()
+    out = g["read_markdown"]()
+
+    # Came from `page.evaluate`, i.e. the live object the worker holds.
+    assert page.marker in out
+    # ADR-0007's out-of-band notes still reach the response, which is the whole
+    # reason `make_read_markdown` takes the namespace: `_bw_warn` is injected
+    # into that same dict, and is read lazily at call time.
+    assert any("read_markdown:" in warning for warning in w._call_warnings)
+
+
+def test_read_markdown_follows_a_page_rebind(monkeypatch):
+    """The view must track the session's current tab like `snapshot` does.
+
+    Both views hang off the one `_live_page_holder`, so a `_rebind_page`
+    (switch_tab / recovery / close-of-current) moves them together. Binding a
+    view to `self._page` directly would pass the test above and still go stale
+    the first time the agent switches tabs.
+    """
+    _forbid_lazy_handle(monkeypatch)
+    w, _page = _fake_worker_with_objects()
+    g = w._build_globals()
+
+    w._live_page_holder.page = type(_page)("second-tab-marker")
+
+    assert "second-tab-marker" in g["read_markdown"]()
+
+
+def test_agent_helpers_are_seeded_from_the_live_surface(monkeypatch, tmp_path):
+    """Same defect class as #59, found while auditing for siblings.
+
+    `_load_agent_helpers` copies the namespace into each helper module's own
+    `__dict__`, which is where a helper's free names resolve. It used to run
+    BEFORE the executor swapped in its live objects, so every helper saw the
+    lazy proxies and any helper touching `page` died the same way
+    `read_markdown` did. The live surface must be bound first.
+    """
+    _forbid_lazy_handle(monkeypatch)
+    (tmp_path / "agent_helpers.py").write_text(
+        "def helper_page():\n"
+        "    return page\n"
+        "def helper_markdown():\n"
+        "    return read_markdown()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+
+    w, page = _fake_worker_with_objects()
+    g = w._build_globals()
+
+    assert g["helper_page"]() is page
+    assert page.marker in g["helper_markdown"]()
 
 
 def test_state_persists_across_executes():
@@ -1070,9 +1175,9 @@ def test_execute_triggers_lazy_cold_start_on_first_call(monkeypatch):
 
         self._page = _P()
         self._context = _Ctx()
-        self._snapshot_holder.page = self._page
+        self._live_page_holder.page = self._page
         from browserwright.repl.snapshot import make_snapshot
-        self._snapshot = make_snapshot(self._snapshot_holder)
+        self._snapshot = make_snapshot(self._live_page_holder)
         self._connected = True
 
     monkeypatch.setattr(_Worker, "_ensure_cold_started", fake_ensure)
