@@ -946,6 +946,13 @@ def _cmd_version(args: list[str]) -> int:
         if relay_status:
             info["daemon_version"] = relay_status.get("daemon_version")
             info["running_extensions"] = relay_status.get("extension_details") or []
+        # Issue #57 — same fix as the daemon CLI's `version check`, kept in step
+        # deliberately: `daemon_version` was fetched and read by nothing, so
+        # `(versions ok)` printed directly under `daemon=0.8.2 drift=minor`.
+        if "--strict-daemon" in args:
+            from .version import apply_strict_daemon
+
+            apply_strict_daemon(info, info["version"])
         if "--json" in args:
             sys.stdout.write(json.dumps(info, sort_keys=True) + "\n")
         elif info["ok"]:

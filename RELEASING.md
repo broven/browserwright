@@ -136,8 +136,25 @@ mise run upgrade-global
 
 This: `uv tool install browserwright --force --refresh` (CLI+daemon from PyPI) →
 downloads the matching `browserwright-extension-<version>.zip` from the GitHub
-Release and unpacks it into the extension dir → `browserwright-daemon restart` →
-`browserwright-daemon extension reload` → `browserwright-daemon version check`.
+Release and unpacks it into the extension dir → `browserwright-daemon restart
+--force` → `browserwright-daemon extension reload` → `browserwright-daemon
+version check --strict-daemon`.
+
+> **Why `--force` and `--strict-daemon` (issue #57).** A restart kills every
+> session's live executor state, so `restart` refuses by default while anyone is
+> driving a session; an upgrade is explicit human intent, so it passes `--force`
+> and prints what it interrupted rather than killing silently. `--strict-daemon`
+> makes the post-check require that the daemon answering `/__status__` is running
+> the version just installed. Without it, the check compared the package to the
+> extension manifest — which on a `uv tool` install (no manifest beside the venv)
+> reduces to "is this string semver", and reported `versions ok` for a whole
+> release while a daemon one version behind kept serving.
+
+> **If the upgrade reports a restart failure**, read the message: it distinguishes
+> "pid unchanged", "new process died on startup", and "new process is running the
+> wrong version", and it quotes the daemon's own stderr. The usual cause is
+> another `browserwright-daemon serve` holding port 19989 — commonly one leaked
+> by a test run in another worktree (`mise run teardown` in that worktree).
 
 > **Why `--refresh`:** without it, uv's index cache can resolve to the *previous*
 > version for a few minutes after a release and silently install the old wheel.
