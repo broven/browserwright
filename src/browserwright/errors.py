@@ -75,6 +75,34 @@ class ElementNotFound(BrowserwrightError):
         super().__init__(f"element not found: {selector!r} after {timeout}s", fix=fix)
 
 
+class UnsupportedContentType(BrowserwrightError):
+    """The page is not HTML, so there is nothing to convert to Markdown.
+
+    Raised loudly on purpose (ADR-0007). A PDF is the motivating case: Chrome's
+    built-in viewer renders a REAL DOM (an ``<embed>`` shell), so a best-effort
+    conversion would succeed and return a short, plausible-looking result that
+    contains none of the document — a silent empty answer, which is the one
+    failure mode the markdown path is built to make impossible.
+
+    browserwright deliberately does not grow a document pipeline. Route the URL
+    to whatever handles that type and keep browserwright for HTML.
+    """
+
+    exit_code = 3
+    default_fix = (
+        "this endpoint only converts HTML; route non-HTML types "
+        "(PDF, images, binaries) to a handler for that type"
+    )
+
+    def __init__(self, url: str = "", content_type: str = "", fix: str = ""):
+        self.url, self.content_type = url, content_type
+        super().__init__(
+            f"not HTML, refusing to convert: {url} (Content-Type: "
+            f"{content_type or 'unknown'})",
+            fix=fix,
+        )
+
+
 class AuthWall(BrowserwrightError):
     exit_code = 4
     default_fix = "stop and ask the user to log in; do not type credentials from a screenshot"

@@ -170,7 +170,50 @@ The tab-explosion failure mode is opening a new tab for every step. Do not do th
 - **Never close the browser or context.** Do NOT call `browser.close()`, `context.close()`, or `page.close()` — those would close the user's real tabs. Browserwright tears down short-lived client transports for you; the tabs stay open.
 - **observe → act → observe.** `snapshot()` to see what is actionable, act through a ref locator, then `snapshot()` again to confirm the result before the next action.
 
-### Observation: `snapshot()`, not screenshots
+### Two views: `snapshot()` to act, `read_markdown()` to read
+
+Both are injected into every heredoc, both are read-only, and both describe the
+**current** page — neither one navigates.
+
+| | use it when you want to | gives you |
+|---|---|---|
+| `snapshot()` | **do** something | a11y tree, every actionable node tagged `[ref=eN]` |
+| `read_markdown()` | **read** something | the page as Markdown, links absolute |
+
+Reach for `read_markdown()` whenever the page is the answer rather than the
+workspace — documentation, an article, a changelog, search results, a table of
+data. It is what `snapshot()` is not: prose, headings, tables, fenced code with
+its language, and every link intact and absolute so you can follow them.
+
+```bash
+browserwright -s "$sid" -e $'
+page.goto("https://docs.example.com/api/auth")
+print(read_markdown())
+'
+```
+
+- `read_markdown(mode="auto")` (the default) returns the main content, and falls
+  back to the page minus nav/footer/sidebar if it cannot isolate one.
+- `read_markdown(mode="full")` returns the page verbatim — use it when you came
+  for the navigation, a form, or **every** link.
+- Output is capped (default 8000 chars) on a line boundary, never mid-link. The
+  untruncated Markdown is written to a temp file and its path is reported on
+  stderr, so you can read the rest if you actually need it.
+- Non-HTML (PDF, images) is refused with its Content-Type rather than returning
+  a plausible-looking empty result. Route those elsewhere.
+
+Do **not** reconstruct prose out of `snapshot()`, and do not reach for
+`page.locator("main").inner_text()` — `inner_text()` throws away every link and
+all structure, which is usually most of why you wanted the text.
+
+To fetch a page you are *not* already on, and without touching your working tab,
+use the one-shot command — it makes and destroys its own session:
+
+```bash
+browserwright markdown https://docs.example.com/api/auth
+```
+
+### Acting: `snapshot()`, not screenshots
 
 `snapshot()` returns a compact accessibility tree where every actionable node carries a `[ref=eN]` token. Act on a ref with Playwright's `aria-ref=` selector engine on the SAME page:
 
@@ -190,13 +233,11 @@ print(snapshot())                                  # confirm
 - Refs are scoped to the most recent `snapshot()` on that page, so re-`snapshot()` after every action (a ref from a stale snapshot may no longer resolve).
 - You still have the full Playwright `page` API (`page.get_by_role(...)`, `page.locator("css=…")`, `page.fill(...)`, `page.wait_for_load_state(...)`, etc.) when you need it.
 
-For bulk text extraction, use Playwright text APIs instead of reconstructing
-paragraphs from `snapshot()`:
-
-```python
-text = page.locator("main").inner_text()
-data = page.evaluate("() => document.body.innerText")
-```
+For reading page content, use `read_markdown()` (above) rather than
+reconstructing paragraphs from `snapshot()`. `page.locator(...).inner_text()`
+remains available when you want the raw text of one specific element and nothing
+else — but it drops links and structure, so it is the wrong tool for reading a
+page.
 
 ## Trust Boundaries
 

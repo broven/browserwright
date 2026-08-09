@@ -42,6 +42,7 @@ from .errors import (  # noqa: F401
     NeedsUserConfirm,
     NetworkError,
     PageLoadFailed,
+    UnsupportedContentType,
 )
 from .primitives.discovery_api import (  # noqa: F401
     list_site_skills,
@@ -69,7 +70,7 @@ EXPORTS = [
     # errors
     "BrowserwrightError", "PageLoadFailed", "ElementNotFound", "AuthWall",
     "Captcha", "NetworkError", "DaemonUnavailable", "CDPError",
-    "NeedsUserConfirm",
+    "NeedsUserConfirm", "UnsupportedContentType",
 ]
 
 __all__ = EXPORTS

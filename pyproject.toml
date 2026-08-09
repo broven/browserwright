@@ -30,6 +30,26 @@ dependencies = [
     # daemon-resolved Chrome and does not need Playwright's bundled browser.
     "playwright>=1.60.0",
     "pyyaml>=6.0.3",
+    # HTML -> Markdown for the `read_markdown()` content view (ADR-0006/0007).
+    # Rust core + PyO3, and it pulls in NOTHING transitively — which is why it
+    # beat `markdownify` (bs4 + soupsieve) and `trafilatura` (lxml + a 32 MB
+    # babel locale tree) here. It is also the only converter measured that
+    # carries `class="language-*"` into a fenced ```lang block and keeps
+    # `rowspan` cells, both of which matter on the documentation pages this
+    # view exists to read.
+    #
+    # We deliberately track upstream rather than freeze: the project is running
+    # a systematic markdown-fidelity campaign (its own "Phase Z..HH" feat
+    # series) that keeps improving exactly what we depend on. The safety net for
+    # that is `tests/skill/test_markdown_golden.py` — golden files turn an
+    # upstream byte-level output change into a CI failure instead of a silent
+    # shift in what every agent reads. ADR-0007 makes those tests a precondition
+    # of this `>=`, not an optional extra.
+    #
+    # The `<4` cap is not conservatism about features: 3.0.0 removed the v1
+    # `convert_to_markdown()` entry point outright, so a major bump can break us
+    # at import time. Raise it deliberately, with the golden files as the diff.
+    "html-to-markdown>=3.10.6,<4",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +78,11 @@ browserwright = [
     "site_skills_starter/**/*.md",
     "site_skills_starter/**/*.py",
     "skill_runtime.md",
+    # Vendored Mozilla Readability, injected as SOURCE TEXT via page.evaluate
+    # (add_script_tag is blocked by page CSP; page.evaluate is not). It has to
+    # ship as a real file for that reason — see repl/vendor/README.md.
+    "repl/vendor/*.js",
+    "repl/vendor/*.md",
 ]
 
 [tool.setuptools.exclude-package-data]
