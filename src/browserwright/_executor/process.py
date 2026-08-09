@@ -101,11 +101,14 @@ def _cap_text(value: str, *, prefix: str) -> tuple[str, bool, str | None]:
 def _cap_warnings(warnings: list[str]) -> tuple[list[str], bool]:
     """Bound both the number of warnings and the length of each one.
 
-    No spill here: warnings are the out-of-band METADATA channel, not content.
-    Spilling a file per warning would bury the very paths these lines carry.
+    Deliberately NOT via ``_cap_text``: warnings are the out-of-band METADATA
+    channel, not content, so they are truncated but never spilled. Routing them
+    through ``_cap_text`` writes one file per over-long warning — which buries
+    the very spill paths these lines exist to carry, and accumulates fast
+    because a warning loop produces up to MAX_WARNINGS of them per call.
     """
     capped = [
-        _cap_text(str(w), prefix="warning")[0] for w in warnings[:MAX_WARNINGS]
+        truncate_hard(str(w), MAX_TEXT_CHARS) for w in warnings[:MAX_WARNINGS]
     ]
     dropped = len(warnings) - len(capped)
     if dropped > 0:

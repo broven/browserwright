@@ -765,11 +765,16 @@ def test_warnings_are_bounded_in_count_and_length():
 for _i in range({MAX_WARNINGS + 50}):
     _bw_warn('w' * {protocol.MAX_TEXT_CHARS + 100})
 """
+    import browserwright._text as text_mod
+
     r = w._execute(protocol.ExecuteRequest(code, 5000))
     assert r.truncated is True
     assert len(r.warnings) <= MAX_WARNINGS + 1  # + the "N suppressed" notice
     assert all(len(w_) <= protocol.MAX_TEXT_CHARS for w_ in r.warnings)
     assert "suppressed" in r.warnings[-1]
+    # Warnings are metadata, not content: truncated but NEVER spilled. One file
+    # per warning would bury the very spill paths these lines carry.
+    assert not list(text_mod.SPILL_DIR.glob("browserwright-warning-*.txt"))
 
 
 def test_truncated_console_is_recoverable_from_disk():

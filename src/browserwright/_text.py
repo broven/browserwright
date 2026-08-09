@@ -67,6 +67,15 @@ MID_LINE_MARKER = "… [truncated mid-line]"
 # days old survive there — so nothing else is going to do this for us.
 SPILL_KEEP = 20
 
+# Where spills land. A module-level name rather than a literal so the test suite
+# can redirect it to a tmp dir — otherwise running the tests litters the
+# developer's real /tmp, which is how the accumulation this constant limits was
+# noticed in the first place. `/tmp` and not `tempfile.gettempdir()`: on macOS
+# the latter is the per-user `/var/folders/…` dir, whose value comes from the
+# TMPDIR of whichever session started the process, and the executor and the CLI
+# reading its spill paths are two processes that need not share one.
+SPILL_DIR = Path("/tmp")
+
 # Monotonic within the process, and deliberately NOT "lowest free index": with
 # pruning in play a recycled index would point an already-issued path at
 # different content, so an agent holding an older path would silently read the
@@ -83,7 +92,7 @@ def _prune_spills(prefix: str) -> None:
     """
     mine: list[tuple[float, Path]] = []
     with contextlib.suppress(OSError):
-        for p in Path("/tmp").glob(f"browserwright-{prefix}-{os.getpid()}-*.txt"):
+        for p in SPILL_DIR.glob(f"browserwright-{prefix}-{os.getpid()}-*.txt"):
             with contextlib.suppress(OSError):
                 mine.append((p.stat().st_mtime, p))
     for _mtime, old in sorted(mine)[:-SPILL_KEEP]:
@@ -106,7 +115,7 @@ def spill_text(text: str, *, prefix: str) -> str | None:
     """
     while True:
         cand = (
-            Path("/tmp")
+            SPILL_DIR
             / f"browserwright-{prefix}-{os.getpid()}-{next(_spill_seq)}.txt"
         )
         if not cand.exists():

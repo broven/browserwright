@@ -171,23 +171,24 @@ def test_pruning_never_recycles_a_path():
     assert len(set(paths)) == len(paths)
 
 
-def test_pruning_only_touches_this_process(tmp_path, monkeypatch):
+def test_pruning_only_touches_this_process():
     """A session must never delete another session's or user's files."""
     import os
-    from pathlib import Path
 
+    import browserwright._text as text_mod
     from browserwright._text import SPILL_KEEP, spill_text
 
     other_pid = os.getpid() + 1
-    stranger = Path("/tmp") / f"browserwright-unit-other-{other_pid}-0.txt"
+    stranger = (
+        text_mod.SPILL_DIR / f"browserwright-unit-other-{other_pid}-0.txt"
+    )
     stranger.write_text("not mine", encoding="utf-8")
-    try:
-        for i in range(SPILL_KEEP + 5):
-            spill_text(f"p{i}", prefix="unit-other")
-        assert stranger.exists(), "pruned a file belonging to another process"
-        assert stranger.read_text(encoding="utf-8") == "not mine"
-    finally:
-        stranger.unlink(missing_ok=True)
+
+    for i in range(SPILL_KEEP + 5):
+        spill_text(f"p{i}", prefix="unit-other")
+
+    assert stranger.exists(), "pruned a file belonging to another process"
+    assert stranger.read_text(encoding="utf-8") == "not mine"
 
 
 def test_a_failed_prune_does_not_fail_the_spill(monkeypatch):

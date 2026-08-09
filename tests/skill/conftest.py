@@ -3,6 +3,22 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_spill_dir(monkeypatch, tmp_path):
+    """Keep truncation spills out of the developer's real /tmp.
+
+    Mirrors the same fixture in tests/daemon/conftest.py: an over-budget
+    `snapshot()` / `read_markdown()` writes its untruncated payload to
+    `_text.SPILL_DIR`, and `SPILL_KEEP` bounds that per-pid — which does nothing
+    across runs, since every run is a new pid.
+    """
+    from browserwright import _text
+
+    spills = tmp_path / "spills"
+    spills.mkdir()
+    monkeypatch.setattr(_text, "SPILL_DIR", spills)
+
+
 @pytest.fixture
 def tmp_bs_home(tmp_path, monkeypatch):
     """Reset the global_memory singleton to a tmp_path-rooted home.
