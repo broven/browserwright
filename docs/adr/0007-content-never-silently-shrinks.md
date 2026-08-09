@@ -146,9 +146,23 @@ return value、task result、`snapshot()` 各自都 spill；`snapshot()` 必须�
 不该存在。截断该限制的是「呈现多少」，不是「保留多少」。spill 失败（OSError）时降级成
 「写不下」的提示而不是让调用失败 —— 内容太长不该变成一次失败的调用。
 
-代价照旧记在这里：这些文件**没有任何东西回收**，和 screenshots、markdown spill 一致。但
-executor 是长驻进程，这条路径的触发频率比 markdown 高一个量级（每个超限调用一个文件）。
-这是明知的取舍，不是疏忽；要改就改成带清理或单文件上限，别悄悄改成「不写了」。
+这条路径**自己回收**，和 screenshots、markdown spill 不同。理由是频率：executor 是长驻
+进程，每个超限调用写一个文件，而 macOS **不清理 `/tmp`**（实测：三天前的文件仍在，机器已
+开机十天），所以指望系统兜底是不成立的。每次 spill 后按 `prefix` 保留最近 `SPILL_KEEP`
+个，更老的删掉。
+
+两条约束不能动：
+
+- **只删自己 pid 名下的文件。** 同机会有别的 session、别的 worktree、别的用户在跑，删到
+  对方的文件是比堆积严重得多的故障。
+- **编号单调递增，不复用空位。** 复用会让一个已经交出去的路径指向**另一份内容**，agent
+  拿着旧路径读到的是错的东西 —— 比文件消失了更坏。
+
+清理全程 best-effort：删不掉不算失败，spill 照常返回路径。
+
+还没解决的是权限：spill 文件是 `644`，躺在 `1777` 的 `/tmp` 里，同机其他用户可读，而正文
+可能是登录态页面的内容。既有的 markdown spill 与 screenshot 有同样的暴露面，所以这是一个
+统一的临时文件策略问题，留待单独处理，不在本 ADR 的截断议题里顺手改。
 
 （原先只有 console 被兜住、且是裸切、且截掉就没了，即
 [#54](https://github.com/broven/browserwright/issues/54) 与

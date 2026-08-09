@@ -139,6 +139,69 @@ def test_spill_text_returns_none_instead_of_raising(monkeypatch):
     assert text_mod.spill_text("x", prefix="unit-fail") is None
 
 
+def test_spills_self_prune_to_the_keep_limit():
+    from pathlib import Path
+
+    from browserwright._text import SPILL_KEEP, spill_text
+
+    paths = [
+        spill_text(f"payload {i}", prefix="unit-prune")
+        for i in range(SPILL_KEEP + 10)
+    ]
+    alive = [p for p in paths if Path(p).exists()]
+
+    assert len(alive) == SPILL_KEEP
+    # It is the NEWEST that survive, and the newest is always readable.
+    assert alive == paths[-SPILL_KEEP:]
+    assert Path(paths[-1]).read_text(encoding="utf-8") == (
+        f"payload {SPILL_KEEP + 9}"
+    )
+
+
+def test_pruning_never_recycles_a_path():
+    """A recycled index would point an already-issued path at different
+    content, so an agent holding an older path would silently read the wrong
+    payload — worse than the file being gone."""
+    from browserwright._text import SPILL_KEEP, spill_text
+
+    paths = [
+        spill_text(f"p{i}", prefix="unit-recycle")
+        for i in range(SPILL_KEEP * 2 + 5)
+    ]
+    assert len(set(paths)) == len(paths)
+
+
+def test_pruning_only_touches_this_process(tmp_path, monkeypatch):
+    """A session must never delete another session's or user's files."""
+    import os
+    from pathlib import Path
+
+    from browserwright._text import SPILL_KEEP, spill_text
+
+    other_pid = os.getpid() + 1
+    stranger = Path("/tmp") / f"browserwright-unit-other-{other_pid}-0.txt"
+    stranger.write_text("not mine", encoding="utf-8")
+    try:
+        for i in range(SPILL_KEEP + 5):
+            spill_text(f"p{i}", prefix="unit-other")
+        assert stranger.exists(), "pruned a file belonging to another process"
+        assert stranger.read_text(encoding="utf-8") == "not mine"
+    finally:
+        stranger.unlink(missing_ok=True)
+
+
+def test_a_failed_prune_does_not_fail_the_spill(monkeypatch):
+    import browserwright._text as text_mod
+
+    def _boom(self, *a, **k):
+        raise OSError("cannot unlink")
+
+    monkeypatch.setattr(text_mod.Path, "unlink", _boom)
+    for i in range(text_mod.SPILL_KEEP + 3):
+        path = text_mod.spill_text(f"p{i}", prefix="unit-prune-fail")
+        assert path is not None
+
+
 def test_the_two_truncators_agree_whenever_lines_fit():
     """Where a whole-line cut is possible at all, hard and soft must produce
     the SAME body — the hard variant only diverges in the fallback."""

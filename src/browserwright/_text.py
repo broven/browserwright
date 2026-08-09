@@ -36,6 +36,8 @@ the agent sees is shortened, what it can still fetch is not.
 """
 from __future__ import annotations
 
+import contextlib
+import itertools
 import os
 from pathlib import Path
 
@@ -58,6 +60,37 @@ TRUNC_MARKER = "… [truncated]"
 MID_LINE_MARKER = "… [truncated mid-line]"
 
 
+# How many spills of one kind one process keeps before dropping its oldest.
+# The executor is long-lived and spills once per over-budget call, so unlike the
+# markdown/screenshot spills this path would otherwise grow without limit for
+# the life of the session. macOS does NOT prune /tmp — verified: files three
+# days old survive there — so nothing else is going to do this for us.
+SPILL_KEEP = 20
+
+# Monotonic within the process, and deliberately NOT "lowest free index": with
+# pruning in play a recycled index would point an already-issued path at
+# different content, so an agent holding an older path would silently read the
+# wrong payload.
+_spill_seq = itertools.count()
+
+
+def _prune_spills(prefix: str) -> None:
+    """Drop this process's oldest ``prefix`` spills, keeping ``SPILL_KEEP``.
+
+    Scoped to our own pid on purpose: a session must never delete another
+    session's, another worktree's, or another user's files out from under them.
+    Entirely best-effort — a spill that cannot be pruned is not a failure.
+    """
+    mine: list[tuple[float, Path]] = []
+    with contextlib.suppress(OSError):
+        for p in Path("/tmp").glob(f"browserwright-{prefix}-{os.getpid()}-*.txt"):
+            with contextlib.suppress(OSError):
+                mine.append((p.stat().st_mtime, p))
+    for _mtime, old in sorted(mine)[:-SPILL_KEEP]:
+        with contextlib.suppress(OSError):
+            old.unlink()
+
+
 def spill_text(text: str, *, prefix: str) -> str | None:
     """Write the UNtruncated ``text`` to /tmp; return its path, or None.
 
@@ -70,22 +103,19 @@ def spill_text(text: str, *, prefix: str) -> str | None:
 
     Returns None on any OSError: failing to spill must never turn a merely long
     result into a failed call. The caller says so in its notice instead.
-
-    Nothing prunes these, exactly like the screenshots and the markdown spills —
-    a deliberate choice inherited from `markdown.spill_path`. Note the executor
-    is long-lived, so this path is hit far more often than the markdown one: one
-    file per over-budget call, for the life of the session.
     """
-    i = 0
     while True:
-        cand = Path("/tmp") / f"browserwright-{prefix}-{os.getpid()}-{i}.txt"
+        cand = (
+            Path("/tmp")
+            / f"browserwright-{prefix}-{os.getpid()}-{next(_spill_seq)}.txt"
+        )
         if not cand.exists():
             break
-        i += 1
     try:
         cand.write_text(text, encoding="utf-8")
     except OSError:
         return None
+    _prune_spills(prefix)
     return str(cand)
 
 
