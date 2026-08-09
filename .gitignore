@@ -47,3 +47,4 @@ node_modules/
 # E2E test artifacts
 tests/daemon/e2e/_artifacts/
 tests/daemon/e2e/_bs_home/
+.claude/worktrees/
