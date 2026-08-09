@@ -12,6 +12,28 @@ from __future__ import annotations
 import pytest
 
 
+def pytest_collection_modifyitems(config, items):
+    """Keep `launchd`-marked tests out of the fast gate unless asked for.
+
+    Same opt-in shape as `real_chrome` in `e2e/conftest.py`: those tests load
+    and boot out real LaunchAgents, which is fine locally but has no business
+    running as a side effect of `pytest tests/daemon`. Opt in with
+    `pytest -m launchd` or by naming the file (`mise run test:launchd`).
+    """
+    if config.option.markexpr and "launchd" in config.option.markexpr:
+        return
+    named = {str(a).split("::")[0] for a in (config.args or ())}
+    skip = pytest.mark.skip(
+        reason="launchd integration -- opt in with `mise run test:launchd` "
+               "or `pytest -m launchd`")
+    for item in items:
+        if "launchd" not in item.keywords:
+            continue
+        if any(item.path.match(pattern) for pattern in named if pattern):
+            continue
+        item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_spill_dir(monkeypatch, tmp_path):
     """Keep truncation spills out of the developer's real /tmp.

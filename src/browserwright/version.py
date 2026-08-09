@@ -192,6 +192,53 @@ def check_versions() -> list[VersionIssue]:
     return issues
 
 
+def strict_daemon_issues(daemon_version: str | None,
+                         installed: str) -> list[VersionIssue]:
+    """Issues for "the *live* daemon must be running exactly ``installed``".
+
+    Issue #57. This is deliberately NOT :attr:`VersionComparison.compatible`.
+    That predicate accepts MINOR drift on purpose — it answers "can this
+    extension and this daemon talk to each other", and `backends/extension.py`
+    depends on its breadth to keep working across a minor bump. Asked after an
+    upgrade, though, it can only ever catch a major bump: 0.9.0 against a still
+    running 0.8.2 is `drift=minor` -> compatible -> "versions ok", which is how
+    a completely failed upgrade reported complete success.
+
+    After an upgrade the only acceptable answer is equality, so this lives apart
+    from `check_versions()` and is opt-in per call site — a dev checkout is
+    routinely a different version from the machine-global daemon, and failing
+    there would be noise.
+    """
+    if daemon_version is None:
+        return [VersionIssue(
+            "daemon-not-running",
+            "no daemon answered /__status__, so its version cannot be confirmed",
+        )]
+    if str(daemon_version) != installed:
+        return [VersionIssue(
+            "daemon-version-mismatch",
+            f"the running daemon reports {daemon_version}, not {installed} — "
+            "the binary on disk was upgraded but the live process was not "
+            "replaced (`browserwright-daemon restart`)",
+        )]
+    return []
+
+
+def apply_strict_daemon(info: dict, installed: str) -> dict:
+    """Fold :func:`strict_daemon_issues` into a `version_info()` dict in place.
+
+    Keeps `ok` and `issues` consistent so every existing consumer — the human
+    branch, the `--json` branch and the exit code — picks the failure up without
+    each one re-deriving it.
+    """
+    extra = strict_daemon_issues(info.get("daemon_version"), installed)
+    if extra:
+        info["ok"] = False
+        info["issues"] = list(info.get("issues") or []) + [
+            issue.__dict__ for issue in extra]
+    return info
+
+
 def version_info() -> dict:
     issues = check_versions()
     return {

@@ -137,7 +137,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "restart",
         help="restart the installed LaunchAgent daemon after an upgrade")
     p_restart.add_argument("--timeout", type=float, default=5.0,
-                           help="seconds to wait for graceful unload/load")
+                           help="seconds to wait for the replacement daemon to "
+                                "come up and report its version")
+    p_restart.add_argument(
+        "--force", action="store_true",
+        help=("restart even though sessions are actively being driven. A "
+              "restart kills every session's live executor state — tabs and "
+              "session records survive, `page` / `context` / variables do "
+              "not — so without this flag `restart` refuses while anyone is "
+              "working (issue #57)."))
 
     # status (v0.2)
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
@@ -220,6 +228,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ver = sub.add_parser("version", help="print the installed version and exit")
     p_ver.add_argument("--json", action="store_true")
     p_ver.add_argument("action", nargs="?", choices=["check"])
+    p_ver.add_argument(
+        "--strict-daemon", action="store_true",
+        help=("fail when the daemon answering /__status__ is not running this "
+              "exact version. Off by default because a dev checkout is "
+              "routinely a different version from the machine-global daemon; "
+              "on after an upgrade, where any drift at all is a failed "
+              "upgrade (issue #57)."))
 
     # extension
     p_ext = sub.add_parser("extension", help="manage connected Chrome extensions")
@@ -656,6 +671,13 @@ def _cmd_version(args, cfg: Config) -> int:
         if relay_status:
             info["daemon_version"] = relay_status.get("daemon_version")
             info["running_extensions"] = relay_status.get("extension_details") or []
+        # Issue #57: `daemon_version` was fetched here and then read by nothing,
+        # so `(versions ok)` could print directly underneath the evidence that
+        # the live daemon was a release behind.
+        if getattr(args, "strict_daemon", False):
+            from browserwright.version import apply_strict_daemon
+
+            apply_strict_daemon(info, __version__)
         if args.json:
             print(json.dumps(info, sort_keys=True))
         else:
@@ -1070,7 +1092,8 @@ def _cmd_uninstall(args, cfg: Config) -> int:
 
 def _cmd_restart(args, cfg: Config) -> int:
     from . import launchagent
-    return _launchagent_cmd(launchagent.restart)
+    return _launchagent_cmd(lambda: launchagent.restart(
+        cfg, force=args.force, timeout=args.timeout))
 
 
 def _launchagent_cmd(op) -> int:

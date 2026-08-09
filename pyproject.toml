@@ -94,6 +94,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "real_chrome: end-to-end test that launches a real Chrome + extension (skipped unless explicitly selected)",
+    "launchd: loads throwaway LaunchAgents to measure real launchd behaviour; macOS-only, skipped unless explicitly selected (issue #57)",
 ]
 
 # Lint config. `select` is explicit on purpose: ruff's *default* rule set grew

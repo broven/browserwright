@@ -57,6 +57,17 @@ run = "uv run python evals/run.py --mock"
 description = "Run the fast local gate (daemon + skill + skill evals)"
 depends = ["test:daemon", "test:skill", "test:evals"]
 
+[tasks."test:launchd"]
+description = "macOS-only: measure real launchd/launchctl behaviour with throwaway LaunchAgents (issue #57)"
+dir = "{{config_root}}"
+# Not in the fast gate, and CI is ubuntu-only, so this is a local gate by
+# construction. It is still worth having: the findings it pins down (legacy
+# load/unload DOES replace a process; launchctl exits 0 on failure; KeepAlive
+# does not revive a plain non-zero exit) were only ever discoverable against a
+# real launchd, and the unit tests that modelled launchd instead got two of the
+# three wrong.
+run = "uv run pytest tests/daemon/test_issue57_launchctl_semantics.py -m launchd -q"
+
 [tasks."test:e2e"]
 description = "Real-Chrome + unpacked-extension E2E (needs Chrome for Testing; opt-in)"
 dir = "{{config_root}}"
@@ -343,7 +354,27 @@ else
   fi
 fi
 
-browserwright-daemon restart
+# `--force`: an upgrade is an explicit human intent and must not be blocked by
+# someone's open session — but the restart kills every session's live executor
+# state, so the names of whatever we interrupted get printed rather than
+# swallowed. Silence about a destructive step is the whole disease of issue #57.
+restart_report="$(browserwright-daemon restart --force)"
+echo "$restart_report"
+python3 - "$restart_report" <<'PY'
+import json
+import sys
+
+try:
+    report = json.loads(sys.argv[1])
+except ValueError:
+    sys.exit(0)
+interrupted = report.get("interrupted") or []
+if interrupted:
+    print("Interrupted by this restart (live executor state is gone; tabs and "
+          "session records survive):")
+    for line in interrupted:
+        print(f"  - {line}")
+PY
 
 if [[ "$ext_changed" == "1" ]]; then
   echo "Requesting Chrome extension reload..."
@@ -371,7 +402,10 @@ while time.monotonic() < deadline:
             if item.get("browserwright_version") or item.get("version")
         })
         if expected in versions:
-            print(f"Extension reconnected on {expected}.")
+            # Name the daemon too. "Extension reconnected on 0.9.0" was printed
+            # verbatim by a 0.8.2 daemon in issue #57 — true and useless.
+            print(f"Extension reconnected on {expected} "
+                  f"(daemon {payload.get('daemon_version') or '?'}).")
             sys.exit(0)
         last = f"connected extension versions: {versions or 'none'}"
     except Exception as exc:
@@ -385,8 +419,13 @@ PY
   fi
 fi
 
-browserwright version check
-browserwright-daemon version check
+# `--strict-daemon`: after an upgrade the live daemon must be running this exact
+# version. The default check only compares the package to the extension
+# manifest, which on a `uv tool` install (no manifest beside the venv) reduces
+# to "is the version string semver" — it reported "versions ok" while a 0.8.2
+# daemon was still serving (issue #57).
+browserwright version check --strict-daemon
+browserwright-daemon version check --strict-daemon
 
 echo ""
 echo "Done. Global browserwright is on $(browserwright version), the matching extension artifact is installed, and the daemon is restarted."
