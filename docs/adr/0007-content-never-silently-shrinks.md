@@ -137,7 +137,20 @@ markdown 轻松三五万字符。所以：**截断后的正文之外，完整内
 所以本文档的不变量要带上第二句：**上层承诺了行完整性之后，下层不得按字节裸切 —— 除非它
 是硬上限，那它必须切，并且必须声明自己切了。**
 
-（原先只有 console 被兜住、且是裸切，即
+而本节标题的前半句「**截断必须配全文**」现在适用于**所有**通道，不只是 markdown：
+`_text.spill_text` 把未截断的原文写进 `/tmp`，路径走 warnings 带外报出。console、
+return value、task result、`snapshot()` 各自都 spill；`snapshot()` 必须自己 spill，因为它
+在传输层看到它**之前**就已经截过一刀，光靠传输层 spill 只会存下已经变短的树。
+
+理由是这条 ADR 的立场本身：上限存在是因为 **agent 读不了 5 万字符**，不是因为那 5 万字符
+不该存在。截断该限制的是「呈现多少」，不是「保留多少」。spill 失败（OSError）时降级成
+「写不下」的提示而不是让调用失败 —— 内容太长不该变成一次失败的调用。
+
+代价照旧记在这里：这些文件**没有任何东西回收**，和 screenshots、markdown spill 一致。但
+executor 是长驻进程，这条路径的触发频率比 markdown 高一个量级（每个超限调用一个文件）。
+这是明知的取舍，不是疏忽；要改就改成带清理或单文件上限，别悄悄改成「不写了」。
+
+（原先只有 console 被兜住、且是裸切、且截掉就没了，即
 [#54](https://github.com/broven/browserwright/issues/54) 与
 [#55](https://github.com/broven/browserwright/issues/55)；两者已修复，生产端默认值现在也从
 `MAX_TEXT_CHARS` 推导为 `PRODUCER_BUDGET`，不再靠运气不撞车。）

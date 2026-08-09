@@ -772,6 +772,82 @@ for _i in range({MAX_WARNINGS + 50}):
     assert "suppressed" in r.warnings[-1]
 
 
+def test_truncated_console_is_recoverable_from_disk():
+    """ADR-0007 §5: a bound shortens what the agent READS; the full payload
+    still has to exist somewhere it can fetch."""
+    from pathlib import Path
+
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 40000
+    r = w._execute(protocol.ExecuteRequest(f"print('A' * {n})", 5000))
+
+    assert len(r.console) <= protocol.MAX_TEXT_CHARS
+    notice = [x for x in r.warnings if "full text is at" in x]
+    assert notice, r.warnings
+    path = notice[0].split("full text is at ")[-1].strip()
+    # The whole payload, not the truncated view, is what landed on disk.
+    assert len(Path(path).read_text(encoding="utf-8")) == n + 1
+
+
+def test_truncated_return_value_is_recoverable_from_disk():
+    from pathlib import Path
+
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 40000
+    r = w._execute(protocol.ExecuteRequest(f"'B' * {n}", 5000))
+
+    assert len(r.return_value) <= protocol.MAX_TEXT_CHARS
+    notice = [x for x in r.warnings if "full text is at" in x]
+    assert notice, r.warnings
+    path = notice[0].split("full text is at ")[-1].strip()
+    assert len(Path(path).read_text(encoding="utf-8")) == n + 2  # repr quotes
+
+
+def test_a_failed_spill_shortens_the_result_but_never_fails_the_call():
+    w, _page = _fake_worker_with_objects()
+    import browserwright._executor.process as proc_mod
+
+    orig = proc_mod.spill_text
+    proc_mod.spill_text = lambda text, *, prefix: None
+    try:
+        n = protocol.MAX_TEXT_CHARS + 5000
+        r = w._execute(protocol.ExecuteRequest(f"print('x' * {n})", 5000))
+    finally:
+        proc_mod.spill_text = orig
+
+    assert r.error is None
+    assert r.exit_code == 0
+    assert r.truncated is True
+    assert any("could not be written to disk" in x for x in r.warnings)
+
+
+def test_oversized_snapshot_spills_the_full_tree():
+    """`snapshot()` is cut BEFORE the transport sees it, so the transport's own
+    spill would only ever capture the already-shortened tree."""
+    from pathlib import Path
+
+    from browserwright._text import PRODUCER_BUDGET
+    from browserwright.repl.snapshot import make_snapshot
+
+    tree = "\n".join(f'  - button "Item {i}" [ref=e{i}]' for i in range(1, 900))
+    assert len(tree) > PRODUCER_BUDGET
+
+    class _Page:
+        def aria_snapshot(self, *, mode):
+            return tree
+
+    notes: list[str] = []
+    snap = make_snapshot(
+        type("H", (), {"page": _Page()})(), warn=notes.append
+    )
+    out = snap(interactive_only=False)
+
+    assert len(out) <= PRODUCER_BUDGET + 32
+    assert notes and "full tree is at" in notes[0]
+    path = notes[0].split("full tree is at ")[-1].strip()
+    assert Path(path).read_text(encoding="utf-8") == tree
+
+
 def test_oversized_task_result_json_stays_valid_json():
     """A truncated JSON document would fail `ExecuteResponse.from_dict`'s own
     validation, which the client answers by reaping the executor — worse than
@@ -786,6 +862,11 @@ def test_oversized_task_result_json_stays_valid_json():
     decoded = json.loads(capped)  # must not raise
     assert decoded["_browserwright_truncated"] is True
     assert decoded["original_size"] == len(raw)
+    # The real result is still fetchable, and still valid JSON.
+    from pathlib import Path
+
+    spilled = Path(decoded["full_result_path"]).read_text(encoding="utf-8")
+    assert json.loads(spilled)["blob"] == "x" * (protocol.MAX_TEXT_CHARS * 2)
     # And the whole response must survive a round-trip through the wire format.
     protocol.ExecuteResponse.from_dict(
         protocol.ExecuteResponse(task_result_json=capped).to_dict()

@@ -27,8 +27,17 @@ silent.
 The invariant this file exists to keep (ADR-0007 §5): no layer may truncate a
 payload at a raw offset once a layer above it has promised line integrity —
 except a hard bound, which must, and must announce it.
+
+And the other half of that same ADR heading — **truncation must come with the
+full text**. A bound exists because an agent cannot read 50,000 characters, not
+because those characters should stop existing. So every truncating layer here
+spills the untruncated payload to a file and reports the path out-of-band; what
+the agent sees is shortened, what it can still fetch is not.
 """
 from __future__ import annotations
+
+import os
+from pathlib import Path
 
 # The transport's hard bound on any single text channel of an executor response.
 # Mirrors playwriter's ~10000-char truncation. This is the ceiling every other
@@ -47,6 +56,37 @@ TRUNC_MARKER = "… [truncated]"
 # reading the output) can tell "you are missing whole lines" apart from "the last
 # line you can see is itself incomplete, do not trust a token at its end".
 MID_LINE_MARKER = "… [truncated mid-line]"
+
+
+def spill_text(text: str, *, prefix: str) -> str | None:
+    """Write the UNtruncated ``text`` to /tmp; return its path, or None.
+
+    The counterpart to the truncators: a bound shortens what the agent reads, it
+    must not destroy what the agent could still want. The path rides back
+    out-of-band (warnings / stderr) and the payload rides the disk rather than
+    the wire — the same reason `screenshots` in the executor protocol is
+    path-based, and the same mechanism `repl/markdown.py` already uses for the
+    content view.
+
+    Returns None on any OSError: failing to spill must never turn a merely long
+    result into a failed call. The caller says so in its notice instead.
+
+    Nothing prunes these, exactly like the screenshots and the markdown spills —
+    a deliberate choice inherited from `markdown.spill_path`. Note the executor
+    is long-lived, so this path is hit far more often than the markdown one: one
+    file per over-budget call, for the life of the session.
+    """
+    i = 0
+    while True:
+        cand = Path("/tmp") / f"browserwright-{prefix}-{os.getpid()}-{i}.txt"
+        if not cand.exists():
+            break
+        i += 1
+    try:
+        cand.write_text(text, encoding="utf-8")
+    except OSError:
+        return None
+    return str(cand)
 
 
 def _keep_whole_lines(text: str, budget: int) -> str | None:

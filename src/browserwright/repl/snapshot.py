@@ -33,16 +33,30 @@ from __future__ import annotations
 # same line-integrity rule (`_text.truncate_hard`) and must not import this
 # module to get it — `repl/` drags Playwright into the import graph. Letting the
 # two truncators drift apart is how one of them silently loses the property.
-from .._text import PRODUCER_BUDGET, truncate_lines
+from .._text import PRODUCER_BUDGET, spill_text, truncate_lines
 from .playwright_handle import PlaywrightHandle
 
 
-def make_snapshot(handle: PlaywrightHandle):
+def make_snapshot(handle: PlaywrightHandle, warn=None):
     """Build the per-heredoc ``snapshot()`` bound to this heredoc's lazy
     Playwright handle. Injected into the exec namespace by ``build_globals``.
 
     Triggering ``snapshot()`` resolves ``handle.page`` (lazily connecting the
-    facade on first use, exactly like ``page``/``context``)."""
+    facade on first use, exactly like ``page``/``context``).
+
+    ``warn`` is the out-of-band notice channel (the executor's ``_bw_warn``);
+    absent it, notices go to stderr, which is where the in-process path renders
+    warnings anyway. It must be a callable that resolves the warnings list at
+    CALL time — the executor replaces that list per call, so a bound
+    ``list.append`` captured here would write into a stale one."""
+
+    def _notify(note: str) -> None:
+        if callable(warn):
+            warn(f"snapshot: {note}")
+        else:
+            import sys
+
+            print(f"[WARNING] snapshot: {note}", file=sys.stderr)
 
     def snapshot(*, interactive_only: bool = True,
                  max_chars: int | None = PRODUCER_BUDGET) -> str:
@@ -84,6 +98,17 @@ def make_snapshot(handle: PlaywrightHandle):
         if interactive_only:
             snap = _filter_interactive(snap)
         if max_chars is not None and len(snap) > max_chars:
+            # Spill BEFORE truncating: this is the first of two cuts the tree
+            # can meet (the transport bounds the printed result again), so
+            # without this the full tree would be unreachable from either.
+            path = spill_text(snap, prefix="snapshot")
+            _notify(
+                f"truncated to {max_chars} of {len(snap)} chars; the full tree "
+                f"is at {path}"
+                if path
+                else f"truncated to {max_chars} of {len(snap)} chars; the full "
+                f"tree could not be written to disk"
+            )
             snap = truncate_lines(snap, max_chars)
         return snap
 

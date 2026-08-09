@@ -105,6 +105,40 @@ def test_truncate_lines_drops_whole_lines_from_the_tail():
         assert ln.endswith("]")
 
 
+# ---- spill: a bound shortens what is read, it does not destroy -------------
+
+
+def test_spill_text_round_trips_the_untruncated_payload():
+    from pathlib import Path
+
+    from browserwright._text import spill_text
+
+    text = "line\n" * 50_000
+    path = spill_text(text, prefix="unit")
+
+    assert path is not None
+    assert Path(path).read_text(encoding="utf-8") == text
+
+
+def test_spill_text_does_not_collide():
+    from browserwright._text import spill_text
+
+    a = spill_text("first", prefix="unit-collide")
+    b = spill_text("second", prefix="unit-collide")
+    assert a != b
+
+
+def test_spill_text_returns_none_instead_of_raising(monkeypatch):
+    """A failed spill must shorten the result, never fail the call."""
+    import browserwright._text as text_mod
+
+    def _boom(self, *a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(text_mod.Path, "write_text", _boom)
+    assert text_mod.spill_text("x", prefix="unit-fail") is None
+
+
 def test_the_two_truncators_agree_whenever_lines_fit():
     """Where a whole-line cut is possible at all, hard and soft must produce
     the SAME body — the hard variant only diverges in the fallback."""

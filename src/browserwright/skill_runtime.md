@@ -239,34 +239,39 @@ remains available when you want the raw text of one specific element and nothing
 else — but it drops links and structure, so it is the wrong tool for reading a
 page.
 
-### How much a call can send back
+### How much a call can send back — and how to get the rest
 
-Every text channel of a call's response is bounded at **10,000 characters** —
-what you printed, the trailing expression's value, and warnings alike. Going
-over is not an error; you get a `[output truncated]` notice on stderr and a
-`… [truncated]` marker at the end of the payload.
+Every text channel of a call's response is bounded at **10,000 characters**:
+what you printed, the trailing expression's value, warnings alike. Going over is
+not an error and **nothing is lost** — the bound only limits how much comes back
+inline.
+
+When a payload is cut you get, on stderr:
+
+```
+[WARNING] output truncated to 10000 chars; the full text is at /tmp/browserwright-console-4711-0.txt
+```
+
+Read that file when you need the rest. The same holds for an over-budget
+`snapshot()` (`the full tree is at …`), for `read_markdown()`, and for a task
+result (`full_result_path` in the JSON marker). Truncation is always about what
+you can comfortably read, never about discarding data.
 
 The cut is taken on a **line boundary**, so a `[ref=eN]` is never severed and
-every ref you can see is safe to act on. Only when a single line is itself
-longer than the budget does it get cut mid-line, and that says
-`… [truncated mid-line]` — do not trust a token at the end of that tail.
+every ref you can see is safe to act on. Only when a single line is itself longer
+than the budget does it get cut mid-line, and that says `… [truncated mid-line]`
+— do not trust a token at the end of that tail.
 
-To get more than that back, do **not** rely on returning a bare expression
-instead of printing (both are bounded the same way). Instead:
+Reaching for the spill file on every call is still the slow path. Prefer:
 
-- **Write it to a file and return the path.** This is the supported way to move
-  a large payload, and what `read_markdown()` does for you automatically.
 - **Ask for less.** `snapshot()` defaults to the interactive-only tree for this
   reason; `read_markdown(mode="article")` drops the page furniture.
-- **Page through it** across several calls — `state` persists between them.
+- **Filter in the heredoc**, where the whole value is still in hand — print the
+  20 rows you want, not the 2,000 you fetched.
+- **Page through it** across several calls; `state` persists between them.
 
-```bash
-browserwright -s "$sid" -e $'
-html = page.content()                      # may be far over the bound
-open("/tmp/page.html", "w").write(html)
-print(f"wrote {len(html)} chars to /tmp/page.html")   # this is what comes back
-'
-```
+Note that returning a bare expression instead of printing does **not** get you
+more — both are bounded the same way, and both spill.
 
 ## Trust Boundaries
 
