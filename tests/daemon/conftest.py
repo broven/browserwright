@@ -13,6 +13,22 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_spill_dir(monkeypatch, tmp_path):
+    """Keep truncation spills out of the developer's real /tmp.
+
+    `_text.spill_text` writes the untruncated payload next to a truncated one,
+    and the suite exercises that path a lot. Left pointing at /tmp it deposits
+    dozens of files per run — the very accumulation `SPILL_KEEP` exists to bound
+    is per-pid, and each test run is a new pid.
+    """
+    from browserwright import _text
+
+    spills = tmp_path / "spills"
+    spills.mkdir()
+    monkeypatch.setattr(_text, "SPILL_DIR", spills)
+
+
+@pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Pop everything daemon-relevant. Some tests re-set what they need."""
     for var in [

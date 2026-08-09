@@ -12,6 +12,7 @@ browser) are covered by `tests/daemon/e2e/test_l2_phase_b_executor.py`.
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 
@@ -692,12 +693,189 @@ def test_playwright_like_timeout_error_carries_fix():
 
 def test_console_truncation():
     w, _page = _fake_worker_with_objects()
-    # Print well over MAX_TEXT_CHARS.
+    # Print well over MAX_TEXT_CHARS, as ONE line: the runaway case the bound
+    # exists for, and the case a whole-line truncator cannot serve alone.
     code = f"print('x' * {protocol.MAX_TEXT_CHARS + 5000})"
     r = w._execute(protocol.ExecuteRequest(code, 2000))
     assert r.truncated is True
-    assert len(r.console) <= protocol.MAX_TEXT_CHARS + 64
-    assert r.console.endswith("[truncated]")
+    assert len(r.console) <= protocol.MAX_TEXT_CHARS
+    # A mid-line cut is announced as such — the tail is NOT a whole line, and
+    # a token at its end must not be trusted.
+    assert r.console.endswith("[truncated mid-line]")
+
+
+def test_console_truncation_is_whole_line_and_never_severs_a_ref():
+    """#55: the transport must not undo a producer's line-integrity promise.
+
+    A raw offset slice can turn `[ref=e291]` into `[ref=e2` — not merely a
+    corrupt token but a VALID ref for a different live element, so acting on it
+    fails silently instead of loudly.
+    """
+    w, _page = _fake_worker_with_objects()
+    lines = "\n".join(
+        f'  - button "Item number {i}" [ref=e{i}]' for i in range(1, 900)
+    )
+    assert len(lines) > protocol.MAX_TEXT_CHARS
+    r = w._execute(protocol.ExecuteRequest(f"print({lines!r})", 5000))
+
+    assert r.truncated is True
+    assert len(r.console) <= protocol.MAX_TEXT_CHARS
+    assert r.console.endswith("[truncated]")  # whole-line cut, not mid-line
+    body = r.console.rsplit("\n… [truncated]", 1)[0]
+    for ln in body.splitlines():
+        if "[ref=" in ln:
+            assert ln.rstrip().endswith("]"), f"severed ref in {ln!r}"
+
+
+def test_return_value_is_bounded_and_reports_the_cut():
+    """#54: `MAX_TEXT_CHARS` must bound the return value too.
+
+    An expression-valued last statement is ordinary agent code, and an uncapped
+    return value large enough to exceed `_MAX_FRAME` is read by the client as a
+    transport error — which REAPS this executor and loses the session's `state`.
+    """
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 5000
+    r = w._execute(protocol.ExecuteRequest(f"'x' * {n}", 5000))
+
+    assert r.return_value is not None
+    assert len(r.return_value) <= protocol.MAX_TEXT_CHARS
+    assert r.truncated is True
+    # Reported out-of-band, so a shortened repr is never mistaken for the whole.
+    assert any("[return value] truncated" in w_ for w_ in r.warnings)
+
+
+def test_print_and_bare_expression_agree_on_the_bound():
+    """The two spellings of the same payload must not differ by 5000 chars."""
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 5000
+    printed = w._execute(protocol.ExecuteRequest(f"print('x' * {n})", 5000))
+    returned = w._execute(protocol.ExecuteRequest(f"'x' * {n}", 5000))
+
+    assert printed.truncated is returned.truncated is True
+    assert len(printed.console) <= protocol.MAX_TEXT_CHARS
+    assert len(returned.return_value) <= protocol.MAX_TEXT_CHARS
+
+
+def test_warnings_are_bounded_in_count_and_length():
+    w, _page = _fake_worker_with_objects()
+    from browserwright._executor.process import MAX_WARNINGS
+
+    code = f"""
+for _i in range({MAX_WARNINGS + 50}):
+    _bw_warn('w' * {protocol.MAX_TEXT_CHARS + 100})
+"""
+    import browserwright._text as text_mod
+
+    r = w._execute(protocol.ExecuteRequest(code, 5000))
+    assert r.truncated is True
+    assert len(r.warnings) <= MAX_WARNINGS + 1  # + the "N suppressed" notice
+    assert all(len(w_) <= protocol.MAX_TEXT_CHARS for w_ in r.warnings)
+    assert "suppressed" in r.warnings[-1]
+    # Warnings are metadata, not content: truncated but NEVER spilled. One file
+    # per warning would bury the very spill paths these lines carry.
+    assert not list(text_mod.SPILL_DIR.glob("browserwright-warning-*.txt"))
+
+
+def test_truncated_console_is_recoverable_from_disk():
+    """ADR-0007 §5: a bound shortens what the agent READS; the full payload
+    still has to exist somewhere it can fetch."""
+    from pathlib import Path
+
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 40000
+    r = w._execute(protocol.ExecuteRequest(f"print('A' * {n})", 5000))
+
+    assert len(r.console) <= protocol.MAX_TEXT_CHARS
+    notice = [x for x in r.warnings if "full text is at" in x]
+    assert notice, r.warnings
+    path = notice[0].split("full text is at ")[-1].strip()
+    # The whole payload, not the truncated view, is what landed on disk.
+    assert len(Path(path).read_text(encoding="utf-8")) == n + 1
+
+
+def test_truncated_return_value_is_recoverable_from_disk():
+    from pathlib import Path
+
+    w, _page = _fake_worker_with_objects()
+    n = protocol.MAX_TEXT_CHARS + 40000
+    r = w._execute(protocol.ExecuteRequest(f"'B' * {n}", 5000))
+
+    assert len(r.return_value) <= protocol.MAX_TEXT_CHARS
+    notice = [x for x in r.warnings if "full text is at" in x]
+    assert notice, r.warnings
+    path = notice[0].split("full text is at ")[-1].strip()
+    assert len(Path(path).read_text(encoding="utf-8")) == n + 2  # repr quotes
+
+
+def test_a_failed_spill_shortens_the_result_but_never_fails_the_call():
+    w, _page = _fake_worker_with_objects()
+    import browserwright._executor.process as proc_mod
+
+    orig = proc_mod.spill_text
+    proc_mod.spill_text = lambda text, *, prefix: None
+    try:
+        n = protocol.MAX_TEXT_CHARS + 5000
+        r = w._execute(protocol.ExecuteRequest(f"print('x' * {n})", 5000))
+    finally:
+        proc_mod.spill_text = orig
+
+    assert r.error is None
+    assert r.exit_code == 0
+    assert r.truncated is True
+    assert any("could not be written to disk" in x for x in r.warnings)
+
+
+def test_oversized_snapshot_spills_the_full_tree():
+    """`snapshot()` is cut BEFORE the transport sees it, so the transport's own
+    spill would only ever capture the already-shortened tree."""
+    from pathlib import Path
+
+    from browserwright._text import PRODUCER_BUDGET
+    from browserwright.repl.snapshot import make_snapshot
+
+    tree = "\n".join(f'  - button "Item {i}" [ref=e{i}]' for i in range(1, 900))
+    assert len(tree) > PRODUCER_BUDGET
+
+    class _Page:
+        def aria_snapshot(self, *, mode):
+            return tree
+
+    notes: list[str] = []
+    snap = make_snapshot(
+        type("H", (), {"page": _Page()})(), warn=notes.append
+    )
+    out = snap(interactive_only=False)
+
+    assert len(out) <= PRODUCER_BUDGET + 32
+    assert notes and "full tree is at" in notes[0]
+    path = notes[0].split("full tree is at ")[-1].strip()
+    assert Path(path).read_text(encoding="utf-8") == tree
+
+
+def test_oversized_task_result_json_stays_valid_json():
+    """A truncated JSON document would fail `ExecuteResponse.from_dict`'s own
+    validation, which the client answers by reaping the executor — worse than
+    the oversized payload. So it degrades to a valid marker object instead."""
+    from browserwright._executor.process import _cap_task_result_json
+
+    raw = json.dumps({"blob": "x" * (protocol.MAX_TEXT_CHARS * 2)})
+    capped, was_cut = _cap_task_result_json(raw)
+
+    assert was_cut is True
+    assert len(capped) <= protocol.MAX_TEXT_CHARS
+    decoded = json.loads(capped)  # must not raise
+    assert decoded["_browserwright_truncated"] is True
+    assert decoded["original_size"] == len(raw)
+    # The real result is still fetchable, and still valid JSON.
+    from pathlib import Path
+
+    spilled = Path(decoded["full_result_path"]).read_text(encoding="utf-8")
+    assert json.loads(spilled)["blob"] == "x" * (protocol.MAX_TEXT_CHARS * 2)
+    # And the whole response must survive a round-trip through the wire format.
+    protocol.ExecuteResponse.from_dict(
+        protocol.ExecuteResponse(task_result_json=capped).to_dict()
+    )
 
 
 def test_warnings_and_screenshots_surface():

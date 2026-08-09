@@ -61,7 +61,7 @@ def test_on_target_changed_rebinds_page_and_swaps_running_globals(monkeypatch):
     new_page = _FakePage("https://c.test/")
     monkeypatch.setattr(ph_mod, "bind_current_page",
                         lambda context, sess: new_page)
-    monkeypatch.setattr(snap_mod, "make_snapshot", lambda holder: "snap")
+    monkeypatch.setattr(snap_mod, "make_snapshot", lambda holder, warn=None: "snap")
 
     sess = _FakeSession("ext-tab-C")
     w._on_target_changed(sess)
@@ -129,7 +129,7 @@ def test_reconcile_page_binding_follows_ledger(monkeypatch):
     new_page = _FakePage("https://ledger.test/")
     monkeypatch.setattr(ph_mod, "bind_current_page",
                         lambda context, sess: new_page)
-    monkeypatch.setattr(snap_mod, "make_snapshot", lambda holder: "snap")
+    monkeypatch.setattr(snap_mod, "make_snapshot", lambda holder, warn=None: "snap")
 
     # Ledger says the current target moved to ext-tab-D (e.g. an in-process
     # heredoc ran bind_target without touching the page surface).

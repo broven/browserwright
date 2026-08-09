@@ -21,6 +21,8 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any
 
+from .._text import MAX_TEXT_CHARS as _MAX_TEXT_CHARS
+
 # Default per-call timeout (ms). Playwriter defaults to 10000ms, but real page
 # ops (cold navigation + network settle) can legitimately take longer, so we
 # pick a more generous default. It is deliberately bounded WELL UNDER any
@@ -28,11 +30,14 @@ from typing import Any
 # so a slow-but-legitimate call never trips idle reclamation mid-flight.
 DEFAULT_TIMEOUT_MS = 90000
 
-# Cap on the rendered text block (console + return value), mirroring
-# playwriter's ~10000-char truncation. Whole-line aware truncation lives in
-# `snapshot._truncate_lines`; here we cap the console blob so a runaway print
-# loop can't ship megabytes back to the agent.
-MAX_TEXT_CHARS = 10000
+# Cap on EVERY text channel of the response — console, return value, warnings
+# and the task result JSON — so a runaway print loop, or an equally ordinary
+# expression-valued last statement, can't ship megabytes back to the agent.
+# Re-exported from `_text` because the producers (`repl/snapshot.py`,
+# `repl/markdown.py`) derive their own budgets from it and must not import the
+# transport to do so; `process._finish` applies it via `_text.truncate_hard`,
+# which prefers whole lines and marks the cut when it cannot keep one.
+MAX_TEXT_CHARS = _MAX_TEXT_CHARS
 TERMINAL_DEADLINE_EXCEEDED = "deadline_exceeded"
 TERMINAL_RESET_REQUESTED = "reset_requested"
 TERMINAL_REASONS = frozenset(
@@ -185,7 +190,9 @@ class ExecuteResponse:
       - ``screenshots``: list of ``{"path": str, ...}`` blocks for any image the
         heredoc captured — path-based (the executor and client share a
         filesystem), so the (possibly large) bytes never ride the wire.
-      - ``truncated``: True when the text block was capped at ``MAX_TEXT_CHARS``.
+      - ``truncated``: True when ANY text channel was capped at
+        ``MAX_TEXT_CHARS`` — console, return value, warnings or task result.
+        Which one it was is said in ``warnings``, the out-of-band channel.
       - ``error``: ``errors.serialize(exc)`` (or None on success), WITH a
         ``traceback`` key for generic exceptions so a shipped heredoc surfaces
         the same traceback the in-process path writes.

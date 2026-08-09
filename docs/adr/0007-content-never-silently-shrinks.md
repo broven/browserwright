@@ -118,15 +118,56 @@ markdown —— 这正是本文档要禁止的静默空结果。
 
 ### 5. 截断必须配全文，且标记走带外
 
-executor 响应的 console 在 10,000 字符处被裸切（`_executor/protocol.py` 的
-`MAX_TEXT_CHARS`），而一个文档页的 markdown 轻松三五万字符。所以：**截断后的正文之外，
-完整内容写入一个临时文件，把路径交给调用方，由它决定读不读。**
+executor 响应的每一条文本通道都被 `MAX_TEXT_CHARS`（10,000）兜住，而一个文档页的
+markdown 轻松三五万字符。所以：**截断后的正文之外，完整内容写入一个临时文件，把路径交给
+调用方，由它决定读不读。**
 
-截断本身按**行边界**做，不按字节 —— 理由与 `repl/snapshot.py` 的 `_truncate_lines` 一致：
-切断 `[文字](http://…` 会造出一个坏链接，正如切断 `[ref=eN]` 会造出一个能点错元素的残
-ref。（那道 10,000 的墙自身的两个既有缺陷见
+截断本身按**行边界**做，不按字节 —— 切断 `[文字](http://…` 会造出一个坏链接，正如切断
+`[ref=eN]` 会造出一个**能点错元素**的残 ref（`[ref=e291]` 被切成 `[ref=e2]` 不是坏 token，
+而是另一个真实元素的合法 ref，所以是静默失败）。
+
+两个截断器都住在 `_text.py`，因为这里有一个真实的张力，两边的解法相反：
+
+- **生产端**（`snapshot()` / `read_markdown()`）用 `truncate_lines`：软预算，宁可让首行整行
+  溢出预算，也不吐半个 ref。
+- **传输层**（`_finish`）用 `truncate_hard`：硬上限，绝不越预算。它必须如此 —— 挡的就是
+  `print('x' * 5_000_000)` 这种**单行** runaway，而软截断器对单行会返回 500 倍预算。它能按
+  整行切就按整行切，实在切不动才行中切，并换一个 `… [truncated mid-line]` 标记**说出来**。
+
+所以本文档的不变量要带上第二句：**上层承诺了行完整性之后，下层不得按字节裸切 —— 除非它
+是硬上限，那它必须切，并且必须声明自己切了。**
+
+而本节标题的前半句「**截断必须配全文**」现在适用于**所有**通道，不只是 markdown：
+`_text.spill_text` 把未截断的原文写进 `/tmp`，路径走 warnings 带外报出。console、
+return value、task result、`snapshot()` 各自都 spill；`snapshot()` 必须自己 spill，因为它
+在传输层看到它**之前**就已经截过一刀，光靠传输层 spill 只会存下已经变短的树。
+
+理由是这条 ADR 的立场本身：上限存在是因为 **agent 读不了 5 万字符**，不是因为那 5 万字符
+不该存在。截断该限制的是「呈现多少」，不是「保留多少」。spill 失败（OSError）时降级成
+「写不下」的提示而不是让调用失败 —— 内容太长不该变成一次失败的调用。
+
+这条路径**自己回收**，和 screenshots、markdown spill 不同。理由是频率：executor 是长驻
+进程，每个超限调用写一个文件，而 macOS **不清理 `/tmp`**（实测：三天前的文件仍在，机器已
+开机十天），所以指望系统兜底是不成立的。每次 spill 后按 `prefix` 保留最近 `SPILL_KEEP`
+个，更老的删掉。
+
+两条约束不能动：
+
+- **只删自己 pid 名下的文件。** 同机会有别的 session、别的 worktree、别的用户在跑，删到
+  对方的文件是比堆积严重得多的故障。
+- **编号单调递增，不复用空位。** 复用会让一个已经交出去的路径指向**另一份内容**，agent
+  拿着旧路径读到的是错的东西 —— 比文件消失了更坏。
+
+清理全程 best-effort：删不掉不算失败，spill 照常返回路径。
+
+还没解决的是权限：spill 文件是 `644`，躺在 `1777` 的 `/tmp` 里，同机其他用户可读，而正文
+可能是登录态页面的内容。既有的 markdown spill 与 screenshot 有同样的暴露面，所以这是一个
+统一的临时文件策略问题，留待单独处理，不在本 ADR 的截断议题里顺手改。
+
+（原先只有 console 被兜住、且是裸切、且截掉就没了，即
 [#54](https://github.com/broven/browserwright/issues/54) 与
-[#55](https://github.com/broven/browserwright/issues/55)。）
+[#55](https://github.com/broven/browserwright/issues/55)；两者已修复，生产端默认值现在也从
+`MAX_TEXT_CHARS` 推导为 `PRODUCER_BUDGET`，不再靠运气不撞车。）
 
 「这次走的是哪条路」（提取 / 全页、有无跨源 frame 被排除、是否截断及全文路径）**走带外**
 —— stdout 是内容，stderr 与响应元数据是元信息，这个划分在 `repl/inline.py` 对 warnings

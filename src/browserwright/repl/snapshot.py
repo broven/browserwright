@@ -29,18 +29,37 @@ aria-snapshot — the first-party AI mode is cleanly available here.
 """
 from __future__ import annotations
 
+# The truncator lives in `_text` because the executor transport applies the
+# same line-integrity rule (`_text.truncate_hard`) and must not import this
+# module to get it — `repl/` drags Playwright into the import graph. Letting the
+# two truncators drift apart is how one of them silently loses the property.
+from .._text import PRODUCER_BUDGET, spill_text, truncate_lines
 from .playwright_handle import PlaywrightHandle
 
 
-def make_snapshot(handle: PlaywrightHandle):
+def make_snapshot(handle: PlaywrightHandle, warn=None):
     """Build the per-heredoc ``snapshot()`` bound to this heredoc's lazy
     Playwright handle. Injected into the exec namespace by ``build_globals``.
 
     Triggering ``snapshot()`` resolves ``handle.page`` (lazily connecting the
-    facade on first use, exactly like ``page``/``context``)."""
+    facade on first use, exactly like ``page``/``context``).
+
+    ``warn`` is the out-of-band notice channel (the executor's ``_bw_warn``);
+    absent it, notices go to stderr, which is where the in-process path renders
+    warnings anyway. It must be a callable that resolves the warnings list at
+    CALL time — the executor replaces that list per call, so a bound
+    ``list.append`` captured here would write into a stale one."""
+
+    def _notify(note: str) -> None:
+        if callable(warn):
+            warn(f"snapshot: {note}")
+        else:
+            import sys
+
+            print(f"[WARNING] snapshot: {note}", file=sys.stderr)
 
     def snapshot(*, interactive_only: bool = True,
-                 max_chars: int | None = 20000) -> str:
+                 max_chars: int | None = PRODUCER_BUDGET) -> str:
         """Observe the current ``page`` as a first-party Playwright AI aria
         snapshot. Returns a compact accessibility tree where each node carries
         a ``[ref=eN]`` ref.
@@ -61,9 +80,15 @@ def make_snapshot(handle: PlaywrightHandle):
             decorative nodes that carry neither a ref nor an accessible name —
             keeps the output token-frugal and interaction-oriented. Set False
             for the full accessibility tree (headings, text, structure).
-          max_chars: hard cap on the returned string (bounds token cost); the
-            tail is replaced with a ``… [truncated]`` marker when exceeded.
-            Pass None to disable the cap.
+          max_chars: whole-line cap on the returned string (bounds token cost),
+            never a mid-line cut — a severed ``[ref=eN]`` would be a ref the
+            agent could act on and hit the WRONG element. The tail is replaced
+            with a ``… [truncated]`` marker when exceeded. The default derives
+            from the executor transport's own bound (``_text.PRODUCER_BUDGET``
+            sits under ``MAX_TEXT_CHARS``) so this cut is not re-cut downstream.
+            Pass None to disable the cap — but the transport still bounds what
+            a heredoc can print back, so a bigger snapshot is best consumed in
+            pieces rather than printed whole.
 
         Returns the snapshot as a string (one node per line, indented to show
         tree structure). Empty-page result is the bare root line.
@@ -73,41 +98,21 @@ def make_snapshot(handle: PlaywrightHandle):
         if interactive_only:
             snap = _filter_interactive(snap)
         if max_chars is not None and len(snap) > max_chars:
-            snap = _truncate_lines(snap, max_chars)
+            # Spill BEFORE truncating: this is the first of two cuts the tree
+            # can meet (the transport bounds the printed result again), so
+            # without this the full tree would be unreachable from either.
+            path = spill_text(snap, prefix="snapshot")
+            _notify(
+                f"truncated to {max_chars} of {len(snap)} chars; the full tree "
+                f"is at {path}"
+                if path
+                else f"truncated to {max_chars} of {len(snap)} chars; the full "
+                f"tree could not be written to disk"
+            )
+            snap = truncate_lines(snap, max_chars)
         return snap
 
     return snapshot
-
-
-_TRUNC_MARKER = "… [truncated]"
-
-
-def _truncate_lines(snap: str, max_chars: int) -> str:
-    """Cap ``snap`` at ``max_chars`` on a LINE boundary, never mid-line.
-
-    Splitting on a raw byte offset can sever a ``[ref=eN]`` token — leaving a
-    corrupt partial ref (``[ref=e1``) the agent might try to act on. So we drop
-    whole lines from the tail until the kept body plus the ``… [truncated]``
-    marker fits the budget. Every line that survives is therefore intact,
-    including any ref it carries. If even the first line overflows the budget we
-    still emit it whole (a ref is only useful intact) followed by the marker.
-    """
-    lines = snap.splitlines()
-    kept: list[str] = []
-    used = 0
-    marker_cost = len(_TRUNC_MARKER) + 1  # + the "\n" before the marker
-    for ln in lines:
-        # +1 for the newline joining this line to the previous body.
-        add = len(ln) + (1 if kept else 0)
-        if used + add + marker_cost > max_chars:
-            break
-        kept.append(ln)
-        used += add
-    if not kept:
-        # Budget too small for even one line + marker: still surface line one
-        # whole — a partial ref is worse than overflowing a soft cap.
-        kept = lines[:1]
-    return "\n".join(kept) + "\n" + _TRUNC_MARKER
 
 
 def _filter_interactive(snap: str) -> str:

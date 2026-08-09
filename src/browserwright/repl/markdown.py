@@ -35,22 +35,23 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..errors import UnsupportedContentType
-from . import _md_normalize
-from ._md_convert import convert_html
 # Shared on purpose rather than reimplemented: cutting Markdown at a byte offset
 # produces a broken `[text](http://…` link for exactly the reason cutting an
 # aria snapshot produces a broken `[ref=e1` — and letting the two truncators
 # drift apart is how one of them silently loses that property.
-from .snapshot import _truncate_lines
+from .._text import PRODUCER_BUDGET, truncate_lines as _truncate_lines
+from . import _md_normalize
+from ._md_convert import convert_html
 
 MODES = ("auto", "article", "full")
 
-# Kept UNDER the executor transport's own console cap (`MAX_TEXT_CHARS = 10000`
-# in `_executor/protocol.py`), which truncates at a raw byte offset and would
-# undo the whole-line cut below. Deliberately not equal to it: a heredoc
-# normally prints other things too. See #55 — `snapshot()`'s 20000 default sits
-# ABOVE that cap and is silently re-cut by it; this view must not repeat that.
-DEFAULT_MAX_CHARS = 8000
+# Kept UNDER the executor transport's own bound (`MAX_TEXT_CHARS`), and now
+# derived from it rather than restated: a heredoc normally prints other things
+# alongside this payload, so the producer budget needs headroom under the
+# channel bound. The transport's cut is whole-line aware too as of #54/#55, but
+# staying under it is still what keeps THIS view's line-integrity promise from
+# being re-cut downstream.
+DEFAULT_MAX_CHARS = PRODUCER_BUDGET
 
 # Below this, an extraction is treated as collapsed rather than concise.
 # Aligned with Readability's own `charThreshold` default, which is the number it

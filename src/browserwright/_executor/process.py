@@ -40,6 +40,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
 from typing import Any
 
+from .._text import spill_text, truncate_hard
 from ..errors import BrowserwrightError, serialize
 from .protocol import (
     MAX_TEXT_CHARS,
@@ -57,6 +58,92 @@ from .protocol import (
 # timeout in the registry is 35s, comfortably above this).
 _COLD_START_CONNECT_ATTEMPTS = 13
 _COLD_START_CONNECT_BACKOFF_S = 0.75
+
+# `_bw_warn` is callable from a loop, so the warnings LIST needs a bound as much
+# as each entry does. The overflow is folded into one final notice rather than
+# dropped silently.
+MAX_WARNINGS = 100
+
+
+def _cut_notice(what: str, path: str | None) -> str:
+    """The out-of-band line that makes a cut recoverable rather than lossy."""
+    if path:
+        return (
+            f"{what} truncated to {MAX_TEXT_CHARS} chars; the full text is at "
+            f"{path}"
+        )
+    return (
+        f"{what} truncated to {MAX_TEXT_CHARS} chars; the full text could not "
+        f"be written to disk, so re-run producing less output"
+    )
+
+
+def _cap_text(value: str, *, prefix: str) -> tuple[str, bool, str | None]:
+    """Bound one text channel. Returns (value, was_truncated, full_text_path).
+
+    Whole-line aware (``truncate_hard``): the transport must never be the layer
+    that severs a `[ref=eN]` a producer took care to keep intact, because the
+    severed token is not merely corrupt — `[ref=e2` cut from `[ref=e291]` is a
+    VALID ref for a different live element, so acting on it fails silently.
+
+    The bound is about what an agent can READ, so the untruncated value is
+    spilled to disk rather than dropped (ADR-0007 §5) and the path is reported
+    out-of-band by the caller. ``None`` means the spill itself failed, which
+    shortens the result but never fails the call.
+    """
+    if len(value) <= MAX_TEXT_CHARS:
+        return value, False, None
+    return truncate_hard(value, MAX_TEXT_CHARS), True, spill_text(
+        value, prefix=prefix
+    )
+
+
+def _cap_warnings(warnings: list[str]) -> tuple[list[str], bool]:
+    """Bound both the number of warnings and the length of each one.
+
+    Deliberately NOT via ``_cap_text``: warnings are the out-of-band METADATA
+    channel, not content, so they are truncated but never spilled. Routing them
+    through ``_cap_text`` writes one file per over-long warning — which buries
+    the very spill paths these lines exist to carry, and accumulates fast
+    because a warning loop produces up to MAX_WARNINGS of them per call.
+    """
+    capped = [
+        truncate_hard(str(w), MAX_TEXT_CHARS) for w in warnings[:MAX_WARNINGS]
+    ]
+    dropped = len(warnings) - len(capped)
+    if dropped > 0:
+        capped.append(f"… {dropped} further warning(s) suppressed")
+    return capped, dropped > 0
+
+
+def _cap_task_result_json(raw: str | None) -> tuple[str | None, bool]:
+    """Bound the task result JSON WITHOUT ever emitting invalid JSON.
+
+    Truncating a JSON document yields one that fails
+    ``ExecuteResponse.from_dict``'s own ``json.loads`` validation, which the
+    client reports as a malformed response and answers by REAPING the executor
+    — losing the session's persistent ``state`` over an oversized payload, a
+    strictly worse outcome than the payload itself. So an over-budget result is
+    replaced by a valid marker object carrying the path to the full JSON, which
+    a caller that actually wants it can read.
+    """
+    if raw is None or len(raw) <= MAX_TEXT_CHARS:
+        return raw, False
+    path = spill_text(raw, prefix="task-result")
+    marker: dict[str, Any] = {
+        "_browserwright_truncated": True,
+        "original_size": len(raw),
+        "full_result_path": path,
+    }
+    marker["reason"] = (
+        f"task result exceeded the {MAX_TEXT_CHARS}-char response bound; "
+        + (
+            f"the full JSON is at {path}"
+            if path
+            else "the full JSON could not be written to disk"
+        )
+    )
+    return json.dumps(marker), True
 
 
 @contextmanager
@@ -352,7 +439,13 @@ class _Worker:
         self._page = ph.bind_current_page(self._context, sess)
         self._page_target_id = sess.current_target_id
         self._snapshot_holder.page = self._page
-        self._snapshot = make_snapshot(self._snapshot_holder)
+        self._snapshot = make_snapshot(
+            self._snapshot_holder,
+            # Late-bound on purpose: `_call_warnings` is REPLACED each
+            # call, so a bound `.append` captured here would append into
+            # the previous call's list and the notice would vanish.
+            warn=lambda m: self._call_warnings.append(m),
+        )
         self._arm_facade_death()
         # Issue #21: the live page must follow the session's current target
         # (``session_runtime.bind_target`` / ``open_session_tab`` /
@@ -409,7 +502,13 @@ class _Worker:
         self._page = page
         self._page_target_id = sess.current_target_id
         self._snapshot_holder.page = page
-        self._snapshot = make_snapshot(self._snapshot_holder)
+        self._snapshot = make_snapshot(
+            self._snapshot_holder,
+            # Late-bound on purpose: `_call_warnings` is REPLACED each
+            # call, so a bound `.append` captured here would append into
+            # the previous call's list and the notice would vanish.
+            warn=lambda m: self._call_warnings.append(m),
+        )
         # Same-call visibility: swap `page` inside the RUNNING heredoc's
         # globals so statements after switch_tab() see the new page.
         if self._active_globals is not None:
@@ -628,23 +727,52 @@ class _Worker:
         terminal_reason: str | None = None,
         task_result_json: str | None = None,
     ) -> ExecuteResponse:
-        """Assemble the response: cap the console at ``MAX_TEXT_CHARS`` and
-        attach the warnings/screenshots collected during the call."""
-        console = buf.getvalue()
-        truncated = False
-        if len(console) > MAX_TEXT_CHARS:
-            console = console[:MAX_TEXT_CHARS] + "\n… [truncated]"
-            truncated = True
+        """Assemble the response with EVERY text channel bounded, and attach the
+        warnings/screenshots collected during the call.
+
+        All four text channels are capped here, not just ``console``. An
+        expression-valued last statement is an entirely ordinary thing for an
+        agent to write, and an uncapped ``return_value`` big enough to exceed
+        ``protocol._MAX_FRAME`` does not merely ship megabytes: the client reads
+        it as a transport error and reaps this executor, taking the session's
+        live ``page`` and persistent ``state`` with it. Bounding the response by
+        construction is what makes that unreachable.
+        """
+        console, console_cut, console_path = _cap_text(
+            buf.getvalue(), prefix="console"
+        )
+        rv_cut, rv_path = False, None
+        if return_value is not None:
+            return_value, rv_cut, rv_path = _cap_text(
+                return_value, prefix="return-value"
+            )
+        task_result_json, task_cut = _cap_task_result_json(task_result_json)
+
+        raw_warnings = (
+            list(self._call_warnings) if warnings is None else list(warnings)
+        )
+        # The cut is reported out-of-band (ADR-0007 §5): stdout is content,
+        # warnings are metadata. Without this the agent sees a short payload and
+        # has no way to tell it was ever longer, nor where the rest went.
+        if console_cut:
+            raw_warnings.append(_cut_notice("output", console_path))
+        if rv_cut:
+            raw_warnings.append(_cut_notice("[return value]", rv_path))
+        if task_cut:
+            raw_warnings.append(
+                f"task result exceeded the {MAX_TEXT_CHARS}-char response bound "
+                f"and was replaced by a marker; use --output json to read it"
+            )
+        capped_warnings, warn_cut = _cap_warnings(raw_warnings)
+
         return ExecuteResponse(
             console=console,
             return_value=return_value,
             error=error,
             exit_code=exit_code,
-            warnings=(
-                list(self._call_warnings) if warnings is None else list(warnings)
-            ),
+            warnings=capped_warnings,
             screenshots=list(self._call_screenshots),
-            truncated=truncated,
+            truncated=console_cut or rv_cut or warn_cut or task_cut,
             terminal_reason=terminal_reason,
             task_result_json=task_result_json,
         )
