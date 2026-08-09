@@ -54,6 +54,20 @@ The same gate runs in CI on every push to `main` and every pull request
 Darwin/Windows Chrome discovery) is exercised through monkeypatched
 platform tables, so the gate passes on Linux CI without real macOS APIs.
 
+The gate is walled off from the developer's real global daemon by an autouse
+fixture in `tests/conftest.py`. It redirects `XDG_RUNTIME_DIR` (so a
+`cleanup_endpoint()` cannot unlink the live daemon's control socket, which would
+make its watchdog self-exit) and neuters the two daemon cold-start entry points,
+with a raising backstop on the low-level detached spawn. `tests/daemon/e2e/` is
+exempt — it starts real daemons deliberately, behind its own port isolation.
+
+Before this existed, `mise run test` reliably evicted the machine-global daemon
+and left a worktree daemon squatting on port 19989 until someone ran `mise run
+teardown`; the damage only surfaced later as a failed `upgrade-global`. If you
+add a test that legitimately needs a real daemon, use the e2e harness rather
+than removing the wall — `tests/daemon/test_issue57_global_daemon_isolation.py`
+asserts it is armed.
+
 > Working from a fresh checkout on a host that already runs a global
 > `browserwright` install plus a loaded Chrome extension? Read
 > [docs/architecture.md → Independent local dev — never touch global
