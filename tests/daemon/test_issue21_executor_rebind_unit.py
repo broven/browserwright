@@ -70,7 +70,7 @@ def test_on_target_changed_rebinds_page_and_swaps_running_globals(monkeypatch):
     assert w._page_target_id == "ext-tab-C"
     # The running heredoc's `page` name now points at the rebound page.
     assert w._active_globals["page"] is new_page
-    assert w._snapshot_holder.page is new_page
+    assert w._live_page_holder.page is new_page
     assert w._call_warnings == []
 
 

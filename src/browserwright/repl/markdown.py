@@ -189,11 +189,16 @@ def spill_path(url: str = "") -> str:
 def make_read_markdown(handle: Any, namespace: Optional[dict] = None):
     """Build the per-heredoc ``read_markdown()`` bound to this heredoc's handle.
 
+    ``handle`` is anything exposing a live ``.page``: the lazy
+    ``PlaywrightHandle`` on the in-process path, or the resident executor's
+    live-page holder (issue #59 — resolving the lazy handle *inside* the
+    executor re-enters ``sync_playwright()`` in a running asyncio loop).
+
     ``namespace`` is the exec globals dict. It is read LAZILY at call time
     because the executor injects its ``_bw_warn`` channel into that same dict
-    *after* `build_globals()` has returned — so binding it now would always
-    miss. Absent that channel (the in-process path) notes go to stderr, which is
-    where `inline.py` renders warnings anyway.
+    only after this factory has run — so binding it now would always miss.
+    Absent that channel (the in-process path) notes go to stderr, which is where
+    `inline.py` renders warnings anyway.
     """
 
     def _emit(notes: list[str]) -> None:

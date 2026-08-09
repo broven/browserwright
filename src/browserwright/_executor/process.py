@@ -170,11 +170,15 @@ def _request_environment(env: dict[str, str]) -> Iterator[None]:
 
 
 class _LivePageHolder:
-    """Adapts a live Playwright ``page`` to the ``.page`` attribute
-    ``snapshot.make_snapshot`` expects (it was written against the lazy
-    ``PlaywrightHandle``). We rebind ``.page`` whenever the worker re-binds the
-    session tab (cold-start / future ``reset()``), so ``snapshot()`` always
-    observes the executor's current live page."""
+    """Adapts a live Playwright ``page`` to the ``.page`` attribute the **view**
+    factories expect (``snapshot.make_snapshot`` / ``markdown.make_read_markdown``
+    were both written against the lazy ``PlaywrightHandle``). We rebind ``.page``
+    whenever the worker re-binds the session tab (cold-start / target change /
+    future ``reset()``), so every view observes the executor's current live page.
+
+    One holder serves ALL views on purpose: a second holder is a second thing to
+    remember to rebind, which is exactly how ``read_markdown`` shipped bound to a
+    handle nobody was updating (issue #59)."""
 
     def __init__(self) -> None:
         self.page: Any = None
@@ -225,7 +229,9 @@ class _Worker:
         self._facade_death_handler: Any = None
         # Persistent per-session state, injected by reference each call (Fork 5).
         self._state: dict[str, Any] = {}
-        self._snapshot_holder = _LivePageHolder()
+        # One live-page holder shared by every injected view (snapshot /
+        # read_markdown). Rebound wherever `self._page` is.
+        self._live_page_holder = _LivePageHolder()
         self._snapshot: Any = None
         # Per-call warnings/screenshots the running code can append to via the
         # injected `_bw_warn` / screenshot helpers. Reset at the start of each
@@ -438,9 +444,9 @@ class _Worker:
         self._context = ph.context_for_browser(self._browser)
         self._page = ph.bind_current_page(self._context, sess)
         self._page_target_id = sess.current_target_id
-        self._snapshot_holder.page = self._page
+        self._live_page_holder.page = self._page
         self._snapshot = make_snapshot(
-            self._snapshot_holder,
+            self._live_page_holder,
             # Late-bound on purpose: `_call_warnings` is REPLACED each
             # call, so a bound `.append` captured here would append into
             # the previous call's list and the notice would vanish.
@@ -501,9 +507,9 @@ class _Worker:
             return
         self._page = page
         self._page_target_id = sess.current_target_id
-        self._snapshot_holder.page = page
+        self._live_page_holder.page = page
         self._snapshot = make_snapshot(
-            self._snapshot_holder,
+            self._live_page_holder,
             # Late-bound on purpose: `_call_warnings` is REPLACED each
             # call, so a bound `.append` captured here would append into
             # the previous call's list and the notice would vanish.
@@ -808,25 +814,44 @@ class _Worker:
         )
 
     def _build_globals(self) -> dict[str, Any]:
-        """The exec namespace: the Phase C surface, but with ``page`` /
-        ``context`` replaced by the LIVE held objects, ``state`` injected by
-        reference (persists across calls — Fork 5), and ``snapshot`` rebound to
-        the live page.
+        """The exec namespace: the Phase C surface with every lazy name replaced
+        by this executor's live equivalent.
 
         We reuse ``_namespace.build_globals()`` so the agent helper layer +
-        EXPORTS stay identical to the heredoc, then OVERWRITE the lazy proxies
-        with live objects. The handle the lazy build injected
-        (``__bw_playwright_handle__``) is dropped — the executor owns teardown,
-        not the per-call namespace."""
+        EXPORTS stay identical to the heredoc, and hand it
+        :meth:`_bind_live_surface` as its live-surface hook so the swap lands
+        *before* the agent helper layer loads (issue #59)."""
         from ..repl import _namespace
 
-        g = _namespace.build_globals()
+        return _namespace.build_globals(self._bind_live_surface)
+
+    def _bind_live_surface(self, g: dict[str, Any]) -> None:
+        """Replace the lazily-bound namespace entries with the live ones.
+
+        Everything ``_namespace.build_globals`` binds to its lazy
+        ``PlaywrightHandle`` must be listed here. Resolving that handle on the
+        worker thread re-enters ``sync_playwright()`` inside the executor's
+        running asyncio loop and raises "Sync API inside the asyncio loop" —
+        which is what shipped for ``read_markdown`` (issue #59). The handle
+        itself is dropped: the executor owns teardown, not the per-call
+        namespace.
+
+        Called by ``build_globals`` BEFORE ``_load_agent_helpers``, so the
+        helper modules are seeded from the live surface too.
+        """
+        from ..repl.markdown import make_read_markdown
+
         g.pop("__bw_playwright_handle__", None)
         g["page"] = self._page
         g["context"] = self._context
         g["state"] = self._state  # same dict object each call → persistent
         if self._snapshot is not None:
             g["snapshot"] = self._snapshot
+        # The other view. Bound to the shared live-page holder (so it follows a
+        # mid-call target change exactly like `snapshot`), and handed THIS call's
+        # globals so its notes find the `_bw_warn` channel injected just below —
+        # `make_read_markdown` reads the namespace lazily for that reason.
+        g["read_markdown"] = make_read_markdown(self._live_page_holder, g)
         # Task invocations inside inline code borrow the same resident surface;
         # never let the public task runner allocate a second Playwright handle.
         g["run_task"] = self._run_task_on_live_surface
@@ -838,7 +863,6 @@ class _Worker:
         # `[WARNING]` line or a screenshot path back through the response.
         g["_bw_warn"] = self._call_warnings.append
         g["_bw_record_screenshot"] = self._record_screenshot
-        return g
 
     def _record_screenshot(self, path: str, **meta: Any) -> str:
         """Register a screenshot the heredoc captured so its path surfaces in
