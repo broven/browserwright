@@ -22,20 +22,73 @@ import { pathToFileURL } from "node:url";
 import { isAbsolute, resolve } from "node:path";
 import type { ModuleContext, ModuleProvider, ModuleRunner, ProviderOutcome, Role } from "./types.ts";
 
-const cache = new Map<string, ModuleRunner<unknown>>();
+/**
+ * Completed and in-flight loads, keyed by spec.
+ *
+ * This stores the PROMISE, not the resolved runner, on purpose. Two web_search
+ * calls fired in the same turn both miss a value cache and both import; under
+ * pi's jiti runtime that race is not merely wasteful but wrong — the second
+ * caller can observe a half-initialized module record and fail the load (see
+ * the mechanism note above loadRunner). A promise cache collapses the second
+ * caller onto the first's in-flight import, so everyone awaits the same
+ * import and sees the same resolved runner.
+ */
+const cache = new Map<string, Promise<ModuleRunner<unknown>>>();
 
-async function loadRunner(spec: string, dir: string): Promise<ModuleRunner<unknown>> {
+/**
+ * How a module runner is loaded. Injectable for tests; production always uses
+ * the native dynamic import, which pi's jiti runtime routes through its own
+ * transpile-and-cache pipeline.
+ *
+ * Why the unwrap (measured, not hypothetical): jiti transpiles .ts modules to
+ * CommonJS and rewrites every static import into a top-level
+ * `await jitiImport(...)` inside an async wrapper. While the module body is
+ * suspended on those awaits, the module record is already in jiti's shared
+ * per-chain cache with `exports.default` still unset. A concurrent import of
+ * the same module then hits that half-initialized record, and jiti's
+ * interopDefault proxy surfaces the RAW exports object (`{ default: runner,
+ * explain }`) as the module's `.default` — which is not a function. Observable
+ * as an intermittent "does not default-export a runner function" on the first
+ * concurrent call, never again once cached. The promise cache above removes
+ * the race; this unwrap is belt-and-braces for any residual interop quirk
+ * (e.g. an environment forcing JITI_INTEROP_DEFAULT=false).
+ */
+export type ModuleImporter = (href: string) => Promise<{ default?: unknown }>;
+
+const defaultImporter: ModuleImporter = (href) => import(href) as Promise<{ default?: unknown }>;
+
+export async function loadRunner(
+	spec: string,
+	dir: string,
+	importer: ModuleImporter = defaultImporter,
+): Promise<ModuleRunner<unknown>> {
 	const cached = cache.get(spec);
 	if (cached) return cached;
 
 	const path = isAbsolute(spec) ? spec : resolve(dir, spec);
-	const imported = (await import(pathToFileURL(path).href)) as { default?: unknown };
-	const runner = imported.default;
-	if (typeof runner !== "function") {
-		throw new Error(`${spec} does not default-export a runner function`);
+	const load = (async () => {
+		const imported = (await importer(pathToFileURL(path).href)) as { default?: unknown };
+		const direct = imported.default as unknown;
+		const runner =
+			typeof direct === "function"
+				? (direct as ModuleRunner<unknown>)
+				: ((direct as { default?: unknown } | null)?.default as unknown);
+		if (typeof runner !== "function") {
+			throw new Error(`${spec} does not default-export a runner function`);
+		}
+		return runner as ModuleRunner<unknown>;
+	})();
+
+	cache.set(spec, load);
+	try {
+		return await load;
+	} catch (error) {
+		// A failed load must not poison the cache forever: drop it so the next
+		// call re-imports. Both callers of a shared rejected promise reach here
+		// (delete is idempotent).
+		cache.delete(spec);
+		throw error;
 	}
-	cache.set(spec, runner as ModuleRunner<unknown>);
-	return runner as ModuleRunner<unknown>;
 }
 
 export async function execModule<T>(
