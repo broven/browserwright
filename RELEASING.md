@@ -26,11 +26,11 @@ auto-upgrader. The only automatic piece is the in-Chrome extension reload (see
 Releases are driven entirely by a **git tag** matching `v*`
 (`.github/workflows/release.yml`):
 
-- The repo's `pyproject.toml` `version` and `chrome-extension/manifest.json`
-  `version` are intentionally **NOT bumped per release** — they stay at the
-  placeholder **`0.0.0`** in git. CI overwrites both **from the tag** at build
-  time. So the tag is the single source of truth for the version; do not edit
-  `pyproject` `version` in a release commit.
+- The repo's `pyproject.toml` `version`, `chrome-extension/manifest.json`
+  `version` and `pi-extension/package.json` `version` are intentionally **NOT
+  bumped per release** — all three stay at the placeholder **`0.0.0`** in git.
+  CI overwrites them **from the tag** at build time. So the tag is the single
+  source of truth for the version; do not edit any of them in a release commit.
 - The placeholder is `0.0.0` so it can never be mistaken for a real release. It
   previously sat at `0.6.2` — a version that *had* shipped — which made every
   checkout look like it was eight releases behind (`browserwright version` said
@@ -38,20 +38,51 @@ Releases are driven entirely by a **git tag** matching `v*`
   installable when it was really an unstamped dev build.
 - `tests/skill/test_release_versioning.py` (in the fast gate) replays the
   workflow's own stamping code against the current `pyproject.toml` /
-  `manifest.json` and fails if CI could no longer stamp them — a trailing
-  comment on the `version` line, a second top-level `version =`, a switch to
-  `dynamic = ["version"]`, drift between the two placeholders, or the two jobs'
-  tag regexes disagreeing. Without it those break the release **after** the tag
-  is pushed, when the only fix is deleting and re-cutting the tag.
+  `manifest.json` / `pi-extension/package.json` and fails if CI could no longer
+  stamp them — a trailing comment on the `version` line, a second top-level
+  `version =`, a switch to `dynamic = ["version"]`, drift between the three
+  placeholders, or the three jobs' tag regexes disagreeing. Without it those
+  break the release **after** the tag is pushed, when the only fix is deleting
+  and re-cutting the tag.
 - Job `publish-pypi` builds the sdist+wheel and uploads to **PyPI** via OIDC
   **trusted publishing** (no stored token), gated on the GitHub `pypi`
   environment.
 - Job `publish-extension` stamps the manifest, zips `chrome-extension/` into
   `browserwright-extension-<version>.zip`, and attaches it to a **GitHub
   Release** named `vX.Y.Z`.
+- Job `publish-npm` stamps `pi-extension/package.json`, runs that package's unit
+  tests, and publishes **`@browserwright/pi`** to npm via OIDC trusted
+  publishing (no stored token), gated on the GitHub `npm` environment. See
+  [ADR-0008](docs/adr/0008-pi-extension-is-a-subpackage.md) for why the pi
+  extension lives in this repo.
+
+The three jobs are independent: none waits on the others, and a failure in one
+does not roll back the rest. That is why the tag-regex agreement is asserted in
+the fast gate rather than discovered at publish time.
 
 Pick the next version by bumping the latest tag (`git tag --sort=-v:refname |
 head`). Patch for fixes, minor for features.
+
+---
+
+## First npm publish
+
+`@browserwright/pi` is a scoped package, so before the first release:
+
+1. Create the **`@browserwright` org** on npmjs.com (free for public packages).
+2. Configure a **trusted publisher** for it: repository `broven/browserwright`,
+   workflow `release.yml`, environment `npm`. This is the npm equivalent of the
+   PyPI setup below, and fails the same way (`npm error 404` / auth error) when
+   any claim disagrees.
+3. Create the `npm` environment in the repo's GitHub settings.
+
+`npm publish --access public` in the job covers the scoped-package default of
+private; it is a no-op on later publishes.
+
+If trusted publishing cannot be set up, fall back to an `NPM_TOKEN` secret and
+`NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` on the publish step — same trade-off
+as the PyPI API-token fallback below: it works, but it is a long-lived
+credential in repo settings.
 
 ---
 

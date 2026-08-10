@@ -379,7 +379,18 @@ tests/
 ├── daemon/               ← Layer 1 tests (+ e2e/ real-Chrome harness)
 ├── skill/                ← Layer 2 tests (CLI, sessions, primitives, memory, install)
 └── conftest.py           ← shared fixtures (tmp_bs_home, fresh_modules)
+
+chrome-extension/         ← MV3 unpacked extension; NOT in the wheel, ships as a
+                            GitHub Release zip (see version.py:165)
+pi-extension/             ← `@browserwright/pi`, the pi agent's web_fetch +
+                            web_search; NOT in the wheel, ships to npm. A CLI
+                            consumer that lives in-repo — see ADR-0008.
 ```
+
+Both of the last two are published from the same git tag as the wheel, by their
+own job in `release.yml`. All three carry a `0.0.0` version sentinel that CI
+stamps; `tests/skill/test_release_versioning.py` is the guard that keeps the
+three jobs agreeing on which tags are valid.
 
 When in doubt, `uv run pytest tests/daemon tests/skill -q` runs the mocked
 suite — no real daemon, no real Chrome. See [TESTING.md](../TESTING.md) for

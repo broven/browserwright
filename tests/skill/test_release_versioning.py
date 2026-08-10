@@ -1,8 +1,9 @@
 """Guards for the tag-is-the-source-of-truth release contract.
 
-`pyproject.toml` and `chrome-extension/manifest.json` are never bumped per
-release: `.github/workflows/release.yml` rewrites both from the pushed git tag
-at build time (see RELEASING.md). That keeps the tag and the shipped version in
+`pyproject.toml`, `chrome-extension/manifest.json` and
+`pi-extension/package.json` are never bumped per release:
+`.github/workflows/release.yml` rewrites all three from the pushed git tag at
+build time (see RELEASING.md). That keeps the tag and every shipped artifact in
 lockstep with no human bump step — but only as long as the stamping steps can
 still find what they rewrite.
 
@@ -28,6 +29,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 MANIFEST = REPO_ROOT / "chrome-extension" / "manifest.json"
+PI_PACKAGE = REPO_ROOT / "pi-extension" / "package.json"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
 # The in-repo value both files carry between releases. Deliberately *not* a
@@ -60,6 +62,7 @@ def _stamping_pattern() -> re.Pattern[str]:
 def test_pyproject_and_manifest_carry_the_placeholder():
     pyproject_version = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["version"]
     manifest_version = json.loads(MANIFEST.read_text(encoding="utf-8"))["version"]
+    pi_version = json.loads(PI_PACKAGE.read_text(encoding="utf-8"))["version"]
 
     assert pyproject_version == PLACEHOLDER_VERSION, (
         f"pyproject version is {pyproject_version!r}, expected the placeholder "
@@ -70,10 +73,17 @@ def test_pyproject_and_manifest_carry_the_placeholder():
         f"chrome-extension/manifest.json version is {manifest_version!r}, "
         f"expected the placeholder {PLACEHOLDER_VERSION!r}."
     )
-    # version.check_versions() reports `extension-version-mismatch` when these
-    # two disagree, so drift between the placeholders breaks `browserwright
-    # version check` in every checkout.
-    assert pyproject_version == manifest_version
+    assert pi_version == PLACEHOLDER_VERSION, (
+        f"pi-extension/package.json version is {pi_version!r}, expected the "
+        f"placeholder {PLACEHOLDER_VERSION!r}."
+    )
+    # version.check_versions() reports `extension-version-mismatch` when the
+    # first two disagree, so drift between the placeholders breaks
+    # `browserwright version check` in every checkout. The npm package is not
+    # part of that runtime check, but it ships from the same tag, so a drifted
+    # placeholder there publishes an @browserwright/pi that claims a version the
+    # CLI it shells out to never had.
+    assert pyproject_version == manifest_version == pi_version
 
 
 def test_release_workflow_can_stamp_pyproject():
@@ -109,6 +119,38 @@ def test_release_workflow_can_stamp_extension_manifest():
     )
 
 
+def test_release_workflow_can_stamp_pi_package():
+    """The npm stamp is `json.loads` -> set `version` -> dump, like the manifest."""
+    package = json.loads(PI_PACKAGE.read_text(encoding="utf-8"))
+    assert "version" in package
+    package["version"] = "9.9.9"
+    round_tripped = json.loads(json.dumps(package, indent=2, ensure_ascii=False) + "\n")
+    assert round_tripped["version"] == "9.9.9"
+    # pi discovers an installed package's entry points through this key. Losing
+    # it in the stamp publishes a package that installs and then does nothing.
+    assert round_tripped["pi"]["extensions"] == ["./index.ts"], (
+        "Stamping must not disturb the pi manifest key."
+    )
+
+
+def test_pi_package_never_bundles_the_host_packages():
+    """pi injects its own typebox and pi-* modules into the extension loader.
+
+    Declaring them as real dependencies installs a second copy, and schema
+    identity then fails across the module boundary — a failure that shows up as
+    a tool whose parameters never validate, not as an import error.
+    """
+    package = json.loads(PI_PACKAGE.read_text(encoding="utf-8"))
+    host_packages = {"typebox", "@earendil-works/pi-coding-agent"}
+    for field in ("dependencies", "bundledDependencies"):
+        declared = set(package.get(field) or [])
+        assert not (declared & host_packages), (
+            f"{field} must not contain {declared & host_packages}; they belong in "
+            "peerDependencies with a \"*\" range."
+        )
+    assert host_packages <= set(package.get("peerDependencies", {}))
+
+
 @pytest.mark.parametrize(
     "tag, expected",
     [
@@ -134,11 +176,11 @@ def test_release_workflow_rejects_malformed_tags(tag):
 def _tag_pattern() -> re.Pattern[str]:
     """Return the tag-validation regex from `release.yml`.
 
-    Both jobs (PyPI + extension zip) embed their own copy of this literal and
-    refuse to build when the pushed tag does not match — that is what stops a
-    `v*` tag like `vnext` from being stamped in as a garbage version. The two
-    copies must agree, or one job could publish while the other rejects the same
-    tag, so this asserts they do.
+    All three jobs (PyPI, extension zip, npm) embed their own copy of this
+    literal and refuse to build when the pushed tag does not match — that is
+    what stops a `v*` tag like `vnext` from being stamped in as a garbage
+    version. The copies must agree, or one job could publish while another
+    rejects the same tag, so this asserts they do.
     """
     text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     sources = [
@@ -151,9 +193,15 @@ def _tag_pattern() -> re.Pattern[str]:
             ".github/workflows/release.yml; update this helper if the workflow "
             "was restructured — do not delete the guard."
         )
+    assert len(sources) == 3, (
+        f"Expected three tag-validating release jobs (PyPI, extension zip, npm), "
+        f"found {len(sources)}. A job that publishes without validating the tag "
+        "can stamp a garbage version; a job that disappeared means an artifact "
+        "silently stopped shipping."
+    )
     assert len(set(sources)) == 1, (
-        "The PyPI job and the extension job validate the release tag with "
-        f"different regexes ({sources}); they must accept exactly the same "
-        "tags or a release can publish a wheel with no matching extension zip."
+        "The release jobs validate the tag with different regexes "
+        f"({sources}); they must accept exactly the same tags or a release can "
+        "publish a wheel with no matching extension zip or npm package."
     )
     return re.compile(sources[0])

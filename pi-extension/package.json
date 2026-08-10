@@ -1,0 +1,51 @@
+{
+  "name": "@browserwright/pi",
+  "version": "0.0.0",
+  "description": "web_fetch and web_search for the pi coding agent, driving the user's real browser through browserwright",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "browserwright",
+    "web-fetch",
+    "web-search",
+    "browser-automation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/broven/browserwright.git",
+    "directory": "pi-extension"
+  },
+  "homepage": "https://github.com/broven/browserwright/tree/main/pi-extension#readme",
+  "bugs": {
+    "url": "https://github.com/broven/browserwright/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "verify.ts",
+    "probe-run.ts",
+    "core/",
+    "!core/*.test.ts",
+    "providers/",
+    "config.json",
+    "probe-cases.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test 'core/*.test.ts'"
+  }
+}

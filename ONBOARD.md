@@ -19,7 +19,7 @@ mise run install    # uv sync --extra ux  (project + dev group + rich)
 ## 2. Run the dev loop
 
 ```bash
-mise run test       # fast gate: daemon + skill unit tests + mocked skill evals
+mise run test       # fast gate: daemon + skill unit tests + mocked evals + pi-extension
 mise run lint       # ruff check (pinned ruff + pinned rule set)
 ```
 
@@ -43,10 +43,11 @@ mise run dev-link    # development only; a broken checkout can break global agen
 | Command | What it does |
 |---------|--------------|
 | `mise run install` | Install all deps (`uv sync --extra ux`) — clone's first command |
-| `mise run test` | Fast local gate: `test:daemon` + `test:skill` + `test:evals` |
+| `mise run test` | Fast local gate: `test:daemon` + `test:skill` + `test:evals` + `test:pi` |
 | `mise run test:daemon` | Daemon / CDP / proxy / backend / relay unit tests |
 | `mise run test:skill` | Agent-layer tests (CLI, sessions, primitives, memory, install) |
 | `mise run test:evals` | Mocked skill command-choice evals (deterministic) |
+| `mise run test:pi` | `pi-extension/` chain + predicate unit tests (`node --test`, no network) |
 | `mise run test:e2e` | Real-Chrome + unpacked-extension E2E (opt-in; see below) |
 | `mise run teardown` | Reclaim **this worktree's** leaked e2e daemons / orphaned Chrome / test artifacts. Idempotent; never touches the global daemon or a sibling worktree. Worktree tooling runs it before deleting a worktree |
 | `mise run lint` | `ruff check` — ruff version pinned in `[tools]`, rule set pinned in `[tool.ruff.lint]` |

@@ -1,0 +1,54 @@
+{
+  "name": "browserwright",
+  "label": "browserwright (your Chrome)",
+  "role": "fetch",
+  "kind": "command",
+  "command": [
+    "browserwright",
+    "markdown",
+    "{url}",
+    "--max-chars=0",
+    "--name=pi-webfetch"
+  ],
+  "returns": "markdown",
+  "timeoutMs": 90000,
+  "retries": 1,
+  "retryWhen": [
+    "PageBindTimeout",
+    "retryable"
+  ],
+  "failWhen": {
+    "matches": []
+  },
+  "_note": [
+    "browserwright >= 0.9.0 has a native one-shot markdown command that owns its",
+    "whole lifecycle: it creates a throwaway session, navigates, converts, and",
+    "tears the session down. Verified 2026-08-09: no leaked sessions afterwards.",
+    "--backend defaults to `extension`, the user's real Chrome, which is what we",
+    "want: the isolated cdp backend would launch a new Chrome and steal the macOS",
+    "active window. Do-not-disturb outranks isolation. It also means this rung",
+    "carries the user's login state, which is the whole reason it is worth having.",
+    "--max-chars=0 disables its 8000-char print cap. Measured: a Wikipedia article",
+    "comes through stdout at 46,033 bytes, so the ~10KB executor stdout truncation",
+    "that forced the old wrapper script does not apply on this path.",
+    "--mode defaults to `auto`: extract the main content, and fall back to the",
+    "page minus nav/aside/footer if extraction collapses. Switch to --mode=full",
+    "here if a docs or API-reference page ever comes back missing its tables or",
+    "code blocks — that is readability's known weak spot, and `full` keeps every",
+    "link.",
+    "failWhen.matches: [] switches OFF the core default list, and the probe on",
+    "2026-08-09 says keep it that way: every case that returned content returned",
+    "genuine content, including x.com, where this rung got a real logged-in",
+    "profile view (2199 chars) that an anonymous fetch is refused.",
+    "This is the ONLY fetch rung this package ships, so a false rejection here",
+    "fails the whole call rather than dropping to something else. That asymmetry",
+    "is why the bar for rejecting is deliberately high. Drop your own provider",
+    "JSON into this directory to add a cheaper or anonymous rung ahead of it.",
+    "Observed but deliberately accepted: g2.com returns a 1330-char skip-links",
+    "stub after 62 seconds — thin, and uncomfortably close to the 90s timeout.",
+    "Known upstream bug (2026-08-09): a PDF URL exits 3 with a raw",
+    "`TargetClosedError` traceback, not the documented UnsupportedContentType",
+    "refusal, so the chain trace carries a Playwright stack instead of a sentence.",
+    "retries/retryWhen: measured 2026-08-09, PageBindTimeout ('timed out binding Playwright to session target ... no replacement page was created') fires intermittently on a healthy daemon and the CLI itself marks it retryable:true. With one rung per tool there is nothing to fall through to, so one retry here is the difference between a blip and a failed call. Scoped by retryWhen so a 404 or an auth wall is not retried."
+  ]
+}
