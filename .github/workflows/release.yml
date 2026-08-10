@@ -157,6 +157,15 @@ jobs:
           node-version: "24"
           registry-url: https://registry.npmjs.org
 
+      # Trusted publishing needs npm >= 11.5.1, and an older npm fails with a
+      # plain authentication error rather than saying what is wrong. Node 24
+      # already bundles a new enough npm; this pins it so a change to the
+      # runner's bundled version cannot quietly break publishing.
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
       - name: Set pi extension version from git tag
         run: |
           python - <<'PY'

@@ -67,22 +67,69 @@ head`). Patch for fixes, minor for features.
 
 ## First npm publish
 
-`@browserwright/pi` is a scoped package, so before the first release:
+npm's trusted publishing has a bootstrapping problem that PyPI's does not:
+**the package must already exist before a trusted publisher can be configured
+for it.** So the first release is manual, and every one after it is automatic.
+
+### One-time, before the first release
 
 1. Create the **`@browserwright` org** on npmjs.com (free for public packages).
-2. Configure a **trusted publisher** for it: repository `broven/browserwright`,
-   workflow `release.yml`, environment `npm`. This is the npm equivalent of the
-   PyPI setup below, and fails the same way (`npm error 404` / auth error) when
-   any claim disagrees.
-3. Create the `npm` environment in the repo's GitHub settings.
+2. **Publish `0.0.1` by hand, once**, so the package exists:
+   ```bash
+   cd pi-extension
+   npm login
+   npm version 0.0.1 --no-git-tag-version   # do NOT commit this
+   npm publish --access public
+   git checkout package.json                # restore the 0.0.0 sentinel
+   ```
+   Restoring the sentinel matters: `test_release_versioning.py` fails the fast
+   gate if `package.json` carries anything but `0.0.0` in git.
+3. On npmjs.com → Packages → `@browserwright/pi` → **Settings → Trusted
+   publishing**, add a GitHub Actions publisher:
 
-`npm publish --access public` in the job covers the scoped-package default of
-private; it is a no-op on later publishes.
+   | field | value |
+   |---|---|
+   | Organization / repository | `broven/browserwright` |
+   | Workflow filename | `release.yml` |
+   | Environment | `npm` |
 
-If trusted publishing cannot be set up, fall back to an `NPM_TOKEN` secret and
-`NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` on the publish step — same trade-off
-as the PyPI API-token fallback below: it works, but it is a long-lived
-credential in repo settings.
+4. Create the **`npm` environment** in the repo's GitHub settings (Settings →
+   Environments → New environment). The job declares
+   `environment: {name: npm}`, so publishing fails without it.
+
+That is it — no token is stored anywhere.
+
+### What makes it work
+
+- `permissions: id-token: write` on the job. Without it npm gets no OIDC token.
+- npm **>= 11.5.1**. An older npm fails with a bare authentication error and no
+  hint about the cause, which is why the job pins it explicitly.
+- Provenance attestations are generated automatically; no `--provenance` flag.
+
+### Things that will break it
+
+- **Renaming `release.yml`.** Trust is pinned to the exact
+  org/repo/workflow-filename triple. Rename the file and every publish fails
+  until the trusted publisher is updated to match.
+- **Publishing from a fork or another repo** — rejected by design.
+- **Self-hosted runners.** Only GitHub-hosted runners issue OIDC tokens npm
+  accepts.
+- **A second package under the same org** needs its own trusted-publisher entry;
+  the setting is per package, not per org.
+
+### Fallback: a stored token
+
+If trusted publishing cannot be used, add an `NPM_TOKEN` repository secret and
+give the publish step:
+
+```yaml
+env:
+  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+Same trade-off as the PyPI API-token fallback below: it works, but it is a
+long-lived credential sitting in repo settings, and it is what trusted
+publishing exists to remove.
 
 ---
 
