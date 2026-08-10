@@ -1,0 +1,14 @@
+{
+  "order": {
+    "fetch": ["browserwright"],
+    "search": ["browserwright-search"]
+  },
+  "defaultFailWhen": {
+    "minChars": 0,
+    "minResults": 0,
+    "matches": ["enable javascript", "just a moment", "checking your browser", "captcha"]
+  },
+  "timeoutMs": 30000,
+  "maxBytes": 51200,
+  "maxLines": 2000
+}

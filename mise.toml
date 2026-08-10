@@ -16,6 +16,13 @@ uv = "latest"
 # exactly that here — 646 findings overnight). The companion rule-set pin lives
 # in pyproject `[tool.ruff.lint]`; bump the two together.
 ruff = "0.16.1"
+# Node was already a de facto dependency before it was ever pinned: three daemon
+# tests shell out to `node` to run fragments of chrome-extension/background.js
+# under node:vm, and they run in the default gate and in CI. Pinning it also
+# gives pi-extension/ a known runtime — its tests are `node --test` over .ts
+# files, which needs Node >= 23.6 for unflagged type stripping. 24 is the LTS
+# line that clears that floor.
+node = "24"
 
 # ---------------------------------------------------------------------------
 # Standard repo-harness verbs. Heavy/operational tasks (dev-link, upgrade-global,
@@ -53,9 +60,16 @@ description = "Mocked skill command-choice evals (zero-cost, deterministic)"
 dir = "{{config_root}}"
 run = "uv run python evals/run.py --mock"
 
+[tasks."test:pi"]
+description = "pi-extension chain/predicate unit tests (node --test, no network)"
+# cwd must be the package root: the test glob is relative, and `node --test`
+# expands it itself rather than letting the shell do it.
+dir = "{{config_root}}/pi-extension"
+run = "node --test 'core/*.test.ts'"
+
 [tasks.test]
-description = "Run the fast local gate (daemon + skill + skill evals)"
-depends = ["test:daemon", "test:skill", "test:evals"]
+description = "Run the fast local gate (daemon + skill + skill evals + pi-extension)"
+depends = ["test:daemon", "test:skill", "test:evals", "test:pi"]
 
 [tasks."test:launchd"]
 description = "macOS-only: measure real launchd/launchctl behaviour with throwaway LaunchAgents (issue #57)"

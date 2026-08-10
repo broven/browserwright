@@ -38,6 +38,7 @@ Chrome / extension / RDP browser
 | Daemon unit/contract tests (`tests/daemon/`) | yes | `mise run test:daemon` |
 | Agent-layer tests (`tests/skill/`) | yes | `mise run test:skill` |
 | Mocked skill evals (`evals/`) | yes | `mise run test:evals` |
+| pi extension unit tests (`pi-extension/core/`) | yes | `mise run test:pi` |
 | Real-Chrome E2E (`tests/daemon/e2e/`) | no — opt-in | `mise run test:e2e` |
 
 ## Fast Local Gate
@@ -45,7 +46,7 @@ Chrome / extension / RDP browser
 Run this before handing off ordinary code changes:
 
 ```bash
-mise run test    # = test:daemon + test:skill + test:evals; mocked, no Chrome, no network
+mise run test    # = test:daemon + test:skill + test:evals + test:pi; mocked, no Chrome, no network
 ```
 
 The same gate runs in CI on every push to `main` and every pull request
@@ -118,8 +119,34 @@ tests/skill/test_coverage_primitives_sweep.py  session-runtime tab helpers, http
 tests/skill/test_coverage_repl_misc.py         inline run, discovery, schemas, errors, CDP loop
 tests/skill/test_cdp_slow_rpc_regression.py    slow-RPC timeout regression
 tests/skill/test_install_extension_v04.py      install wizard + extension availability
-tests/skill/test_release_versioning.py         release stamping contract (see RELEASING.md)
+tests/skill/test_release_versioning.py         release stamping contract for all three artifacts (see RELEASING.md)
 ```
+
+## pi Extension Tests
+
+```bash
+mise run test:pi                       # or: cd pi-extension && node --test 'core/*.test.ts'
+```
+
+TypeScript, run by `node --test` with native type stripping — no build step, no
+test framework, no network. Needs Node >= 23.6 for unflagged stripping; `node`
+is pinned in `mise.toml` for exactly this reason.
+
+The executor is injected throughout `pi-extension/core/`, so the fallback engine
+is testable without a browser. That is deliberately where the tests are: a rung
+never tried, a JS shell accepted as success, or an empty search result list
+returned as an answer all produce **no error** — just quietly worse answers.
+
+Two live harnesses sit outside the gate because they hit real sites and open
+tabs in the user's Chrome:
+
+```bash
+cd pi-extension
+node verify.ts                         # real fetch chain
+node verify.ts --search "some query"   # real search chain
+```
+
+---
 
 ## Real Chrome E2E (opt-in)
 

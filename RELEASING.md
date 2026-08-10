@@ -26,11 +26,11 @@ auto-upgrader. The only automatic piece is the in-Chrome extension reload (see
 Releases are driven entirely by a **git tag** matching `v*`
 (`.github/workflows/release.yml`):
 
-- The repo's `pyproject.toml` `version` and `chrome-extension/manifest.json`
-  `version` are intentionally **NOT bumped per release** — they stay at the
-  placeholder **`0.0.0`** in git. CI overwrites both **from the tag** at build
-  time. So the tag is the single source of truth for the version; do not edit
-  `pyproject` `version` in a release commit.
+- The repo's `pyproject.toml` `version`, `chrome-extension/manifest.json`
+  `version` and `pi-extension/package.json` `version` are intentionally **NOT
+  bumped per release** — all three stay at the placeholder **`0.0.0`** in git.
+  CI overwrites them **from the tag** at build time. So the tag is the single
+  source of truth for the version; do not edit any of them in a release commit.
 - The placeholder is `0.0.0` so it can never be mistaken for a real release. It
   previously sat at `0.6.2` — a version that *had* shipped — which made every
   checkout look like it was eight releases behind (`browserwright version` said
@@ -38,20 +38,98 @@ Releases are driven entirely by a **git tag** matching `v*`
   installable when it was really an unstamped dev build.
 - `tests/skill/test_release_versioning.py` (in the fast gate) replays the
   workflow's own stamping code against the current `pyproject.toml` /
-  `manifest.json` and fails if CI could no longer stamp them — a trailing
-  comment on the `version` line, a second top-level `version =`, a switch to
-  `dynamic = ["version"]`, drift between the two placeholders, or the two jobs'
-  tag regexes disagreeing. Without it those break the release **after** the tag
-  is pushed, when the only fix is deleting and re-cutting the tag.
+  `manifest.json` / `pi-extension/package.json` and fails if CI could no longer
+  stamp them — a trailing comment on the `version` line, a second top-level
+  `version =`, a switch to `dynamic = ["version"]`, drift between the three
+  placeholders, or the three jobs' tag regexes disagreeing. Without it those
+  break the release **after** the tag is pushed, when the only fix is deleting
+  and re-cutting the tag.
 - Job `publish-pypi` builds the sdist+wheel and uploads to **PyPI** via OIDC
   **trusted publishing** (no stored token), gated on the GitHub `pypi`
   environment.
 - Job `publish-extension` stamps the manifest, zips `chrome-extension/` into
   `browserwright-extension-<version>.zip`, and attaches it to a **GitHub
   Release** named `vX.Y.Z`.
+- Job `publish-npm` stamps `pi-extension/package.json`, runs that package's unit
+  tests, and publishes **`@browserwright/pi`** to npm via OIDC trusted
+  publishing (no stored token), gated on the GitHub `npm` environment. See
+  [ADR-0008](docs/adr/0008-pi-extension-is-a-subpackage.md) for why the pi
+  extension lives in this repo.
+
+The three jobs are independent: none waits on the others, and a failure in one
+does not roll back the rest. That is why the tag-regex agreement is asserted in
+the fast gate rather than discovered at publish time.
 
 Pick the next version by bumping the latest tag (`git tag --sort=-v:refname |
 head`). Patch for fixes, minor for features.
+
+---
+
+## First npm publish
+
+npm's trusted publishing has a bootstrapping problem that PyPI's does not:
+**the package must already exist before a trusted publisher can be configured
+for it.** So the first release is manual, and every one after it is automatic.
+
+### One-time, before the first release
+
+1. Create the **`@browserwright` org** on npmjs.com (free for public packages).
+2. **Publish `0.0.1` by hand, once**, so the package exists:
+   ```bash
+   cd pi-extension
+   npm login
+   npm version 0.0.1 --no-git-tag-version   # do NOT commit this
+   npm publish --access public
+   git checkout package.json                # restore the 0.0.0 sentinel
+   ```
+   Restoring the sentinel matters: `test_release_versioning.py` fails the fast
+   gate if `package.json` carries anything but `0.0.0` in git.
+3. On npmjs.com → Packages → `@browserwright/pi` → **Settings → Trusted
+   publishing**, add a GitHub Actions publisher:
+
+   | field | value |
+   |---|---|
+   | Organization / repository | `broven/browserwright` |
+   | Workflow filename | `release.yml` |
+   | Environment | `npm` |
+
+4. Create the **`npm` environment** in the repo's GitHub settings (Settings →
+   Environments → New environment). The job declares
+   `environment: {name: npm}`, so publishing fails without it.
+
+That is it — no token is stored anywhere.
+
+### What makes it work
+
+- `permissions: id-token: write` on the job. Without it npm gets no OIDC token.
+- npm **>= 11.5.1**. An older npm fails with a bare authentication error and no
+  hint about the cause, which is why the job pins it explicitly.
+- Provenance attestations are generated automatically; no `--provenance` flag.
+
+### Things that will break it
+
+- **Renaming `release.yml`.** Trust is pinned to the exact
+  org/repo/workflow-filename triple. Rename the file and every publish fails
+  until the trusted publisher is updated to match.
+- **Publishing from a fork or another repo** — rejected by design.
+- **Self-hosted runners.** Only GitHub-hosted runners issue OIDC tokens npm
+  accepts.
+- **A second package under the same org** needs its own trusted-publisher entry;
+  the setting is per package, not per org.
+
+### Fallback: a stored token
+
+If trusted publishing cannot be used, add an `NPM_TOKEN` repository secret and
+give the publish step:
+
+```yaml
+env:
+  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+Same trade-off as the PyPI API-token fallback below: it works, but it is a
+long-lived credential sitting in repo settings, and it is what trusted
+publishing exists to remove.
 
 ---
 

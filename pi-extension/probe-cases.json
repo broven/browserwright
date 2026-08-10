@@ -1,0 +1,22 @@
+[
+  { "name": "article", "url": "https://en.wikipedia.org/wiki/Markdown", "expose": "normal long article" },
+  { "name": "spa-shell", "url": "https://web.telegram.org/", "expose": "client-rendered shell, no server HTML" },
+  { "name": "bot-wall", "url": "https://www.g2.com/", "expose": "bot challenge / interstitial" },
+  { "name": "login-wall", "url": "https://x.com/elonmusk", "expose": "needs the user's session cookies" },
+  { "name": "not-found", "url": "https://example.com/definitely-not-here", "expose": "404 handling" },
+  {
+    "name": "huge",
+    "url": "https://en.wikipedia.org/wiki/List_of_Latin_phrases_(full)",
+    "expose": "page far past the 50KB truncation limit"
+  },
+  {
+    "name": "pdf",
+    "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+    "expose": "non-HTML content type"
+  },
+  {
+    "name": "localhost",
+    "url": "http://localhost:3000/",
+    "expose": "local dev server — remote providers cannot reach it, curl and browserwright can"
+  }
+]
