@@ -9,8 +9,7 @@ against an injected ``page`` (and ``context``). The handle:
   - **connects through the daemon facade**: it reads the facade ws URL the
     daemon advertised (``browserwright-daemon status``'s ``facade.ws`` →
     ``_ipc.read_facade_file``) and ``chromium.connect_over_cdp`` to it. The
-    facade drives both the cdp and extension backends (see
-    ``.trellis/spec/backend/playwright-cdp-facade.md``).
+    facade drives both the cdp and extension backends.
   - **binds ``page`` to the session's current tab**: it resolves the session's
     ``current_target_id`` (ledger fast-path via ``ensure_session_target``) and
     selects the Playwright ``Page`` whose CDP ``targetId`` matches it. If the
