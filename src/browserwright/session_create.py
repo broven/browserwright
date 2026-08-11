@@ -22,6 +22,7 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 """
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 from typing import Optional
@@ -208,6 +209,60 @@ def reset_executor(record: dict) -> str:
     return (
         f"session {sid} reset; executor was recycled. "
         "The browser and tabs were left untouched."
+    )
+
+
+def attach_active(record: dict, *, json_out: bool = False) -> str:
+    """Adopt the focused-window active tab into a session's tab group.
+
+    The agent-side wrapper for ``browserwright-daemon attach-active``: the
+    daemon asks the extension to MOVE the currently-focused-window active tab
+    into this session's tab group and attach it, so the agent drives the page
+    the user is actually looking at. The adopted tab is a regular group
+    member — no borrowed flag — so it closes with the group on ``session
+    end`` exactly like an agent-opened tab, and a tab already sitting in any
+    other tab group (the user's own manual groups included) is refused as
+    "occupied"; the user must drag it out first.
+
+    For ``cdp`` sessions the daemon's honest equivalent applies: the session
+    is bound to the browser's current page.
+
+    Returns a human-readable confirmation line, or the daemon's payload as
+    JSON when ``json_out`` is set.
+    """
+    _ensure_daemon_running()
+    sid = str(record.get("id"))
+    cmd = ["browserwright-daemon", "attach-active", "--session", sid, "--json"]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15.0)
+    except subprocess.TimeoutExpired:
+        from .errors import DaemonUnavailable
+
+        raise DaemonUnavailable(
+            f"attach-active timed out after 15s for session {sid}",
+            fix="retry; if it persists, run `browserwright-daemon status`",
+        )
+    if proc.returncode != 0:
+        # The daemon CLI prints the reason; propagate it verbatim so the
+        # agent sees the "tab is in a group — drag it out" guidance.
+        from .errors import BrowserwrightError
+
+        msg = proc.stderr.strip() or (
+            f"attach-active failed (exit {proc.returncode})")
+        raise BrowserwrightError(msg)
+    try:
+        payload = json.loads(proc.stdout.strip())
+    except ValueError:
+        payload = {}
+    if json_out:
+        return json.dumps(payload, sort_keys=True)
+    title = payload.get("title") or "(untitled)"
+    url = payload.get("url") or ""
+    return (
+        f"session {sid} adopted the active tab "
+        f"(tabId={payload.get('tabId')}, groupId={payload.get('groupId')}): "
+        f"{title} — {url}"
     )
 
 
