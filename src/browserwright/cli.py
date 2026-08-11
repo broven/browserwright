@@ -33,6 +33,7 @@ Usage:
   browserwright session new --backend=<extension|cdp|env> --name=SESSION_LABEL [--create | --attach=PORT]
   browserwright session reset <id>
   browserwright session end --session=ID
+  browserwright session attach-active [--session=ID | -s ID] [--json]
   browserwright session list [--json]
   browserwright session prune [--idle=SECONDS]
   browserwright whoami --session=ID
@@ -720,12 +721,12 @@ def _cmd_memory(args: list[str]) -> int:
 
 
 def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
-    """``browserwright session {new|reset|end|list|prune} ...`` (P2)."""
+    """``browserwright session {new|attach-active|reset|end|list|prune} ...`` (P2)."""
     from . import session_create
     from . import session_registry as reg
 
     if not args:
-        print("usage: browserwright session {new|reset|end|list|prune} ...", file=sys.stderr)
+        print("usage: browserwright session {new|attach-active|reset|end|list|prune} ...", file=sys.stderr)
         return 1
     inner_session, args, err = _extract_session_arg(args)
     if err:
@@ -734,7 +735,7 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     if inner_session:
         session_id = inner_session
     if not args:
-        print("usage: browserwright session {new|reset|end|list|prune} ...", file=sys.stderr)
+        print("usage: browserwright session {new|attach-active|reset|end|list|prune} ...", file=sys.stderr)
         return 1
     sub = args[0]
     kw = _parse_kv_args(args[1:])
@@ -768,6 +769,19 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
             return 1
         print(f"OK: session {sid} created", file=sys.stderr)
         print(sid)  # token-frugal: bare id
+        return 0
+
+    if sub == "attach-active":
+        from .errors import BrowserwrightError
+        from .session_ctx import resolve_session_or_env
+        try:
+            rec = resolve_session_or_env(session_id)
+            message = session_create.attach_active(
+                rec, json_out=bool(kw.get("json")))
+        except (BrowserwrightError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return getattr(e, "exit_code", 1)
+        print(message)
         return 0
 
     if sub == "end":

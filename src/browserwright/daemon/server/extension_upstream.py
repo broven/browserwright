@@ -1037,8 +1037,9 @@ class ExtensionUpstream:
 
         The adopted tab becomes a regular group member — it closes with the
         group on `end_session` (no separate borrowed flag). The extension
-        REFUSES (raises) if the focused tab already belongs to another
-        session's group; that error propagates to the caller.
+        REFUSES (raises) if the focused tab already belongs to ANY other tab
+        group (the user's own manual groups count as occupied); that error
+        propagates to the caller.
         """
         if session_id is not None:
             async with self._lock_for(session_id):

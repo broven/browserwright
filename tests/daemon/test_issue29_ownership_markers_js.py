@@ -373,6 +373,142 @@ vm.runInContext(
     assert result["responses"][0]["result"]["groupId"] == 101
 
 
+def test_attach_active_refuses_tab_in_other_group_fresh_session() -> None:
+    """Adopt rule: the focused tab sitting in ANY group other than the
+    session's own is refused — even when the session has no live group yet.
+    Before this rule a fresh session (ourGroupId == -1) silently stole the
+    tab out of the user's own manual group."""
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const calls = [];
+const responses = [];
+const chrome = {
+  tabs: {
+    async query({ active, currentWindow }) {
+      calls.push({ kind: "query", active, currentWindow });
+      return [{ id: 17, url: "https://active/", title: "Active", groupId: 5 }];
+    },
+    async group(props) {
+      calls.push({ kind: "group", props });
+      return 101;
+    },
+  },
+  tabGroups: {
+    async get(id) {
+      calls.push({ kind: "tabGroups.get", id });
+      return { id, title: "Agent" };
+    },
+  },
+  storage: {
+    session: {
+      async get() { return {}; },
+      async set(value) { Object.assign(storageData, value); },
+    },
+  },
+};
+const storageData = {};
+const realm = vm.createContext({
+  chrome, console,
+  stripMarker: (t) => t || "",
+  safeSend: (m) => responses.push(m),
+});
+vm.runInContext(input.ownershipRegion, realm);
+vm.runInContext(input.resolveSessionGroup, realm);
+vm.runInContext(input.doAttachActive, realm);
+
+(async () => {
+  await vm.runInContext("doAttachActive(2, null, 'Agent', 'SESS-A')", realm);
+  process.stdout.write(JSON.stringify({
+    responses,
+    stole: calls.some((c) => c.kind === "group"),
+  }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    result = _run_node_probe(_ownership_sources(), probe)
+
+    assert result["stole"] is False, "must not move the tab into a group"
+    err = result["responses"][0]["error"]
+    assert err["code"] == -32000
+    assert "tab group" in err["message"]
+    assert "Drag the tab out" in err["message"]
+
+
+def test_attach_active_reuses_tab_in_own_group() -> None:
+    """A tab already inside the session's own live group is adopted in place
+    (idempotent re-attach), not refused and not moved again."""
+    probe = r"""
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const calls = [];
+const storageData = {};
+const responses = [];
+const chrome = {
+  tabs: {
+    async query({ active, currentWindow }) {
+      calls.push({ kind: "query", active, currentWindow });
+      return [{ id: 17, url: "https://active/", title: "Active", groupId: 100 }];
+    },
+    async group({ groupId, tabIds }) {
+      calls.push({ kind: "group", groupId, tabIds });
+      return typeof groupId === "number" ? groupId : 101;
+    },
+  },
+  tabGroups: {
+    async get(id) {
+      calls.push({ kind: "tabGroups.get", id });
+      return { id, title: "Agent" };
+    },
+    async update(id, props) {
+      calls.push({ kind: "tabGroups.update", id, props });
+      return { id, ...props };
+    },
+  },
+  storage: {
+    session: {
+      async get() { return {}; },
+      async set(value) { Object.assign(storageData, value); },
+    },
+  },
+};
+const realm = vm.createContext({
+  chrome, console,
+  stripMarker: (t) => t || "",
+  safeSend: (m) => responses.push(m),
+});
+vm.runInContext(input.ownershipRegion, realm);
+vm.runInContext(input.resolveSessionGroup, realm);
+vm.runInContext(input.ensureTabInGroup, realm);
+vm.runInContext(input.doAttachActive, realm);
+vm.runInContext(
+  "async function attachTab(tabId, opts) {}\n" +
+  "async function postAttachCosmetics(tabId) {}",
+  realm,
+);
+
+(async () => {
+  await vm.runInContext(
+    "doAttachActive(2, 100, 'Agent', 'SESS-A')", realm);
+  process.stdout.write(JSON.stringify({
+    responses,
+    joinedOwnGroup: calls.some(
+      (c) => c.kind === "group" && c.groupId === 100),
+  }));
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+    result = _run_node_probe(_ownership_sources(), probe)
+
+    assert result["responses"][0]["result"]["groupId"] == 100
+    # Joined the existing group directly; never created a second one.
+    assert result["joinedOwnGroup"] is True
+
+
 def test_query_group_annotates_owned_session_id_per_member() -> None:
     probe = r"""
 const vm = require("node:vm");

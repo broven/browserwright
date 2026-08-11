@@ -743,10 +743,12 @@ async function doAttachActive(id, groupId, groupName, sessionId) {
   // closes with the group on endSession like any other member — there is no
   // separate "borrowed" flag.
   //
-  // Refuse-on-conflict: if the focused tab already lives in ANOTHER session's
-  // group (a real group whose id differs from ours), we refuse and do NOT
-  // steal it out of that group. Ungrouped tabs (groupId == -1) and tabs
-  // already in our group are fine to adopt.
+  // Refuse-on-conflict: if the focused tab already lives in ANY tab group
+  // other than ours (a real group whose id differs from ours — the user's own
+  // manual groups count as occupied too, since a tab group is the isolation
+  // unit between sessions), we refuse and do NOT steal it out of that group.
+  // Ungrouped tabs (groupId == -1) and tabs already in our group are fine to
+  // adopt.
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) {
@@ -762,15 +764,15 @@ async function doAttachActive(id, groupId, groupName, sessionId) {
     const ourGroupId = await _resolveSessionGroup(groupId, groupName);
     const tabGroup = typeof tab.groupId === "number" ? tab.groupId : -1;
     const inAGroup = tabGroup >= 0;  // -1 == chrome.tabGroups.TAB_GROUP_ID_NONE
-    if (inAGroup && ourGroupId >= 0 && tabGroup !== ourGroupId) {
+    if (inAGroup && tabGroup !== ourGroupId) {
       safeSend({
         type: "response",
         id,
         error: {
           code: -32000,
-          message: "focused tab belongs to another session's tab group " +
-            "(groupId=" + tabGroup + "); refusing to steal it. Drag it out " +
-            "of that group first, or adopt it from its owning session.",
+          message: "focused tab is in a tab group (groupId=" + tabGroup +
+            "); refusing to take it over. Drag the tab out of the group " +
+            "first, then retry.",
         },
       });
       return;

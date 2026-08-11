@@ -375,8 +375,9 @@ class RelayServer:
         currently-focused-window active tab into this session's tab group and
         attach the debugger. ``group_id`` identifies the destination group;
         ``group_name`` is only the title to apply if a new group is created.
-        The extension refuses (error) if the focused tab already belongs to a
-        DIFFERENT session's group.
+        The extension refuses (error) if the focused tab already belongs to ANY
+        tab group other than the session's own (manual user groups count as
+        occupied).
 
         The adopted tab is a regular group member — it closes with the group on
         ``end_session`` (no separate borrowed/owned flag).
