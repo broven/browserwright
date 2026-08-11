@@ -439,6 +439,34 @@ def requires_headful(reason: str) -> None:
         pytest.skip(f"needs a headful Chrome ({reason}); unset BW_E2E_HEADLESS")
 
 
+#: Default size for the e2e Chrome window (`--window-size=W,H`). Smaller than
+#: Chrome's own default so a headful run is less of an ambush on the machine
+#: you are working on — 26 of these windows open per suite run.
+#:
+#: This is the *viewport* too: the facade reaches these pages over
+#: `connect_over_cdp`, which leaves `viewport=None`, so the page viewport is
+#: whatever the OS window is. Shrinking it changes what the tests see, not just
+#: what you see — 900,700 lands a 900x557 viewport (Chrome's default here was
+#: 1200x704).
+#:
+#: Measured 2026-08-11, extension backend, headful macOS: the one size-coupled
+#: assertion is `test_screenshot_is_non_trivial`'s >5KB PNG, and it holds with
+#: room to spare at every size Chrome will honour — 30KB at Chrome's default,
+#: 25KB at 900x700, 20KB at 640x480, 18KB at the floor. macOS clamps the window
+#: to ~500px wide, so `--window-size=320,240` really yields a 500x232 viewport;
+#: you cannot get small enough to starve that assertion.
+E2E_WINDOW_SIZE = "900,700"
+
+
+def e2e_window_size() -> str:
+    """Window size for the e2e Chrome; `BW_E2E_WINDOW_SIZE=W,H` overrides.
+
+    Set it to the empty string to pass no `--window-size` at all (Chrome's own
+    default) — the escape hatch for a test that needs a full-size viewport.
+    """
+    return os.environ.get("BW_E2E_WINDOW_SIZE", E2E_WINDOW_SIZE)
+
+
 def _launch_cft_with_extension(
     cft_binary: Path, ext_dir: Path, *, cdp_port: int = 0,
 ) -> ChromeHandle:
@@ -447,6 +475,7 @@ def _launch_cft_with_extension(
     args = [
         str(cft_binary),
         *(["--headless=new"] if e2e_headless() else []),
+        *([f"--window-size={e2e_window_size()}"] if e2e_window_size() else []),
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={cdp_port}",
         "--no-first-run",
@@ -454,6 +483,14 @@ def _launch_cft_with_extension(
         "--remote-allow-origins=*",
         "--no-proxy-server",
         "--enable-features=UserScriptUserExtensionToggle",
+        # Disable OS keychain integration — same pair `launch_chrome.py` passes,
+        # and for the same reason: without them macOS pops a modal asking for
+        # the login keychain password ("…Chromium Safe Storage…") on every
+        # fresh-profile start, i.e. once per e2e Chrome. The throwaway
+        # user-data-dir has nothing encrypted in it, so the basic/mock store is
+        # functionally equivalent.
+        "--password-store=basic",
+        "--use-mock-keychain",
         f"--load-extension={ext_dir}",
         "about:blank",
     ]
