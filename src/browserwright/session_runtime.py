@@ -1,13 +1,13 @@
 """Internal session tab runtime: open / bind / resolve / reconnect-recover.
 
-A session's durable extension anchor is its Chrome tab-group id. The ledger
-record carries a ``runtime`` cache (``current_target_id``, ``group_id``,
-``owned_tab_ids``, ``updated_at``) as a fast path — the source of truth is the
-live tab group keyed by that numeric id, recoverable via the daemon verb
+A session's durable extension anchor is its Chrome tab-group TITLE,
+``<name>-BW<sid>`` (ADR-0009). The ledger record carries a ``runtime`` cache
+(``current_target_id``, ``updated_at``) as a fast path — the source of truth
+is the live tab group found by that title, recoverable via the daemon verb
 ``BrowserwrightDaemon.recoverSession``.
 
 ``ensure_session_target`` runs a 3-step fallback (in-process → ledger.runtime
-fast path → group-id recovery) so callers re-attach to a session's tab across
+fast path → title recovery) so callers re-attach to a session's tab across
 daemon restarts / extension reconnects / new processes without doing anything.
 
 This module is also the INTERNAL home of the agent-path tab lifecycle that
@@ -64,10 +64,10 @@ def persist_target(target_id: Optional[str], *, group_id: Optional[int] = None,
     can fast-path re-attach without querying the tab group. ``target_id=None``
     clears the cached binding (the current tab was closed).
 
-    ``group_id`` (the durable extension tab-group anchor) is preserved from the
-    existing record when the caller does not know it — a binding change must
-    never orphan the session from its tab group (CONTEXT.md: group_id is
-    load-bearing durable state)."""
+    ``group_id`` is accepted for call-site compatibility only: it is preserved
+    from the existing record when the caller does not know it (legacy ledgers
+    may still carry it) but since ADR-0009 nothing is written back — the
+    group is found by its title, and no caller may ever disagree about that."""
     if sess is None:
         from .session import current_session
         sess = current_session()
@@ -167,19 +167,18 @@ def ensure_session_target(sess) -> Optional[str]:
             except CDPError:
                 pass  # stale/closed tab — fall through to group recovery
 
-    # Step 3: durable group recovery by the persisted numeric groupId — NOT the
-    # title (names aren't unique; the session = the tab group, keyed by id). The
-    # groupId is cached in ledger.runtime.group_id on every open; without it
-    # there's nothing to recover (a brand-new session, or Chrome itself
-    # restarted and reassigned group ids — which needs no recovery).
-    runtime = (rec.get("runtime") or {}) if isinstance(rec, dict) else {}
-    gid = runtime.get("group_id")
+    # Step 3: durable group recovery by the session's tab-group TITLE
+    # (ADR-0009): `<name>-BW<sid>`, derived by the daemon from the ledger — the
+    # only anchor that is ours AND survives a browser restart. The numeric
+    # groupId is Chrome's recycled handle, and the old per-tab markers lived in
+    # chrome.storage.session, which Chrome wipes on restart. A session with no
+    # ledger row has nothing to recover.
     sid = rec.get("id") if isinstance(rec, dict) else _resolve_sid(sess)
-    if not isinstance(gid, int) or gid < 0:
+    if not sid:
         return None
     try:
         payload = sess.cdp.send(
-            "BrowserwrightDaemon.recoverSession", groupId=gid, bsSession=sid,
+            "BrowserwrightDaemon.recoverSession", bsSession=sid,
         )
     except CDPError:
         return None
@@ -188,7 +187,7 @@ def ensure_session_target(sess) -> Optional[str]:
     target_id = register_recovered(sess, payload)
     if target_id is None:
         return None
-    persist_target(target_id, group_id=payload.get("groupId"), sess=sess)
+    persist_target(target_id, sess=sess)
     return target_id
 
 
@@ -295,8 +294,8 @@ def open_session_tab(
         "tabId": payload.get("tabId"),
         "url": payload.get("url", url),
         "title": payload.get("title", ""),
-        # groupId is the session's tab-group id on extension (the durable
-        # reconnect anchor), -1 on cdp/env (tab groups are an extension concept).
+        # groupId is informational only since ADR-0009 (the binding is the
+        # group title); -1 on cdp/env (tab groups are an extension concept).
         "groupId": payload.get("groupId", -1),
     }
 

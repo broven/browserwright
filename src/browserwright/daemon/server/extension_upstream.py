@@ -1113,11 +1113,11 @@ class ExtensionUpstream:
             "recovered": recovered,
         }
 
-    async def recover(self, session_id: str | None = None, *,
-                      group_id: int | None = None) -> dict:
-        if group_id is None:
-            raise ValueError("extension recovery requires group_id")
-        return await self.recover_session(session_id, group_id=group_id)
+    async def recover(self, session_id: str | None = None) -> dict:
+        # ADR-0009: the verbs layer calls recover with only the session id and
+        # the group is found by its TITLE; the numeric groupId param is gone
+        # (a leftover signature would have made title recovery unreachable).
+        return await self.recover_session(session_id)
 
     async def close_tab(self, target: str) -> dict:
         """Close a tab addressed by upstream sessionId or targetId.
