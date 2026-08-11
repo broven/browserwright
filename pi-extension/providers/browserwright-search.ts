@@ -1,5 +1,5 @@
 /**
- * The `web_search` rung: drive a real search engine in the user's own Chrome.
+ * The `bw_web_search` rung: drive a real search engine in the user's own Chrome.
  *
  * This is a `kind: "module"` provider rather than a `kind: "command"` one
  * because a search is not one shot at a subprocess. It is: mint a session,

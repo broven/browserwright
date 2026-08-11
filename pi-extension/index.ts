@@ -1,6 +1,10 @@
 /**
- * @browserwright/pi — `web_fetch` and `web_search` for pi, backed by
+ * @browserwright/pi — `bw_web_fetch` and `bw_web_search` for pi, backed by
  * declarative providers that drive browserwright.
+ *
+ * Tool names are `bw_`-prefixed (not bare `web_fetch`/`web_search`) because
+ * providers reserve generic tool names: grok rejects a custom function named
+ * `web_search` with a 400. The prefix keeps every provider safe.
  *
  * A provider is a JSON file in providers/; adding one needs no code change.
  * This package ships only the browserwright rungs, which are the ones that
@@ -48,10 +52,10 @@ export default function (pi: ExtensionAPI) {
 			onUpdate?.({ content: [{ type: "text", text: `*${text}*` }] });
 		};
 
-	// ---- web_fetch ---------------------------------------------------------
+	// ---- bw_web_fetch ------------------------------------------------------
 
 	pi.registerTool({
-		name: "web_fetch",
+		name: "bw_web_fetch",
 		label: "Fetch Web Page",
 		description:
 			"Fetch a URL and return its content as Markdown. " +
@@ -60,7 +64,7 @@ export default function (pi: ExtensionAPI) {
 			"Output over 50KB is truncated and the full text written to a temp file whose path is given.",
 		promptSnippet: "Fetch a URL as markdown, through the user's real browser",
 		promptGuidelines: [
-			"Prefer `web_fetch` over curl or a shell HTTP client for reading web pages — it renders JavaScript " +
+			"Prefer `bw_web_fetch` over curl or a shell HTTP client for reading web pages — it renders JavaScript " +
 				"and carries the user's login state, so it can read pages an anonymous request cannot.",
 		],
 		parameters: Type.Object({
@@ -92,7 +96,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.setStatus("browserwright", "");
 
 			if (!result.ok) {
-				throw new ToolFailure(renderFailure(result, url, { tool: "web_fetch", alternatives: fetchNames }));
+				throw new ToolFailure(renderFailure(result, url, { tool: "bw_web_fetch", alternatives: fetchNames }));
 			}
 
 			return {
@@ -113,20 +117,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---- web_search --------------------------------------------------------
+	// ---- bw_web_search -----------------------------------------------------
 
 	pi.registerTool({
-		name: "web_search",
+		name: "bw_web_search",
 		label: "Search the Web",
 		description:
 			"Search the web and return ranked results as title, URL, snippet and date. " +
 			`Providers in order: ${config.order.search.join(" → ")}. ` +
 			"Also returns the engine's own AI Overview, knowledge panel, 'people also ask' and " +
 			"related searches when that query triggered them. Returns links, never page bodies — " +
-			"call web_fetch on the ones worth reading.",
+			"call bw_web_fetch on the ones worth reading.",
 		promptSnippet: "Search the web and get back ranked links",
 		promptGuidelines: [
-			"`web_search` returns links, not page contents. After searching, call `web_fetch` on the one or two " +
+			"`bw_web_search` returns links, not page contents. After searching, call `bw_web_fetch` on the one or two " +
 				"results actually worth reading rather than fetching all of them.",
 		],
 		parameters: Type.Object({
@@ -141,7 +145,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const query = params.query.trim();
-			if (!query) throw new ToolFailure("web_search needs a non-empty query");
+			if (!query) throw new ToolFailure("bw_web_search needs a non-empty query");
 			const setStatus = statusReporter(ctx, onUpdate);
 
 			const result = await runChain<SearchPayload>({
@@ -167,7 +171,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.setStatus("browserwright", "");
 
 			if (!result.ok) {
-				throw new ToolFailure(renderFailure(result, query, { tool: "web_search", alternatives: searchNames }));
+				throw new ToolFailure(renderFailure(result, query, { tool: "bw_web_search", alternatives: searchNames }));
 			}
 
 			return {
@@ -188,11 +192,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---- /browserwright ----------------------------------------------------
+	// ---- /bw ---------------------------------------------------------------
+	// Named `/bw` (not `/browserwright`) so it cannot be confused with the
+	// `browserwright` skill, which pi exposes as `/skill:browserwright`.
 
-	pi.registerCommand("browserwright", {
+	pi.registerCommand("bw", {
 		description:
-			"Inspect providers (/browserwright list) or probe one against real URLs (/browserwright probe <provider>)",
+			"Inspect providers (/bw list) or probe one against real URLs (/bw probe <provider>)",
 		handler: async (args, ctx) => {
 			const [subcommand, target] = args.trim().split(/\s+/);
 

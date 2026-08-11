@@ -4,8 +4,8 @@ Two tools for [pi](https://github.com/badlogic/pi-mono), backed by **declarative
 providers** that drive [browserwright](https://github.com/broven/browserwright):
 
 ```
-web_fetch(url, provider?)      → the page as Markdown
-web_search(query, provider?)   → ranked links + the SERP features Google showed
+bw_web_fetch(url, provider?)   → the page as Markdown
+bw_web_search(query, provider?) → ranked links + the SERP features Google showed
 ```
 
 Both run through the user's **own Chrome**, so they see what the user sees —
@@ -29,14 +29,18 @@ browserwright version check      # expect drift=equal
 The npm package and the Python package are cut from the same git tag, so their
 versions always match. Install them together.
 
+The names are `bw_`-prefixed rather than bare `web_fetch`/`web_search` because
+providers reserve generic tool names: grok rejects a custom function named
+`web_search` with a 400, so the prefix keeps every provider safe.
+
 ## The two tools
 
-`web_search` returns **links, never page bodies**. The model then calls
-`web_fetch` on the one or two worth reading. That split is deliberate: fetching
+`bw_web_search` returns **links, never page bodies**. The model then calls
+`bw_web_fetch` on the one or two worth reading. That split is deliberate: fetching
 all ten hits costs ~30 seconds and 50KB+ of context to answer a question that
 usually needs one of them.
 
-### What `web_search` returns
+### What `bw_web_search` returns
 
 | field | contents |
 |-------|----------|
@@ -106,11 +110,11 @@ This package ships **only the browserwright rungs**. There is one per tool:
 
 | tool | provider | kind |
 |------|----------|------|
-| `web_fetch` | `browserwright` | `command` — `browserwright markdown <url>` |
-| `web_search` | `browserwright-search` | `module` — a session lifecycle in TS |
+| `bw_web_fetch` | `browserwright` | `command` — `browserwright markdown <url>` |
+| `bw_web_search` | `browserwright-search` | `module` — a session lifecycle in TS |
 
 That is a real trade-off, and it points the wrong way for casual fetches: every
-`web_fetch` opens a tab in the daily browser and takes ~4-7s, where a hosted
+`bw_web_fetch` opens a tab in the daily browser and takes ~4-7s, where a hosted
 reader API answers in ~1s without touching Chrome. What you get for it is login
 state and full JS rendering, which no anonymous rung has.
 
@@ -247,10 +251,13 @@ worth repeating.
 ## Probe: rules from evidence, not guesses
 
 ```
-/browserwright list             # show both chains
-/browserwright probe            # every fetch provider
-/browserwright probe browserwright
+/bw list             # show both chains
+/bw probe            # every fetch provider
+/bw probe browserwright
 ```
+
+The slash command is `/bw` (not `/browserwright`) so it cannot be confused with
+pi's `browserwright` skill, which pi exposes as `/skill:browserwright`.
 
 Runs a provider against the real URLs in `probe-cases.json` — a normal article,
 a client-rendered shell, a bot wall, a login wall, a 404, a page past the
@@ -304,7 +311,7 @@ the `tool_result` event see `isError: false`. So a chain failure here throws.
   attacker, and blocking private addresses would remove localhost fetching,
   which is a real workflow. The requested URL is printed so internal fetches
   stay visible in the transcript.
-- **No body fetching inside `web_search`.** See the two-tool split above.
+- **No body fetching inside `bw_web_search`.** See the two-tool split above.
 
 ## License
 

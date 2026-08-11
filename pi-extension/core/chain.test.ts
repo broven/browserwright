@@ -257,7 +257,7 @@ describe("runChain", () => {
 	});
 
 	it("never offers one role's providers to the other tool", async () => {
-		// A search provider must not be reachable from web_fetch even when it is
+		// A search provider must not be reachable from bw_web_fetch even when it is
 		// the only thing declared, or the model gets rows where it asked for prose.
 		const mixed = new Map<string, Provider>([...providers, ...searchProviders]);
 		const result = await runChain<string>({
@@ -452,12 +452,12 @@ describe("renderResults", () => {
 			query,
 		);
 
-	it("lists numbered hits and points the model at web_fetch", () => {
+	it("lists numbered hits and points the model at bw_web_fetch", () => {
 		const text = render({ results: [{ position: 1, title: "Docs", url: "https://d", snippet: "how to" }] });
 		assert.match(text, /1 results for "how to"/);
 		assert.match(text, /1\. Docs/);
 		assert.match(text, /https:\/\/d/);
-		assert.match(text, /web_fetch/);
+		assert.match(text, /bw_web_fetch/);
 	});
 
 	it("puts the date beside the snippet so freshness is visible without parsing prose", () => {
@@ -521,9 +521,9 @@ describe("renderFailure", () => {
 				],
 			},
 			"https://example.com",
-			{ tool: "web_fetch", alternatives: ["remote", "hosted"] },
+			{ tool: "bw_web_fetch", alternatives: ["remote", "hosted"] },
 		);
-		assert.match(text, /web_fetch failed for https:\/\/example\.com/);
+		assert.match(text, /bw_web_fetch failed for https:\/\/example\.com/);
 		assert.match(text, /remote: http 403/);
 		assert.match(text, /missing env HOSTED_TOKEN/);
 	});
@@ -532,7 +532,7 @@ describe("renderFailure", () => {
 		const text = renderFailure(
 			{ ok: false, attempts: [{ provider: "remote", ok: false, ms: 10, reason: "http 403" }] },
 			"https://example.com",
-			{ tool: "web_fetch", alternatives: ["remote", "browser"] },
+			{ tool: "bw_web_fetch", alternatives: ["remote", "browser"] },
 		);
 		assert.match(text, /provider="browser"/);
 		assert.equal(/provider="remote"/.test(text), false);
@@ -544,7 +544,7 @@ describe("renderFailure", () => {
 		const text = renderFailure(
 			{ ok: false, attempts: [{ provider: "browser", ok: false, ms: 10, reason: "exit 3" }] },
 			"https://example.com",
-			{ tool: "web_fetch", alternatives: ["browser"] },
+			{ tool: "bw_web_fetch", alternatives: ["browser"] },
 		);
 		assert.equal(/Retry with/.test(text), false);
 	});

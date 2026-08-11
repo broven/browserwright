@@ -41,7 +41,7 @@ if (url !== undefined) {
 	console.log(
 		chained.ok
 			? `${renderSuccess(chained, { url, maxBytes: config.maxBytes, maxLines: config.maxLines }).slice(0, 600)}\n`
-			: `${renderFailure(chained, url, { tool: "web_fetch", alternatives: [...providersForRole(providers, "fetch").keys()] })}\n`,
+			: `${renderFailure(chained, url, { tool: "bw_web_fetch", alternatives: [...providersForRole(providers, "fetch").keys()] })}\n`,
 	);
 
 	console.log("── each fetch provider in isolation ──");
@@ -84,7 +84,7 @@ if (query !== undefined) {
 		searched.ok
 			? renderResults(searched, query)
 			: renderFailure(searched, query, {
-					tool: "web_search",
+					tool: "bw_web_search",
 					alternatives: [...providersForRole(providers, "search").keys()],
 				}),
 	);

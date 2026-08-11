@@ -1,7 +1,7 @@
 {
   "name": "@browserwright/pi",
   "version": "0.0.0",
-  "description": "web_fetch and web_search for the pi coding agent, driving the user's real browser through browserwright",
+  "description": "bw_web_fetch and bw_web_search for the pi coding agent, driving the user's real browser through browserwright",
   "license": "AGPL-3.0-only",
   "type": "module",
   "keywords": [
