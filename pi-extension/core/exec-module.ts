@@ -25,7 +25,7 @@ import type { ModuleContext, ModuleProvider, ModuleRunner, ProviderOutcome, Role
 /**
  * Completed and in-flight loads, keyed by spec.
  *
- * This stores the PROMISE, not the resolved runner, on purpose. Two web_search
+ * This stores the PROMISE, not the resolved runner, on purpose. Two bw_web_search
  * calls fired in the same turn both miss a value cache and both import; under
  * pi's jiti runtime that race is not merely wasteful but wrong — the second
  * caller can observe a half-initialized module record and fail the load (see

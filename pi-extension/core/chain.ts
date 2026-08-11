@@ -8,7 +8,7 @@
  *
  * The engine is payload-agnostic: it never looks inside `content`, it only asks
  * the caller-supplied `inspect` to reduce it to text plus an item count. That is
- * what lets one chain serve `web_fetch` (a Markdown blob) and `web_search`
+ * what lets one chain serve `bw_web_fetch` (a Markdown blob) and `bw_web_search`
  * (a list of results).
  */
 
