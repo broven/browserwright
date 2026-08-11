@@ -217,12 +217,13 @@ CASES = [
     # the real-agent run may fail here — that is the regression signal.
     {
         "id": "cu-07",
-        "name": "Extension backend: navigate the bound page in place, don't spawn tabs",
+        "name": "One-shot visit: navigate the bound page in place (no tab)",
         "category": "command-usage",
         # Phase C: the agent drives a Playwright `page` bound to the session's
-        # current tab. The tab-explosion failure mode is opening a fresh tab per
-        # step; the discipline is to navigate the bound `page` in place. Opening
-        # a second tab requires the explicit `context.new_page()` escape hatch.
+        # current tab. Tabs are for workstreams you return to; a one-shot visit
+        # leaves nothing to return to, so navigating the bound `page` in place
+        # is right, and opening a tab would leave a real user-visible tab
+        # behind for nothing.
         "prompt": (
             "You're driving my everyday Chrome through the extension backend "
             "(BD_BACKEND=extension). Open https://news.ycombinator.com so I can "
@@ -238,8 +239,8 @@ CASES = [
             r"\bnew_tab\s*\(",
             r"\bopen_background\s*\(",
             r"\bgoto_url\s*\(",
-            # Casually spawning a tab for a simple navigation is the explosion
-            # anti-pattern; `page.goto` reuses the bound tab.
+            # A one-shot visit has no workstream to return to — opening a tab
+            # leaves a real user-visible tab behind for nothing.
             r"\bcontext\.new_page\s*\(",
         ],
         "rubric": COMMAND_RUBRIC,
@@ -293,6 +294,34 @@ CASES = [
             r"\bpage_info\s*\(",
             r"\bjs\s*\(",
             r"\b(puppeteer|selenium)\b",
+        ],
+        "rubric": COMMAND_RUBRIC,
+    },
+    {
+        "id": "cu-10",
+        "name": "Form + docs: keep the form tab, read docs in a second tab, switch",
+        "category": "command-usage",
+        # Tabs are workstreams: the form holds state (already-filled input), so
+        # navigating the bound page to the docs would lose it. The correct move
+        # is a second tab (`context.new_page`) + `switch_tab` between the two;
+        # `page.goto(docs)` on the bound page is the anti-pattern.
+        "prompt": (
+            "You're driving my everyday Chrome through the extension backend "
+            "(BD_BACKEND=extension). I'm filling the signup form at "
+            "https://app.example.com/signup and already entered my name. The "
+            "API key field's format rules are in a JS-rendered table at "
+            "https://docs.example.com/api-keys - check it with a real browser, "
+            "then fill the API key field. Don't lose what I've already filled."
+        ),
+        "context": LOADED_CONTEXT,
+        "expected_patterns": [
+            r"\bcontext\.new_page\s*\(",
+            r"\bswitch_tab\s*\(",
+            r"\bpage\.(locator|fill|get_by_role)\s*\(",
+        ],
+        "forbidden_patterns": [
+            # Navigating the BOUND page away from the form loses its state.
+            r"page\.goto\s*\([^)]*docs\.example\.com",
         ],
         "rubric": COMMAND_RUBRIC,
     },

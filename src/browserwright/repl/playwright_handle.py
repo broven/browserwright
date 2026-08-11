@@ -114,8 +114,15 @@ def _session_id_from(sess: Any) -> str | None:
 
 
 def _agent_page_targets(sess: Any) -> list[dict]:
-    """All page-type targets `{targetId, url}` of the session, via the AGENT
-    CDP path (`sess.cdp` → daemon `Target.getTargets`).
+    """All page-type targets `{targetId, url, title}` of the session, via the
+    AGENT CDP path (`sess.cdp` → daemon `Target.getTargets`).
+
+    Extension: the daemon already scopes the enumeration to the session's tab
+    group (`scoped_target_infos` — two sessions sharing one Chrome stay
+    mutually invisible). cdp: the session's browser instance. This is also
+    what the agent-facing ``tabs()`` / ``switch_tab()`` primitives
+    (``tab_surface``) use, so the ids always line up with the ledger's
+    ``current_target_id``.
 
     Why the agent path and not a Playwright CDP session? Two Playwright CDP
     sessions for target enumeration are FATAL over the extension facade:
@@ -136,7 +143,11 @@ def _agent_page_targets(sess: Any) -> list[dict]:
             continue
         tid = ti.get("targetId")
         if isinstance(tid, str):
-            out.append({"targetId": tid, "url": ti.get("url", "")})
+            out.append({
+                "targetId": tid,
+                "url": ti.get("url", ""),
+                "title": ti.get("title", ""),
+            })
     return out
 
 
