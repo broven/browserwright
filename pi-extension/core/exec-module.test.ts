@@ -3,7 +3,7 @@
  *
  * The importer is injected, so nothing here touches jiti, the network or a
  * browser. The concurrency case is the regression test for the intermittent
- * "does not default-export a runner function" seen when two web_search calls
+ * "does not default-export a runner function" seen when two bw_web_search calls
  * raced the FIRST module load under pi's jiti runtime: a promise cache makes
  * the second caller share the first's in-flight import instead of importing a
  * half-initialized module record. See the mechanism note above loadRunner in
