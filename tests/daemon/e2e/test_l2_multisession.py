@@ -455,8 +455,9 @@ if errors:
         tab_ids = [entry["tabId"] for entry in results.values()]
 
         titles = _chrome_tab_group_titles(e2e_chrome, extension_id, group_ids)
+        # ADR-0009: the group title is the session binding `<name>-BW<sid>`.
         assert titles == {
-            entry["groupId"]: sessions[session_id]
+            entry["groupId"]: f"{sessions[session_id]}-BW{session_id}"
             for session_id, entry in results.items()
         }
 

@@ -35,8 +35,12 @@ from . import _namespace
 # objects); `page` / `context` / `snapshot` are live cross-process objects.
 # `run_task` is routed too, so its browser surface is always borrowed from the
 # same resident executor instead of opening a temporary Playwright controller.
+# `tabs` / `switch_tab` route so switch_tab's target-changed hook can swap the
+# RUNNING heredoc's `page` (issue #21 same-call visibility) and so the session
+# is the executor's resident one.
 _EXECUTOR_NAMES = frozenset(
-    {"page", "context", "snapshot", "state", "reset", "run_task"}
+    {"page", "context", "snapshot", "state", "reset", "run_task",
+     "tabs", "switch_tab"}
 )
 
 

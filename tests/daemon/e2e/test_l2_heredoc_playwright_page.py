@@ -239,18 +239,6 @@ def _bound_target(backend: str, sid: str) -> str | None:
     return (rec.get("runtime") or {}).get("current_target_id")
 
 
-def _session_group_id(sid: str) -> int | None:
-    ledger_path = (Path(__file__).resolve().parent / "_bs_home" / "extension"
-                   / "sessions" / "ledger.json")
-    try:
-        data = json.loads(ledger_path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-    gid = ((data.get("sessions", {}).get(sid, {}).get("runtime") or {})
-           .get("group_id"))
-    return gid if isinstance(gid, int) and gid >= 0 else None
-
-
 def _chrome_group_tab_ids(chrome, extension_id: str, group_id: int) -> list[int]:
     from browserwright.cdp import CDPSession
 
@@ -308,9 +296,71 @@ def _wait_extension_worker_connected(chrome, extension_id: str) -> None:
         f"extension worker did not report relay connection; last={last_result!r}")
 
 
+def _session_group_title(sid: str) -> str | None:
+    """ADR-0009: the session's tab-group title `<name>-BW<sid>`, derived from
+    the ledger exactly like the daemon's ``session_group_title``."""
+    ledger_path = (Path(__file__).resolve().parent / "_bs_home" / "extension"
+                   / "sessions" / "ledger.json")
+    try:
+        data = json.loads(ledger_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    name = (data.get("sessions", {}).get(sid, {}) or {}).get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return f"{name.strip()}-BW{sid}"
+
+
+def _session_group_id(chrome, extension_id: str, sid: str) -> int | None:
+    """Resolve the session's LIVE Chrome tab group by its title (ADR-0009) —
+    not from the ledger, which no longer stores a numeric group id. Returns
+    the matching group's id, or None when no group carries the title (user
+    renamed it / it never existed)."""
+    title = _session_group_title(sid)
+    if title is None:
+        return None
+    return _chrome_group_id_by_title(chrome, extension_id, title)
+
+
+def _chrome_group_id_by_title(chrome, extension_id: str, title: str) -> int | None:
+    """Exact-title group lookup through the extension worker. Deliberately
+    `chrome.tabGroups.query({})` + exact compare, mirroring background.js —
+    `query({title})` matches a PATTERN, so a `*`/`?` in the name would change
+    what matches (ADR-0009)."""
+    from browserwright.cdp import CDPSession
+
+    cdp = CDPSession(chrome.ws_url)
+    try:
+        worker = _extension_worker_target_id(cdp, extension_id)
+        session_id = cdp.attach(worker)
+        expression = (
+            "(async () => {"
+            f"const expected = {json.dumps(title)};"
+            "const groups = await chrome.tabGroups.query({});"
+            "const hit = groups.find(g => g.title === expected);"
+            "return hit ? hit.id : -1;"
+            "})()"
+        )
+        result = cdp.send(
+            "Runtime.evaluate",
+            session=session_id,
+            expression=expression,
+            returnByValue=True,
+            awaitPromise=True,
+        )
+    finally:
+        cdp.close()
+    if "exceptionDetails" in result:
+        raise AssertionError(f"tab group title query failed: {result!r}")
+    value = result.get("result", {}).get("value")
+    return value if isinstance(value, int) and value >= 0 else None
+
+
 def _assert_one_session_group(chrome, extension_id: str, sid: str) -> list[int]:
-    gid = _session_group_id(sid)
-    assert gid is not None, f"session {sid} did not persist runtime.group_id"
+    gid = _session_group_id(chrome, extension_id, sid)
+    assert gid is not None, (
+        f"session {sid} has no live group titled "
+        f"{_session_group_title(sid)!r} (ADR-0009)")
     tab_ids = _chrome_group_tab_ids(chrome, extension_id, gid)
     assert tab_ids, f"session group {gid} has no tabs"
     return tab_ids
@@ -357,7 +407,7 @@ def _one_group_case(
             f"heredoc failed; stdout={result.stdout!r} stderr={result.stderr!r}")
         tab_ids = _assert_one_session_group(chrome, extension_id, sid)
     finally:
-        gid = _session_group_id(sid)
+        gid = _session_group_id(chrome, extension_id, sid)
         tab_ids = (
             _chrome_group_tab_ids(chrome, extension_id, gid)
             if gid is not None else []
@@ -466,7 +516,7 @@ def test_one_group_after_recover_extension(ext_autofacade_ready, e2e_chrome,
             f"recovered heredoc failed; stdout={second.stdout!r} stderr={second.stderr!r}")
         tab_ids = _assert_one_session_group(e2e_chrome, extension_id, sid)
     finally:
-        gid = _session_group_id(sid)
+        gid = _session_group_id(e2e_chrome, extension_id, sid)
         tab_ids = (
             _chrome_group_tab_ids(e2e_chrome, extension_id, gid)
             if gid is not None else []

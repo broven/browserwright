@@ -203,25 +203,30 @@ browserwright userscript remove <id>
 
 ### The heredoc surface
 
-Browser driving is **real synchronous Playwright**. Every heredoc gets three
-names injected, already connected through the daemon's Playwright CDP facade:
+Browser driving is **real synchronous Playwright**. Every heredoc gets the
+following names injected, already connected through the daemon's Playwright
+CDP facade:
 
 - **`page`** — a Playwright `Page` bound to the session's current tab, **reused
   across heredocs**. Navigate it in place (`page.goto`, `page.locator`,
   `page.fill`, `page.click`, …); never `page.close()`.
-- **`context`** — the Playwright `BrowserContext`. `context.new_page()` only when
-  you genuinely need a second tab.
+- **`context`** — the Playwright `BrowserContext`. `context.new_page()` opens
+  a real second tab (in the session's tab group on extension) — then `goto()`
+  it; manage several tabs with the `tabs()` / `switch_tab()` primitives.
 - **`snapshot()`** — a first-party AI aria snapshot; each node carries a
   `[ref=eN]` you act on via `page.locator("aria-ref=eN")`. Prefer this over
   screenshots; re-`snapshot()` after each action (observe → act → observe).
 
-The connection is lazy — a heredoc that only uses the helpers below opens no
-browser. **Tab discipline:** reuse the bound tab, navigate in place, never
-close the browser/context (those are the user's real tabs).
+Tabs are workstreams, not steps: keep a tab for a page you will return to
+(its state — scroll, form input, JS state — survives), navigate in place when
+you are passing through, and never close the browser/context (those are the
+user's real tabs). `switch_tab("url-substring")` moves the session's current
+tab (the one `page` is bound to) between open tabs.
 
 Non-browser helpers (also pre-imported):
 
 - **HTTP (no browser, for static pages):** `http_get(url)`
+- **Tabs:** `tabs`, `switch_tab` (session tab management, see above)
 - **Memory:** `remember`, `remember_global`, `remember_preference`, `memory_read`
 - **Site-skills / tasks:** `list_site_skills`, `load_site_skill`, `run_task`, `bootstrap_site`
 

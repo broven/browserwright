@@ -34,6 +34,33 @@ browserwright session end --session=$sid
 
 Use `--backend=extension` for the user's daily Chrome. Use `--backend=cdp --create` for an isolated Chrome that the daemon owns. Use `--backend=cdp --attach=<port|url>` to bind to a browser someone else owns — a local port, or a `ws://`/`wss://`/`http://` endpoint for an anti-detect, fingerprint or cloud profile; ending the session never closes it. Each attached session carries its own endpoint, so one daemon can drive many external browsers at once.
 
+### Adopting the page the user is looking at
+
+When the user asks you to help with the page they currently have focused in
+Chrome ("help me with this page", "fill this form out for me"), do NOT open
+it in a new tab. Adopt their active tab into the session instead:
+
+```bash
+sid=$(browserwright session new --backend=extension --name=task-label)
+browserwright session attach-active --session=$sid
+browserwright -s "$sid" -e $'print(page.title())\nprint(page.url)'
+# ...operate the adopted page exactly like any other, then end the session
+browserwright session end --session=$sid
+```
+
+`attach-active` asks the extension to move Chrome's currently-focused-window
+active tab into the session's tab group and bind it as the session's page.
+After that, the adopted tab behaves exactly like a tab the agent opened
+itself: `page` is live on it, new pages join the same group, and `session
+end` closes it with the group. There is no borrowed/owned distinction — the
+adopted tab is a regular member.
+
+Failure mode: the daemon REFUSES if the focused tab already sits in any tab
+group other than this session's own — the user's own manual tab groups count
+as occupied, because a tab group is the isolation unit between sessions. Tell
+the user to drag the tab out of its group (or into this session's group) and
+retry; never try to steal a tab out of another group.
+
 For multi-line code, heredocs, JSON literals, or complex quoting, prefer a file
 or stdin over a dense one-liner:
 
@@ -74,12 +101,13 @@ directly over the local executor socket and are not written to persistent
 
 ## Driving The Browser: real Playwright
 
-Inside `browserwright -s <id> -e <code>` you write **synchronous Playwright**. Four names are injected for you, served by a **resident per-session executor** the daemon spawns on first browser use:
+Inside `browserwright -s <id> -e <code>` you write **synchronous Playwright**. Four names are injected for you, served by a **resident per-session executor** the daemon spawns on first browser use, plus two session primitives (`tabs`, `switch_tab`):
 
 - `page` — a Playwright `Page` **bound to the session's current tab**.
-- `context` — the Playwright `BrowserContext`. Use `context.new_page()` only when you genuinely need a second tab.
+- `context` — the Playwright `BrowserContext`. `context.new_page()` opens a real second tab in the session's browser (the session's tab group on extension), then `goto(url)` it. See *Working across several tabs* below.
 - `state` — a plain `dict` that **persists across calls** (see below).
 - `snapshot()` — observe the page (see below).
+- `tabs()` / `switch_tab(...)` — manage several open tabs (see below).
 
 ```bash
 browserwright -s "$sid" -e $'
@@ -90,10 +118,10 @@ print(snapshot())
 ```
 
 The connection is **lazy**: code that never touches `page` / `context` /
-`snapshot` / `state` / `reset` / `run_task` (for example, one that only calls
-`remember()`) opens no browser connection and spawns no executor. `run_task()`
-uses the resident executor because a task may drive its injected Playwright
-surface.
+`snapshot` / `state` / `reset` / `run_task` / `tabs` / `switch_tab` (for
+example, one that only calls `remember()`) opens no browser connection and
+spawns no executor. `run_task()` uses the resident executor because a task may
+drive its injected Playwright surface.
 
 ### Navigation: `page.goto()` has smart waiting
 
@@ -161,14 +189,55 @@ If the executor itself is wedged and cannot run `reset()`, use `browserwright se
 
 An outer executor request deadline follows the same fail-stop rule: Browserwright terminates that executor and waits for daemon confirmation before the command returns. The next command starts fresh on the same browser tabs. An ordinary Playwright action timeout that is caught and returned normally does **not** recycle the executor. After fail-stop, Python `finally` blocks are not guaranteed to run and webpage side effects are not rolled back.
 
-### Tab discipline (read this)
+### Tabs are workstreams, not steps
 
-The tab-explosion failure mode is opening a new tab for every step. Do not do that.
+A session's browser can hold several tabs at once. **Whether to open a second
+tab is a judgment call about the work, not a discipline violation** — but
+every tab is a real, user-visible tab (on extension it lands in the session's
+tab group), so open one for work you will *return to*, not for each step.
 
-- **Reuse + navigate in place.** `page` is your working tab. Move it with `page.goto(url)`. Across separate calls `page` resolves to the same tab — you are continuing the same session, not starting over.
-- **Only `context.new_page()` when you truly need another tab** (e.g. comparing two pages side by side). Each one is a real tab the user will see; don't spawn them casually.
+- **Keep a tab for a page you will come back to.** A form you are filling, a
+  page you are comparing against, a preview you will re-check. A tab keeps
+  that page's state — scroll, form input, JS state — intact.
+- **Navigate in place (`page.goto`) when you are passing through.** If you
+  will not return to the page, don't leave a tab behind.
+- **The failure mode is per-step tabs**, e.g. one new tab per search result
+  you glance at — not the act of opening a tab itself.
 - **Never close the browser or context.** Do NOT call `browser.close()`, `context.close()`, or `page.close()` — those would close the user's real tabs. Browserwright tears down short-lived client transports for you; the tabs stay open.
 - **observe → act → observe.** `snapshot()` to see what is actionable, act through a ref locator, then `snapshot()` again to confirm the result before the next action.
+
+### Working across several tabs: `tabs()` + `switch_tab()`
+
+Open a second tab with Playwright's `context.new_page()` + `page.goto(url)`
+(the real Playwright API — `new_page()` takes no URL), then move the
+session's *current tab* — the one `page` is bound to — with `switch_tab()`.
+`tabs()` lists what is open; `switch_tab` takes a URL substring or a `Page`
+object, and the injected `page` follows it **in the same call and across
+calls**. The browser never steals the user's focus; the tab you switch to is
+made current, not foregrounded.
+
+```bash
+browserwright -s "$sid" -e $'
+page.goto("https://app.example.com/signup")
+print(snapshot())                                  # start the form
+page.locator("aria-ref=e3").fill("alice@example.com")
+preview = context.new_page()
+preview.goto("https://app.example.com/preview")
+switch_tab("app.example.com/signup")              # back to the form
+page.locator("aria-ref=e5").fill("sk-...")        # still filled in
+switch_tab("app.example.com/preview")             # check the preview
+print(snapshot())
+'
+```
+
+- `tabs()` returns `[{targetId, url, title, current}]` — only the session's
+  own tabs (the tab group on extension, the browser instance on cdp).
+- `switch_tab("substring")` matches URLs case-insensitively and must be
+  unique; on ambiguity or no match it errors and lists the open tabs.
+- `switch_tab(page_obj)` accepts a live `Page` from `context.pages()` /
+  `context.new_page()` — useful when two tabs share the same URL.
+- Every tab stays alive between calls; the executor keeps the same live
+  browser context, so `context.pages()` and `tabs()` agree across calls.
 
 ### Two views: `snapshot()` to act, `read_markdown()` to read
 
@@ -293,6 +362,10 @@ These run without driving the browser:
 - `http_get(url, ...)` — fetch a URL directly (escape hatch, no tab).
 - `remember(...)`, `remember_global(...)`, `remember_preference(...)`, `memory_read(...)` — site / global memory.
 - `list_site_skills(...)`, `load_site_skill(...)`, `run_task(...)`, `bootstrap_site(...)` — the task / site-skill layer.
+
+The tab-management pair `tabs()` / `switch_tab()` also lives on this surface
+(see *Working across several tabs*) — they manage the session's tabs but
+ever navigate the current page.
 
 ## Site Memory
 

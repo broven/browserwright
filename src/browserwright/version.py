@@ -10,7 +10,12 @@ from pathlib import Path
 
 
 PACKAGE_NAME = "browserwright"
-EXTENSION_PROTOCOL_VERSION = "1"
+# Bumped to "2" by ADR-0009: the group binding moved from per-tab ownership
+# markers to the group title, so `queryGroup` no longer carries
+# `ownedSessionId` and `attachActive` / `createTab` / `queryGroup` no longer
+# take `groupId` / `sessionId`. A version-1 extension cannot answer the new
+# shape, and the drift check reloads it.
+EXTENSION_PROTOCOL_VERSION = "2"
 _SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"

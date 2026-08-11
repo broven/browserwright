@@ -87,11 +87,7 @@ class _MockExtension:
             tab = self._next_created_tab
             self._next_created_tab += 1
             url = msg.get("url", "about:blank")
-            group_id = msg.get("groupId")
-            if not isinstance(group_id, int) or group_id < 0:
-                group_id = 700 if msg.get("groupName") else -1
-            if group_id >= 0 and msg.get("groupName"):
-                self.group_titles[group_id] = str(msg["groupName"])
+            group_id = self._group_for_title(msg.get("groupName"), create=True)
             self.tabs_meta[tab] = {
                 "url": url, "title": "new", "groupId": group_id}
             # The extension announces the attach (the relay turns it into a
@@ -104,7 +100,7 @@ class _MockExtension:
                                          "title": "new", "groupId": group_id})
             return
         if kind == "queryGroup":
-            gid = msg.get("groupId")
+            gid = self._group_for_title(msg.get("groupName"), create=False)
             tabs = []
             if isinstance(gid, int) and gid >= 0:
                 tabs = [
@@ -145,6 +141,23 @@ class _MockExtension:
         if kind == "ping":
             await self.ws.send(json.dumps({"type": "pong", "ts": msg.get("ts")}))
             return
+
+    def _group_for_title(self, title, *, create):
+        """Resolve a group by its title — the binding since ADR-0009.
+
+        Mirrors the real extension: a title match is the only way to find a
+        group, and `createTab` mints one under that title when none exists.
+        """
+        if not isinstance(title, str) or not title:
+            return -1
+        for gid, known in self.group_titles.items():
+            if known == title:
+                return gid
+        if not create:
+            return -1
+        gid = 700 + len(self.group_titles)
+        self.group_titles[gid] = title
+        return gid
 
     async def _respond(self, cmd_id, result: dict) -> None:
         assert self.ws is not None
@@ -314,10 +327,7 @@ async def test_set_discover_targets_acks_and_replays():
 
 async def test_session_bound_replay_only_announces_session_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={
-        "group_id": 44,
-        "current_target_id": "ext-tab-10",
-    })
+    reg.update(sid, runtime={"current_target_id": "ext-tab-10"})
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
@@ -325,7 +335,7 @@ async def test_session_bound_replay_only_announces_session_group(tmp_home):
     await relay.wait_ready(timeout=2.0)
     await ext.announce_attached(
         tab_id=10, url="https://mine/", group_id=44,
-        group_title="Research")
+        group_title=f"Research-BW{sid}")
     await ext.announce_attached(tab_id=11, url="https://other/", group_id=55)
     await asyncio.sleep(0.05)
     client = _FakeClient()
@@ -356,10 +366,7 @@ async def test_session_bound_replay_only_announces_session_group(tmp_home):
 
 async def test_session_bound_browser_methods_reject_foreign_targets(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={
-        "group_id": 44,
-        "current_target_id": "ext-tab-10",
-    })
+    reg.update(sid, runtime={"current_target_id": "ext-tab-10"})
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
@@ -367,10 +374,10 @@ async def test_session_bound_browser_methods_reject_foreign_targets(tmp_home):
     await relay.wait_ready(timeout=2.0)
     await ext.announce_attached(
         tab_id=10, url="https://mine/", group_id=44,
-        group_title="Research")
+        group_title=f"Research-BW{sid}")
     await ext.announce_attached(
         tab_id=11, url="https://secret/", group_id=55,
-        group_title="Other")
+        group_title=f"Other-BW{sid}")
     await asyncio.sleep(0.05)
     client = _FakeClient()
     bridge = ExtensionFacadeBridge(client=client, relay=relay, session_id=sid)
@@ -418,7 +425,11 @@ async def test_session_bound_browser_methods_reject_foreign_targets(tmp_home):
         await relay.stop()
 
 
-async def test_session_scope_is_enforced_without_transport():
+async def test_session_scope_is_enforced_without_transport(monkeypatch):
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda sid: {"id": sid, "name": sid.rsplit("-", 1)[-1], "runtime": {}})
+
     class _Relay:
         port = 19989
         connection_generation = 1
@@ -437,9 +448,11 @@ async def test_session_scope_is_enforced_without_transport():
                     url="https://secret/", title="Secret"),
             ]
 
-        async def query_group_tabs(self, *, group_id, timeout=10.0):
-            members = {44: [10], 55: [11]}.get(group_id, [])
-            return {"groupId": group_id, "tabs": [
+        async def query_group_tabs(self, group_name=None, *, timeout=10.0):
+            # Title-keyed, like the extension since ADR-0009.
+            groups = {"A-BWsession-A": (44, [10]), "B-BWsession-B": (55, [11])}
+            gid, members = groups.get(group_name, (-1, []))
+            return {"groupId": gid, "groupTitle": group_name or "", "tabs": [
                 {"tabId": tab_id} for tab_id in members
             ]}
 
@@ -530,10 +543,7 @@ async def test_create_target_opens_background_tab():
 
 async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
     sid = reg.allocate(backend="extension", owner="create", name="Research")
-    reg.update(sid, runtime={
-        "group_id": 44,
-        "current_target_id": "ext-tab-10",
-    })
+    reg.update(sid, runtime={"current_target_id": "ext-tab-10"})
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
@@ -541,7 +551,7 @@ async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
     await relay.wait_ready(timeout=2.0)
     await ext.announce_attached(
         tab_id=10, url="https://existing/", group_id=44,
-        group_title="Research")
+        group_title=f"Research-BW{sid}")
     client = _FakeClient()
     async def _noop_frame(_text):
         return None
@@ -561,7 +571,7 @@ async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
         tid = res["result"]["targetId"]
         tab_id = int(tid.rsplit("-", 1)[1])
         assert ext.tabs_meta[tab_id]["groupId"] == 44
-        assert (reg.get(sid).get("runtime") or {})["group_id"] == 44
+        assert "group_id" not in (reg.get(sid).get("runtime") or {})
     finally:
         client.eof()
         with contextlib_suppress():
@@ -570,7 +580,10 @@ async def test_session_bound_create_target_uses_and_persists_group(tmp_home):
         await relay.stop()
 
 
-async def test_session_scoped_create_target_joins_session_group():
+async def test_session_scoped_create_target_joins_session_group(monkeypatch):
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda sid: {"id": sid, "name": "Scoped Session", "runtime": {}})
     relay = RelayServer(port=0)
     port = await relay.start()
     ext = _MockExtension()
@@ -593,7 +606,7 @@ async def test_session_scoped_create_target_joins_session_group():
 
         assert ext.create_tab_messages
         created = ext.create_tab_messages[-1]
-        assert created["groupName"] == "Scoped Session"
+        assert created["groupName"] == "Scoped Session-BWbw-s"
         assert "groupId" not in created
         assert bridge._ext._groups["bw-s"] == 700  # noqa: SLF001
     finally:
@@ -634,64 +647,18 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
         res = await client.wait_for(lambda f: f.get("id") == 3 and "result" in f)
         tid = res["result"]["targetId"]
         tab_id = int(tid.rsplit("-", 1)[1])
-        assert ext.tabs_meta[tab_id]["groupId"] == 88
-        assert binding_owner.group_for_session(sid) == 88
-        assert (reg.get(sid).get("runtime") or {})["group_id"] == 88
+        # The facade joins the group carrying this session's derived title and
+        # refreshes the live binding to whatever id currently holds it.
+        gid = ext.tabs_meta[tab_id]["groupId"]
+        assert ext.group_titles[gid] == f"Research-BW{sid}"
+        assert binding_owner.group_for_session(sid) == gid
+        assert "group_id" not in (reg.get(sid).get("runtime") or {})
     finally:
         client.eof()
         with contextlib_suppress():
             await asyncio.wait_for(run_task, timeout=2.0)
         await ext.close()
         await relay.stop()
-
-
-async def test_session_scoped_create_target_persists_group_id(monkeypatch):
-    updates: list[tuple[str, dict]] = []
-
-    class _Registry:
-        @staticmethod
-        def get(_session_id):
-            return {"runtime": {"current_target_id": "ext-tab-old"}}
-
-        @staticmethod
-        def update(session_id, **fields):
-            updates.append((session_id, fields))
-
-    import browserwright.session_registry as session_registry
-
-    monkeypatch.setattr(session_registry, "get", _Registry.get)
-    monkeypatch.setattr(session_registry, "update", _Registry.update)
-
-    async with _wired() as (relay, ext, client, bridge):
-        bridge = ExtensionFacadeBridge(
-            client=client, relay=relay,
-            session_id="bw-s", session_name="Scoped Session")
-        await bridge._handle_create_target(3, {"url": "https://scoped/"})  # noqa: SLF001
-
-    assert updates
-    sid, fields = updates[-1]
-    assert sid == "bw-s"
-    assert fields["runtime"]["current_target_id"] == "ext-tab-old"
-    assert fields["runtime"]["group_id"] == 700
-    assert isinstance(fields["runtime"]["updated_at"], float)
-
-
-async def test_session_scoped_create_target_does_not_trust_bare_group_id():
-    async with _wired() as (relay, ext, client, bridge):
-        bridge = ExtensionFacadeBridge(
-            client=client, relay=relay,
-            session_id="bw-s", session_name="Scoped Session",
-            session_group_id=42)
-        await bridge._handle_create_target(3, {"url": "https://scoped/"})  # noqa: SLF001
-
-        assert ext.create_tab_messages
-        created = ext.create_tab_messages[-1]
-        assert created["groupName"] == "Scoped Session"
-        assert "groupId" not in created
-        assert bridge._ext._groups["bw-s"] == 700  # noqa: SLF001
-
-
-# ---- A4: Runtime.enable barrier --------------------------------------------
 
 
 async def test_runtime_enable_forwarded_and_acked():

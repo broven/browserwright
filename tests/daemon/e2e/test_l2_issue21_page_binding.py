@@ -128,8 +128,11 @@ def test_page_binding_follows_switch_tab_across_close_of_old_tab(
 
         # ...and `page` must have followed the switch: it is C's page, NOT the
         # stale about:blank the old binding left behind.
+        # `page.title` may or may not carry the extension's "👀 " attach
+        # prefix depending on injection timing (pre-existing race, unrelated
+        # to the switch binding under test) — containment tolerates both.
         page_title = _grep(r.stdout, "PAGE_TITLE")
-        assert page_title == "C-target", (
+        assert "C-target" in page_title, (
             f"page did not follow switch_tab: page.title={page_title!r} "
             f"(url={_grep(r.stdout, 'PAGE_URL')!r})")
 
@@ -138,7 +141,7 @@ def test_page_binding_follows_switch_tab_across_close_of_old_tab(
                           runtime_dir=runtime_dir, timeout=60)
         assert r2.returncode == 0, (
             f"fresh-interpreter heredoc failed: {r2.stdout!r} {r2.stderr!r}")
-        assert _grep(r2.stdout, "PAGE_TITLE2") == "C-target", (
+        assert "C-target" in _grep(r2.stdout, "PAGE_TITLE2"), (
             f"stale binding survived a fresh interpreter: {r2.stdout!r}")
 
         # Terminal reset(): the next command cold-starts and re-resolves the
@@ -150,11 +153,11 @@ def test_page_binding_follows_switch_tab_across_close_of_old_tab(
                           runtime_dir=runtime_dir, timeout=90)
         assert r4.returncode == 0, (
             f"post-reset heredoc failed: {r4.stdout!r} {r4.stderr!r}")
-        assert _grep(r4.stdout, "PAGE_TITLE3") == "C-target", (
+        assert "C-target" in _grep(r4.stdout, "PAGE_TITLE3"), (
             f"reset() did not re-resolve page to the attached tab: "
             f"{r4.stdout!r}")
     finally:
-        gid = _session_group_id(sid)
+        gid = _session_group_id(e2e_chrome, extension_id, sid)
         if gid is not None:
             tab_ids = _chrome_group_tab_ids(e2e_chrome, extension_id, gid)
             _chrome_close_tabs(e2e_chrome, extension_id, tab_ids)

@@ -42,9 +42,10 @@ The unit of isolation, and the only durable identity. One code agent gets one
 session. The session id travels through the Layer 2 CLI, daemon IPC, the
 Playwright facade, and the ledger.
 
-**Trap:** a session's `--name` is a *human label*, not an identity key. Names
-need not be unique. The stable keys are the session id and (on extension) the
-numeric `group_id`.
+**Trap:** a session's `--name` is a *human label*, not an identity key — names
+need not be unique. The stable key is the session id. On extension the two are
+combined into the group title `<name>-BW<sid>`, and it is the `<sid>` half that
+makes it unique (see `binding`).
 
 ### workspace
 What a session's browser *is*, materially. Backend-specific:
@@ -89,7 +90,7 @@ A record has two tiers, and conflating them is the recurring bug:
 | tier | fields | authority |
 |---|---|---|
 | durable fact | `id` · `backend` · `owner` · `workspace` · `name` · `created_at` · `last_seen` | authoritative — the daemon obeys these |
-| runtime cache | `runtime.{current_target_id, group_id, owned_tab_ids, updated_at}` | a *candidate* — written best-effort, re-proven against the live browser |
+| runtime cache | `runtime.{current_target_id, updated_at}` | a *candidate* — written best-effort, re-proven against the live browser |
 
 Four jobs, all load-bearing:
 
@@ -109,10 +110,13 @@ Four jobs, all load-bearing:
   session alive forever). Auto-prune measures it, and removes a row only after
   that session's workspace teardown is confirmed.
 
-**Trap — `runtime` is a cache, not the record.** `runtime.group_id` is
-load-bearing durable state, not a cosmetic label: it is how the daemon finds
-the same tab group again after a restart. But it is a *candidate*, never proof
-— ownership is proven by the extension's per-tab markers (see `binding`).
+**Trap — `runtime` is a cache, and nothing in it is load-bearing.** Since
+ADR-0009 it holds only `current_target_id` and `updated_at`. The extension's
+group binding is *not* in here: `runtime.group_id` used to be, and the daemon
+used it to find the tab group again after a restart — that job now belongs to
+the group title (see `binding`), which needs no durable mirror. Don't add one
+back; a cached id that can disagree with the live browser is the shape of bug
+this removed.
 
 **Trap — readers bypass the lock.** Reads are unlocked for speed (which is why
 writes are atomic: a reader sees the old ledger or the new one, never half of
@@ -250,19 +254,31 @@ The link from a session to its live browser handle: the numeric `group_id` on
 `extension`, the attached target on `cdp`. Live binding lives in
 process; the ledger holds the durable copy used to recover after a restart.
 
-**Extension anchor (issue #29):** ownership is *derived*, not asserted. The
-extension stamps every tab it places in a session group with a per-tab marker
-(`chrome.storage.session`, keyed by tabId, value = owning sessionId); a group
-is proven to be the session's iff a member tab carries that session's marker.
-Chrome wipes `chrome.storage.session` on browser restart, so no stale marker
-can ever attach to a recycled tab id — and therefore **a browser restart makes
-ownership unprovable**: the ledger `group_id` is a *candidate*, never proof.
-Unproven groups are never adopted (no opening, recovery, teardown, or
-enumeration against them); `attachActiveTab` is the explicit re-adoption
-escape and falls back to a fresh group. The title is a human label, never an
-anchor. Extensions too old to report marker evidence degrade to the old
-title+membership heuristic with both failure directions still open — only an
-extension update closes them.
+**Extension anchor (ADR-0009):** the group **title** is the binding, and the
+only one. It is `<name>-BW<sid>` — the session's `--name`, then a visible `-BW`
+token, then the session id. The extension writes it when it creates the group
+and finds the group again by comparing titles exactly; the numeric groupId is
+Chrome's handle, useful within one browser session and never an identity.
+
+Three properties do the work, and each is load-bearing:
+
+- **Ours, and it survives.** We write the title; Chrome restores it with the
+  group. That makes it the only anchor that is both. A browser restart is the
+  only situation in which a stale group can still exist — Chrome recycles
+  groupIds across one, and the per-tab markers this replaced lived in
+  `chrome.storage.session`, which Chrome wipes on one by design.
+- **`-BW` is a namespace, not decoration.** It is what makes a title match
+  structurally unable to land on a group the *user* created. That is the
+  failure direction #29 existed to prevent, and here it is closed by
+  construction rather than by probability.
+- **`sid` makes it unique without entropy.** The ledger's `next_id` is
+  monotonic and never reused, so two sessions cannot collide.
+
+**Trap — the assumption is that titles don't change.** A user who renames the
+group takes it out of the session by that act: we no longer find it, treat it
+as gone, and neither warn nor retry. That is accepted, not overlooked — it buys
+exactly one lookup path. #29 was itself forced by two heuristics disagreeing,
+and a second anchor would be that trap a third time.
 
 ### ghost target
 A synthesized CDP `targetInfo` for an extension tab. The extension backend has
