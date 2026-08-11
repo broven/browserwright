@@ -20,10 +20,11 @@
 // for what is "in" the session; a tab dragged out of the group leaves the
 // session (we detach it and emit `detached`).
 //
-// Ownership of a group (issue #29) is proven by per-tab markers we write when
-// placing a tab in a session group (`ownedTabs`, persisted in
-// chrome.storage.session — see the ownership-markers section below); the
-// daemon never adopts a group whose members carry no marker for the session.
+// A group belongs to a session iff its TITLE is that session's `<name>-BW<sid>`
+// (ADR-0009). We write that title when we create the group and Chrome restores
+// it with the group, which makes it the one anchor that is both ours and
+// survives a browser restart. The numeric groupId is Chrome's handle, never the
+// identity.
 //
 //   us → daemon:
 //     {"type":"hello","installId":"...","browser":"chrome","version":"..."}
@@ -50,7 +51,7 @@
 //   they exist only to resume Chromium-paused OOPIF/worker targets.
 
 const RELAY_URL = "ws://127.0.0.1:19989/";
-const BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION = "1";
+const BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION = "2";  // ADR-0009: title binding
 const PROTOCOL_VERSION = "1.3";  // chrome.debugger.attach signature
 const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000, 10000];
 
@@ -489,15 +490,15 @@ async function handleDaemonMessage(msg) {
     case "command":
       return await doCommand(id, msg.tabId, msg.method, msg.params || {});
     case "attachActive":
-      return await doAttachActive(id, msg.groupId, msg.groupName, msg.sessionId);
+      return await doAttachActive(id, msg.groupName);
     case "createTab":
       return await doCreateTab(
-        id, msg.url, msg.groupName, msg.groupId, msg.background,
-        msg.skipPostAttachCommands, msg.sessionId);
+        id, msg.url, msg.groupName, msg.background,
+        msg.skipPostAttachCommands);
     case "closeTab":
       return await doCloseTab(id, msg.tabId);
     case "queryGroup":
-      return await doQueryGroup(id, msg.groupName, msg.groupId);
+      return await doQueryGroup(id, msg.groupName);
     case "userscript.install":
       return await doUserscriptInstall(id, msg.script);
     case "userscript.list":
@@ -737,7 +738,7 @@ async function doAttach(id, tabId) {
   }
 }
 
-async function doAttachActive(id, groupId, groupName, sessionId) {
+async function doAttachActive(id, groupName) {
   // Adopt the user's focused-window active tab INTO this session's tab group
   // (docs C1: adopt, not borrow). The tab becomes a regular group member and
   // closes with the group on endSession like any other member — there is no
@@ -761,7 +762,7 @@ async function doAttachActive(id, groupId, groupName, sessionId) {
     }
     // Resolve this session's destination group (existing groupId if still
     // live, else create a fresh one on the tab).
-    const ourGroupId = await _resolveSessionGroup(groupId, groupName);
+    const ourGroupId = await _resolveSessionGroup(groupName);
     const tabGroup = typeof tab.groupId === "number" ? tab.groupId : -1;
     const inAGroup = tabGroup >= 0;  // -1 == chrome.tabGroups.TAB_GROUP_ID_NONE
     if (inAGroup && tabGroup !== ourGroupId) {
@@ -782,7 +783,6 @@ async function doAttachActive(id, groupId, groupName, sessionId) {
     // it with the session name for human-readable Chrome UI.
     const finalGroupId = await _ensureTabInGroup(
       tab.id, groupName, ourGroupId, tab.windowId);
-    markTabOwned(tab.id, sessionId, finalGroupId);
     const attached = await attachTab(tab.id, { skipIfAttached: true });
     safeSend({
       type: "response",
@@ -804,25 +804,34 @@ async function doAttachActive(id, groupId, groupName, sessionId) {
   }
 }
 
-async function _resolveSessionGroup(groupId, groupName) {
+async function _resolveSessionGroup(groupName) {
   // Return the live groupId for this session, or -1 if none exists yet.
-  // Primary key = the numeric groupId the daemon remembers; if that group
-  // still exists, use it. Do not query by groupName because titles are
-  // user-editable and not unique. Never creates a group here.
-  if (typeof groupId === "number" && groupId >= 0) {
-    try {
-      await chrome.tabGroups.get(groupId);
-      return groupId;  // still live
-    } catch (_e) {
-      // groupId went invalid (empty group auto-deleted, etc.).
+  //
+  // ADR-0009: the group TITLE is the session's only binding (`<name>-BW<sid>`).
+  // We write it at group creation and Chrome restores it along with the group,
+  // which makes it the one anchor that is both ours and survives a browser
+  // restart. The numeric groupId is Chrome's handle — recycled across restarts
+  // and dropped the moment the group goes empty — so it is never the identity.
+  // Never creates a group here.
+  //
+  // Enumerate and compare exactly rather than `chrome.tabGroups.query({title})`:
+  // that field is documented as "Match group titles against a pattern" with an
+  // unpublished pattern syntax, so a session name containing `*` or `?` would
+  // silently change what matches.
+  if (typeof groupName !== "string" || !groupName) return -1;
+  try {
+    const groups = await chrome.tabGroups.query({});
+    for (const g of Array.isArray(groups) ? groups : []) {
+      if (g && g.title === groupName) return g.id;
     }
+  } catch (_e) {
+    // No tabGroups access, or a transient failure — same answer as "no group".
   }
   return -1;
 }
 
 async function doCreateTab(
-  id, url, groupName, sessionGroupId, background, skipPostAttachCommands,
-  sessionId) {
+  id, url, groupName, background, skipPostAttachCommands) {
   try {
     if (typeof url !== "string" || !url) {
       throw new Error("createTab requires a url");
@@ -833,15 +842,12 @@ async function doCreateTab(
     const active = background === false;
     const tab = await chrome.tabs.create({ url, active });
     let groupId = -1;
-    // Bind the tab to the session's group. Prefer the daemon-remembered
-    // numeric groupId; create a fresh group named with the session name when
-    // no live id is available.
-    if ((typeof sessionGroupId === "number" && sessionGroupId >= 0) ||
-        (typeof groupName === "string" && groupName)) {
-      const resolved = await _resolveSessionGroup(sessionGroupId, groupName);
+    // Bind the tab to the session's group: join the one whose title is this
+    // session's, or create it under that title when none exists yet (ADR-0009).
+    if (typeof groupName === "string" && groupName) {
+      const resolved = await _resolveSessionGroup(groupName);
       groupId = await _ensureTabInGroup(
         tab.id, groupName, resolved, tab.windowId);
-      markTabOwned(tab.id, sessionId, groupId);
     }
     const attached = await attachTab(tab.id);
     let title = tab.title || "";
@@ -916,7 +922,6 @@ async function doCloseTab(id, tabId) {
     invalidateMarkerInstall(tabId);
     markedTabs.delete(tabId);
     attachedTabs.delete(tabId);
-    unmarkTabOwned(tabId);
     safeSend({ type: "response", id, result: { ok: true, tabId } });
   } catch (e) {
     const msg = String(e?.message || e || "").toLowerCase();
@@ -926,8 +931,7 @@ async function doCloseTab(id, tabId) {
       invalidateMarkerInstall(tabId);
       markedTabs.delete(tabId);
       attachedTabs.delete(tabId);
-      unmarkTabOwned(tabId);
-      safeSend({ type: "response", id, result: { ok: true, tabId } });
+        safeSend({ type: "response", id, result: { ok: true, tabId } });
       return;
     }
     safeSend({
@@ -1011,14 +1015,14 @@ async function armAutoAttach(tabId, epoch) {
   }
 }
 
-async function doQueryGroup(id, groupName, sessionGroupId) {
+async function doQueryGroup(id, groupName) {
   // Live group membership = the single source of truth for "what's in this
   // session's browser" (docs invariant 2). The daemon asks for the tabs of
-  // the session's group; we resolve only by the durable numeric groupId.
+  // the session's group; we resolve it by TITLE (ADR-0009).
   // Returns groupId -1 / [] when no group matches — the session's browser
   // currently has no tabs.
   try {
-    const groupId = await _resolveSessionGroup(sessionGroupId, groupName);
+    const groupId = await _resolveSessionGroup(groupName);
     if (groupId < 0) {
       safeSend({ type: "response", id, result: { groupId: -1, tabs: [] } });
       return;
@@ -1048,10 +1052,6 @@ async function doQueryGroup(id, groupName, sessionGroupId) {
       title: stripMarker(tab.title),
       active: !!tab.active,
       lastAccessed: tab.lastAccessed || 0,
-      // Issue #29: per-tab ownership evidence. The field is ALWAYS present
-      // (null when unmarked) so the daemon can distinguish "new extension,
-      // group unproven" from "legacy extension, no marker support".
-      ownedSessionId: ownedSessionIdFor(tab.id),
     }));
     // Most-recently-accessed first so the daemon can pick a representative tab.
     out.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
@@ -1619,73 +1619,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 });
 
-// ---- ownership markers: per-tab session ownership (issue #29) ------------
-//
-// The durable anchor for "which tab group belongs to which session" is NOT
-// the group title (user-editable, non-unique) or the numeric groupId (only
-// unique within one browser session — recycled after a restart). It is this
-// per-tab marker: tabId -> {s: owning sessionId, g: owning groupId}, written
-// when we place a tab in a session group and persisted in
-// chrome.storage.session. That storage area survives service-worker and
-// daemon restarts, and Chrome wipes it on browser restart — which is exactly
-// what we want: no stale marker can ever attach to a recycled tab id.
-// The daemon proves ownership by asking queryGroup which members carry its
-// session's marker; group membership (chrome.tabs.query({groupId})) stays
-// the single source of truth for what is "in" the session.
-const BD_OWNED_KEY = "bdOwnedTabs";
-// tabId -> {s: sessionId, g: groupId}
-const ownedTabs = new Map();
-// Serialized writes: chrome.storage.session calls must not interleave.
-let ownedPersistChain = Promise.resolve();
-
-async function persistOwnedTabs() {
-  const snapshot = {};
-  for (const [tabId, marker] of ownedTabs) {
-    snapshot[String(tabId)] = marker;
-  }
-  const write = chrome.storage.session.set({ [BD_OWNED_KEY]: snapshot })
-    .catch((e) => console.warn("[bd-relay] ownedTabs persist failed:", e));
-  ownedPersistChain = ownedPersistChain.then(() => write);
-  return ownedPersistChain;
-}
-
-async function loadOwnedTabs() {
-  try {
-    const v = await chrome.storage.session.get([BD_OWNED_KEY]);
-    const stored = v[BD_OWNED_KEY] || {};
-    for (const [tabId, marker] of Object.entries(stored)) {
-      if (marker && typeof marker.s === "string" && marker.s
-          && typeof marker.g === "number" && marker.g >= 0) {
-        ownedTabs.set(Number(tabId), { s: marker.s, g: marker.g });
-      }
-    }
-  } catch (e) {
-    console.warn("[bd-relay] ownedTabs load failed:", e);
-  }
-}
-
-// Ownership is a FACT about the tab's placement, separate from the cosmetic
-// title marker. Write-through is best-effort (fire-and-forget chain): a lost
-// marker fails SAFE (the daemon reports ownership unproven), never unsafe.
-function markTabOwned(tabId, sessionId, groupId) {
-  if (typeof tabId !== "number" || typeof sessionId !== "string" || !sessionId
-      || typeof groupId !== "number" || groupId < 0) {
-    return;
-  }
-  ownedTabs.set(tabId, { s: sessionId, g: groupId });
-  persistOwnedTabs();
-}
-
-function unmarkTabOwned(tabId) {
-  if (!ownedTabs.delete(tabId)) return;
-  persistOwnedTabs();
-}
-
-function ownedSessionIdFor(tabId) {
-  const marker = ownedTabs.get(tabId);
-  return marker ? marker.s : null;
-}
-
 // ---- group-membership = session membership --------------------------------
 //
 // docs invariant 3: entering/leaving the session's tab group == entering/
@@ -1718,7 +1651,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   // session's group it should still be in here, but an attached agent tab
   // that the user pulls out of its group is, by the locked model, leaving the
   // session — detach it. (Re-adopting requires an explicit attach_active.)
-  unmarkTabOwned(tabId);  // it left its session's group — ownership ends
   _detachAttachedTab(tabId, "dragged_out_of_group").catch((e) =>
     console.warn("[bd-relay] drag-out detach failed:", e));
 });
@@ -1736,7 +1668,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   invalidateMarkerInstall(tabId);
   attachedTabs.delete(tabId);
   markedTabs.delete(tabId);
-  unmarkTabOwned(tabId);
   safeSend({ type: "detached", tabId, reason: "tab_closed" });
 });
 
@@ -1864,8 +1795,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 usSyncAll().catch((e) => console.warn("[bd-relay] usSyncAll on init failed:", e));
-loadOwnedTabs().catch((e) =>
-  console.warn("[bd-relay] ownedTabs load on init failed:", e));
 connect();
 maintainLoop();
 pingLoop();

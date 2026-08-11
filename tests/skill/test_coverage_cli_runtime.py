@@ -231,7 +231,7 @@ def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys)
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["version"] == payload["extension_version"]
-    assert payload["extension_protocol_version"] == "1"
+    assert payload["extension_protocol_version"] == "2"
     assert payload["daemon_version"] == "9.9.9"
     assert payload["running_extensions"][0]["version_drift"] == "patch"
 
@@ -947,11 +947,11 @@ def test_cmd_session_reset_reports_unconfirmed_reap(
     assert reg.get(sid) is not None
 
 
-def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch):
+def test_session_create_end_extension_passes_no_group_id(tmp_bs_home, monkeypatch):
     from browserwright import session_create, session_registry as reg
 
     sid = reg.allocate(backend="extension", owner="attach", name="shared")
-    reg.update(sid, runtime={"group_id": 12})
+    reg.update(sid, runtime={"current_target_id": "ext-tab-7"})
     calls = []
     monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
 
@@ -959,15 +959,11 @@ def test_session_create_end_extension_threads_group_id(tmp_bs_home, monkeypatch)
 
     # The daemon's one terminal lifecycle closes the extension group, reaps the
     # executor, and revokes clients while leaving the browser itself running.
+    # ADR-0009: no group id is threaded through — the daemon derives the group's
+    # title from the ledger, so Layer 2 has nothing to pass and cannot pass a
+    # stale one.
     assert calls == [
-        [
-            "browserwright-daemon",
-            "end-session",
-            "--session",
-            sid,
-            "--group-id",
-            "12",
-        ],
+        ["browserwright-daemon", "end-session", "--session", sid],
     ]
     assert "still running" in message
     assert reg.get(sid) is None

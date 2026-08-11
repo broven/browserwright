@@ -219,7 +219,7 @@ async def test_relay_commands_refuse_immediately_when_no_extension_is_connected(
             # no-op, and a membership query degrades to "can't tell" (None) so
             # the caller can fall back.
             assert await relay.detach_tab(1) is None
-            assert await relay.query_group_tabs(group_id=1) is None
+            assert await relay.query_group_tabs(group_name="g") is None
 
 
 @pytest.mark.asyncio

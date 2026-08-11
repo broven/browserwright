@@ -142,7 +142,7 @@ def _ensure_daemon_running() -> None:
 #: the issue #32 initiate-then-join contract: initiate is fast, the join
 #: covers the daemon-side teardown worst case, and progress is printed while
 #: waiting. Must be >= the CLI's own total wait budget.
-_END_SESSION_CLI_TIMEOUT = 120.0
+_END_SESSION_CLI_TIMEOUT = 80.0
 
 
 def _end_daemon_session(record: dict) -> bool:
@@ -157,11 +157,6 @@ def _end_daemon_session(record: dict) -> bool:
     if not sid:
         return True
     cmd = ["browserwright-daemon", "end-session", "--session", str(sid)]
-    if record.get("backend") == "extension":
-        runtime = record.get("runtime") or {}
-        gid = runtime.get("group_id")
-        if isinstance(gid, int) and gid >= 0:
-            cmd += ["--group-id", str(gid)]
     return _run(cmd, timeout=_END_SESSION_CLI_TIMEOUT) == 0
 
 

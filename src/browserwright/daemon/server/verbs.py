@@ -17,11 +17,17 @@ from functools import partial
 from typing import Any, Awaitable, Callable, Protocol
 
 from ... import session_registry
+from .extension_upstream import session_group_title
 from .state import ClientState, UpstreamPhase
 
 logger = logging.getLogger(__name__)
 
-_END_SESSION_BUDGET_S = 8.0
+#: Workspace teardown's own budget. 60s (ADR-0009): the tab-close path can sit
+#: behind an extension reconnect, and the callers above it are sized to strictly
+#: exceed this (daemon CLI 70s, Layer 2 80s) so nobody times out mid-teardown —
+#: the original #32 symptom. Note this deadline is computed BEFORE the executor
+#: reap, which can spend ~4s of it.
+_END_SESSION_BUDGET_S = 60.0
 
 
 def _teardown_budget_result(backend: str) -> dict:
@@ -95,14 +101,15 @@ class SessionVerbsMixin:
     methods. Never instantiated on its own.
     """
 
-    def _session_group_name(
-        self, client: ClientState, session_id: str,
-        explicit: str | None = None,
-    ) -> str:
-        """Extension-only human-visible tab group title for a session."""
-        if explicit:
-            return explicit
-        return client.session_name or session_id
+    def _session_group_name(self, session_id: str) -> str | None:
+        """The tab group title that IS this session's binding (ADR-0009).
+
+        Derived from the ledger, never from a client param: a caller-supplied
+        title would let two callers disagree about a session's identity, which
+        is the failure #29 existed to stop and the reason `openBackgroundTab`
+        no longer honours `params.groupName`.
+        """
+        return session_group_title(session_id)
 
     def _request_session_param(self, params: dict) -> str | None:
         session = params.get("bsSession") or params.get("session")
@@ -323,7 +330,7 @@ class SessionVerbsMixin:
             client, req_id, "attach active failed",
             lambda upstream: upstream.attach_active(
                 session_id=session_id,
-                group_name=self._session_group_name(client, session_id)),
+                group_name=self._session_group_name(session_id)),
             error_code=-32000)
         if info is None:
             return
@@ -391,7 +398,7 @@ class SessionVerbsMixin:
         # Extension-only: the tab-group title comes from the session label in
         # the ledger unless explicitly overridden. The durable identity is the
         # numeric groupId returned by the extension path, not this title.
-        group_name = self._session_group_name(client, session, group_name)
+        group_name = self._session_group_name(session)
         # `background` (default True) protects the user's focus on the
         # extension backend; background=False opens the tab in the foreground.
         background = params.get("background")
@@ -424,13 +431,17 @@ class SessionVerbsMixin:
         commands route through the normal sessionId translation path (mirrors
         openBackgroundTab). The adapter decides whether recovery means durable
         group reconstruction or raw-CDP current-page rebinding."""
-        group_id = params.get("groupId")
-        if group_id is not None and (
-                not isinstance(group_id, int) or group_id < 0):
+        # ADR-0009: recovery finds the group by the session's title, so there
+        # is no id to pass. Reject a lingering `groupId` loudly rather than
+        # ignoring it — a client still sending one is working from a model of
+        # ownership that no longer exists, and silently succeeding would hide
+        # that from them.
+        if params.get("groupId") is not None:
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32602,
-                "BrowserwrightDaemon.recoverSession params.groupId must be "
-                "a non-negative integer"))
+                "BrowserwrightDaemon.recoverSession no longer takes "
+                "params.groupId: a session's tab group is found by its title "
+                "(ADR-0009). Drop the parameter."))
             return
         session_id = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.recoverSession", params)
@@ -440,7 +451,7 @@ class SessionVerbsMixin:
             client, req_id, "recoverSession failed",
             lambda upstream: upstream.recover(
                 session_id,
-                group_id=group_id if isinstance(group_id, int) else None),
+            ),
             value_error_code=-32602)
         if result is None:
             return
@@ -458,7 +469,7 @@ class SessionVerbsMixin:
 
         Issue #32 initiate contract: the response is sent after the bounded
         fast phase (clients revoked, executor reaped, phase=terminating); the
-        unbounded workspace teardown keeps running daemon-side under the
+        60s-bounded workspace teardown keeps running daemon-side under the
         session lock. A retried ``endSession`` (the CLI's poll) joins the
         in-flight teardown and returns the FINAL result, so the caller can
         never time out mid-teardown and never mistakes slow for hung.
@@ -482,8 +493,6 @@ class SessionVerbsMixin:
         daemon = self.daemon
         registry = getattr(daemon, "executors", None) if daemon is not None else None
 
-        group_id = params.get("groupId")
-        group_id = group_id if isinstance(group_id, int) and group_id >= 0 else None
         # Adapters stop cooperatively at this deadline, after committing every
         # confirmed mutation. The registry deliberately never hard-cancels the
         # callback between a browser write and its durable checkpoint.
@@ -559,7 +568,7 @@ class SessionVerbsMixin:
             # Declared on the protocol, so called directly — see the
             # target_belongs_to_session note below on why probing is wrong.
             return await upstream.end_session_before(
-                session, group_id, deadline=teardown_deadline)
+                session, deadline=teardown_deadline)
 
         daemon_terminate = getattr(daemon, "terminate_session", None)
         terminate = (
@@ -574,7 +583,7 @@ class SessionVerbsMixin:
                         budget=_END_SESSION_BUDGET_S,
                         # Issue #32: return at the initiate boundary. The
                         # bounded fast phase (revoke + reap) completed; the
-                        # unbounded workspace teardown continues daemon-side
+                        # bounded workspace teardown continues daemon-side
                         # and the caller polls/joins for the final result — a
                         # slow teardown can no longer outlive this RPC.
                         wait=False)
@@ -620,7 +629,7 @@ class SessionVerbsMixin:
                     return
             result = await self._invoke_upstream(
                 client, req_id, "endSession failed",
-                lambda upstream: upstream.end_session(session, group_id))
+                lambda upstream: upstream.end_session(session))
             if result is None:
                 return
         await self._send_to_client(client.client_id, _result_response(req_id, result))

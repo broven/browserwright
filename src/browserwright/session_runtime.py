@@ -80,10 +80,10 @@ def persist_target(target_id: Optional[str], *, group_id: Optional[int] = None,
             existing = (rec.get("runtime") or {}).get("group_id")
             if isinstance(existing, int):
                 group_id = existing
+    # ADR-0009 dropped `group_id` and `owned_tab_ids` from this cache: the
+    # group is found by title, and nothing ever read `owned_tab_ids`.
     runtime = {
         "current_target_id": target_id,
-        "group_id": group_id,
-        "owned_tab_ids": [],
         "updated_at": time.time(),
     }
     try:

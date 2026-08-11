@@ -280,12 +280,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_es.add_argument("--session", required=True,
                       help="the browserwright session id whose tabs to clean up")
-    p_es.add_argument("--group-id", default=None, type=int,
-                      help="durable numeric tab-group id for session teardown: "
-                           "when the daemon lost this session's in-memory "
-                           "binding (reconnect / restart), close the tabs in "
-                           "this group instead (names aren't unique, so the id "
-                           "is the key)")
     # Output is always JSON (single-line discipline); no --json flag.
 
     # kill-executor (Phase B) — reap ONLY a session's resident executor, no
@@ -918,9 +912,9 @@ def _close_tab_params(a) -> dict:
 
 
 def _end_session_params(a) -> dict:
-    gid = getattr(a, "group_id", None)
-    return {"session": a.session,
-            **({"groupId": gid} if gid is not None else {})}
+    # ADR-0009: the daemon derives the session's tab-group title from the
+    # ledger, so teardown carries no group id.
+    return {"session": a.session}
 
 
 def _require_reaped(result: dict) -> None:
@@ -944,7 +938,7 @@ def _require_complete_end_session(result: dict) -> None:
 
 #: Issue #32 initiate-then-join contract. The initiate RPC only does the
 #: bounded fast phase (revoke + reap) and returns in well under a second; the
-#: unbounded workspace teardown continues daemon-side. The join RPC blocks
+#: 60s-bounded workspace teardown continues daemon-side. The join RPC blocks
 #: until the teardown finishes (or the daemon restarts and re-initiates), so
 #: its per-attempt timeout covers the whole daemon-side worst case.
 _END_SESSION_INITIATE_TIMEOUT = 10.0
@@ -953,7 +947,7 @@ _END_SESSION_JOIN_TIMEOUT = 20.0
 #: giving up. Generous on purpose: progress is printed while waiting, so a
 #: slow teardown is visible, and a teardown still running after this long is
 #: wedged regardless of backend.
-_END_SESSION_TOTAL_WAIT_S = 90.0
+_END_SESSION_TOTAL_WAIT_S = 70.0
 
 
 def _end_session_rpc(cfg: Config, params: dict, session: str,
@@ -970,7 +964,7 @@ def _cmd_end_session(args, cfg: Config) -> int:
     """P5 teardown under the issue #32 initiate-then-join contract.
 
     The first call initiates: the daemon revokes clients, reaps the executor,
-    publishes phase=terminating, and returns immediately while the unbounded
+    publishes phase=terminating, and returns immediately while the bounded
     workspace teardown keeps running daemon-side. This handler then re-issues
     `endSession` to JOIN the in-flight teardown, printing progress to stderr
     so a slow teardown is distinguishable from a hung daemon. Exit 0 only

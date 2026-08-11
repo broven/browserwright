@@ -330,7 +330,7 @@ def test_tab_rpc_handlers_cover_success_and_failures(monkeypatch, capsys):
     )
     assert calls[2][1] == {"bsSession": "bw-s", "sessionId": "S", "targetId": "T"}
     assert calls[4][1] == {"session": "sess"}
-    assert calls[5][1] == {"session": "sess", "groupId": 8}
+    assert calls[5][1] == {"session": "sess"}  # ADR-0009: no group id
     captured = capsys.readouterr()
     assert '"sessionId": "S"' in captured.out
     assert '"kept": ["T"]' in captured.out
@@ -410,7 +410,7 @@ def test_end_session_initiate_then_join_polls_to_the_final_result(
     assert _cmd("end-session")(_ns(session="bw-s", group_id=7), Config()) == 0
 
     assert len(calls) == 2
-    assert calls[0][1] == {"session": "bw-s", "groupId": 7}
+    assert calls[0][1] == {"session": "bw-s"}  # ADR-0009: no group id
     for _method, _params, kwargs in calls:
         assert kwargs["browser_session"] == "bw-s"
         assert kwargs["client_label"] == "cli-end-session"

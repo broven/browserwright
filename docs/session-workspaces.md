@@ -75,18 +75,19 @@ Hard invariants:
 - `runtime.group_id` in the session ledger is durable state, not a cosmetic
   label. It lets the daemon recover the same group after restart — as a
   *candidate*, never as proof.
-- In-process relay state is the fast path; ledger `runtime.group_id` is the
-  restart/reconnect fallback. A tab-creation path must refresh from these
-  sources before asking Chrome to create a new group.
-- Group ownership is **derived from the extension's per-tab markers** (issue
-  #29): the extension stamps every tab it places in a session group
-  (`chrome.storage.session`, keyed by tabId, value = owning sessionId), and a
-  group is adopted only if a member tab carries the session's marker. The
-  title is never an anchor (user-editable, non-unique); recycled group/tab ids
-  after a browser restart make ownership unprovable, and an unproven group is
-  never adopted — opening, recovery, and teardown fail explicitly, and
-  `attachActiveTab` is the re-adoption escape (fresh group). Extensions too
-  old to report markers degrade to the legacy title+membership heuristic.
+- A session's group is identified by its **title** — `<name>-BW<sid>`
+  (ADR-0009). We write it when the group is created and Chrome restores it
+  with the group, which makes it the one anchor that is both ours and survives
+  a browser restart. In-process relay state caches the numeric id Chrome
+  currently uses; a tab-creation path refreshes from that cache first, then
+  falls back to the title lookup.
+- There is no second anchor. The numeric groupId is Chrome's handle (recycled
+  across restarts, dropped when the group empties) and the ledger no longer
+  mirrors it. The visible `-BW` token is what makes a title match structurally
+  unable to land on a user-created group.
+- **Accepted assumption: titles do not change.** A user who renames the group
+  takes it out of the session by that act — we stop finding it and treat it as
+  gone, without warning or retry.
 
 The extension backend does not isolate cookies, localStorage, IndexedDB,
 extensions, downloads, or the Chrome profile. All extension sessions share the
@@ -217,9 +218,11 @@ Executor cleanup is separate from browser ownership and may run for any session.
 request/response verb: its worst case (serial tab closes over a cold extension
 reconnect window) outlives any caller's timeout, so the daemon returns at the
 **initiate boundary** — after the bounded fast phase (clients revoked,
-executor reaped and confirmed dead, phase `terminating`) — and the unbounded
-workspace teardown keeps running as a daemon-side task under the same
-per-session lock. The caller **joins** by re-issuing `endSession`, which
+executor reaped and confirmed dead, phase `terminating`) — and the workspace
+teardown keeps running as a daemon-side task under the same per-session lock,
+bounded at **60s** (ADR-0009). The callers above it are sized to strictly
+exceed that (daemon CLI 70s, Layer 2 80s) so none of them can time out while
+the teardown is still running — the original symptom this contract fixed. The caller **joins** by re-issuing `endSession`, which
 blocks until the teardown finishes and returns the final result; the CLI
 (`session end`) does initiate → progress-printed join → final result, and
 `browserwright-daemon ps` exposes the per-session phase so a slow teardown is

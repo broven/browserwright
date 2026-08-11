@@ -337,13 +337,11 @@ class RelayServer:
         return out
 
     async def query_group_tabs(self, group_name: str | None = None, *,
-                               group_id: int | None = None,
                                timeout: float = 15.0) -> dict | None:
         """Live membership query: ask the extension for the tabs of the
-        session's tab group. ``group_id`` is the durable primary key (the
-        numeric Chrome groupId); ``group_name`` is accepted for older callers
-        but is not a lookup key because titles are not unique. Returns
-        ``{"groupId":int,"tabs":
+        session's tab group. ``group_name`` is the session's group TITLE and is
+        the only lookup key (ADR-0009). Returns
+        ``{"groupId":int,"groupTitle":str,"tabs":
         [{tabId,url,title,active,lastAccessed}, ...]}`` — ``groupId == -1`` /
         empty tabs when no group matches (the session's browser has no tabs).
         Returns None when no extension is connected (caller falls back)."""
@@ -358,8 +356,6 @@ class RelayServer:
         body: dict = {"type": "queryGroup"}
         if group_name:
             body["groupName"] = group_name
-        if isinstance(group_id, int) and group_id >= 0:
-            body["groupId"] = group_id
         return await self._request(
             ext, body,
             timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
@@ -367,17 +363,14 @@ class RelayServer:
 
     async def attach_active_tab(self, *,
                                 group_name: str | None = None,
-                                group_id: int | None = None,
                                 expected_generation: int | None = None,
-                                timeout: float = 10.0,
-                                session_id: str | None = None) -> GhostTarget:
+                                timeout: float = 10.0) -> GhostTarget:
         """Daemon-driven adopt (docs C1): ask the extension to MOVE Chrome's
         currently-focused-window active tab into this session's tab group and
-        attach the debugger. ``group_id`` identifies the destination group;
-        ``group_name`` is only the title to apply if a new group is created.
-        The extension refuses (error) if the focused tab already belongs to ANY
-        tab group other than the session's own (manual user groups count as
-        occupied).
+        attach the debugger. ``group_name`` is the session's group title, which
+        both identifies the destination group and names it when one has to be
+        created (ADR-0009). The extension refuses (error) if the focused tab
+        already belongs to a DIFFERENT session's group.
 
         The adopted tab is a regular group member — it closes with the group on
         ``end_session`` (no separate borrowed/owned flag).
@@ -396,12 +389,6 @@ class RelayServer:
         body: dict = {"type": "attachActive"}
         if group_name:
             body["groupName"] = group_name
-        if isinstance(group_id, int) and group_id >= 0:
-            body["groupId"] = group_id
-        # Issue #29: the session id lets the extension stamp the adopted tab
-        # with its per-tab ownership marker (chrome.storage.session).
-        if session_id:
-            body["sessionId"] = session_id
         for i in range(ATTACH_RETRY_LIMIT):
             try:
                 result = await self._request(ext, body, timeout=timeout)
@@ -497,28 +484,23 @@ class RelayServer:
         url: str,
         *,
         group_name: str | None = "Agent",
-        group_id: int | None = None,
         background: bool = True,
         skip_post_attach_commands: bool = False,
         expected_generation: int | None = None,
         timeout: float = 10.0,
-        session_id: str | None = None,
     ) -> GhostTarget:
         """Spec Phase B Feature 1: open a tab in the background (active=false)
         in the session's tab group, attach ``chrome.debugger`` to it, and
         return a GhostTarget bound to the new tab. The user's currently-active
         tab keeps focus.
 
-        The session's group is identified by ``group_id`` (the durable numeric
-        Chrome groupId) when known; ``group_name`` (= session name) is only the
-        human-visible title to use when a new group must be created. The
-        extension resolves by id, or creates a new group when the id is absent
-        or invalid.
+        The session's group is identified by ``group_name`` — the session's
+        group title, which is its binding (ADR-0009). The extension joins the
+        group carrying that title, or creates one under it.
 
-        ``group_name=None`` and no ``group_id`` skips the grouping step; the
-        resulting GhostTarget carries the extension-reported ``group_id``
-        (which may be ``-1`` when no group was requested or grouping failed in
-        a recoverable way).
+        ``group_name=None`` skips the grouping step; the resulting GhostTarget
+        carries the extension-reported ``group_id`` (which may be ``-1`` when
+        no group was requested or grouping failed in a recoverable way).
         """
         deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
         ext = self._pick_active_extension()
@@ -530,13 +512,6 @@ class RelayServer:
         body: dict = {"type": "createTab", "url": url}
         if group_name:
             body["groupName"] = group_name
-        if isinstance(group_id, int) and group_id >= 0:
-            body["groupId"] = group_id
-        # Issue #29: the session id lets the extension stamp the new tab with
-        # its per-tab ownership marker (chrome.storage.session) — the durable
-        # anchor that replaces the title/groupId heuristic.
-        if session_id:
-            body["sessionId"] = session_id
         # background=False opens the tab in the foreground (active:true);
         # default True keeps the user's focus tab. Only sent when foreground
         # is requested so existing extensions default to background.

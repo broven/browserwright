@@ -1172,21 +1172,20 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
                         "failed": [], "kept": []}
             if rec.get("backend") == "extension":
                 runtime = rec.get("runtime") or {}
-                group_id = runtime.get("group_id")
-                group_id = (
-                    group_id
-                    if isinstance(group_id, int) and group_id >= 0
-                    else None
-                )
                 clean = {"ok": True, "backend": "extension", "closed": [],
                          "failed": [], "kept": []}
-                if group_id is None:
-                    # Nothing was ever bound in Chrome, so there is nothing to
+                if not runtime:
+                    # This session never touched Chrome, so there is nothing to
                     # tear down and the record is already clean. Saying so is
                     # what lets it be pruned at all — this path runs from the
                     # idle watchdog, which fires when nobody has touched the
                     # session, i.e. exactly when the lazily-opened adapter is
                     # cold.
+                    #
+                    # ADR-0009: an empty `runtime` is the signal, not a missing
+                    # `runtime.group_id`. That field is gone, and reading its
+                    # absence as "never bound" would now be true of every
+                    # session, pruning live ones.
                     return clean
                 holder = daemon.shared_context.holder
                 if holder.upstream is None:
@@ -1202,7 +1201,7 @@ async def _auto_prune_sessions(daemon: "Daemon", *, reason: str) -> list[dict]:
                 upstream = holder.upstream
                 if upstream is None:
                     raise RuntimeError("extension upstream unavailable")
-                return await upstream.end_session(sid, group_id)
+                return await upstream.end_session(sid)
             return {"ok": True, "backend": str(rec.get("backend") or "unknown"),
                     "closed": [], "failed": [], "kept": []}
 
@@ -1324,9 +1323,33 @@ async def _idle_watchdog(
         return
 
 
+#: How long shutdown waits for in-flight workspace teardowns. Must exceed the
+#: teardown budget (`verbs._END_SESSION_BUDGET_S`) by enough to let a teardown
+#: that started just before SIGTERM finish its last tab close.
+_SHUTDOWN_TEARDOWN_DRAIN_S = 65.0
+
+
 async def _graceful_shutdown(daemon: "Daemon") -> None:
-    """Called on SIGTERM. Run close etiquette on every context then close
-    the listener."""
+    """Called on SIGTERM. Drain in-flight teardowns, run close etiquette on
+    every context, then close the listener."""
+    # ADR-0009: teardown may be mid-flight for up to the full teardown budget,
+    # and `trigger_close` below pulls the relay out from under it — which can
+    # land between a tab close and its ledger checkpoint. Wait for those tasks
+    # FIRST; ordering this after the close is equivalent to not draining at all.
+    registry = getattr(daemon, "executors", None)
+    pending = getattr(registry, "_pending_teardowns", None)
+    if isinstance(pending, dict) and pending:
+        tasks = [t for t in pending.values() if t is not None]
+        logger.info("shutdown: draining %d in-flight workspace teardown(s)",
+                    len(tasks))
+        with contextlib.suppress(Exception):
+            await asyncio.wait(tasks, timeout=_SHUTDOWN_TEARDOWN_DRAIN_S)
+        still = [t for t in tasks if not t.done()]
+        if still:
+            logger.warning(
+                "shutdown: %d teardown(s) still running after %.0fs; "
+                "the ledger row is kept and the retry resumes them",
+                len(still), _SHUTDOWN_TEARDOWN_DRAIN_S)
     for ctx in daemon.all_contexts():
         try:
             await ctx.holder.trigger_close("daemon_shutdown")
