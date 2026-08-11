@@ -26,10 +26,13 @@ session's current tab, reused across heredocs) and observes with ``snapshot()``
 to the session's current tab. The internal tab lifecycle the Playwright binding
 glue relies on lives in ``browserwright.session_runtime``.
 
-What remains in EXPORTS is the set of NON-browser-driving helpers that do not
-overlap Playwright: ``http_get`` (no-browser escape hatch), the memory verbs,
-and the site-skill / task layer.
+What remains in EXPORTS is the set of helpers that do not overlap Playwright:
+``http_get`` (no-browser escape hatch), the memory verbs, the site-skill /
+task layer, and the session tab-management pair ``tabs()`` / ``switch_tab()``
+(Playwright cannot express "the session's current tab", so these are
+first-class primitives, documented in the generated skill).
 """
+from .tab_surface import TabMatchError, switch_tab, tabs  # noqa: F401
 from .version import __version__  # noqa: F401
 
 from .errors import (  # noqa: F401
@@ -61,6 +64,9 @@ from .primitives.site import (  # noqa: F401
 EXPORTS = [
     # http (escape hatch — no browser; does not overlap Playwright)
     "http_get",
+    # session tab management (Playwright cannot express the session's
+    # current tab; see tab_surface.py)
+    "tabs", "switch_tab",
     # memory + site
     "bootstrap_site", "remember", "remember_global", "remember_preference",
     "memory_read",
@@ -70,7 +76,7 @@ EXPORTS = [
     # errors
     "BrowserwrightError", "PageLoadFailed", "ElementNotFound", "AuthWall",
     "Captcha", "NetworkError", "DaemonUnavailable", "CDPError",
-    "NeedsUserConfirm", "UnsupportedContentType",
+    "NeedsUserConfirm", "UnsupportedContentType", "TabMatchError",
 ]
 
 __all__ = EXPORTS
