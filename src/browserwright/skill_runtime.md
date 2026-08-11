@@ -34,6 +34,33 @@ browserwright session end --session=$sid
 
 Use `--backend=extension` for the user's daily Chrome. Use `--backend=cdp --create` for an isolated Chrome that the daemon owns. Use `--backend=cdp --attach=<port|url>` to bind to a browser someone else owns — a local port, or a `ws://`/`wss://`/`http://` endpoint for an anti-detect, fingerprint or cloud profile; ending the session never closes it. Each attached session carries its own endpoint, so one daemon can drive many external browsers at once.
 
+### Adopting the page the user is looking at
+
+When the user asks you to help with the page they currently have focused in
+Chrome ("help me with this page", "fill this form out for me"), do NOT open
+it in a new tab. Adopt their active tab into the session instead:
+
+```bash
+sid=$(browserwright session new --backend=extension --name=task-label)
+browserwright session attach-active --session=$sid
+browserwright -s "$sid" -e $'print(page.title())\nprint(page.url)'
+# ...operate the adopted page exactly like any other, then end the session
+browserwright session end --session=$sid
+```
+
+`attach-active` asks the extension to move Chrome's currently-focused-window
+active tab into the session's tab group and bind it as the session's page.
+After that, the adopted tab behaves exactly like a tab the agent opened
+itself: `page` is live on it, new pages join the same group, and `session
+end` closes it with the group. There is no borrowed/owned distinction — the
+adopted tab is a regular member.
+
+Failure mode: the daemon REFUSES if the focused tab already sits in any tab
+group other than this session's own — the user's own manual tab groups count
+as occupied, because a tab group is the isolation unit between sessions. Tell
+the user to drag the tab out of its group (or into this session's group) and
+retry; never try to steal a tab out of another group.
+
 For multi-line code, heredocs, JSON literals, or complex quoting, prefer a file
 or stdin over a dense one-liner:
 

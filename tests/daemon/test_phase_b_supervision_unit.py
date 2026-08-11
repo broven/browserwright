@@ -488,11 +488,11 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
 
     class _Upstream:
         def __init__(self):
-            self.ended: list[tuple[str, int | None]] = []
+            self.ended: list[str] = []
 
-        async def end_session(self, session_id, group_id=None):
+        async def end_session(self, session_id):
             assert reg.get(session_id) is not None
-            self.ended.append((session_id, group_id))
+            self.ended.append(session_id)
             return {"ok": True, "closed": [], "failed": [], "kept": []}
 
     upstream = _Upstream()
@@ -508,7 +508,7 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
 
     assert [rec["id"] for rec in pruned] == [sid]
     assert daemon.executors.killed == [sid]
-    assert upstream.ended == [(sid, 17)]
+    assert upstream.ended == [sid]  # ADR-0009: no group id threaded through
     assert reg.get(sid) is None
 
 

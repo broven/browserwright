@@ -115,6 +115,11 @@ def launch_cft_with_extension(
         "--remote-allow-origins=*",
         "--no-proxy-server",
         "--enable-features=UserScriptUserExtensionToggle",
+        # See the same pair in `launch_chrome.py` / e2e conftest: without them
+        # macOS prompts for the login keychain password on every fresh-profile
+        # start, which blocks the run behind a modal.
+        "--password-store=basic",
+        "--use-mock-keychain",
         f"--load-extension={ext_dir}",
         "about:blank",
     ]

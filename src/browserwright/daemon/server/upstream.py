@@ -87,18 +87,15 @@ class Upstream(Protocol):
     async def attach_active(self, *, session_id: str | None = None,
                             group_name: str | None = None) -> dict: ...
 
-    async def end_session(self, session_id: str,
-                          group_id: int | None = None) -> dict: ...
+    async def end_session(self, session_id: str) -> dict: ...
 
     #: Deadline-aware end_session. Declared here so the caller does not have to
     #: probe for it — a `hasattr` fallback to the unbounded variant would make
     #: the teardown budget silently optional.
-    async def end_session_before(self, session_id: str,
-                                 group_id: int | None = None, *,
+    async def end_session_before(self, session_id: str, *,
                                  deadline: float) -> dict: ...
 
-    async def recover(self, session_id: str | None = None, *,
-                      group_id: int | None = None) -> dict: ...
+    async def recover(self, session_id: str | None = None) -> dict: ...
 
     async def send_cdp(self, frame: str) -> None: ...
 
@@ -467,8 +464,7 @@ class CdpUpstream:
                 session_id, e)
         return result
 
-    async def end_session(self, session_id: str,
-                          group_id: int | None = None) -> dict:
+    async def end_session(self, session_id: str) -> dict:
         """End an cdp workspace; env/attach ownership remains external."""
         ended: bool | None = None
         if self._on_end_session is not None:
@@ -479,7 +475,7 @@ class CdpUpstream:
                 "backend": self.backend_name}
 
     async def end_session_before(
-        self, session_id: str, group_id: int | None = None, *, deadline: float,
+        self, session_id: str, *, deadline: float,
     ) -> dict:
         """Bounded raw-workspace teardown with an honest retryable result."""
         ended: bool | None = None
@@ -510,8 +506,7 @@ class CdpUpstream:
             "backend": self.backend_name,
         }
 
-    async def recover(self, session_id: str | None = None, *,
-                      group_id: int | None = None) -> dict:
+    async def recover(self, session_id: str | None = None) -> dict:
         """Return the nearest honest raw-CDP recovery equivalent.
 
         Raw workspaces have no durable group binding, so there are no group

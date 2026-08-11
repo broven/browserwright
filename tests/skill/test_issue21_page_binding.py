@@ -6,7 +6,7 @@ these tests pin the session_runtime mechanics the executor's rebind hook
 depends on:
 
   - ``bind_target`` (the switch_tab equivalent) fires the target-changed hook
-    and preserves the durable ``runtime.group_id`` anchor;
+    and repoints ``runtime.current_target_id``;
   - ``close_session_tab`` of the CURRENT tab clears + persists the binding and
     fires the hook (close of a non-current tab does neither);
   - ``register_recovered`` (open_session_tab / recovery) fires the hook.
@@ -93,24 +93,20 @@ def hooked_session(fresh_modules, tmp_bs_home):
     rt.set_target_changed_hook(None)
 
 
-def test_bind_target_fires_hook_and_preserves_group_id(hooked_session):
+def test_bind_target_fires_hook_and_repoints_current_target(hooked_session):
     from browserwright import session_registry as reg
     from browserwright import session_runtime as rt
 
     sess, fake, fired, sid = hooked_session
-    # A durable group anchor already exists in the ledger runtime.
     reg.update(sid, runtime={
-        "current_target_id": "ext-tab-A", "group_id": 7,
-        "owned_tab_ids": [], "updated_at": 0.0,
+        "current_target_id": "ext-tab-A", "updated_at": 0.0,
     })
 
     assert rt.bind_target(sess, "ext-tab-C") == {"targetId": "ext-tab-C"}
     assert sess.current_target_id == "ext-tab-C"
     # The hook fired with this session (executor rebinds its live page).
     assert fired == [sess], f"hook not fired by bind_target: {fired}"
-    # The durable group anchor survived the switch (issue #21 durability).
     rec = reg.get(sid)
-    assert (rec.get("runtime") or {}).get("group_id") == 7
     assert (rec.get("runtime") or {}).get("current_target_id") == "ext-tab-C"
 
 
@@ -120,8 +116,7 @@ def test_close_of_current_tab_clears_persists_and_fires_hook(hooked_session):
 
     sess, fake, fired, sid = hooked_session
     reg.update(sid, runtime={
-        "current_target_id": "ext-tab-A", "group_id": 7,
-        "owned_tab_ids": [], "updated_at": 0.0,
+        "current_target_id": "ext-tab-A", "updated_at": 0.0,
     })
     fired.clear()
 
@@ -135,7 +130,6 @@ def test_close_of_current_tab_clears_persists_and_fires_hook(hooked_session):
     runtime = rec.get("runtime") or {}
     assert runtime.get("current_target_id") is None
     # The durable group anchor is NOT wiped by the clearing.
-    assert runtime.get("group_id") == 7
 
 
 def test_close_of_non_current_tab_touches_nothing(hooked_session):
@@ -144,8 +138,7 @@ def test_close_of_non_current_tab_touches_nothing(hooked_session):
 
     sess, fake, fired, sid = hooked_session
     reg.update(sid, runtime={
-        "current_target_id": "ext-tab-C", "group_id": 7,
-        "owned_tab_ids": [], "updated_at": 0.0,
+        "current_target_id": "ext-tab-C", "updated_at": 0.0,
     })
     sess.current_target_id = "ext-tab-C"  # in-process mirror of the ledger
     fired.clear()
@@ -156,7 +149,6 @@ def test_close_of_non_current_tab_touches_nothing(hooked_session):
     assert fired == [], f"hook fired on close of non-current tab: {fired}"
     rec = reg.get(sid)
     assert (rec.get("runtime") or {}).get("current_target_id") == "ext-tab-C"
-    assert (rec.get("runtime") or {}).get("group_id") == 7
 
 
 def test_register_recovered_fires_hook(hooked_session):
@@ -191,18 +183,16 @@ def test_hook_failure_never_breaks_tab_op(hooked_session):
         rt.set_target_changed_hook(None)
 
 
-def test_persist_target_none_clears_and_preserves_group(hooked_session):
+def test_persist_target_none_clears_the_current_target(hooked_session):
     from browserwright import session_registry as reg
     from browserwright import session_runtime as rt
 
     sess, _fake, _fired, sid = hooked_session
     reg.update(sid, runtime={
-        "current_target_id": "ext-tab-A", "group_id": 5,
-        "owned_tab_ids": [], "updated_at": 0.0,
+        "current_target_id": "ext-tab-A", "updated_at": 0.0,
     })
 
     rt.persist_target(None, sess=sess)
     rec = reg.get(sid)
     runtime = rec.get("runtime") or {}
     assert runtime.get("current_target_id") is None
-    assert runtime.get("group_id") == 5

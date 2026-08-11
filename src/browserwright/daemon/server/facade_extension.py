@@ -57,7 +57,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import time
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection
@@ -67,6 +66,7 @@ from .extension_upstream import (
     ExtensionUpstream,
     _tab_id_from_target_id,
     make_target_info,
+    session_group_title,
 )
 from .relay import RelayServer, _CommandError
 
@@ -139,13 +139,12 @@ class ExtensionFacadeBridge:
     def __init__(
         self, *, client: ServerConnection, relay: RelayServer,
         session_id: str | None = None, session_name: str | None = None,
-        session_group_id: int | None = None,
         binding_owner: ExtensionUpstream | None = None,
     ):
         self._client = client
         self._relay = relay
         self._session_id = session_id
-        loaded_name, _loaded_group_id = self._load_session_scope(session_id)
+        loaded_name = self._load_session_scope(session_id)
         self._session_name = session_name or loaded_name or session_id
         # A dedicated ExtensionUpstream over the SAME relay. on_frame routes
         # synthesized/forwarded frames back to THIS Playwright client. on_close
@@ -208,31 +207,25 @@ class ExtensionFacadeBridge:
         # rather than a blind sleep.
         self._ctx_waiters: dict[int, list[asyncio.Future]] = {}
     @staticmethod
-    def _load_session_scope(session_id: str | None) -> tuple[str | None, int | None]:
+    def _load_session_scope(session_id: str | None) -> str | None:
         if not session_id:
             return None, None
         rec = session_registry.get(session_id)
         if not isinstance(rec, dict):
-            return None, None
+            return None
         name = rec.get("name")
-        name = name if isinstance(name, str) and name else None
-        runtime = rec.get("runtime") or {}
-        gid = runtime.get("group_id") if isinstance(runtime, dict) else None
-        gid = gid if isinstance(gid, int) and gid >= 0 else None
-        return name, gid
+        return name if isinstance(name, str) and name else None
 
     def _record_group_binding(self, group_id: int) -> None:
+        """Record the live in-memory binding only.
+
+        ADR-0009 removed the durable `runtime.group_id` mirror that used to be
+        written here: the group is found again by its title, so a cached numeric
+        id is a second source of truth with nothing to add.
+        """
         if not self._session_id or group_id < 0:
             return
         self._binding_owner._bind_group(self._session_id, group_id)  # noqa: SLF001
-        try:
-            rec = session_registry.get(self._session_id) or {}
-            runtime = dict(rec.get("runtime") or {})
-            runtime["group_id"] = group_id
-            runtime["updated_at"] = time.time()
-            session_registry.update(self._session_id, runtime=runtime)
-        except Exception:
-            pass
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -508,7 +501,7 @@ class ExtensionFacadeBridge:
         # announce attachedToTarget OURSELVES first, THEN send the response.
         self._creating += 1
         try:
-            group_name = self._session_name or "Agent"
+            group_name = session_group_title(self._session_id) or "Agent"
             gt = await self._ext.open_background_tab(
                 url, group_name=group_name,
                 session_id=self._session_id,

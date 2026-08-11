@@ -152,7 +152,7 @@ async def test_inflight_request_retries_on_the_reconnected_extension():
         await ext1.connect(relay.port, install_id="ext-A")
         await relay.wait_ready(timeout=HANG_BUDGET_S)
 
-        call = asyncio.create_task(relay.query_group_tabs(group_id=5, timeout=HANG_BUDGET_S))
+        call = asyncio.create_task(relay.query_group_tabs(group_name="g", timeout=HANG_BUDGET_S))
         first = await ext1.next_command()
         assert first["type"] == "queryGroup"
 
@@ -165,7 +165,7 @@ async def test_inflight_request_retries_on_the_reconnected_extension():
         try:
             retry = await ext2.next_command(timeout=HANG_BUDGET_S)
             assert retry["type"] == "queryGroup"
-            assert retry["groupId"] == 5
+            assert retry["groupName"] == "g"
             assert retry["id"] != first["id"]
             await ext2.respond(retry["id"], result={"groupId": 5, "tabs": []})
 
@@ -188,7 +188,7 @@ async def test_inflight_request_raises_when_no_extension_ever_reconnects(monkeyp
         await ext.connect(relay.port, install_id="ext-lonely")
         await relay.wait_ready(timeout=HANG_BUDGET_S)
 
-        call = asyncio.create_task(relay.query_group_tabs(group_id=1, timeout=HANG_BUDGET_S))
+        call = asyncio.create_task(relay.query_group_tabs(group_name="g", timeout=HANG_BUDGET_S))
         assert (await ext.next_command())["type"] == "queryGroup"
         await ext.close()
         await ext.wait_closed()
@@ -216,7 +216,7 @@ async def test_extension_without_install_id_still_recovers_via_any_replacement(m
         await ext1.connect(relay.port, install_id="")
         await relay.wait_ready(timeout=HANG_BUDGET_S)
 
-        call = asyncio.create_task(relay.query_group_tabs(group_id=7, timeout=HANG_BUDGET_S))
+        call = asyncio.create_task(relay.query_group_tabs(group_name="g", timeout=HANG_BUDGET_S))
         assert (await ext1.next_command())["type"] == "queryGroup"
         await ext1.close()
         await ext1.wait_closed()
@@ -255,7 +255,7 @@ async def test_timed_out_request_on_a_ghost_socket_takes_the_reconnect_path(monk
         # fresh at dispatch time, so the *timeout* is what discovers the ghost.
         with pytest.raises(ConnectionError,
                            match="did not reconnect after request failure"):
-            await relay.query_group_tabs(group_id=1, timeout=0.6)
+            await relay.query_group_tabs(group_name="g", timeout=0.6)
         elapsed = time.monotonic() - started
         assert elapsed < HANG_BUDGET_S
         # The ghost socket was torn down rather than left to poison later calls.
@@ -378,7 +378,7 @@ async def test_relay_shutdown_unblocks_inflight_callers(monkeypatch):
     await ext.connect(relay.port, install_id="ext-bye")
     await relay.wait_ready(timeout=HANG_BUDGET_S)
 
-    call = asyncio.create_task(relay.query_group_tabs(group_id=1, timeout=30.0))
+    call = asyncio.create_task(relay.query_group_tabs(group_name="g", timeout=30.0))
     assert (await ext.next_command())["type"] == "queryGroup"
 
     started = time.monotonic()

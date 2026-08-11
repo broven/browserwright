@@ -737,21 +737,23 @@ async def test_open_recover_close_and_end_error_translation_branches():
     await router.route_from_client(client, json.dumps({
         "id": 6,
         "method": "BrowserwrightDaemon.recoverSession",
-        "params": {"groupId": 2},
+        "params": {},
     }))
     assert last_error(cap, client)["code"] == -32603
 
-    async def end_with_group(session: str, group_id: int):
-        return {"session": session, "groupId": group_id}
+    # ADR-0009: endSession takes only the session; the daemon derives the
+    # group's title from the ledger, so a caller cannot hand it a group id.
+    async def end_session_only(session: str):
+        return {"session": session, "ok": True}
 
-    router.upstream.end_session = end_with_group
+    router.upstream.end_session = end_session_only
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.endSession",
-        "params": {"session": client.session_id, "groupId": 12},
+        "params": {"session": client.session_id},
     }))
     assert cap.per_client[client.client_id][-1]["result"] == {
-        "session": client.session_id, "groupId": 12,
+        "session": client.session_id, "ok": True,
     }
 
 

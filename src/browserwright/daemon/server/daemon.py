@@ -279,7 +279,7 @@ class Daemon:
 
         Issue #32 contract: the verb handler passes ``wait=False`` and gets
         back at the initiate boundary — ``{initiated, phase: "terminating"}``
-        — with the unbounded workspace teardown continuing as a daemon-side
+        — with the 60s-bounded workspace teardown continuing as a daemon-side
         task. Every other caller (auto-prune, embedders, tests) keeps the
         default ``wait=True`` blocking semantics: initiate, then join the
         in-flight teardown and return its FINAL result. A retry of

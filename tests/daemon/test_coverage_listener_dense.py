@@ -444,18 +444,18 @@ async def test_relay_request_cleanup_and_public_helpers_without_socket(monkeypat
         ext.pending[cmd_id].set_result({"tabId": 8, "url": "https://new/", "groupId": "44"})
 
     task = asyncio.create_task(complete_request())
-    gt = await relay.attach_active_tab(group_name="Agent", group_id=44, timeout=1)
+    gt = await relay.attach_active_tab(group_name="Agent", timeout=1)
     await task
     assert sent[0]["type"] == "attachActive"
     assert sent[0]["groupName"] == "Agent"
-    assert sent[0]["groupId"] == 44
+    assert sent[0]["groupName"] == "Agent"  # ADR-0009: title, not id
     assert gt.tab_id == 8
     assert gt.group_id == 44
     assert 8 in ext.tabs
     assert ext.pending == {}
 
     auto_results.append({"groupId": 44, "tabs": []})
-    assert await relay.query_group_tabs(group_id=44, timeout=1) == {"groupId": 44, "tabs": []}
+    assert await relay.query_group_tabs("Agent", timeout=1) == {"groupId": 44, "tabs": []}
 
     auto_results.append({"result": {"value": 1}})
     assert await relay.send_cdp(5, "Runtime.evaluate", {"expression": "1"}, timeout=1) == {
