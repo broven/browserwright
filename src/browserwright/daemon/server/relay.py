@@ -410,6 +410,74 @@ class RelayServer:
             timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
             replay_safe=True)
 
+    async def list_groups(self, *, timeout: float = 15.0) -> list[dict]:
+        """Enumerate every Chrome tab group, as ``[{"id": int, "title": str}]``.
+
+        Used by the facade's auto-group reaper to find orphaned
+        ``*-BWauto-<sid>`` groups whose owning connection is gone. Returns []
+        when no extension is connected.
+        """
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+        ext = self._pick_active_extension()
+        if ext is None:
+            return []
+        ext = await self._ensure_extension_fresh(
+            ext, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+        if ext is None:
+            return []
+        resp = await self._request(
+            ext, {"type": "listGroups"},
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            replay_safe=True)
+        groups = resp.get("groups") if isinstance(resp, dict) else None
+        if not isinstance(groups, list):
+            return []
+        out: list[dict] = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gid = g.get("id")
+            title = g.get("title")
+            if isinstance(gid, int) and isinstance(title, str):
+                out.append({"id": gid, "title": title})
+        return out
+
+    async def close_group_tabs(self, group_name: str, *,
+                               timeout: float = 15.0) -> dict:
+        """Close every tab of the group whose TITLE is ``group_name``.
+
+        Used by the auto-group reaper and teardown: close each member tab via
+        the extension (same primitive as the session teardown loop), then the
+        group disappears on its own (Chrome deletes empty groups). Returns
+        ``{"closed": [...tabIds], "failed": [...], "uncertain": [...]}``.
+        """
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+        info = await self.query_group_tabs(
+            group_name, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+        if info is None:
+            return {"closed": [], "failed": [], "uncertain": []}
+        tabs = info.get("tabs") if isinstance(info, dict) else []
+        generation = self._relay_generation()
+        closed: list[int] = []
+        failed: list[int] = []
+        uncertain: list[int] = []
+        for t in tabs:
+            if not isinstance(t, dict):
+                continue
+            tab_id = t.get("tabId")
+            if not isinstance(tab_id, int):
+                continue
+            try:
+                await self.close_tab(
+                    tab_id, expected_generation=generation,
+                    timeout=max(0.001, deadline - asyncio.get_running_loop().time()))
+                closed.append(tab_id)
+            except asyncio.TimeoutError:
+                uncertain.append(tab_id)
+            except Exception:  # noqa: BLE001 - best-effort sweep
+                failed.append(tab_id)
+        return {"closed": closed, "failed": failed, "uncertain": uncertain}
+
     async def attach_active_tab(self, *,
                                 group_name: str | None = None,
                                 expected_generation: int | None = None,

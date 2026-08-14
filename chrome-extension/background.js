@@ -499,6 +499,8 @@ async function handleDaemonMessage(msg) {
       return await doCloseTab(id, msg.tabId);
     case "queryGroup":
       return await doQueryGroup(id, msg.groupName);
+    case "listGroups":
+      return await doListGroups(id);
     case "userscript.install":
       return await doUserscriptInstall(id, msg.script);
     case "userscript.list":
@@ -1012,6 +1014,25 @@ async function armAutoAttach(tabId, epoch) {
     await sleep(50);
   } catch (e) {
     console.warn("[bd-relay] auto-attach arm(" + tabId + ") failed:", e);
+  }
+}
+
+async function doListGroups(id) {
+  // Enumerate every tab group the browser currently has, as [{id, title}].
+  // The daemon's auto-group reaper uses this to find orphaned
+  // `*-BWauto-<sid>` groups whose owning facade connection is gone (daemon
+  // crash / extension SW death) and close them. Title-filtering happens
+  // daemon-side; here we return everything.
+  try {
+    const groups = await chrome.tabGroups.query({});
+    const out = [];
+    for (const g of Array.isArray(groups) ? groups : []) {
+      if (!g || typeof g.id !== "number") continue;
+      out.push({ id: g.id, title: typeof g.title === "string" ? g.title : "" });
+    }
+    safeSend({ type: "response", id, result: { groups: out } });
+  } catch (e) {
+    safeSend({ type: "response", id, result: { groups: [] } });
   }
 }
 

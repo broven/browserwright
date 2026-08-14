@@ -44,6 +44,7 @@ import contextlib
 import http
 import json
 import logging
+import re
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -101,6 +102,12 @@ class PlaywrightFacade:
         self._daemon = daemon
         # Track live passthrough/bridge tasks so stop() can cancel them.
         self._sessions: set[asyncio.Task] = set()
+        # ADR-0010: live auto-group sids for sessionless extension clients.
+        # The reaper closes orphaned ``*-BWauto-<sid>`` groups (daemon crash /
+        # extension SW death) whose sid is NOT in this set.
+        self._auto_sessions: set[str] = set()
+        self._reaper_task: asyncio.Task | None = None
+        self._reaper_interval: float = 15 * 60.0
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -125,11 +132,18 @@ class PlaywrightFacade:
                 break
         logger.info("playwright facade listening on ws://%s:%d%s",
                     self._host, self._port, FACADE_WS_PATH)
+        if self._relay_getter is not None:
+            self._reaper_task = asyncio.create_task(self._auto_reaper_loop())
         return self._port
 
     async def stop(self) -> None:
         if self._server is None:
             return
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reaper_task
+            self._reaper_task = None
         for task in list(self._sessions):
             task.cancel()
             # `await`ing a cancelled task re-raises CancelledError, which is a
@@ -243,6 +257,23 @@ class PlaywrightFacade:
         qs = parse_qs(parsed.query)
         return (qs.get("session") or [None])[0]
 
+    def _label_for_connection(self, conn: ServerConnection) -> str | None:
+        """`?label=` query param → the auto-group's human title prefix.
+
+        Sanitized: stripped, truncated to 40 chars, and ``-BWauto-<hex>``
+        (which the title matching keys on) may not appear inside it. None →
+        the bridge falls back to ``anon``.
+        """
+        parsed = urlparse(conn.request.path or "/")
+        qs = parse_qs(parsed.query)
+        label = (qs.get("label") or [None])[0]
+        if label is None:
+            return None
+        label = " ".join(label.split())[:40]
+        if not label or "-BWauto-" in label:
+            return None
+        return label
+
     def _context_for_connection(self, conn: ServerConnection) -> UpstreamContext | None:
         """Resolve the session-bound upstream context for this facade client.
 
@@ -341,7 +372,9 @@ class PlaywrightFacade:
                 binding_owner = candidate
         bridge = ExtensionFacadeBridge(
             client=conn, relay=relay,
-            session_id=session_id, binding_owner=binding_owner)
+            session_id=session_id, binding_owner=binding_owner,
+            label=self._label_for_connection(conn),
+            auto_registry=self._auto_sessions)
         try:
             await bridge.run()
         except websockets.exceptions.ConnectionClosed:
@@ -350,6 +383,55 @@ class PlaywrightFacade:
             logger.warning("facade(ext): bridge crashed: %r", e)
             with contextlib.suppress(Exception):
                 await bridge.aclose()
+
+    # ---- auto-group reaper (ADR-0010) -----------------------------------
+
+    _AUTO_TITLE_RE = re.compile(r"-BW(auto-[0-9a-f]{8})$")
+
+    @classmethod
+    def _auto_sid_from_title(cls, title: str) -> str | None:
+        m = cls._AUTO_TITLE_RE.search(title or "")
+        return m.group(1) if m else None
+
+    async def _auto_reaper_loop(self) -> None:
+        """Sweep orphaned auto groups: once shortly after startup (a previous
+        daemon crash / extension SW death can strand groups), then every
+        ``_reaper_interval``. Best-effort; failures only log."""
+        try:
+            await asyncio.sleep(1.0)  # let the extension reconnect first
+            await self._sweep_auto_groups()
+            while True:
+                await asyncio.sleep(self._reaper_interval)
+                await self._sweep_auto_groups()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("facade(ext): auto-group reaper crashed")
+
+    async def _sweep_auto_groups(self) -> None:
+        """Close ``*-BWauto-<sid>`` groups whose sid has no live bridge.
+
+        Live bridges register their sid in ``self._auto_sessions`` at connect
+        and unregister at teardown; a group whose owner is gone is an orphan.
+        """
+        relay = self._relay_getter() if self._relay_getter is not None else None
+        if relay is None:
+            return
+        try:
+            groups = await relay.list_groups(timeout=10.0)
+        except Exception:  # noqa: BLE001 - best-effort sweep
+            return
+        for g in groups:
+            title = g.get("title") if isinstance(g, dict) else ""
+            sid = self._auto_sid_from_title(str(title or ""))
+            if sid is None or sid in self._auto_sessions:
+                continue
+            logger.info("facade(ext): reaping orphaned auto group %r", title)
+            try:
+                await relay.close_group_tabs(str(title), timeout=10.0)
+            except Exception as e:  # noqa: BLE001 - best-effort
+                logger.warning(
+                    "facade(ext): reaper close failed for %r: %r", title, e)
 
     async def _handle_cdp_client(
         self, conn: ServerConnection, ctx: UpstreamContext | None = None,
