@@ -226,8 +226,41 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # The extension-skip check diffs chrome-extension/ against the
+          # previous release tag, which needs the full tag history.
+          fetch-depth: 0
+
+      # The store is a slow lane (one review cycle per version, item locked
+      # while a review is pending). When a release did not touch
+      # chrome-extension/, the packaged extension is byte-identical modulo the
+      # version stamp, so uploading it would churn a review round for nothing:
+      # store users keep the last published extension and the daemon's
+      # install-source reporting keeps the version story honest. The check
+      # below sets run_changed=false and every later step is gated on it, so
+      # the job completes green with a "skipped" message instead of wasting a
+      # review round.
+      - name: Check whether chrome-extension changed
+        id: ext_changed
+        run: |
+          cur="${GITHUB_REF_NAME}"
+          prev="$(git tag --sort=-version:refname | sed -n 2p || true)"
+          if [ -z "$prev" ]; then
+            echo "No previous release tag; publishing."
+            echo "run_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$(git diff --name-only "$prev" "$cur" -- chrome-extension/)" ]; then
+            echo "chrome-extension/ unchanged since $prev — skipping CWS publish " \
+                 "(extension binary identical; only the version stamp would differ)."
+            echo "run_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "chrome-extension/ changed since $prev; publishing."
+          echo "run_changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Set extension version from git tag
+        if: steps.ext_changed.outputs.run_changed == 'true'
         run: |
           python - <<'PY'
           import json
@@ -264,6 +297,7 @@ jobs:
       # CWS rejects the GitHub Release zip (everything nested under
       # chrome-extension/); the manifest must sit at the zip root.
       - name: Repackage with manifest at zip root (CWS shape)
+        if: steps.ext_changed.outputs.run_changed == 'true'
         run: |
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist/cws
@@ -277,6 +311,7 @@ jobs:
       # "CWS secrets setup"). The access token is written to a file, never
       # printed, so it cannot leak into the job log.
       - name: Obtain OAuth access token
+        if: steps.ext_changed.outputs.run_changed == 'true'
         run: |
           curl -sS -X POST https://oauth2.googleapis.com/token \
             -d "client_id=${{ secrets.CWS_CLIENT_ID }}" \
@@ -298,6 +333,7 @@ jobs:
       # or material code change): that is not an error, the item goes live when
       # review clears, so it is reported as a loud note instead of a red build.
       - name: Upload and publish to Chrome Web Store
+        if: steps.ext_changed.outputs.run_changed == 'true'
         run: |
           python - <<'PY'
           import json
@@ -336,7 +372,27 @@ jobs:
               {"Content-Type": "application/zip"},
           )
           if upload.get("uploadState") != "SUCCESS":
-              print(f"CWS upload did not succeed: {upload}", file=sys.stderr)
+              detail = json.dumps(upload, ensure_ascii=False)
+              errors = upload.get("itemError") or []
+              codes = [e.get("error_code") for e in errors]
+              print(f"CWS upload did not succeed: {detail}", file=sys.stderr)
+              if "ITEM_NOT_UPDATABLE" in codes:
+                  # The item is locked while a previous version is pending
+                  # review (or ready to publish / deleted). Nothing to fix in
+                  # this release — the store is a slow lane and the previous
+                  # upload goes live when review clears. Say so instead of a
+                  # generic failure, but still fail: the store did NOT get this
+                  # version and that must not pass silently.
+                  print(
+                      "Item is locked (pending review of a previous version). "
+                      "The store is a slow lane: the earlier version publishes "
+                      "when Google's review clears (usually ≤3 days), and only "
+                      "then can this version be uploaded — re-run this job or "
+                      "tag the next release after that. Do NOT unpublish to "
+                      "unlock it; that blocks new submissions until the review "
+                      "finishes.",
+                      file=sys.stderr,
+                  )
               raise SystemExit(1)
           print(f"Uploaded as item draft: {upload.get('id')}")
 

@@ -391,9 +391,15 @@ discipline (extension version == daemon version, checked by `doctor`). So:
 - **`vX.Y.Z-rc*` tags skip CWS entirely.** They still auto-publish to PyPI,
   npm, and the GitHub Release (all of which accept `-rc1` suffixes). Pre-release
   testing happens via the unpacked build.
-- **Pure `vX.Y.Z` tags publish to the store** (default audience). Store users
-  auto-update once the version lands; the daemon's `install_source` reporting
-  keeps the mismatch warning honest in the meantime.
+- **Pure `vX.Y.Z` tags publish to the store** (default audience), but only when
+  the release actually changed `chrome-extension/` — the job diffs it against
+  the previous release tag and skips (with a clear message) when the extension
+  source is byte-identical, since uploading it would just churn a review round
+  for a version-number change. Backend-only / skill-only releases therefore
+  never touch the store; store users keep the last published extension and
+  `doctor`'s version-mismatch note stays honest until the next extension
+  change. Store users auto-update once the version lands; the daemon's
+  `install_source` reporting keeps the mismatch warning honest in the meantime.
 - **Trusted-testers distribution stays manual.** When a real beta audience
   exists, push a build to `publishTarget=trustedTesters` (or publish a separate
   private BETA item per the [official beta flow](https://developer.chrome.com/docs/extensions/develop/migrate/publish-mv3));
