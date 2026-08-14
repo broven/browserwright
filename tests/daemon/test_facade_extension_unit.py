@@ -1130,3 +1130,23 @@ async def test_sessionless_auto_group_title_uses_label():
         await asyncio.wait_for(run_task, timeout=2.0)
         await ext.close()
         await relay.stop()
+
+
+async def test_get_browser_contexts_synthesizes_single_context():
+    """puppeteer-core's connect() bootstraps with Target.getBrowserContexts;
+    the extension backend has no real contexts, so the bridge advertises the
+    single synthetic context the page targets already carry."""
+    async with _wired() as (relay, ext, client, bridge):
+        client.feed({"id": 7, "method": "Target.getBrowserContexts",
+                     "params": {}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 7 and "result" in f)
+        ctx_ids = res["result"]["browserContextIds"]
+        assert ctx_ids == ["browserwright-ext-default"], ctx_ids
+        # And a subsequent createTarget with that context id still works.
+        client.feed({"id": 8, "method": "Target.createTarget",
+                     "params": {"url": "about:blank",
+                                "browserContextId": "browserwright-ext-default"}})
+        res2 = await client.wait_for(
+            lambda f: f.get("id") == 8 and "result" in f)
+        assert res2["result"]["targetId"].startswith("ext-tab-")

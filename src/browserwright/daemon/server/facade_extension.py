@@ -357,6 +357,18 @@ class ExtensionFacadeBridge:
             await self._respond(req_id, {"sessionId": _BROWSER_SESSION_ID})
             return
 
+        # --- Target.getBrowserContexts → synthesize one context. ---
+        # puppeteer-core's `connect()` calls this during its browser bootstrap
+        # (Playwright's connect_over_cdp does not). The extension backend has no
+        # real browser contexts (P4 — isolation is tab groups), so we advertise
+        # the single synthetic context the page targets already carry. puppeteer
+        # then creates pages via Target.createTarget with that browserContextId,
+        # which the auto/session group path ignores safely.
+        if method == "Target.getBrowserContexts" and session_id is None:
+            await self._respond(req_id, {
+                "browserContextIds": [_SYNTHETIC_BROWSER_CONTEXT_ID]})
+            return
+
         # --- Target.getTargetInfo: the handshake asks for the browser target ---
         # (no/unknown targetId) — synthesize it; a tab targetId returns that
         # tab's info. ExtensionUpstream errors here (it expects a sessionId), so
