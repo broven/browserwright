@@ -79,6 +79,13 @@ async def test_manual_reload_broadcasts_without_guard(monkeypatch):
     relay = RelayServer()
     sent: list[dict] = []
 
+    # D: reload verification would otherwise wait the full verify timeout for
+    # a replacement SW; this unit test covers the broadcast, not the wait.
+    async def _no_replacement(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(RelayServer, "_wait_for_replacement", _no_replacement)
+
     class FakeConn:
         async def send(self, text: str):
             sent.append(json.loads(text))
@@ -96,6 +103,8 @@ async def test_manual_reload_broadcasts_without_guard(monkeypatch):
     result = await relay.reload_extensions(reason="manual")
 
     assert result["sent"] == 1
+    assert result["ok"] is False  # no replacement SW came back (D)
+    assert result["dead"][0]["install_id"] == "ready"
     assert sent == [
         {
             "type": "reloadExtension",
@@ -110,10 +119,31 @@ def test_daemon_extension_reload_cli_dispatches_rpc(monkeypatch, capsys):
 
     async def fake_rpc(cfg, method, params, **kwargs):
         calls.append((method, params))
-        return {"ok": True, "sent": 2, "extensions": []}
+        return {"ok": True, "sent": 2, "reconnected": 2, "dead": [],
+                "extensions": []}
 
     monkeypatch.setattr(cli_mod, "_rpc_via_ws", fake_rpc)
 
     assert cli_mod.main(["extension", "reload"]) == 0
     assert calls == [("BrowserwrightDaemon.extension.reload", {"reason": "manual"})]
-    assert "reload requested for 2 extension(s)" in capsys.readouterr().out
+    assert "reload complete: 2 of 2 extension(s) reconnected" in \
+        capsys.readouterr().out
+
+
+def test_daemon_extension_reload_cli_reports_dead_sw(monkeypatch, capsys):
+    """D: when a reloaded SW does not come back, the CLI says so explicitly
+    (exit 1 + manual recovery guidance) instead of claiming success."""
+    async def fake_rpc(cfg, method, params, **kwargs):
+        return {
+            "ok": False, "sent": 1, "reconnected": 0,
+            "dead": [{"install_id": "i1", "version": "1.0.0"}],
+            "extensions": [],
+        }
+
+    monkeypatch.setattr(cli_mod, "_rpc_via_ws", fake_rpc)
+
+    assert cli_mod.main(["extension", "reload"]) == 1
+    err = capsys.readouterr().err
+    assert "did not come back after reload" in err
+    assert "chrome://extensions" in err
+    assert "browserwright doctor" in err

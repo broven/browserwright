@@ -15,7 +15,26 @@ browserwright-daemon version check
 browserwright-daemon status --json
 ```
 
-If `version check` reports an extension mismatch after installing the matching package, restart the daemon and run `browserwright-daemon extension reload`. With a LaunchAgent daemon use `browserwright-daemon restart`; for a foreground daemon, use `browserwright-daemon stop` followed by the normal `serve` command. Manual Chrome reload is only the fallback when no connected extension confirms the reload.
+If `version check` reports an extension mismatch after installing the matching package:
+
+1. Diagnose first, restart second. Run `browserwright doctor` and
+   `browserwright-daemon status --json` to see what is actually mismatched;
+   the extension may already be current.
+2. Restart the daemon only when the daemon itself is stale: with a LaunchAgent
+   daemon use `browserwright-daemon restart` (it refuses while sessions are
+   active — end or `session reset` them first), or for a foreground daemon
+   `browserwright-daemon stop` followed by the normal `serve` command.
+3. Only if the EXTENSION is stale do you reload it, and only with your eyes
+   open: `browserwright-daemon extension reload` destroys the extension's
+   service worker, and Chrome does not always restart it. The command now
+   verifies the SW comes back and fails loudly if it does not. If it fails,
+   open `chrome://extensions`, click reload on the browserwright extension, or
+   restart the browser, then re-run `browserwright doctor`.
+
+Never reach for `restart --force` as an agent: it kills every session's live
+executor state (`page`/`context`/variables) and the refusal message tells you
+which sessions to end or reset first. `--force` exists only for the
+maintainer's `upgrade-global` tooling.
 
 `status --json` also reports the Playwright facade endpoint (`facade.ws`). The facade is **on by default** — inline browser calls connect through it automatically. A null `facade.ws` means the daemon is down or was started with `--facade-port 0`.
 

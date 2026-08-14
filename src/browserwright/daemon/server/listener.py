@@ -51,6 +51,14 @@ logger = logging.getLogger(__name__)
 
 _SESSION_PRUNE_INTERVAL_S = 3600.0
 
+# A (auto-recovery): wait this long after an extension hello before
+# re-attaching sessions, so a version-drift reload (which kills the SW right
+# after this hello) has time to land first; and throttle consecutive recovery
+# sweeps so a reconnect burst (maintainLoop backoff) does not hammer the
+# extension with attach round-trips.
+_AUTO_RECOVER_DELAY_S = 3.0
+_AUTO_RECOVER_THROTTLE_S = 10.0
+
 
 def _executor_ready_budget_s() -> float:
     """Bound extension reconnect grace below the control-plane deadline."""
@@ -694,6 +702,7 @@ class _UpstreamHolder:
         # Keep the extension adapter (and its live session→group bindings)
         # across idle detach/reattach. The relay is transport only.
         self._extension_adapter: ExtensionUpstream | None = None
+        self._last_auto_recover: float = 0.0
         self._open_lock = asyncio.Lock()
         self._cfg: Config = cfg
         # v0.4: only populated when backend=extension. Owned by the holder
@@ -967,6 +976,14 @@ class _UpstreamHolder:
                     on_close=self._on_upstream_closed,
                 )
                 self._extension_adapter = ext
+            # A (auto-recovery): every extension (re)connect re-attaches the
+            # extension sessions whose relay ghost table died with the old
+            # connection. Guarded by hasattr: unit tests stub the relay with
+            # a bare object().
+            if hasattr(self.relay, "_on_extension_hello"):
+                self.relay._on_extension_hello = (  # noqa: SLF001
+                    self._on_extension_hello
+                )
             # Use the daemon's open timeout (default 5s in tests) but allow
             # the user a generous window (60s) to load the extension. Spec
             # §8.4 'extension-permission' ux_cost — user has to click the
@@ -991,6 +1008,55 @@ class _UpstreamHolder:
         # is what `daemon ps` shows per context. "ext://relay" is only the
         # fallback for an adapter that reports nothing.
         await self.state.set_connected(ext.ws_url or "ext://relay")
+
+    async def _on_extension_hello(self) -> None:
+        """A (auto-recovery): extension (re)connected with a fresh SW.
+
+        A reloaded/updated SW reconnects with an EMPTY ``attachedTabs`` set,
+        so the relay's ghost table for every extension session's tabs is gone
+        and nothing re-announces it. Re-attach each session's tab group by
+        its title (ADR-0009) so the tabs become drivable again WITHOUT any
+        client action. Idempotent: sessions whose ghost survived (same-SW ws
+        reconnect, re-announce) short-circuit in ``attach_tab``.
+
+        Runs fire-and-forget with a short delay: a version-drift reload may
+        land right after this hello and would kill the SW mid-recovery; and
+        a reconnect burst (maintainLoop backoff) is throttled so we don't
+        hammer the extension with attach round-trips.
+        """
+
+        async def _recover() -> None:
+            try:
+                await asyncio.sleep(_AUTO_RECOVER_DELAY_S)
+            except asyncio.CancelledError:
+                return
+            now = time.monotonic()
+            if (now - self._last_auto_recover) < _AUTO_RECOVER_THROTTLE_S:
+                return
+            self._last_auto_recover = now
+            ext = self._extension_adapter
+            if ext is None:
+                return
+            try:
+                from ... import session_registry as reg
+                rows = reg.list_all()
+            except Exception as e:  # noqa: BLE001 - recovery is best-effort
+                logger.warning("auto-recover: ledger unreadable: %r", e)
+                return
+            for rec in rows:
+                sid = str(rec.get("id") or "")
+                if rec.get("backend") != "extension":
+                    continue
+                try:
+                    await ext.recover_session(sid)
+                    logger.info(
+                        "auto-recovered session %s after extension reconnect",
+                        sid)
+                except Exception:  # noqa: BLE001 - no group / empty group /
+                    # still reconnecting -- the next hello retries.
+                    pass
+
+        asyncio.create_task(_recover())
 
     async def _end_raw_session(
         self, session_id: str, *, deadline: float | None = None,

@@ -184,13 +184,23 @@ def redacted(record: Optional[dict]) -> Optional[dict]:
             "workspace": {**workspace, "url": redact_url(workspace["url"])}}
 
 
+def _numeric_sort_key(key: object) -> int:
+    """Sort sessions by their numeric id; non-numeric ids (test seeds,
+    hand-edited ledgers) sort last instead of raising -- one dirty record must
+    not take down callers like the auto-recovery sweep."""
+    try:
+        return int(key)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 10**18
+
+
 def list_all() -> list[dict]:
     """All session records, ordered by id."""
     p = _ledger_path()
     if not p.exists():
         return []
     sessions = json.loads(p.read_text())["sessions"]
-    return [sessions[k] for k in sorted(sessions, key=int)]
+    return [sessions[k] for k in sorted(sessions, key=_numeric_sort_key)]
 
 
 def stale(*, idle_seconds: float) -> list[dict]:
@@ -204,7 +214,7 @@ def stale(*, idle_seconds: float) -> list[dict]:
         e for e in sessions.values()
         if now - e.get("last_seen", 0.0) >= idle_seconds
     ]
-    return sorted(records, key=lambda e: int(e.get("id", 0)))
+    return sorted(records, key=lambda e: _numeric_sort_key(e.get("id", 0)))
 
 
 def prune(*, idle_seconds: float) -> list[dict]:
