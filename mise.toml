@@ -237,7 +237,7 @@ description = "Alias for dev-link; development only and not release-isolated"
 depends = ["dev-link"]
 
 [tasks.upgrade-global]
-description = "Upgrade global browserwright from PyPI, install the matching GitHub Release Chrome extension artifact, restart the daemon, and verify"
+description = "Upgrade global browserwright from PyPI, install the matching GitHub Release Chrome extension artifact and pi npm extension, restart the daemon, and verify"
 dir = "{{config_root}}"
 run = """
 #!/usr/bin/env bash
@@ -441,8 +441,37 @@ fi
 browserwright version check --strict-daemon
 browserwright-daemon version check --strict-daemon
 
+# --- Update the pi extension (@browserwright/pi). ---------------------------
+# Third release target from the same git tag (ADR-0008): the pi agent's
+# bw_web_fetch/bw_web_search tools ship as the npm package @browserwright/pi,
+# installed into pi's own config via `pi install npm:@browserwright/pi`
+# (~/.pi/agent/settings.json -> ~/.pi/agent/npm/). This task used to leave it
+# behind, silently drifting from the CLI after every release.
+#
+# Deliberately guarded:
+#   - `pi update <source>` FAILS when the source is not in settings, and a
+#     machine that never installed the pi package must not fail the upgrade.
+#   - The quote-inclusive grep matches exactly the unversioned spec
+#     `npm:@browserwright/pi` — the only form pi considers update-eligible.
+#     A versioned spec (npm:@browserwright/pi@x.y.z) is "pinned" and skipped
+#     by pi, so keep the settings entry unversioned or this silently stops
+#     updating again.
+#   - Only user-scope installs are touched; project-local `.pi/` installs are
+#     pinned to their project, not synced by a machine-global upgrade.
+if command -v pi >/dev/null 2>&1; then
+  if grep -q '"npm:@browserwright/pi"' "$HOME/.pi/agent/settings.json" 2>/dev/null; then
+    echo ""
+    echo "Updating pi extension @browserwright/pi (npm)..."
+    pi update npm:@browserwright/pi
+  else
+    echo "Skipping pi extension: npm:@browserwright/pi is not in pi user settings."
+  fi
+else
+  echo "Skipping pi extension: pi CLI not on PATH."
+fi
+
 echo ""
-echo "Done. Global browserwright is on $(browserwright version), the matching extension artifact is installed, and the daemon is restarted."
+echo "Done. Global browserwright is on $(browserwright version), the matching extension artifact and pi extension are installed, and the daemon is restarted."
 """
 
 [tasks.version-check]

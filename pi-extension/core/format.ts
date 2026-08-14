@@ -117,7 +117,7 @@ const ANSWER_BOX_CAP = 1200;
 
 /**
  * The search success path. Links plus whatever SERP features the query
- * triggered — but never page bodies: `web_fetch` already does that, and the
+ * triggered — but never page bodies: `bw_web_fetch` already does that, and the
  * model is in a better position to decide which two of ten links are worth the
  * tokens.
  *
@@ -171,7 +171,7 @@ export function renderResults(result: ChainResult<SearchPayload>, query: string)
 		out.push("## Related searches", payload.relatedSearches.join(" · "), "");
 	}
 
-	out.push("Use web_fetch on a URL above to read it.");
+	out.push("Use bw_web_fetch on a URL above to read it.");
 	return out.join("\n");
 }
 

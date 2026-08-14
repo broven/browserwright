@@ -3,8 +3,8 @@
  *
  * Provider declarations are plain JSON files in providers/. Adding a provider
  * means dropping one file in there — no code change, no registration table.
- * A declaration that names no `role` serves `web_fetch`, which is what the
- * majority of reader APIs are.
+ * A declaration that names no `role` serves the fetch role (`bw_web_fetch`),
+ * which is what the majority of reader APIs are.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -30,7 +30,7 @@ const DEFAULT_CONFIG: PiConfig = {
 	// The default line of defence. minChars stays 0 on purpose: a false positive
 	// escalates to a rung that opens a tab in the user's real Chrome, so
 	// over-eager rejection interrupts them. Per-provider thresholds are meant to
-	// come from `/browserwright probe` evidence, not from guesses.
+	// come from `/bw probe` evidence, not from guesses.
 	defaultFailWhen: {
 		minChars: 0,
 		minResults: 0,

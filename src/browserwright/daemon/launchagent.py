@@ -453,7 +453,10 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
             "kills every session's live executor state (tabs and session "
             "records survive; `page` / `context` / your variables do not).\n"
             f"{detail}\n"
-            "Re-run with `--force` to restart anyway.", 4)
+            "End or reset the sessions above first (`browserwright session "
+            "list`, `session end`, `session reset`), then re-run `restart`. "
+            "`--force` exists only for the maintainer's upgrade tooling; it "
+            "is not the recovery path for a working daemon.", 4)
 
     # Resolve what "up to date" means BEFORE tearing anything down, so a plist
     # we cannot interrogate fails fast instead of after the daemon is already

@@ -223,8 +223,12 @@ def playwright_error_fix(exc: BaseException) -> str:
     exc_type = type(exc).__name__
     if "frame detached" in lower or "target closed" in lower or "page closed" in lower:
         return (
-            "run reset() as a standalone/final statement; then re-snapshot "
-            "and retry in the next command"
+            "the session's tab binding is gone (extension reloaded/updated, "
+            "daemon restarted, or the tab was closed). Run "
+            "`browserwright session reset` in the NEXT command to recycle the "
+            "executor (the session re-attaches automatically), or "
+            "`browserwright session attach-active` to adopt the tab you are "
+            "looking at, then retry"
         )
     if "timeout" not in lower and exc_type != "TimeoutError":
         return ""

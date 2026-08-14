@@ -176,6 +176,7 @@ def test_restart_refuses_when_someone_is_working(harness):
     msg = str(e.value)
     assert "refusing to restart" in msg
     assert "--force" in msg
+    assert "session end" in msg and "session reset" in msg
     assert "7 (idle 4s)" in msg
     assert e.value.exit_code == 4
     # And it must not have touched launchd at all.

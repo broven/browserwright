@@ -1,5 +1,5 @@
 /**
- * Headless probe runner — the same code path as `/webfetch probe`, without pi's
+ * Headless probe runner — the same code path as `/bw probe`, without pi's
  * confirmation dialog. Use it when you want the evidence matrix captured to a
  * file rather than rendered into a session.
  *
