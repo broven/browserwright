@@ -340,6 +340,26 @@ non-fatal case is Google deciding to **re-review** the update (permission or
 material code change): the job prints a `::warning::` and the item goes live
 when review clears (usually ≤ 3 days; store users then auto-update).
 
+### Post-release store check (agent ritual)
+
+The agent that cut the release verifies the store outcome explicitly after
+every tag, because a blocked store publish is easy to miss inside an
+otherwise-green run:
+
+1. `gh run view <id>` — `Publish Chrome extension to Web Store` must be
+   **success**;
+2. success → grep its log for which branch ran: `skipping CWS publish`
+   (extension unchanged, expected) vs `Chrome Web Store updated to ...
+   (publish accepted)` (published);
+3. failure → grep `--log-failed` for `ITEM_NOT_UPDATABLE`: the item is
+   locked while a previous version is under review. Report to the user as
+   "store blocked — the earlier version publishes when review clears
+   (usually ≤ 3 days); this version needs a re-run/tag after that; do NOT
+   unpublish to unlock". Any other failure is a real bug in the job.
+
+The store can therefore lag releases by one review cycle; the daemon's
+`install_source` / drift reporting keeps that visible locally.
+
 ### CWS secrets setup (one-time)
 
 These four GitHub secrets (repo settings → Secrets → Actions) are the only
