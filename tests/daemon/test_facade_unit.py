@@ -303,3 +303,66 @@ async def _get_json(url: str, host: str | None = None):
             return json.loads(resp.read().decode("utf-8"))
 
     return await asyncio.to_thread(_fetch)
+
+
+# ---- ADR-0010: auto-group reaper + label sanitization ----------------------
+
+
+def test_auto_sid_from_title_parsing():
+    from browserwright.daemon.server.facade import PlaywrightFacade
+    assert PlaywrightFacade._auto_sid_from_title(
+        "hermes-BWauto-1a2b3c4d") == "auto-1a2b3c4d"
+    assert PlaywrightFacade._auto_sid_from_title(
+        "anon-BWauto-00000000") == "auto-00000000"
+    assert PlaywrightFacade._auto_sid_from_title("Research-BW12") is None
+    assert PlaywrightFacade._auto_sid_from_title("") is None
+    assert PlaywrightFacade._auto_sid_from_title(
+        "hermes-BWauto-xyz") is None
+    assert PlaywrightFacade._auto_sid_from_title(
+        "evil-BWauto-1a2b3c4d-more") is None
+
+
+def test_label_connection_sanitization():
+    from browserwright.daemon.server.facade import PlaywrightFacade
+    f = PlaywrightFacade(cfg=Config(backend="cdp"), port=0)
+    cases = [
+        ("/cdp?label=hermes", "hermes"),
+        ("/cdp?label=my%20job", "my job"),
+        ("/cdp?label=", None),
+        ("/cdp", None),
+        ("/cdp?label=evil-BWauto-deadbeef", None),
+        ("/cdp?label=" + "x" * 100, "x" * 40),
+    ]
+    for path, want in cases:
+        conn = SimpleNamespace(request=SimpleNamespace(path=path))
+        assert f._label_for_connection(conn) == want, path
+
+
+async def test_reaper_closes_orphaned_auto_groups_and_keeps_live():
+    from browserwright.daemon.server.facade import PlaywrightFacade
+    f = PlaywrightFacade(cfg=Config(backend="extension"), port=0)
+    f._auto_sessions.add("auto-live1234")
+    closed: list[str] = []
+
+    class MockRelay:
+        async def list_groups(self, **kw):
+            return [
+                {"id": 1, "title": "live-BWauto-live1234"},   # live → keep
+                {"id": 2, "title": "anon-BWauto-deadbeef"},   # orphan → close
+                {"id": 3, "title": "Research-BW12"},          # not auto → keep
+            ]
+
+        async def close_group_tabs(self, title, **kw):
+            closed.append(title)
+            return {}
+
+    f._relay_getter = lambda: MockRelay()  # noqa: E731
+    await f._sweep_auto_groups()
+    assert closed == ["anon-BWauto-deadbeef"]
+
+
+async def test_reaper_no_relay_is_noop():
+    from browserwright.daemon.server.facade import PlaywrightFacade
+    f = PlaywrightFacade(cfg=Config(backend="extension"), port=0)
+    f._relay_getter = lambda: None  # noqa: E731
+    await f._sweep_auto_groups()  # must not raise

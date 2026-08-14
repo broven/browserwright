@@ -195,6 +195,14 @@ the request's `Host` header, so the ws URL points back at the address the
 client actually used. No auth is added, so only bind an interface you trust
 (a Tailscale IP is private to your tailnet).
 
+**Remote clients own one tab group each (extension backend, ADR-0010):** a
+connection without `?session=` is auto-scoped to its own private tab group —
+`<label>-BWauto-<hex>`, where `?label=` sets the prefix (default `anon`). It
+can only see and operate the tabs in that group; the group is created on first
+use, closed when the connection drops (ws heartbeat + 15-min orphan reaper),
+and never reused across connections. Add `?label=` so the group title tells
+you who owns it: `connect_over_cdp("ws://<tailnet-ip>:19990/cdp?label=hermes")`.
+
 ### Userscripts
 
 Author Tampermonkey-style scripts the `extension` backend injects on matching sites:

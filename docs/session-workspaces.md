@@ -72,6 +72,13 @@ Hard invariants:
   inside that session's group.
 - Probe tabs and real user-work tabs are not separate workspaces; they belong to
   the same group.
+- **Sessionless raw CDP clients get an auto group (ADR-0010):** a facade
+  connection without `?session=` still owns exactly one private tab group
+  (`<label>-BWauto-<hex>`, `?label=` sets the prefix) and is scoped to it —
+  it can only see/operate its own tabs. The group is created on first use and
+  torn down when the connection closes (ws heartbeat + a 15-min orphan reaper
+  back that up). Never reuse a sessionless connection to reach someone else's
+  tabs.
 - `runtime.group_id` in the session ledger is durable state, not a cosmetic
   label. It lets the daemon recover the same group after restart — as a
   *candidate*, never as proof.
@@ -92,7 +99,8 @@ Hard invariants:
 The extension backend does not isolate cookies, localStorage, IndexedDB,
 extensions, downloads, or the Chrome profile. All extension sessions share the
 user's normal Chrome profile. Tab groups isolate only tab membership and the
-daemon's session-scoped visibility.
+daemon's session-scoped visibility — for ledger sessions AND auto groups
+(ADR-0010) alike.
 
 `--name` is a required human label. For extension sessions it becomes the Chrome
 tab group title, but it is not the identity key. Names need not be unique; the

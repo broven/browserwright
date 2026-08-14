@@ -170,10 +170,15 @@ class _MockExtension:
                                 group_title: str | None = None) -> None:
         assert self.ws is not None
         self.tabs_meta[tab_id] = {"url": url, "title": title}
+        # Mirror the real extension: an `attached` announce can carry the tab's
+        # group. With an explicit group_id the title is that group's title;
+        # with only a title we resolve (creating if needed) like the extension.
+        if group_id is not None and group_title is not None:
+            self.group_titles[group_id] = group_title
+        elif group_title is not None:
+            group_id = self._group_for_title(group_title, create=True)
         if group_id is not None:
             self.tabs_meta[tab_id]["groupId"] = group_id
-            if group_title is not None:
-                self.group_titles[group_id] = group_title
         await self.ws.send(json.dumps({
             "type": "attached", "tabId": tab_id,
             "targetInfo": {"url": url, "title": title},
@@ -274,8 +279,11 @@ def contextlib_suppress():
 
 async def test_set_auto_attach_replays_attached_for_known_tabs():
     async with _wired() as (relay, ext, client, bridge):
-        # The extension already has one attached tab (popup-driven).
-        await ext.announce_attached(tab_id=42, url="https://a/", title="A")
+        # The extension already has one attached tab (popup-driven) — inside
+        # THIS connection's auto group, which is the only thing it may see.
+        await ext.announce_attached(
+            tab_id=42, url="https://a/", title="A",
+            group_title=bridge.auto_title)
         # Let the relay register the ghost.
         await asyncio.sleep(0.05)
 
@@ -305,7 +313,9 @@ async def test_tab_attached_after_handshake_triggers_events():
         assert await client.wait_for(lambda f: f.get("id") == 1)
 
         # A new tab shows up LATER (e.g. user opened one) → fan-out → events.
-        await ext.announce_attached(tab_id=77, url="https://late/", title="L")
+        await ext.announce_attached(
+            tab_id=77, url="https://late/", title="L",
+            group_title=bridge.auto_title)
         attached = await client.wait_for(
             lambda f: f.get("method") == "Target.attachedToTarget"
             and f["params"]["targetInfo"]["targetId"] == "ext-tab-77")
@@ -314,7 +324,7 @@ async def test_tab_attached_after_handshake_triggers_events():
 
 async def test_set_discover_targets_acks_and_replays():
     async with _wired() as (relay, ext, client, bridge):
-        await ext.announce_attached(tab_id=5)
+        await ext.announce_attached(tab_id=5, group_title=bridge.auto_title)
         await asyncio.sleep(0.05)
         client.feed({"id": 9, "method": "Target.setDiscoverTargets",
                      "params": {"discover": True}})
@@ -664,7 +674,7 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
 async def test_runtime_enable_forwarded_and_acked():
     async with _wired() as (relay, ext, client, bridge):
         # First attach a tab so we have a session.
-        await ext.announce_attached(tab_id=8)
+        await ext.announce_attached(tab_id=8, group_title=bridge.auto_title)
         await asyncio.sleep(0.05)
         client.feed({"id": 1, "method": "Target.setAutoAttach",
                      "params": {"autoAttach": True}})
@@ -685,7 +695,7 @@ async def test_runtime_enable_forwarded_and_acked():
 
 async def test_async_page_event_tagged_with_session():
     async with _wired() as (relay, ext, client, bridge):
-        await ext.announce_attached(tab_id=8)
+        await ext.announce_attached(tab_id=8, group_title=bridge.auto_title)
         await asyncio.sleep(0.05)
         client.feed({"id": 1, "method": "Target.setAutoAttach",
                      "params": {"autoAttach": True}})
@@ -744,9 +754,10 @@ async def test_bridge_does_not_clobber_agent_event_handler():
 
 
 async def _attach_one(ext: _MockExtension, client: _FakeClient, *,
-                      tab_id: int) -> str:
+                      tab_id: int, group_title: str | None = None) -> str:
     """Announce a tab and run the discovery handshake; return its sessionId."""
-    await ext.announce_attached(tab_id=tab_id)
+    await ext.announce_attached(
+        tab_id=tab_id, group_title=group_title)
     await asyncio.sleep(0.05)
     client.feed({"id": 1, "method": "Target.setAutoAttach",
                  "params": {"autoAttach": True}})
@@ -761,7 +772,8 @@ async def test_attached_target_carries_browser_context_id():
     attachedToTarget before building CRPage. The synthesized targetInfo must
     carry a stable non-empty id + type=page + waitingForDebugger:false."""
     async with _wired() as (relay, ext, client, bridge):
-        await _attach_one(ext, client, tab_id=42)
+        await _attach_one(ext, client, tab_id=42,
+                          group_title=bridge.auto_title)
         att = client.result_for  # noqa: F841 — readability only
         attached = next(f for f in client.sent
                         if f.get("method") == "Target.attachedToTarget")
@@ -776,7 +788,8 @@ async def test_page_session_set_auto_attach_is_forwarded():
     surface OOPIF child targets to chrome.debugger. The extension handles the
     child sessions and the facade keeps their lifecycle events hidden."""
     async with _wired() as (relay, ext, client, bridge):
-        sid = await _attach_one(ext, client, tab_id=8)
+        sid = await _attach_one(ext, client, tab_id=8,
+                                group_title=bridge.auto_title)
         ext.commands_seen.clear()
         client.feed({"id": 30, "sessionId": sid,
                      "method": "Target.setAutoAttach",
@@ -793,7 +806,8 @@ async def test_child_target_lifecycle_events_are_not_forwarded_to_playwright():
     must not expose them as page-session events until child-session routing is
     implemented."""
     async with _wired() as (relay, ext, client, bridge):
-        sid = await _attach_one(ext, client, tab_id=8)
+        sid = await _attach_one(ext, client, tab_id=8,
+                                group_title=bridge.auto_title)
         assert sid
         before = len(client.sent)
         await ext.push_event(
@@ -827,7 +841,8 @@ async def test_runtime_enable_does_disable_enable_dance_and_gates_on_event():
     """PR3 fix #2: Runtime.enable issues Runtime.disable→enable to force a
     re-emit, and gates its response on the default executionContextCreated."""
     async with _wired() as (relay, ext, client, bridge):
-        sid = await _attach_one(ext, client, tab_id=8)
+        sid = await _attach_one(ext, client, tab_id=8,
+                                group_title=bridge.auto_title)
         ext.commands_seen.clear()
         client.feed({"id": 20, "sessionId": sid, "method": "Runtime.enable",
                      "params": {}})
@@ -872,7 +887,8 @@ async def test_close_target_emits_detach_and_destroy_events():
     response (real Chrome always does; Playwright's page teardown AWAITS the
     destroy — without it new_page() cleanup hangs forever)."""
     async with _wired() as (relay, ext, client, bridge):
-        sid = await _attach_one(ext, client, tab_id=8)
+        sid = await _attach_one(ext, client, tab_id=8,
+                                group_title=bridge.auto_title)
         assert sid
         client.feed({"id": 50, "method": "Target.closeTarget",
                      "params": {"targetId": "ext-tab-8"}})
@@ -906,7 +922,8 @@ async def test_main_frame_id_rewrite_round_trip_and_agent_path_isolation():
     commands. The rewrite must NOT corrupt the shared relay event dict that the
     agent path's primary _on_event also consumes."""
     async with _wired() as (relay, ext, client, bridge):
-        sid = await _attach_one(ext, client, tab_id=8)
+        sid = await _attach_one(ext, client, tab_id=8,
+                                group_title=bridge.auto_title)
         # Teach the mock to answer Page.getFrameTree with a REAL main-frame id.
         real_frame_id = "REALFRAME123"
 
@@ -1042,5 +1059,74 @@ async def test_agent_first_tab_of_groupless_session_is_announced(tmp_home):
         client.eof()
         with contextlib_suppress():
             await asyncio.wait_for(run_task, timeout=2.0)
+        await ext.close()
+        await relay.stop()
+
+
+# ---- ADR-0010: auto groups for sessionless extension connections -----------
+
+
+async def test_sessionless_auto_group_isolation_between_connections():
+    """Two sessionless clients on the same relay must not see each other's
+    tabs: each owns exactly one tab group, discovery is scoped to it."""
+    async with _wired() as (relay, ext, client_a, bridge_a):
+        client_b = _FakeClient()
+        bridge_b = ExtensionFacadeBridge(client=client_b, relay=relay)
+        run_b = asyncio.create_task(bridge_b.run())
+        try:
+            assert bridge_a.auto_title != bridge_b.auto_title
+            await ext.announce_attached(
+                tab_id=91, url="https://a/", title="A",
+                group_title=bridge_a.auto_title)
+            await ext.announce_attached(
+                tab_id=92, url="https://b/", title="B",
+                group_title=bridge_b.auto_title)
+            await asyncio.sleep(0.1)
+
+            infos_a = await bridge_a._ext.scoped_target_infos(  # noqa: SLF001
+                bridge_a._session_id)  # noqa: SLF001
+            assert {i["targetId"] for i in infos_a} == {"ext-tab-91"}
+
+            infos_b = await bridge_b._ext.scoped_target_infos(  # noqa: SLF001
+                bridge_b._session_id)  # noqa: SLF001
+            assert {i["targetId"] for i in infos_b} == {"ext-tab-92"}
+        finally:
+            client_b.eof()
+            await asyncio.wait_for(run_b, timeout=2.0)
+
+
+async def test_sessionless_auto_group_teardown_closes_its_tabs():
+    """aclose() must close the connection's own auto-group tabs (the tabs it
+    created), leaving the user's Chrome running."""
+    async with _wired() as (relay, ext, client, bridge):
+        client.feed({"id": 1, "method": "Target.createTarget",
+                     "params": {"url": "about:blank"}})
+        res = await client.wait_for(
+            lambda f: f.get("id") == 1 and "result" in f)
+        tab_id = int(res["result"]["targetId"].rsplit("-", 1)[1])
+        assert tab_id in ext.tabs_meta
+        client.eof()
+        await asyncio.sleep(0.3)  # run() exits → aclose teardown
+        assert tab_id not in ext.tabs_meta, (
+            "auto-group teardown must close the connection's own tab")
+
+
+async def test_sessionless_auto_group_title_uses_label():
+    """`?label=` becomes the group title prefix: ``<label>-BWauto-<hex>``."""
+    relay = RelayServer(port=0)
+    port = await relay.start()
+    ext = _MockExtension()
+    await ext.connect(port)
+    await relay.wait_ready(timeout=2.0)
+    client = _FakeClient()
+    bridge = ExtensionFacadeBridge(
+        client=client, relay=relay, label="hermes")
+    run_task = asyncio.create_task(bridge.run())
+    try:
+        assert bridge.auto_title == f"hermes-BW{bridge._session_id}"  # noqa: SLF001
+        assert bridge._session_id.startswith("auto-")  # noqa: SLF001
+    finally:
+        client.eof()
+        await asyncio.wait_for(run_task, timeout=2.0)
         await ext.close()
         await relay.stop()

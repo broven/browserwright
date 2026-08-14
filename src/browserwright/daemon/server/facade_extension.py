@@ -57,6 +57,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import secrets
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection
@@ -66,7 +67,6 @@ from .extension_upstream import (
     ExtensionUpstream,
     _tab_id_from_target_id,
     make_target_info,
-    session_group_title,
 )
 from .relay import RelayServer, _CommandError
 
@@ -140,9 +140,26 @@ class ExtensionFacadeBridge:
         self, *, client: ServerConnection, relay: RelayServer,
         session_id: str | None = None, session_name: str | None = None,
         binding_owner: ExtensionUpstream | None = None,
+        label: str | None = None,
+        auto_registry: set[str] | None = None,
     ):
         self._client = client
         self._relay = relay
+        self._is_auto = session_id is None
+        self._auto_registry = auto_registry
+        if self._is_auto:
+            # AUTO mode (ADR-0010): a sessionless raw CDP client still gets a
+            # private tab group — ``<label>-BWauto-<hex>`` — so every
+            # extension consumer owns exactly one group and can only see/act
+            # on its own tabs ("no exceptions"). The synthetic sid keeps every
+            # existing group-scoped path (`scoped_target_infos`,
+            # `target_belongs_to_session`, `_record_group_binding`) working
+            # unchanged; the title override teaches group resolution the
+            # auto title without touching the persistent ledger.
+            auto_sid = f"auto-{secrets.token_hex(4)}"
+            session_id = auto_sid
+            label = label or "anon"
+            session_name = label
         self._session_id = session_id
         loaded_name = self._load_session_scope(session_id)
         self._session_name = session_name or loaded_name or session_id
@@ -156,6 +173,13 @@ class ExtensionFacadeBridge:
             group_owner=binding_owner,
         )
         self._binding_owner = binding_owner or self._ext
+        if self._is_auto:
+            assert session_id is not None  # auto sid assigned above
+            self._auto_sid = session_id
+            self._auto_title = f"{label}-BW{session_id}"
+            self._ext.bind_group_title(session_id, self._auto_title)
+            if self._auto_registry is not None:
+                self._auto_registry.add(session_id)
         # Ledger group ids are recovery candidates, not proof of live
         # ownership: Chrome can recycle them after restart. The shared
         # ExtensionUpstream validates title + known-tab membership before it
@@ -206,6 +230,16 @@ class ExtensionFacadeBridge:
         # so `_handle_runtime_enable` can gate its response on the real event
         # rather than a blind sleep.
         self._ctx_waiters: dict[int, list[asyncio.Future]] = {}
+
+    @property
+    def auto_title(self) -> str | None:
+        """The tab group title of an auto (sessionless) connection, or None.
+
+        Deterministic per connection (``<label>-BWauto-<hex>``); exposed so
+        callers/tests can place tabs into the same group the scoping resolves.
+        """
+        return self._auto_title if self._is_auto else None
+
     @staticmethod
     def _load_session_scope(session_id: str | None) -> str | None:
         if not session_id:
@@ -263,6 +297,20 @@ class ExtensionFacadeBridge:
             for fut in self._ctx_waiters.pop(tab_id, []):
                 if not fut.done():
                     fut.cancel()
+        # AUTO teardown: close this connection's own group (its tabs), drop
+        # the title override, and unregister from the reaper's live set. This
+        # is what keeps a reconnecting consumer from accumulating orphaned
+        # tab groups in the user's real Chrome.
+        if self._is_auto and self._session_id:
+            if self._auto_registry is not None:
+                self._auto_registry.discard(self._session_id)
+            try:
+                await self._ext.close_auto_group(self._session_id)
+            except Exception as e:  # noqa: BLE001 - teardown is best-effort
+                logger.warning(
+                    "facade(ext): auto-group teardown failed for %s: %r",
+                    self._session_id, e)
+            self._session_id = None
 
     # ---- client frame handling ------------------------------------------
 
@@ -501,7 +549,7 @@ class ExtensionFacadeBridge:
         # announce attachedToTarget OURSELVES first, THEN send the response.
         self._creating += 1
         try:
-            group_name = session_group_title(self._session_id) or "Agent"
+            group_name = self._ext._group_title_for(self._session_id) or "Agent"
             gt = await self._ext.open_background_tab(
                 url, group_name=group_name,
                 session_id=self._session_id,

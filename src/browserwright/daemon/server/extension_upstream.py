@@ -219,6 +219,28 @@ class ExtensionUpstream:
             group_owner._group_locks if group_owner is not None else {})
         self._group_generations: dict[str, int] = (
             group_owner._group_generations if group_owner is not None else {})
+        # Per-instance title overrides for AUTO-assigned facade groups (no
+        # ledger row, so `session_group_title` cannot derive one). A bridge
+        # for a sessionless extension connection binds its own
+        # ``<label>-BWauto-<sid>`` title here; every group-sensitive path then
+        # resolves the group by that title exactly like a ledger session
+        # (ADR-0009). Never shared with `group_owner`: each connection's auto
+        # title is private to that connection.
+        self._title_overrides: dict[str, str] = {}
+
+    def bind_group_title(self, session_id: str, title: str) -> None:
+        """Record an in-memory group title for a sessionless/auto session."""
+        self._title_overrides[session_id] = title
+
+    def _group_title_for(self, session_id: str | None) -> str | None:
+        """Group title for ``session_id``: override first (auto sessions),
+        then the ledger-derived title (ADR-0009)."""
+        if not session_id:
+            return None
+        override = self._title_overrides.get(session_id)
+        if override:
+            return override
+        return session_group_title(session_id)
 
     def reset_session_announce(self, session_id: str | None) -> None:
         self._relay.reset_session_announce(session_id)
@@ -312,7 +334,7 @@ class ExtensionUpstream:
                     and live_generation == self._relay_generation()):
                 return live, None
 
-        title = session_group_title(session_id)
+        title = self._group_title_for(session_id)
         if not title:
             return None, None
 
@@ -373,7 +395,7 @@ class ExtensionUpstream:
                      else max(0.001, deadline - time.monotonic())))
         if info is None:
             query_generation = self._relay_generation()
-            query_kwargs: dict = {"group_name": session_group_title(session_id)}
+            query_kwargs: dict = {"group_name": self._group_title_for(session_id)}
             if deadline is not None:
                 query_kwargs["timeout"] = max(
                     0.001, deadline - time.monotonic())
@@ -470,6 +492,40 @@ class ExtensionUpstream:
         async with self._lock_for(session_id):
             return await self._end_session_locked(
                 session_id, deadline=deadline)
+
+    async def close_auto_group(self, session_id: str) -> dict:
+        """Teardown an AUTO-assigned facade group (sessionless connection).
+
+        Closes every tab in the group, then drops the in-memory group binding
+        and title override. Best-effort: the Chrome group disappears on its
+        own once empty, and an empty/unbound group is a no-op. Leaves the
+        user's real Chrome running — only the connection's own tabs are
+        agent-owned (docs: extension teardown semantics).
+        """
+        async with self._lock_for(session_id):
+            try:
+                _gid, members = await self._group_member_tabs(
+                    session_id, timeout=5.0)
+            except asyncio.TimeoutError:
+                members = []
+            except Exception:  # noqa: BLE001 - best-effort sweep
+                members = []
+            generation = self._relay_generation()
+            closed: list[int] = []
+            failed: list[int] = []
+            for tab_id in members:
+                try:
+                    await self._relay.close_tab(
+                        tab_id, timeout=5.0,
+                        expected_generation=generation)
+                    closed.append(tab_id)
+                except Exception:  # noqa: BLE001 - best-effort
+                    failed.append(tab_id)
+                self.evict_tab_sessions(tab_id)
+            self._groups.pop(session_id, None)
+            self._group_generations.pop(session_id, None)
+            self._title_overrides.pop(session_id, None)
+            return {"closed": closed, "failed": failed}
 
     async def _end_session_locked(self, session_id: str, *,
                                   deadline: float | None = None) -> dict:
@@ -877,7 +933,7 @@ class ExtensionUpstream:
         # with this title or creates it. The title is DERIVED, never taken from
         # the caller: honouring a passed name would let two callers put one
         # session in two groups, the split #29 existed to prevent.
-        group_name = session_group_title(session_id) or group_name
+        group_name = self._group_title_for(session_id) or group_name
         validated_generation = self._relay_generation()
         ghost = await self._relay.attach_active_tab(
             group_name=group_name, timeout=10.0,
@@ -940,7 +996,7 @@ class ExtensionUpstream:
         # Honouring a passed name would let two callers put one session in two
         # different groups — the split #29 existed to prevent. The parameter
         # survives only for the sessionless path, which has no title to derive.
-        group_name = session_group_title(session_id) or group_name
+        group_name = self._group_title_for(session_id) or group_name
         validated_generation = self._relay_generation()
         self.reset_session_announce(session_id)
         gt = await self._relay.create_background_tab(
@@ -1008,7 +1064,7 @@ class ExtensionUpstream:
         if not infos:
             return await self.open_tab(
                 "about:blank", session_id=session_id,
-                group_name=session_id or "Agent")
+                group_name=self._group_title_for(session_id) or "Agent")
         info = infos[0]
         tab_id = _tab_id_from_target_id(str(info.get("targetId", "")))
         if tab_id is None:
@@ -1062,14 +1118,14 @@ class ExtensionUpstream:
         if info is None and isinstance(resolved_group_id, int) and resolved_group_id >= 0:
             query_generation = self._relay_generation()
             info = await self._relay.query_group_tabs(
-                group_name=session_group_title(session_id))
+                group_name=self._group_title_for(session_id))
             if query_generation != self._relay_generation():
                 raise RuntimeError(
                     "extension reconnected while resolving group membership")
         if not info or not info.get("tabs"):
             raise RuntimeError(
                 f"no recoverable tabs for session {session_id!r} "
-                f"(no group titled {session_group_title(session_id)!r}, "
+                f"(no group titled {self._group_title_for(session_id)!r}, "
                 "or it is empty)")
         group_id = int(resolved_group_id if resolved_group_id is not None else -1)
         tabs = info["tabs"]
