@@ -216,7 +216,8 @@ This: `uv tool install browserwright --force --refresh` (CLI+daemon from PyPI) �
 downloads the matching `browserwright-extension-<version>.zip` from the GitHub
 Release and unpacks it into the extension dir → `browserwright-daemon restart
 --force` → `browserwright-daemon extension reload` → `browserwright-daemon
-version check --strict-daemon`.
+version check --strict-daemon` → `pi update npm:@browserwright/pi` (pi
+extension, only when it is installed in pi's user settings).
 
 > **Why `--force` and `--strict-daemon` (issue #57).** A restart kills every
 > session's live executor state, so `restart` refuses by default while anyone is
