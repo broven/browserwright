@@ -55,6 +55,11 @@ Releases are driven entirely by a **git tag** matching `v*`
   publishing (no stored token), gated on the GitHub `npm` environment. See
   [ADR-0008](docs/adr/0008-pi-extension-is-a-subpackage.md) for why the pi
   extension lives in this repo.
+- Job `publish-cws` repackages `chrome-extension/` with `manifest.json` at the
+  zip root (the shape CWS requires) and publishes it to the **Chrome Web
+  Store** via the official Upload API, gated on the GitHub `cws` environment.
+  It runs **only on pure `X.Y.Z` tags** — pre-release tags (`vX.Y.Z-rc*`) skip
+  it (see [Store & pre-releases](#store--pre-releases)).
 
 The three jobs are independent: none waits on the others, and a failure in one
 does not roll back the rest. That is why the tag-regex agreement is asserted in
@@ -299,7 +304,97 @@ Confirm the connected extension version (daemon running):
 
 ```bash
 curl -s http://127.0.0.1:19989/__status__ \
-  | python3 -c "import json,sys; print([i.get('browserwright_version') for i in json.load(sys.stdin).get('extension_details',[])])"
+  | python3 -c "import json,sys; print([i.get('browserwright_version') for i in json.load(sys.stdin).get('extension_details',[])])”
 ```
 
 A non-empty list showing the new version means it's connected and current.
+
+> **Store installs don't reload.** The drift-driven `reloadExtension` is
+> skipped when the connected extension is a Chrome Web Store install
+> (`install_source=store` in `/__status__`): `chrome.runtime.reload()` can't
+> change a store build's version, and the store auto-updates on its own. A
+> store extension that lags the daemon resolves when a matching version is
+> published (see below); until then `doctor` shows a cosmetic mismatch warning
+> and sessions still work.
+
+---
+
+## Chrome Web Store publishing (`publish-cws`)
+
+The `publish-cws` job uploads the extension to the Chrome Web Store on every
+pure `vX.Y.Z` tag, using the official Upload API:
+
+1. **Repackage** `chrome-extension/` with `manifest.json` at the zip root (CWS
+   rejects the GitHub Release zip, which nests everything under
+   `chrome-extension/`).
+2. **OAuth2 token exchange** (`client_id` / `client_secret` / `refresh_token`
+   → `access_token`). CWS has no OIDC/trusted publishing, so this is the one
+   stored-credential channel in this repo's CI.
+3. **Upload** `PUT /upload/chromewebstore/v1.1/items/$ITEM_ID` (replaces the
+   draft) and **publish** `POST .../publish` (default audience).
+
+Failure policy: a genuine API error (auth, rejected version) **fails the
+release** — a half-published release is worse than a loud one. The one
+non-fatal case is Google deciding to **re-review** the update (permission or
+material code change): the job prints a `::warning::` and the item goes live
+when review clears (usually ≤ 3 days; store users then auto-update).
+
+### CWS secrets setup (one-time)
+
+These four GitHub secrets (repo settings → Secrets → Actions) are the only
+stored credentials in this repo's CI. Only tag pushers can trigger the job, so
+whoever can push `main` effectively holds the store publish key — keep that
+set small.
+
+| Secret | Value |
+|---|---|
+| `CWS_ITEM_ID` | `okgnalaalckoaeledbjhpjiccmcdceeb` (the store item id) |
+| `CWS_CLIENT_ID` | Google Cloud OAuth client id |
+| `CWS_CLIENT_SECRET` | Google Cloud OAuth client secret |
+| `CWS_REFRESH_TOKEN` | OAuth refresh token (see below) |
+
+Generating the OAuth pair (official path, [Web Store API docs](https://developer.chrome.com/docs/webstore/using_webstore_api)):
+
+1. [Google Cloud console](https://console.cloud.google.com) → create/select a
+   project → enable the **Chrome Web Store API**.
+2. **OAuth consent screen** → External → fill app info; add your email as a
+   **test user**.
+3. **Credentials** → Create credentials → **OAuth client ID** → app type
+   **Desktop app** → note `client_id` / `client_secret`.
+4. In a browser (logged into the CWS developer account — **2FA must be on**),
+   authorize and grab the code:
+
+   ```
+   https://accounts.google.com/o/oauth2/auth?response_type=code&scope=https://www.googleapis.com/auth/chromewebstore&client_id=$CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
+   ```
+
+5. Exchange the code for a refresh token:
+
+   ```bash
+   curl "https://oauth2.googleapis.com/token" -d \
+     "client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code=$CODE&grant_type=authorization_code&redirect_uri=urn:ietf:wg:oauth:2.0:oob"
+   ```
+
+   Store the `refresh_token` from the response as `CWS_REFRESH_TOKEN`. It
+   authorizes store publishes until revoked.
+
+### Store & pre-releases
+
+The store item has exactly **one version slot** and CWS enforces two rules:
+versions are numeric only (no `-rc1`), and every upload must be **strictly
+greater** than the currently published version. Publishing an rc with the
+final's number (e.g. `0.13.0` for both `v0.13.0-rc1` and `v0.13.0`) therefore
+collides, and giving rcs a different number breaks the repo's version-parity
+discipline (extension version == daemon version, checked by `doctor`). So:
+
+- **`vX.Y.Z-rc*` tags skip CWS entirely.** They still auto-publish to PyPI,
+  npm, and the GitHub Release (all of which accept `-rc1` suffixes). Pre-release
+  testing happens via the unpacked build.
+- **Pure `vX.Y.Z` tags publish to the store** (default audience). Store users
+  auto-update once the version lands; the daemon's `install_source` reporting
+  keeps the mismatch warning honest in the meantime.
+- **Trusted-testers distribution stays manual.** When a real beta audience
+  exists, push a build to `publishTarget=trustedTesters` (or publish a separate
+  private BETA item per the [official beta flow](https://developer.chrome.com/docs/extensions/develop/migrate/publish-mv3));
+  do not automate it into the tag pipeline — the same-version collision above
+  makes it stateful.

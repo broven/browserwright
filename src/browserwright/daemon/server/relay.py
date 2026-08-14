@@ -75,6 +75,18 @@ logger = logging.getLogger(__name__)
 # bind an ephemeral port.
 DEFAULT_RELAY_PORT = 19989
 
+# The Chrome Web Store item id of the published browserwright extension
+# (`okgnalaalckoaeledbjhpjiccmcdceeb`). The relay classifies a connected
+# extension's install source from the ws handshake `Origin:
+# chrome-extension://<id>` header: an id in this set is a store install
+# (auto-updating, `chrome.runtime.reload()` cannot change its version), any
+# other id is a development/unpacked load (path-derived id, unique per
+# machine, reloadable from disk). No Origin at all (curl/raw ws clients)
+# is "unknown". Tests override via `RelayServer(store_extension_ids=...)`.
+DEFAULT_STORE_EXTENSION_IDS = frozenset({
+    "okgnalaalckoaeledbjhpjiccmcdceeb",
+})
+
 # Spec §A.4: OpenCLI `extension/src/cdp.ts:96-150` retries 3 times when
 # chrome.debugger.attach fails with "Another debugger is already attached".
 # We mirror the same cadence — keeps the user-visible retry feel consistent
@@ -135,6 +147,21 @@ class _InflightCall:
         }
 
 
+def classify_install_source(ext_id: str, store_ids: frozenset[str]) -> str:
+    """Classify an extension's install source from its Origin header id.
+
+    ``ext_id`` is the id from `Origin: chrome-extension://<id>` on the ws
+    upgrade ("" when the client sent no Origin). Unpacked loads get a
+    path-derived id that is unique per machine and never equals a store
+    item id, so any non-empty id outside ``store_ids`` is a development
+    load. A missing Origin is "unknown" — callers keep the conservative
+    default behavior (drift reload allowed, generic doctor wording).
+    """
+    if not ext_id:
+        return "unknown"
+    return "store" if ext_id in store_ids else "development"
+
+
 def _oldest_pending_s(ext: "_ExtensionConn") -> float | None:
     """Age of this connection's longest-outstanding relay call, or None when it
     is idle (or when every pending future was inserted without meta)."""
@@ -169,6 +196,11 @@ class _ExtensionConn:
     browserwright_version: str = ""
     extension_protocol_version: str = ""
     version_drift: str = VersionDrift.UNKNOWN.value
+    # Where this extension came from, classified at ws handshake from the
+    # Origin header: "store" (Chrome Web Store item id), "development"
+    # (unpacked/other id), or "unknown" (no Origin). Store installs
+    # auto-update and ignore version-drift reload requests.
+    install_source: str = "unknown"
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     pending: dict[int, asyncio.Future] = field(default_factory=dict)
     #: Same keys as `pending`, describing what each awaited call is (see
@@ -187,9 +219,15 @@ class RelayServer:
     """
 
     def __init__(self, *, port: int = DEFAULT_RELAY_PORT,
-                 host: str = "127.0.0.1"):
+                 host: str = "127.0.0.1",
+                 store_extension_ids: frozenset[str] | None = None):
         self._port = port
         self._host = host
+        self._store_extension_ids = (
+            DEFAULT_STORE_EXTENSION_IDS
+            if store_extension_ids is None
+            else frozenset(store_extension_ids)
+        )
         self._server: Any = None
         self._extensions: dict[str, _ExtensionConn] = {}
         # Monotonic connection epoch. A fresh extension hello may represent a
@@ -711,6 +749,7 @@ class RelayServer:
         return {
             "install_id": getattr(ext, "install_id", ""),
             "browser": getattr(ext, "browser", ""),
+            "install_source": getattr(ext, "install_source", "unknown"),
             "version": ext_version,
             "browserwright_version": ext_browserwright_version,
             "daemon_version": __version__,
@@ -771,6 +810,19 @@ class RelayServer:
             return False
 
     async def _maybe_reload_for_version_drift(self, ext: _ExtensionConn) -> None:
+        if ext.install_source == "store":
+            # A Chrome Web Store install auto-updates; `chrome.runtime.reload()`
+            # would only restart the same installed version, so a drift-driven
+            # reload is a pointless round-trip. The store lag resolves itself
+            # when a matching version is published there.
+            logger.debug(
+                "skip drift reload for store extension: install_id=%s "
+                "extension=%s daemon=%s",
+                ext.install_id,
+                ext.browserwright_version or ext.version,
+                __version__,
+            )
+            return
         comparison = compare_versions(ext.browserwright_version or ext.version, __version__)
         if comparison.drift in {VersionDrift.EQUAL, VersionDrift.UNKNOWN}:
             return
@@ -1014,10 +1066,22 @@ class RelayServer:
                 "extension relay refuses non-extension Origin (anti-CSRF)\n",
             )
             return resp
+        # Stash the extension id from the Origin header on the connection so
+        # `_handler` can classify install source (store vs development). This
+        # is the same id the anti-CSRF check above already trusted.
+        conn.bd_origin_extension_id = (
+            origin[len("chrome-extension://"):] if origin else ""
+        )
         return None  # allow upgrade
 
     async def _handler(self, conn: ServerConnection) -> None:
-        ext = _ExtensionConn(conn=conn)
+        ext = _ExtensionConn(
+            conn=conn,
+            install_source=classify_install_source(
+                getattr(conn, "bd_origin_extension_id", ""),
+                self._store_extension_ids,
+            ),
+        )
         # Use the conn's id() as a temp key until hello arrives.
         temp_key = f"_pending-{id(conn)}"
         self._extensions[temp_key] = ext

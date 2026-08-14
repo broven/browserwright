@@ -65,11 +65,17 @@ ${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock
 Linux currently does not auto-install a service; run `browserwright-daemon serve`
 from your own systemd-user unit or process supervisor.
 
-The browser extension is intentionally not part of the PyPI packaging contract.
-The long-term user path is to publish/install it through the Chrome Web Store.
-Until then, local development can use the repo's `chrome-extension/` directory,
-and global installs should use the GitHub Release extension artifact described
-below.
+The browser extension is intentionally not part of the PyPI packaging contract:
+it ships through the **Chrome Web Store** and installs from there like any
+other extension (auto-updating, no Developer mode):
+
+https://chromewebstore.google.com/detail/browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb
+
+Developers working on the extension itself can load the repo's
+`chrome-extension/` directory unpacked (chrome://extensions → Developer mode
+→ Load unpacked); the GitHub Release extension artifact and `mise run
+upgrade-global` are the fallback distribution path for machines that want a
+specific pinned version without the store.
 
 The agent skill bundle remains a thin shell around the installed CLI. For PyPI
 installs, the intended stable contract is:

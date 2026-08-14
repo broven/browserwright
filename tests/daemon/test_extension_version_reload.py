@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
+import websockets
 
 from browserwright import version as version_mod
 from browserwright.daemon import cli as cli_mod
-from browserwright.daemon.server.relay import RelayServer, _ExtensionConn
+from browserwright.daemon.server.relay import (
+    RelayServer,
+    _ExtensionConn,
+    classify_install_source,
+)
 from browserwright.version import VersionDrift, compare_versions
 
 
@@ -71,6 +77,128 @@ async def test_relay_hello_ack_status_and_guarded_reload(monkeypatch):
         },
     )
     assert [msg["type"] for msg in sent].count("reloadExtension") == 1
+
+
+@pytest.mark.asyncio
+async def test_store_extension_skips_drift_reload(monkeypatch):
+    # A Chrome Web Store install auto-updates; the drift-driven reload request
+    # would only restart the same installed version, so it must be skipped.
+    monkeypatch.setattr("browserwright.daemon.server.relay.__version__", "1.2.4")
+    relay = RelayServer()
+    sent: list[dict] = []
+
+    class FakeConn:
+        async def send(self, text: str):
+            sent.append(json.loads(text))
+
+    ext = _ExtensionConn(
+        conn=FakeConn(),
+        install_source="store",
+    )
+    relay._extensions["tmp"] = ext
+
+    await relay._dispatch_from_extension(
+        ext,
+        "tmp",
+        {
+            "type": "hello",
+            "installId": "install-1",
+            "browser": "chrome",
+            "version": "1.2.3",
+            "browserwrightVersion": "1.2.3",
+            "extensionProtocolVersion": version_mod.EXTENSION_PROTOCOL_VERSION,
+        },
+    )
+
+    assert [msg["type"] for msg in sent] == ["helloAck"]
+    status = relay.status_payload()
+    assert status["extension_details"][0]["install_source"] == "store"
+
+
+@pytest.mark.asyncio
+async def test_development_extension_still_gets_drift_reload(monkeypatch):
+    # Unpacked/dev loads keep the reload behavior — that is how a freshly
+    # unpacked build picks up the matching version.
+    monkeypatch.setattr("browserwright.daemon.server.relay.__version__", "1.2.4")
+    relay = RelayServer()
+    sent: list[dict] = []
+
+    class FakeConn:
+        async def send(self, text: str):
+            sent.append(json.loads(text))
+
+    ext = _ExtensionConn(conn=FakeConn(), install_source="development")
+    relay._extensions["tmp"] = ext
+
+    await relay._dispatch_from_extension(
+        ext,
+        "tmp",
+        {
+            "type": "hello",
+            "installId": "install-2",
+            "browser": "chrome",
+            "version": "1.2.3",
+            "browserwrightVersion": "1.2.3",
+            "extensionProtocolVersion": version_mod.EXTENSION_PROTOCOL_VERSION,
+        },
+    )
+
+    assert [msg["type"] for msg in sent] == ["helloAck", "reloadExtension"]
+
+
+def test_classify_install_source():
+    store_ids = frozenset({"okgnalaalckoaeledbjhpjiccmcdceeb"})
+    assert classify_install_source("okgnalaalckoaeledbjhpjiccmcdceeb", store_ids) == "store"
+    assert classify_install_source("jklmnoabcdevwxyz1234567890abcdef", store_ids) == "development"
+    assert classify_install_source("", store_ids) == "unknown"
+    # A test relay with a different store-id set classifies the real store id
+    # as development — install source follows the configured item ids.
+    assert classify_install_source(
+        "okgnalaalckoaeledbjhpjiccmcdceeb", frozenset({"other-item-id"})
+    ) == "development"
+
+
+@pytest.mark.asyncio
+async def test_relay_classifies_install_source_from_ws_origin():
+    # Real handshake: the ws Origin header (Chrome MV3 SW emits
+    # chrome-extension://<id>) must drive the per-connection install_source.
+    relay = RelayServer(port=0)
+    await relay.start()
+    try:
+        port = relay.port
+
+        async def open_conn(origin_id: str, install_id: str):
+            ws = await websockets.connect(
+                f"ws://127.0.0.1:{port}/",
+                origin=f"chrome-extension://{origin_id}",
+            )
+            await ws.send(json.dumps({
+                "type": "hello",
+                "installId": install_id,
+                "browser": "chrome",
+                "version": "1.0.0",
+                "browserwrightVersion": "1.0.0",
+                "extensionProtocolVersion": version_mod.EXTENSION_PROTOCOL_VERSION,
+            }))
+            return ws
+
+        # Keep both connections open while we read status — the handler
+        # removes a connection from the table once it disconnects.
+        store_ws = await open_conn("okgnalaalckoaeledbjhpjiccmcdceeb", "store-ext")
+        dev_ws = await open_conn("abcdefghijklmnopqrstuvwxyz012345", "dev-ext")
+        await asyncio.sleep(0.2)
+
+        by_id = {
+            e["install_id"]: e["install_source"]
+            for e in relay.status_payload()["extension_details"]
+        }
+        assert by_id["store-ext"] == "store"
+        assert by_id["dev-ext"] == "development"
+
+        await store_ws.close()
+        await dev_ws.close()
+    finally:
+        await relay.stop()
 
 
 @pytest.mark.asyncio

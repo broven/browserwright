@@ -1217,6 +1217,7 @@ def _pretty_ps(p: dict) -> None:
         for e in exts:
             print(f"  {e.get('install_id') or '?'}  "
                   f"version={e.get('browserwright_version') or '?'}  "
+                  f"source={e.get('install_source') or '?'}  "
                   f"pending={e.get('pending', 0)}  "
                   f"oldest={_secs(e.get('oldest_pending_s'))}")
         for r in relay.get("inflight") or []:

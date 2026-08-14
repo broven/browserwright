@@ -22,12 +22,15 @@ ws://127.0.0.1:<port>/devtools/browser/<browser-id>
 
 ## Driving the user's daily Chrome
 
-To drive the user's daily Chrome, use the **extension** backend (it relays CDP through the unpacked extension's `chrome.debugger` API — no remote-debugging port, no Allow popups):
+To drive the user's daily Chrome, use the **extension** backend (it relays CDP through the extension's `chrome.debugger` API — no remote-debugging port, no Allow popups):
 
 ```bash
-# 1. Load the unpacked extension once (browserwright-daemon ships it under chrome-extension/).
-$ browserwright-daemon extension-path --json    # prints the absolute path
-# In Chrome: chrome://extensions → toggle Developer mode → Load unpacked → pick that path.
+# 1. Install the extension once — from the Chrome Web Store (recommended,
+#    auto-updating) or unpacked for development:
+#    store: https://chromewebstore.google.com/detail/
+#           browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb
+#    dev:   browserwright-daemon extension-path --json → chrome://extensions
+#           → Developer mode → Load unpacked → pick that path.
 
 # 2. Start the relay (typically as a LaunchAgent / systemd unit).
 #    One global daemon, fixed socket — `serve` needs no --backend (it serves
@@ -105,14 +108,16 @@ $ browserwright-daemon doctor
    想卸：`browserwright-daemon uninstall`。  
    想查：`browserwright-daemon list`。
 
-2. 把 `browserwright-daemon/chrome-extension/` 整个目录作为 **unpacked extension** 装到 Chrome：
-   - 打开 `chrome://extensions/`
-   - 右上角打开"开发者模式"
-   - 点"加载已解压的扩展程序"，选 `chrome-extension/` 目录
+2. 把扩展装到 Chrome（二选一）：
+   - **商店版（推荐）**：Chrome Web Store 搜索 browserwright 安装：
+     https://chromewebstore.google.com/detail/browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb
+     自动更新，不需要开发者模式。
+   - **unpacked（开发用）**：把 `browserwright-daemon/chrome-extension/` 整个目录装到 Chrome：
+     打开 `chrome://extensions/` → 右上角打开"开发者模式" → 点"加载已解压的扩展程序"，选 `chrome-extension/` 目录
 
 3. 装好后，扩展会自动连接 daemon —— 不需要点扩展图标，也不需要手动 attach 任何 tab。后续 daemon 重启 / Chrome 重启 / extension service worker idle 都由 `maintainLoop` + `chrome.alarms` + `chrome.runtime.onStartup` 自动恢复，**零手动操作**。
 
-升级已加载的 unpacked extension 时，先更新磁盘上的扩展目录并重启 daemon，然后运行：
+升级商店版扩展：商店自动更新；daemon 的漂移检查对商店版跳过 reload（reload 无法改变商店版版本）。升级 unpacked 扩展：先更新磁盘上的扩展目录并重启 daemon，然后运行：
 
 ```bash
 browserwright-daemon extension reload

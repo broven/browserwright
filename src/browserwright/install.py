@@ -218,14 +218,16 @@ def run() -> int:
         print("    (`--name` labels the attached browser session; choose a short task label.)")
     elif choice == "3":
         ext_dir = chrome_extension_path()
-        print("  1. Install the unpacked Chrome extension:")
+        print("  1. Install the Chrome extension (store build recommended):")
+        print("       - Chrome Web Store → install browserwright:")
+        print("         https://chromewebstore.google.com/detail/")
+        print("         browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb")
+        print("       - Developers: chrome://extensions → toggle 'Developer mode'")
         if ext_dir:
-            print("       - chrome://extensions → toggle 'Developer mode'")
-            print("       - click 'Load unpacked' → pick:")
+            print("         → 'Load unpacked' → pick:")
             print(f"           {ext_dir}")
         else:
-            print("       - chrome://extensions → toggle 'Developer mode'")
-            print("       - click 'Load unpacked' → pick the daemon's")
+            print("         → 'Load unpacked' → pick the daemon's")
             print("         `chrome-extension/` directory.")
             print("         (Hint: `browserwright-daemon extension-path --json` prints it.)")
         print("  2. Start the single global daemon:")

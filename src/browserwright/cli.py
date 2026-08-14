@@ -986,6 +986,7 @@ def _cmd_version(args: list[str]) -> int:
                     f"{ext.get('install_id') or '?'} "
                     f"version={ext.get('browserwright_version') or ext.get('version') or '?'} "
                     f"daemon={ext.get('daemon_version') or '?'} "
+                    f"source={ext.get('install_source') or '?'} "
                     f"drift={ext.get('version_drift') or '?'}"
                 )
         return 0 if info["ok"] else 1

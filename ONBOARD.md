@@ -55,7 +55,7 @@ mise run dev-link    # development only; a broken checkout can break global agen
 | `mise run build` | Build wheel/sdist (`uv build`) |
 | `mise run dev` | (no-op) no dev server — see step 2 |
 | `mise run dev-link` | Symlink this checkout into global PATH + skill dirs (dev only) |
-| `mise run upgrade-global` | Sync global install to PyPI latest + matching extension artifact ([RELEASING.md](RELEASING.md)) |
+| `mise run upgrade-global` | Sync global install to PyPI latest + matching extension artifact (dev fallback; production users install the extension from the Chrome Web Store — see [RELEASING.md](RELEASING.md)) |
 | `mise run version-check` | Verify package / skill / daemon / extension versions agree |
 
 Cutting a release, fixing the PyPI publish, or updating the global install when

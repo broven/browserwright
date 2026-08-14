@@ -176,7 +176,7 @@ def test_release_workflow_rejects_malformed_tags(tag):
 def _tag_pattern() -> re.Pattern[str]:
     """Return the tag-validation regex from `release.yml`.
 
-    All three jobs (PyPI, extension zip, npm) embed their own copy of this
+    All four jobs (PyPI, extension zip, npm, CWS) embed their own copy of this
     literal and refuse to build when the pushed tag does not match — that is
     what stops a `v*` tag like `vnext` from being stamped in as a garbage
     version. The copies must agree, or one job could publish while another
@@ -193,11 +193,11 @@ def _tag_pattern() -> re.Pattern[str]:
             ".github/workflows/release.yml; update this helper if the workflow "
             "was restructured — do not delete the guard."
         )
-    assert len(sources) == 3, (
-        f"Expected three tag-validating release jobs (PyPI, extension zip, npm), "
-        f"found {len(sources)}. A job that publishes without validating the tag "
-        "can stamp a garbage version; a job that disappeared means an artifact "
-        "silently stopped shipping."
+    assert len(sources) == 4, (
+        f"Expected four tag-validating release jobs (PyPI, extension zip, npm, "
+        f"CWS), found {len(sources)}. A job that publishes without validating "
+        "the tag can stamp a garbage version; a job that disappeared means an "
+        "artifact silently stopped shipping."
     )
     assert len(set(sources)) == 1, (
         "The release jobs validate the tag with different regexes "

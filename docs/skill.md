@@ -41,8 +41,8 @@ BD_PORT=9333 BD_BACKEND=cdp browserwright <<'PY'
 print(page_info())
 PY
 
-# Extension backend — drives the user's daily Chrome via the unpacked
-# relay extension, zero popups. See ../browserwright-daemon/README.md for setup.
+# Extension backend — drives the user's daily Chrome via the store-installed
+# relay extension (zero popups). See ../browserwright-daemon/README.md for setup.
 BD_BACKEND=extension browserwright <<'PY'
 print(page_info())
 PY
@@ -123,9 +123,9 @@ user with that dialog. Two safe paths:
    and grab the ws URL from `http://127.0.0.1:9333/json/version`.
 
 2. **One-shot live "does it actually work" verify against the user's real
-   Chrome** uses the `extension` backend — load the unpacked relay
-   extension once and subsequent calls all reuse the same upstream ws,
-   zero popups.
+   Chrome** uses the `extension` backend — install the relay extension once
+   (Chrome Web Store, or unpacked for development) and subsequent calls all
+   reuse the same upstream ws, zero popups.
 
 ## v0.4 — Browser-extension relay (zero popups, zero banner)
 
@@ -139,12 +139,13 @@ extension itself holds the debugger handle. The Skill side is wired through
 End-to-end setup (run once, then forget it):
 
 ```bash
-# 1. Install the unpacked extension. browserwright install prints the
-#    absolute path; alternatively ask the daemon directly:
-browserwright-daemon extension-path --json
-# → {"path": "/.../browserwright-daemon/chrome-extension"}
-# Then in Chrome: chrome://extensions → Developer mode → Load unpacked
-# → pick that directory.
+# 1. Install the extension — from the Chrome Web Store (recommended,
+#    auto-updating) or unpacked for development:
+#    store: https://chromewebstore.google.com/detail/
+#           browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb
+#    dev:   browserwright install option 3, or `browserwright-daemon
+#           extension-path --json` → chrome://extensions → Developer mode
+#           → Load unpacked → pick that directory.
 
 # 2. Start the daemon as a Mode B relay (one global daemon, fixed socket).
 browserwright-daemon serve
@@ -172,7 +173,7 @@ freshly-shipped daemon backend.
 |---|---|---|---|---|
 | `cdp` (isolated profile) | wizard option **1** (default) — `browserwright-daemon launch-chrome` | dedicated background user-data-dir | ❌ | ❌ |
 | `cdp` (fingerprint browser) | wizard option **2** — user runs AdsPower / MultiLogin / etc. | user's fingerprint browser | ❌ | ❌ |
-| `extension` | wizard option **3** — load unpacked extension | user's daily Chrome via `chrome.debugger` | ❌ | ❌ |
+| `extension` | wizard option **3** — install from Chrome Web Store (or load unpacked for development) | user's daily Chrome via `chrome.debugger` | ❌ | ❌ |
 | `env` | externally-owned browser via `BD_CDP_WS` / `BD_CDP_URL` | external (attach-owned, never closed on `session end`) | ❌ | ❌ |
 
 ## v0.5.1 — Review remediation release

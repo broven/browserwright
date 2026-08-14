@@ -170,7 +170,9 @@ def _needs_action(backend_name: str) -> str | None:
         # opens, not here.
         return "launch Chrome with --remote-debugging-port=9222 (or use launch-chrome)"
     if backend_name == "extension":
-        return ("load the unpacked extension from browserwright-daemon/chrome-extension/ "
-                "(chrome://extensions/ → enable Developer mode → Load unpacked); "
-                "or run `browserwright install` option 3")
+        return ("install the browserwright extension from the Chrome Web Store "
+                "(https://chromewebstore.google.com/detail/"
+                "browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb); "
+                "developers: chrome://extensions/ → enable Developer mode → "
+                "Load unpacked; or run `browserwright install` option 3")
     return None
