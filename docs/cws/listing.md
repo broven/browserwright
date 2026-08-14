@@ -97,7 +97,18 @@ recommended). The extension's only UI is the popup; a good screenshot is the
 popup rendered on a neutral desktop background at 1280x800 (see the manual
 recipe below).
 
-## Manual upload steps (dashboard)
+## Automated publishing
+
+Since vX.Y.Z releases, the `publish-cws` job in `.github/workflows/release.yml`
+performs the repackaging + upload + publish steps below automatically on every
+pure `vX.Y.Z` tag (pre-release tags skip the store — see RELEASING.md "Store &
+pre-releases"). The manual recipe is kept as the fallback for store-only hot
+fixes or a broken CI.
+
+The store item id is `okgnalaalckoaeledbjhpjiccmcdceeb`; the live listing is
+https://chromewebstore.google.com/detail/browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb
+
+### Manual upload steps (dashboard)
 
 1. <https://chrome.google.com/webstore/devconsole> → **Add new item** → upload
    `browserwright-cws-<version>.zip`.

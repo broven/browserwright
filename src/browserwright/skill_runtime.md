@@ -7,7 +7,7 @@ Two CLIs work together:
 
 ## Version Discipline
 
-The installed package version is the authority for the CLI, daemon, generated skill document, and unpacked extension. Before using the extension backend, run:
+The installed package version is the authority for the CLI, daemon, generated skill document, and extension. Before using the extension backend, run:
 
 ```bash
 browserwright version check
@@ -35,6 +35,8 @@ Never reach for `restart --force` as an agent: it kills every session's live
 executor state (`page`/`context`/variables) and the refusal message tells you
 which sessions to end or reset first. `--force` exists only for the
 maintainer's `upgrade-global` tooling.
+
+**Store-installed extensions differ:** the Chrome Web Store build auto-updates and `chrome.runtime.reload()` cannot change its version, so the daemon skips its drift-driven reload request for store installs (it reports `install_source=store` in status/doctor). A store extension behind the daemon resolves itself when a matching version is published to the store; until then `doctor` shows a cosmetic version-mismatch warning, and sessions still work.
 
 `status --json` also reports the Playwright facade endpoint (`facade.ws`). The facade is **on by default** — inline browser calls connect through it automatically. A null `facade.ws` means the daemon is down or was started with `--facade-port 0`.
 

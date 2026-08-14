@@ -104,9 +104,11 @@ class ExtensionBackend(Backend):
                 detail=("extension relay is running but no Chrome extension "
                         "has connected yet"),
                 needs_user_action=(
-                    "load `chrome-extension/` as an unpacked extension in "
-                    "Chrome (chrome://extensions/ → enable Developer mode "
-                    "→ Load unpacked)"),
+                    "install the browserwright extension from the Chrome Web "
+                    "Store (https://chromewebstore.google.com/detail/"
+                    "browserwright-daemon-rela/okgnalaalckoaeledbjhpjiccmcdceeb); "
+                    "developers: chrome://extensions/ → enable Developer mode "
+                    "→ Load unpacked → pick `chrome-extension/`"),
                 ux_cost=self.ux_cost,
             )
 
@@ -121,6 +123,26 @@ class ExtensionBackend(Backend):
             if item.get("browserwright_version")
             and item.get("browserwright_version") != package_version()
         ]
+        if len(details) >= 2:
+            # Two connected extensions (e.g. the store build + an unpacked dev
+            # load in the same profile) make the daemon's choice of which
+            # extension answers a tab ambiguous. Warn instead of guessing.
+            return DoctorResult(
+                name=self.name,
+                available=True,
+                ws_url=None,
+                detail=(
+                    f"{len(details)} extension(s) connected "
+                    f"(install_ids={install_ids})"
+                ),
+                ux_warning=(
+                    "multiple browserwright extensions are connected "
+                    "(store + unpacked?); keep exactly one installed or the "
+                    "daemon may drive the wrong one"
+                ),
+                needs_user_action=None,
+                ux_cost=self.ux_cost,
+            )
         if incompatible:
             return DoctorResult(
                 name=self.name,
@@ -130,8 +152,16 @@ class ExtensionBackend(Backend):
                     "extension relay connected, but protocol is incompatible "
                     f"(daemon expects {EXTENSION_PROTOCOL_VERSION})"
                 ),
-                ux_warning="reload the unpacked extension from the matching release",
-                needs_user_action="reload `chrome-extension/` in Chrome",
+                ux_warning=(
+                    "reload the unpacked extension from the matching release; "
+                    "a store install auto-updates once a compatible version is "
+                    "published there"
+                ),
+                needs_user_action=(  # noqa: SIM114 - wording differs by install source
+                    "update the extension: a store install updates itself; "
+                    "an unpacked load needs `browserwright-daemon extension "
+                    "reload` (or re-upload to the Chrome Web Store)"
+                ),
                 ux_cost=self.ux_cost,
             )
         warning = None
@@ -141,9 +171,15 @@ class ExtensionBackend(Backend):
                 for item in version_mismatch
                 if item.get("browserwright_version")
             })
+            store = any(
+                item.get("install_source") == "store"
+                for item in details
+            )
             warning = (
                 f"extension version(s) {seen} do not match package "
-                f"{package_version()}; reload the unpacked extension"
+                f"{package_version()}"
+                + ("; the store build auto-updates once a matching version "
+                   "is published" if store else "; reload the unpacked extension")
             )
         tabs = int(status.get("tab_count", 0))
         return DoctorResult(

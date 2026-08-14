@@ -210,3 +210,153 @@ jobs:
         # and harmless afterwards. No --dry-run guard here on purpose: the tests
         # above are the gate, and a half-published release is worse than a loud one.
         run: npm publish --access public
+
+  publish-cws:
+    # Chrome Web Store publish via the official Upload API (OAuth2). Runs only
+    # on pure X.Y.Z tags: CWS accepts only numeric versions and rejects a
+    # re-upload of the version currently published, so a pre-release suffix
+    # (vX.Y.Z-rc1) cannot live on the same store item without breaking version
+    # parity with the daemon — rc builds are tested unpacked and never touch
+    # the store (see RELEASING.md "Store & pre-releases").
+    name: Publish Chrome extension to Web Store
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    environment:
+      name: cws
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set extension version from git tag
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(
+              r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:[a-zA-Z0-9_.!+-]+)?",
+              tag,
+          )
+          if not match:
+              print(
+                  f"Tag {tag!r} is not a supported package version tag. "
+                  "Use tags like v0.6.3.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          version = tag[1:] if tag.startswith("v") else tag
+          path = Path("chrome-extension/manifest.json")
+          manifest = json.loads(path.read_text(encoding="utf-8"))
+          manifest["version"] = version
+          path.write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+          print(f"Extension version set from git tag: {version}")
+          PY
+
+      # CWS rejects the GitHub Release zip (everything nested under
+      # chrome-extension/); the manifest must sit at the zip root.
+      - name: Repackage with manifest at zip root (CWS shape)
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/cws
+          cp -r chrome-extension "dist/cws/unpacked"
+          cd dist/cws
+          zip -qr "browserwright-cws-${version}.zip" unpacked
+          cd ../..
+
+      # OAuth2 token exchange. The refresh token is the first stored secret in
+      # this repo's CI (CWS has no OIDC/trusted publishing — see RELEASING.md
+      # "CWS secrets setup"). The access token is written to a file, never
+      # printed, so it cannot leak into the job log.
+      - name: Obtain OAuth access token
+        run: |
+          curl -sS -X POST https://oauth2.googleapis.com/token \
+            -d "client_id=${{ secrets.CWS_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.CWS_CLIENT_SECRET }}" \
+            -d "refresh_token=${{ secrets.CWS_REFRESH_TOKEN }}" \
+            -d "grant_type=refresh_token" > /tmp/cws_token.json
+          python - <<'PY'
+          import json
+          data = json.load(open("/tmp/cws_token.json"))
+          if "access_token" not in data:
+              print(f"CWS token exchange failed: {data}", file=sys.stderr)
+              raise SystemExit(1)
+          open("/tmp/cws_token", "w").write(data["access_token"])
+          PY
+
+      # Upload + publish. Genuine API errors (auth, rejected version) fail the
+      # release loudly — a half-published release is worse than a loud one.
+      # The one exception is Google deciding to re-review the update (permission
+      # or material code change): that is not an error, the item goes live when
+      # review clears, so it is reported as a loud note instead of a red build.
+      - name: Upload and publish to Chrome Web Store
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          token = open("/tmp/cws_token").read().strip()
+          item_id = "${{ secrets.CWS_ITEM_ID }}"
+          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          zip_path = f"dist/cws/browserwright-cws-{version}.zip"
+
+          def call(url, method, body=b"", extra=None):
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "x-goog-api-version": "2",
+              }
+              if extra:
+                  headers.update(extra)
+              req = urllib.request.Request(url, data=body, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.load(resp)
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode("utf-8", errors="replace")
+                  print(f"CWS API {method} {url} failed: HTTP {e.code} {detail}",
+                        file=sys.stderr)
+                  raise
+
+          print(f"Uploading {zip_path} ({os.path.getsize(zip_path)} bytes) ...")
+          upload = call(
+              f"https://www.googleapis.com/upload/chromewebstore/v1.1/items/{item_id}",
+              "PUT",
+              open(zip_path, "rb").read(),
+              {"Content-Type": "application/zip"},
+          )
+          if upload.get("uploadState") != "SUCCESS":
+              print(f"CWS upload did not succeed: {upload}", file=sys.stderr)
+              raise SystemExit(1)
+          print(f"Uploaded as item draft: {upload.get('id')}")
+
+          print("Publishing (default audience) ...")
+          publish = call(
+              f"https://www.googleapis.com/chromewebstore/v1.1/items/{item_id}/publish",
+              "POST",
+              b"",
+              {"Content-Length": "0"},
+          )
+          statuses = publish.get("status") or []
+          print(f"CWS publish response: {publish}")
+          if "PUBLISHED" in statuses:
+              print(f"Chrome Web Store updated to {version} (PUBLISHED).")
+          else:
+              print(
+                  "::warning::Chrome Web Store accepted the upload but the "
+                  "update is not PUBLISHED yet — Google is re-reviewing it "
+                  "(status " + json.dumps(statuses) + "). It goes live when "
+                  "review clears; the store then auto-updates users. No "
+                  "release action needed."
+              )
+          PY
