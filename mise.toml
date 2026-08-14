@@ -421,6 +421,18 @@ while time.monotonic() < deadline:
             print(f"Extension reconnected on {expected} "
                   f"(daemon {payload.get('daemon_version') or '?'}).")
             sys.exit(0)
+        # A store install never matches the just-released version here: it
+        # auto-updates from the Chrome Web Store on Chrome's own schedule.
+        # The reload step already skipped it; don't warn about a non-problem.
+        if details and all(item.get("install_source") == "store" for item in details):
+            seen = sorted({
+                str(item.get("browserwright_version") or item.get("version") or "")
+                for item in details if item.get("browserwright_version") or item.get("version")
+            })
+            print(f"Store extension connected (version {seen or '?'}) — it "
+                  "auto-updates from the Chrome Web Store; the daemon is "
+                  "already on " + str(payload.get("daemon_version") or "?") + ".")
+            sys.exit(0)
         last = f"connected extension versions: {versions or 'none'}"
     except Exception as exc:
         last = repr(exc)

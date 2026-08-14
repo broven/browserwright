@@ -715,10 +715,16 @@ def _cmd_extension(args, cfg: Config) -> int:
                 return
             sent = int(result.get("sent", 0) or 0)
             reconnected = int(result.get("reconnected", 0) or 0)
+            skipped = int(result.get("skipped", 0) or 0)
+            skip_note = (
+                f"; {skipped} store extension(s) skipped (auto-update, "
+                "reload cannot change their version)"
+                if skipped else ""
+            )
             if result.get("ok"):
                 print(
                     f"reload complete: {reconnected} of {sent} extension(s) "
-                    "reconnected")
+                    f"reconnected{skip_note}")
                 return
             # D (reload verification): the reload was sent but the SW did not
             # come back. Say so explicitly -- "sent" is not "done" -- and give

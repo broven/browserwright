@@ -242,6 +242,38 @@ async def test_manual_reload_broadcasts_without_guard(monkeypatch):
     ]
 
 
+@pytest.mark.asyncio
+async def test_manual_reload_skips_store_extension():
+    # `extension reload` must not reload a store install: it cannot change
+    # the version and the SW restart drops every chrome.debugger session
+    # (and may leave the SW dead per the D reload-verification contract).
+    relay = RelayServer()
+    sent: list[dict] = []
+
+    class FakeConn:
+        async def send(self, text: str):
+            sent.append(json.loads(text))
+
+    ext = _ExtensionConn(
+        conn=FakeConn(),
+        install_id="store-ext",
+        browser="chrome",
+        version="1.0.0",
+        browserwright_version="1.0.0",
+        install_source="store",
+    )
+    ext.hello_received.set()
+    relay._extensions["store-ext"] = ext
+
+    result = await relay.reload_extensions(reason="manual")
+
+    assert sent == []  # nothing sent to a store install
+    assert result["sent"] == 0
+    assert result["skipped"] == 1
+    assert result["ok"] is True
+    assert result["extensions"][0]["skipped"] is True
+
+
 def test_daemon_extension_reload_cli_dispatches_rpc(monkeypatch, capsys):
     calls: list[tuple[str, dict]] = []
 
