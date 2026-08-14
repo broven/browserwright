@@ -118,7 +118,7 @@ $ browserwright-daemon doctor
 browserwright-daemon extension reload
 ```
 
-daemon 会让已连接的扩展调用 `chrome.runtime.reload()`，从磁盘重新加载代码并自动重连。`mise run upgrade-global` 已经包含这一步；只有首次安装或 reload 未确认时才需要回到 `chrome://extensions/` 手动加载/刷新。
+daemon 会让已连接的扩展调用 `chrome.runtime.reload()` 从磁盘重新加载代码。注意：reload 会销毁扩展的 service worker，而 Chrome **不一定**会自动重启它（MV3 的 alarm 恢复网会被 reload 清掉）。`extension reload` 命令现在会验证 SW 是否重新连回，没回来会明确报错并给出手动恢复指引（`chrome://extensions` 手动重载或重启浏览器）。`mise run upgrade-global` 已经包含这一步。
 
 ### 使用 / Agent-driven attach
 

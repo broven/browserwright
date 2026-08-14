@@ -706,16 +706,45 @@ def _extension_relay_status(cfg: Config) -> dict | None:
 def _cmd_extension(args, cfg: Config) -> int:
     action = getattr(args, "extension_cmd", None)
     if action == "reload":
+        outcome: dict = {}
+
         def _emit(result: dict) -> None:
+            outcome["result"] = result
             if args.json:
                 print(json.dumps(result, sort_keys=True))
-            else:
-                sent = int(result.get("sent", 0) or 0)
-                print(f"reload requested for {sent} extension(s)")
+                return
+            sent = int(result.get("sent", 0) or 0)
+            reconnected = int(result.get("reconnected", 0) or 0)
+            if result.get("ok"):
+                print(
+                    f"reload complete: {reconnected} of {sent} extension(s) "
+                    "reconnected")
+                return
+            # D (reload verification): the reload was sent but the SW did not
+            # come back. Say so explicitly -- "sent" is not "done" -- and give
+            # the agent the manual recovery path instead of a silent lie.
+            print(
+                f"error: {sent - reconnected} of {sent} extension(s) did not "
+                "come back after reload", file=sys.stderr)
+            for d in result.get("dead") or []:
+                print(
+                    f"  install_id={d.get('install_id')} "
+                    f"version={d.get('version')}",
+                    file=sys.stderr)
+            print(
+                "chrome.runtime.reload() destroys the service worker and "
+                "Chrome does not always restart it automatically. To recover: "
+                "open chrome://extensions, click reload on the browserwright "
+                "extension, or restart the browser, then run "
+                "`browserwright doctor`.", file=sys.stderr)
 
-        return _rpc_cmd(
+        rc = _rpc_cmd(
             cfg, "BrowserwrightDaemon.extension.reload", {"reason": "manual"},
-            client_label="cli-extension-reload", timeout=8.0, emit=_emit)
+            client_label="cli-extension-reload", timeout=30.0, emit=_emit)
+        result = outcome.get("result")
+        if result is not None and not result.get("ok"):
+            return 1
+        return rc
     print("usage: browserwright-daemon extension reload", file=sys.stderr)
     return 1
 

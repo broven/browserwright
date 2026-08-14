@@ -116,6 +116,12 @@ def run_code(code: str, *, session_id: str,
     except Exception:  # noqa: BLE001
         sys.stdout.write(buf.getvalue())
         sys.stderr.write(traceback.format_exc())
+        # C: surface the recovery hint for raw Playwright failures (target
+        # closed etc.) instead of dropping it with the traceback.
+        from ..errors import playwright_error_fix
+        fix = playwright_error_fix(sys.exc_info()[1])
+        if fix:
+            sys.stderr.write(f"[fix] {fix}\n")
         return 3
     finally:
         # Phase C: tear down the lazy Playwright connection at heredoc end. A
@@ -177,4 +183,10 @@ def _run_on_executor(sess, code: str, *,
             sys.stderr.write(tb if tb.endswith("\n") else tb + "\n")
         else:
             sys.stderr.write(json.dumps(resp.error) + "\n")
+        # C: a generic Playwright error carries a `fix` recovery hint in the
+        # serialized envelope; the traceback path above would otherwise drop
+        # it. Print it as its own line so the agent sees the next step.
+        fix = resp.error.get("fix") if isinstance(resp.error, dict) else None
+        if fix:
+            sys.stderr.write(f"[fix] {fix}\n")
     return resp.exit_code

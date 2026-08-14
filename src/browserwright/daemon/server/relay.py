@@ -85,6 +85,12 @@ APP_PING_INTERVAL = 5.0
 STALE_FRAME_AFTER = 30.0
 RECONNECT_WAIT_TIMEOUT = 35.0
 
+# D (reload verification): after sending reloadExtension we wait this long for
+# the SW to come back before declaring it dead. Chrome does not reliably
+# restart a reloaded MV3 SW (the alarm net is cleared by the reload), so this
+# is the honest bound: longer delays only mean a slower "it is dead" answer.
+_RELOAD_VERIFY_TIMEOUT_S = 15.0
+
 
 @dataclass
 class GhostTarget:
@@ -212,6 +218,11 @@ class RelayServer:
         self._event_listeners: set[Callable[[dict], Awaitable[None]]] = set()
         self._session_announce_events: dict[str, asyncio.Event] = {}
         self._reload_attempts: set[tuple[str, str, str]] = set()
+        # A (auto-recovery): invoked fire-and-forget on every extension hello
+        # (fresh SW after a reload/update, or a ws reconnect). The listener
+        # uses it to re-attach extension sessions whose ghost table was lost
+        # with the previous connection. Set by the listener.
+        self._on_extension_hello: Callable[[], Awaitable[None]] | None = None
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -664,10 +675,17 @@ class RelayServer:
         reason: str = "manual",
         expected_version: str | None = None,
     ) -> dict:
-        """Ask every connected extension to reload from disk immediately.
+        """Ask every connected extension to reload from disk immediately, then
+        VERIFY each service worker comes back (D, reload verification).
 
-        ``chrome.runtime.reload()`` tears down the service worker, so this is a
-        best-effort one-way message rather than a request/response round trip.
+        ``chrome.runtime.reload()`` tears down the service worker; Chrome does
+        NOT always restart it (the MV3 alarm recovery net is cleared by the
+        reload and neither onInstalled nor onStartup fire). So "sent" is not
+        "done": we wait ``_RELOAD_VERIFY_TIMEOUT_S`` for a replacement
+        connection with the same install_id and report ``dead`` for the ones
+        that did not return, so callers can tell the agent the honest next
+        step (manual reload at chrome://extensions / browser restart) instead
+        of pretending the reload worked.
         """
         details: list[dict] = []
         for ext in list(self._extensions.values()):
@@ -679,15 +697,27 @@ class RelayServer:
                 expected_version=expected_version or __version__,
                 guard=False,
             )
+            replacement = None
+            if ok:
+                try:
+                    replacement = await self._wait_for_replacement(
+                        ext, timeout=_RELOAD_VERIFY_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 - report as dead, never crash
+                    replacement = None
             details.append({
                 "install_id": ext.install_id,
                 "browser": ext.browser,
                 "version": ext.browserwright_version or ext.version,
                 "sent": ok,
+                "reconnected": replacement is not None,
             })
+        dead = [d for d in details if d["sent"] and not d["reconnected"]]
         return {
-            "ok": True,
+            "ok": not dead,
             "sent": sum(1 for item in details if item["sent"]),
+            "reconnected": sum(
+                1 for item in details if item["reconnected"]),
+            "dead": dead,
             "extensions": details,
         }
 
@@ -782,6 +812,25 @@ class RelayServer:
             expected_version=__version__,
             guard=True,
         )
+        # D (reload verification): the auto reload path cannot block the hello
+        # handler, so verify fire-and-forget and log the honest outcome -- an
+        # SW that does not come back leaves the extension offline until a
+        # manual chrome://extensions reload or browser restart.
+        asyncio.create_task(self._verify_reload_came_back(ext))
+
+    async def _verify_reload_came_back(self, old_ext: _ExtensionConn) -> None:
+        try:
+            replacement = await self._wait_for_replacement(
+                old_ext, timeout=_RELOAD_VERIFY_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - verification is best-effort
+            replacement = None
+        if replacement is None:
+            logger.warning(
+                "version-drift reload did not come back for install_id=%s: "
+                "the extension service worker needs a manual reload at "
+                "chrome://extensions or a browser restart",
+                old_ext.install_id or "(unknown)",
+            )
 
     def _pick_active_extension(self) -> _ExtensionConn | None:
         for ext in self._extensions.values():
@@ -1120,6 +1169,12 @@ class RelayServer:
                     e,
                 )
             await self._maybe_reload_for_version_drift(ext)
+            if self._on_extension_hello is not None:
+                try:
+                    await self._on_extension_hello()
+                except Exception as e:  # noqa: BLE001 - never break hello
+                    logger.warning(
+                        "extension hello callback failed: %r", e)
             return
 
         if kind == "ping":

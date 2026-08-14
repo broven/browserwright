@@ -46,6 +46,7 @@ from .protocol import (
     MAX_TEXT_CHARS,
     TERMINAL_DEADLINE_EXCEEDED,
     TERMINAL_RESET_REQUESTED,
+    TERMINAL_TARGET_CLOSED,
     ExecuteRequest,
     ExecuteResponse,
     recv_message,
@@ -58,6 +59,27 @@ from .protocol import (
 # timeout in the registry is 35s, comfortably above this).
 _COLD_START_CONNECT_ATTEMPTS = 13
 _COLD_START_CONNECT_BACKOFF_S = 0.75
+
+
+_TARGET_CLOSED_MARKERS = (
+    "target page, context or browser has been closed",
+    "execution context was destroyed",
+    "frame detached",
+    "target closed",
+    "page closed",
+)
+
+
+def _is_target_closed_family(exc: BaseException) -> bool:
+    """True for the Playwright errors that mean "the tab binding under this
+    page object is gone": TargetClosedError and its siblings (execution
+    context destroyed, frame detached). The executor cannot repair the zombie
+    page in place -- it must exit so the next command cold-starts and
+    re-attaches the session (B, target-closed self-heal)."""
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TARGET_CLOSED_MARKERS)
 
 # `_bw_warn` is callable from a loop, so the warnings LIST needs a bound as much
 # as each entry does. The overflow is folded into one final notice rather than
@@ -686,7 +708,35 @@ class _Worker:
                     fix = playwright_error_fix(e)
                     if fix:
                         error["fix"] = fix
-                    return self._finish(buf, error=error, exit_code=3)
+                    terminal_reason = None
+                    if _is_target_closed_family(e):
+                        # B (target-closed self-heal): the session's tab
+                        # binding died under us (extension SW reload/update,
+                        # daemon restart, user closed the tab). The page is a
+                        # zombie and the facade connection still holds the
+                        # daemon's single-attacher slot, which deadlocks every
+                        # recovery path until this executor is reaped. So flush
+                        # this (hint-carrying) response and exit: the next
+                        # command cold-starts, re-attaches the session's tab
+                        # group (title-keyed recoverSession) and releases the
+                        # slot. The hint must NOT teach `session new` -- the
+                        # session itself is fine; only the executor is not.
+                        sid = self._session_id or "<id>"
+                        error["fix"] = (
+                            "the session's tab binding is gone (extension "
+                            "reloaded/updated, daemon restarted, or the tab was "
+                            "closed). The executor recycled itself; the NEXT "
+                            "command re-attaches the session automatically. If "
+                            "the tab is gone for good, run `browserwright "
+                            f"session reset -s {sid}` first, or `browserwright "
+                            f"session attach-active -s {sid}` to adopt the tab "
+                            "you are looking at, then retry."
+                        )
+                        terminal_reason = TERMINAL_TARGET_CLOSED
+                    return self._finish(
+                        buf, error=error, exit_code=3,
+                        terminal_reason=terminal_reason,
+                    )
         finally:
             self._active_globals = None
         return self._finish(
