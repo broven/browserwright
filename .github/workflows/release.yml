@@ -349,8 +349,12 @@ jobs:
           )
           statuses = publish.get("status") or []
           print(f"CWS publish response: {publish}")
-          if "PUBLISHED" in statuses:
-              print(f"Chrome Web Store updated to {version} (PUBLISHED).")
+          # The publish API reports success as status ['OK'] (the docs' sample
+          # shows ['PUBLISHED'] — accept both). A review round, when Google
+          # decides one is needed, does not change this response; the item
+          # goes live when review clears.
+          if any(s in ("OK", "PUBLISHED") for s in statuses):
+              print(f"Chrome Web Store updated to {version} (publish accepted).")
           else:
               print(
                   "::warning::Chrome Web Store accepted the upload but the "

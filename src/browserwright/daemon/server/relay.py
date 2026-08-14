@@ -729,6 +729,22 @@ class RelayServer:
         for ext in list(self._extensions.values()):
             if not ext.hello_received.is_set():
                 continue
+            if ext.install_source == "store":
+                # A store build auto-updates from the Web Store; reloading it
+                # cannot change its version and the SW restart drops every
+                # chrome.debugger session it holds (and per D above may leave
+                # the SW dead). Skipping keeps `extension reload` honest for
+                # unpacked dev builds without nuking store sessions.
+                details.append({
+                    "install_id": ext.install_id,
+                    "browser": ext.browser,
+                    "version": ext.browserwright_version or ext.version,
+                    "sent": False,
+                    "skipped": True,
+                    "reason": "store install auto-updates; reload cannot "
+                               "change its version",
+                })
+                continue
             ok = await self._send_reload_extension(
                 ext,
                 reason=reason,
@@ -749,12 +765,14 @@ class RelayServer:
                 "sent": ok,
                 "reconnected": replacement is not None,
             })
-        dead = [d for d in details if d["sent"] and not d["reconnected"]]
+        dead = [d for d in details if d["sent"] and not d.get("reconnected")]
+        skipped = [d for d in details if d.get("skipped")]
         return {
             "ok": not dead,
             "sent": sum(1 for item in details if item["sent"]),
             "reconnected": sum(
-                1 for item in details if item["reconnected"]),
+                1 for item in details if item.get("reconnected")),
+            "skipped": len(skipped),
             "dead": dead,
             "extensions": details,
         }
