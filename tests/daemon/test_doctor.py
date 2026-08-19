@@ -28,6 +28,10 @@ EXPECTED_TOP_KEYS = {
     "schema_version", "recommended", "backends",
     # v3 (issue #28): daemon-liveness probe, same fields as `status --json`.
     "alive", "probe_state", "pid",
+    # The Playwright facade, and why it is missing when it is. Additive to
+    # schema 3: a facade that never bound used to be invisible here, so doctor
+    # reported all green while every browser-driving call failed.
+    "facade", "facade_error",
 }
 KNOWN_UX_COSTS = {"none", "banner", "extension-permission"}
 
@@ -41,7 +45,7 @@ def _no_live_daemon(monkeypatch):
 
 
 def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
-                   pid=None):
+                   pid=None, facade=None, facade_error=None):
     async def _fake(cfg, *, probe=None):
         return DaemonStatus(
             alive=alive,
@@ -50,7 +54,8 @@ def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
             port_holder_pid=None,
             version=None,
             endpoint={"transport": "unix", "path": "/dev/null"},
-            facade=None,
+            facade=facade,
+            facade_error=facade_error,
         )
 
     monkeypatch.setattr(doctor_mod, "daemon_status_async", _fake)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from browserwright.daemon import _ipc
 from browserwright.daemon import cli as cli_mod
 from browserwright.daemon import platforms as platforms_mod
 from browserwright.daemon.backends.base import ResolveResult
@@ -50,7 +51,7 @@ def test_cli_main_unavailable_verbose_prints_attempts(monkeypatch, capsys):
 def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
     from browserwright.daemon import _ipc
 
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: (None, None))
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: _ipc.NO_PONG)
     monkeypatch.setattr(
         _ipc,
         "endpoint_describe",
@@ -78,7 +79,7 @@ def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):
 
         def ping(self, timeout):
             calls.append(timeout)
-            return (None, None)
+            return _ipc.NO_PONG
 
         def socket_present(self):
             return True
@@ -91,9 +92,6 @@ def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):
         def endpoint(self):
             return {"transport": "unix", "path": str(sock),
                     "host": None, "port": None, "token": None}
-
-        def facade(self):
-            return (None, None)
 
         def sleep(self, seconds):
             pass

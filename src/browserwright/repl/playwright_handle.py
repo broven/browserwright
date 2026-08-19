@@ -6,10 +6,11 @@ against an injected ``page`` (and ``context``). The handle:
   - **connects lazily**: nothing happens until the first attribute access on
     ``page`` / ``context``. A pure ``memory()`` / site-skill call never opens
     a browser connection (see :class:`_LazyHandle`).
-  - **connects through the daemon facade**: it reads the facade ws URL the
-    daemon advertised (``browserwright-daemon status``'s ``facade.ws`` →
-    ``_ipc.read_facade_file``) and ``chromium.connect_over_cdp`` to it. The
-    facade drives both the cdp and extension backends.
+  - **connects through the daemon facade**: it asks the running daemon for its
+    facade ws URL over ``/__ping__`` (``_ipc.ping_status_sync`` → the same
+    answer ``browserwright-daemon status`` prints as ``facade.ws``) and
+    ``chromium.connect_over_cdp`` to it. The facade drives both the cdp and
+    extension backends.
   - **binds ``page`` to the session's current tab**: it resolves the session's
     ``current_target_id`` (ledger fast-path via ``ensure_session_target``) and
     selects the Playwright ``Page`` whose CDP ``targetId`` matches it. If the
@@ -32,7 +33,6 @@ is no loop conflict with Playwright's sync driver.
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -46,14 +46,14 @@ _PAGE_BIND_POLL_INTERVAL_S = 0.05
 class FacadeUnavailable(BrowserwrightError):
     """The Playwright facade ws could not be discovered/connected.
 
-    Carried fix: ensure the daemon is running (it auto-enables the facade); a
-    daemon predating Phase C, or one started with ``--facade-port 0``, won't
-    advertise one."""
+    The daemon answers this live over ``/__ping__``, so the message carries the
+    daemon's OWN reason (disabled by config, bind failure, still starting up)
+    rather than a guess. The generic fix below is only the fallback for the
+    case where no daemon answered at all."""
 
-    default_fix = ("ensure the daemon is running and the Playwright facade is "
-                   "enabled (it is on by default; `browserwright-daemon "
-                   "status --json` should show a non-null `facade.ws`). Do not "
-                   "pass `--facade-port 0`.")
+    default_fix = ("ensure the daemon is running (`browserwright-daemon "
+                   "status --json` should show a non-null `facade.ws`; the "
+                   "facade is on by default). Do not pass `--facade-port 0`.")
 
 
 def _current_browserwright_session_id() -> str | None:
@@ -74,23 +74,36 @@ def _with_session_query(ws_url: str, session_id: str | None) -> str:
 
 
 def _facade_ws_url(*, session_id: str | None = None) -> str:
-    """Discover the running daemon's facade ws URL.
+    """Ask the running daemon for its facade ws URL.
 
-    Prefers an explicit ``BD_FACADE_WS`` override (tests / advanced setups),
-    else reads the daemon's ``_ipc`` facade discovery file. Raises
-    :class:`FacadeUnavailable` when nothing is found."""
-    override = os.environ.get("BD_FACADE_WS")
+    The daemon is the only thing that knows whether the facade bound, on which
+    host/port, or why it did not — so we ask it, every time, over the cheap
+    ``/__ping__`` HTTP probe. There is deliberately no cached copy on disk: the
+    previous design published a `browserwright-daemon.facade` file, macOS reaped
+    it out of /tmp after three days, and a perfectly healthy facade became
+    invisible to every client while `doctor` reported all green.
+
+    Raises :class:`FacadeUnavailable`, distinguishing the three real causes:
+    no daemon, a daemon too old to advertise, and a daemon that says why.
+    """
+    from ..daemon import _ipc
+
     if session_id is None:
         session_id = _current_browserwright_session_id()
-    if override:
-        return _with_session_query(override, session_id)
-    from ..daemon import _ipc
-    ws, _port = _ipc.read_facade_file()
-    if not ws:
+    pong = _ipc.ping_status_sync()
+    if pong.pid is None:
         raise FacadeUnavailable(
-            "no Playwright facade advertised by the daemon "
-            "(facade discovery file absent)")
-    return _with_session_query(ws, session_id)
+            "no daemon is running, so there is no Playwright facade to connect "
+            "to (start it with `browserwright-daemon start`)")
+    if pong.facade is None:
+        raise FacadeUnavailable(
+            f"daemon {pong.version or 'of unknown version'} does not advertise "
+            "its Playwright facade — it predates live facade discovery. "
+            "Restart it after upgrading: `browserwright-daemon restart`")
+    if not pong.facade.available:
+        raise FacadeUnavailable(
+            f"the daemon has no Playwright facade: {pong.facade.error}")
+    return _with_session_query(pong.facade.ws, session_id)
 
 
 def _session_scoped_ws_url(ws_url: str, session_id: str | None) -> str:
@@ -175,7 +188,8 @@ def connect_over_cdp(pw: Any, *, session_id: str | None = None,
     times over a few seconds absorbs that startup race. The per-heredoc Phase C
     consumer keeps ``attempts=1`` (the daemon is already warm there); only the
     executor cold-start passes a higher count. Discovery (`_facade_ws_url`) is
-    re-read each attempt so a freshly-(re)written facade file is picked up."""
+    re-asked of the daemon each attempt, so a facade that binds a moment after
+    the listener does is picked up rather than cached as absent."""
     attempts = max(1, attempts)
     last_exc: Exception | None = None
     for i in range(attempts):

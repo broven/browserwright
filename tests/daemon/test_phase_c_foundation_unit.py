@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
+import pytest
+
 from browserwright.daemon import _ipc
 from browserwright.daemon.config import (
     DEFAULT_FACADE_HOST,
@@ -102,36 +104,55 @@ def test_session_idle_prune_loads_from_toml_and_env(tmp_path):
     assert overridden.session_idle_prune == 33.0
 
 
-# ---- _ipc facade discovery file --------------------------------------------
+# ---- facade discovery: answered live by the daemon, never from a file ------
+#
+# There is no discovery file any more. The daemon answers `/__ping__` with its
+# live facade state, because the file version shipped a silent outage: macOS
+# reaped `/tmp/browserwright-daemon.facade` after three days, the facade itself
+# stayed bound and healthy on :19990, and every client plus `status` plus
+# `doctor` reported the facade as simply absent. These tests pin the three
+# answers a client can get.
 
 
-def test_facade_file_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    assert _ipc.read_facade_file() == (None, None)  # absent
-    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
-    assert _ipc.read_facade_file() == ("ws://127.0.0.1:19990/cdp", 19990)
-    assert _ipc.facade_path().exists()
+def _pong(**kw):
+    """A pong as `ping_status_sync` would return it."""
+    return _ipc.PongInfo(pid=kw.pop("pid", 4242),
+                         version=kw.pop("version", "0.15.1"), **kw)
 
 
-def test_facade_file_cleanup(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
-    _ipc.cleanup_endpoint()
-    assert not _ipc.facade_path().exists()
-    assert _ipc.read_facade_file() == (None, None)
+def test_pong_carries_bound_facade_roundtrip():
+    body = _ipc.make_pong_body(
+        4242, _ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990))
+    pong = _ipc.parse_pong(body)
+    assert pong.pid == 4242
+    assert pong.facade.available
+    assert (pong.facade.ws, pong.facade.port) == ("ws://127.0.0.1:19990/cdp", 19990)
 
 
-def test_facade_file_bad_json(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    _ipc.facade_path().write_text("not json")
-    assert _ipc.read_facade_file() == (None, None)
+def test_pong_carries_unavailability_reason():
+    body = _ipc.make_pong_body(
+        4242, _ipc.FacadeInfo.unavailable("disabled via --facade-port 0"))
+    pong = _ipc.parse_pong(body)
+    assert pong.facade is not None
+    assert not pong.facade.available
+    assert pong.facade.error == "disabled via --facade-port 0"
 
 
-def test_facade_ws_url_carries_bound_browserwright_session(tmp_path, monkeypatch):
+def test_pong_without_facade_key_is_unknown_not_broken():
+    """An OLD daemon omits the key entirely. That must stay distinguishable
+    from "facade unavailable", because the fix differs: upgrade+restart vs
+    read the daemon's reason."""
+    body = json.dumps({"pong": True, "pid": 4242, "version": "0.14.0"}).encode()
+    assert _ipc.parse_pong(body).facade is None
+
+
+def test_facade_ws_url_carries_bound_browserwright_session(monkeypatch):
     import browserwright.repl.playwright_handle as ph
 
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+    monkeypatch.setattr(
+        _ipc, "ping_status_sync",
+        lambda timeout=1.0: _pong(
+            facade=_ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990)))
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "cdp 7")
 
     # The daemon parses the query with parse_qs, which decodes both `+` and
@@ -144,25 +165,70 @@ def test_facade_ws_url_carries_bound_browserwright_session(tmp_path, monkeypatch
     assert parse_qs(parts.query)["session"] == ["cdp 7"]
 
 
-def test_facade_ws_url_preserves_existing_query(tmp_path, monkeypatch):
+def test_facade_ws_url_preserves_existing_query(monkeypatch):
     import browserwright.repl.playwright_handle as ph
 
-    monkeypatch.setenv("BD_FACADE_WS", "ws://127.0.0.1:19990/cdp?debug=1")
+    monkeypatch.setattr(
+        _ipc, "ping_status_sync",
+        lambda timeout=1.0: _pong(
+            facade=_ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp?debug=1", 19990)))
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "s-1")
 
     assert ph._facade_ws_url() == "ws://127.0.0.1:19990/cdp?debug=1&session=s-1"
 
 
+def test_facade_ws_url_quotes_the_daemons_own_reason(monkeypatch):
+    """The whole point of the rework: the client's error says WHY, in the
+    daemon's words, instead of the old "discovery file absent"."""
+    import browserwright.repl.playwright_handle as ph
+
+    monkeypatch.setattr(
+        _ipc, "ping_status_sync",
+        lambda timeout=1.0: _pong(facade=_ipc.FacadeInfo.unavailable(
+            "facade failed to bind 100.72.20.32:19990: OSError(49)")))
+    monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: None)
+
+    with pytest.raises(ph.FacadeUnavailable) as ei:
+        ph._facade_ws_url()
+    assert "failed to bind 100.72.20.32:19990" in str(ei.value)
+
+
+def test_facade_ws_url_tells_you_to_restart_an_old_daemon(monkeypatch):
+    import browserwright.repl.playwright_handle as ph
+
+    monkeypatch.setattr(_ipc, "ping_status_sync",
+                        lambda timeout=1.0: _pong(version="0.14.0", facade=None))
+    monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: None)
+
+    with pytest.raises(ph.FacadeUnavailable) as ei:
+        ph._facade_ws_url()
+    msg = str(ei.value)
+    assert "0.14.0" in msg
+    assert "restart" in msg
+
+
+def test_facade_ws_url_reports_a_dead_daemon_as_such(monkeypatch):
+    import browserwright.repl.playwright_handle as ph
+
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
+    monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: None)
+
+    with pytest.raises(ph.FacadeUnavailable) as ei:
+        ph._facade_ws_url()
+    assert "no daemon is running" in str(ei.value)
+
+
 # ---- status --json surfaces facade -----------------------------------------
 
 
-def test_status_json_includes_facade(tmp_path, monkeypatch, capsys):
+def test_status_json_includes_facade(monkeypatch, capsys):
     from browserwright.daemon import cli
 
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    # Pretend a daemon is alive and advertising a facade.
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: (4242, "0.6.0"))
-    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+    monkeypatch.setattr(
+        _ipc, "ping_status_sync",
+        lambda timeout=1.0: _ipc.PongInfo(
+            pid=4242, version="0.15.1",
+            facade=_ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990)))
 
     class _Args:
         json = True
@@ -172,15 +238,35 @@ def test_status_json_includes_facade(tmp_path, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["alive"] is True
     assert out["facade"] == {"ws": "ws://127.0.0.1:19990/cdp", "port": 19990}
+    assert out["facade_error"] is None
+
+
+def test_status_json_reports_why_the_facade_is_missing(monkeypatch, capsys):
+    """A live daemon with no facade must say why — the failure this whole
+    change exists to make impossible was `facade: null` with no reason."""
+    from browserwright.daemon import cli
+
+    monkeypatch.setattr(
+        _ipc, "ping_status_sync",
+        lambda timeout=1.0: _ipc.PongInfo(
+            pid=4242, version="0.15.1",
+            facade=_ipc.FacadeInfo.unavailable("disabled via --facade-port 0")))
+
+    class _Args:
+        json = True
+
+    rc = cli._cmd_status(_Args(), Config())
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["facade"] is None
+    assert out["facade_error"] == "disabled via --facade-port 0"
 
 
 def test_status_json_facade_null_when_dead(tmp_path, monkeypatch, capsys):
     from browserwright.daemon import cli
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: (None, None))
-    # Even if a stale facade file lingers, a dead daemon reports facade=None.
-    _ipc.write_facade_file("ws://127.0.0.1:19990/cdp", 19990)
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
 
     class _Args:
         json = True
@@ -190,6 +276,8 @@ def test_status_json_facade_null_when_dead(tmp_path, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["alive"] is False
     assert out["facade"] is None
+    # A dead daemon's facade needs no separate explanation: `alive: false` is it.
+    assert out["facade_error"] is None
 
 
 # ---- lazy heredoc page/context: no connect on construction -----------------

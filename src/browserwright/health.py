@@ -152,7 +152,38 @@ def doctor_checks() -> dict:
                 "update browserwright-daemon to match browserwright",
             )
 
-    # 3. schema version sanity (catches a daemon too old to speak the blob)
+    # 3. facade — the Playwright door. Every `page` / `context` / `snapshot()`
+    #    call connects through it, so a live daemon whose facade never bound (or
+    #    was disabled) means 100% of browser-driving calls fail. That state used
+    #    to be completely invisible here: the discovery file it was published to
+    #    got reaped out of /tmp, `doctor` said all green, and every `-e`/`-f`
+    #    invocation failed with an unexplained FacadeUnavailable. It is a `fail`,
+    #    same tier as a down daemon, because the practical consequence is the
+    #    same. Skipped when the daemon is down — that is already reported above,
+    #    and one root cause should not print as two failures.
+    if not synthetic and info.get("alive") is not False:
+        facade = info.get("facade")
+        if isinstance(facade, dict) and facade.get("ws"):
+            add("facade", "pass",
+                f"Playwright facade at {facade['ws']}", "")
+        elif "facade" in info:
+            reason = (info.get("facade_error")
+                      or "the daemon reports no Playwright facade")
+            add(
+                "facade",
+                "fail",
+                f"no Playwright facade: {reason}",
+                "restart the daemon (`browserwright-daemon restart`); if it was "
+                "started with `--facade-port 0`, drop that flag",
+            )
+        else:
+            # A pre-facade doctor blob. Can't observe it, so don't assert it.
+            add("facade", "warn",
+                "cannot verify the Playwright facade (doctor blob predates the "
+                "facade field)",
+                "update browserwright-daemon to match browserwright")
+
+    # 4. schema version sanity (catches a daemon too old to speak the blob)
     sv = info.get("schema_version")
     if not synthetic:
         if sv in _SUPPORTED_DOCTOR_SCHEMAS:
@@ -165,7 +196,7 @@ def doctor_checks() -> dict:
                 "update browserwright-daemon and browserwright to matching versions",
             )
 
-    # 4. at least one usable backend (relay/extension/cdp connection probe)
+    # 5. at least one usable backend (relay/extension/cdp connection probe)
     backends = info.get("backends") or []
     usable = [b for b in backends if b.get("available")]
     daemon_down = info.get("alive") is False
@@ -203,7 +234,7 @@ def doctor_checks() -> dict:
                 "create an cdp session after `browserwright-daemon serve`",
             )
 
-    # 5. extension/relay specific: if an extension backend exists but is
+    # 6. extension/relay specific: if an extension backend exists but is
     #    unavailable, call it out as its own actionable check.
     ext = next((b for b in backends if b.get("name") == "extension"), None)
     if ext is not None:
@@ -245,7 +276,7 @@ def doctor_checks() -> dict:
             or "update browserwright-daemon, browserwright, and the Chrome extension to matching versions",
         )
 
-    # 5. helper surface parses (local, deterministic): can we import the
+    # 7. helper surface parses (local, deterministic): can we import the
     #    primitive surface agents actually call? A broken install / syntax
     #    error here would otherwise only show up mid-task.
     try:

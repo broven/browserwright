@@ -26,6 +26,11 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from . import _ipc
 
 
 #: Probe states, in the order `status` can reach them.
@@ -59,6 +64,10 @@ class DaemonStatus:
     version: str | None
     endpoint: dict
     facade: dict | None
+    #: Why there is no facade, straight from the daemon. Set exactly when
+    #: `facade` is None and the daemon answered — the missing half of the old
+    #: "facade: null, no idea why" report.
+    facade_error: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -73,9 +82,14 @@ class DaemonStatus:
             "version": self.version,
             "endpoint": self.endpoint,
             # Playwright facade discovery (Phase C). None when the facade is
-            # disabled or the daemon predates auto-enable. The skill layer reads
-            # this to `connect_over_cdp` the heredoc `page`/`context`.
+            # disabled, failed to bind, or the daemon predates auto-enable. The
+            # client layer reads this to `connect_over_cdp` the heredoc
+            # `page`/`context`.
             "facade": self.facade,
+            # Populated whenever `facade` is None on a live daemon: the daemon's
+            # own words for why. Answered live over `/__ping__` — there is no
+            # discovery file to go missing behind our back.
+            "facade_error": self.facade_error,
         }
 
 
@@ -95,13 +109,17 @@ class DaemonProbe:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
 
-    def ping(self, timeout: float) -> tuple[int | None, str | None]:
-        """``(pid, version)`` from the daemon's ``/__ping__``, or ``(None, None)``."""
+    def ping(self, timeout: float) -> "_ipc.PongInfo":
+        """The daemon's ``/__ping__`` answer as an ``_ipc.PongInfo``.
+
+        Carries pid, version AND the live facade state — one round trip, one
+        source of truth. Returns ``_ipc.NO_PONG`` when nothing answers.
+        """
         from . import _ipc
         return _ipc.ping_status_sync(timeout=timeout)
 
-    async def ping_async(self, timeout: float) -> tuple[int | None, str | None]:
-        """``(pid, version)`` for async drivers (``daemon doctor``).
+    async def ping_async(self, timeout: float) -> "_ipc.PongInfo":
+        """The ``_ipc.PongInfo`` for async drivers (``daemon doctor``).
 
         The sync :meth:`ping` runs ``asyncio.run`` internally, which raises
         inside a running event loop — so async callers must not call it
@@ -150,10 +168,6 @@ class DaemonProbe:
         from . import _ipc
         return _ipc.endpoint_describe()
 
-    def facade(self) -> tuple[str | None, int | None]:
-        from . import _ipc
-        return _ipc.read_facade_file()
-
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
 
@@ -168,12 +182,14 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
     """
     p = probe if probe is not None else DaemonProbe(cfg)
 
-    pid, version = await p.ping_async(1.0)
+    pong = await p.ping_async(1.0)
+    pid, version = pong.pid, pong.version
     probe_state = OK if pid is not None else NOT_RUNNING
     port_holder_pid = None
 
     if pid is None and p.socket_present():
-        pid, version, probe_state = _retry_then_classify(p)
+        pong, probe_state = _retry_then_classify(p)
+        pid, version = pong.pid, pong.version
         if probe_state == TRANSIENT_PROBE_FAILED:
             # Still unresponsive, but its socket file is present — a half-alive
             # daemon may be holding the relay/facade ports. Report the truth
@@ -185,7 +201,20 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
                 port_holder_pid = (p.confirmed_stale_holder(ports)
                                    or p.live_pid_file_pid())
 
-    facade_ws, facade_port = p.facade()
+    # The facade is whatever the daemon just said it is. `pong.facade is None`
+    # means the daemon predates facade advertising — reported as "unknown", not
+    # as a healthy or a broken facade.
+    facade = pong.facade
+    facade_dict = ({"ws": facade.ws, "port": facade.port}
+                   if (pid is not None and facade is not None and facade.available)
+                   else None)
+    facade_error = None
+    if pid is not None and facade_dict is None:
+        facade_error = (
+            facade.error if facade is not None and facade.error
+            else (f"daemon {version or 'of unknown version'} does not advertise "
+                  "its Playwright facade; restart it with "
+                  "`browserwright-daemon restart` after upgrading"))
     return DaemonStatus(
         alive=pid is not None,
         probe_state=probe_state,
@@ -193,8 +222,8 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
         port_holder_pid=port_holder_pid,
         version=version,
         endpoint=p.endpoint(),
-        facade=({"ws": facade_ws, "port": facade_port}
-                if (pid is not None and facade_ws) else None),
+        facade=facade_dict,
+        facade_error=facade_error,
     )
 
 
@@ -214,11 +243,14 @@ def _retry_then_classify(p: DaemonProbe):
 
     A daemon mid-GC / mid-reconnect can miss one 1s ping and still be perfectly
     alive, so a single miss must not be reported as death.
+
+    Returns ``(pong, probe_state)``.
     """
+    from . import _ipc
     deadline = time.monotonic() + p.retry_window
     while time.monotonic() < deadline:
         p.sleep(p.retry_interval)
-        pid, version = p.ping(0.3)
-        if pid is not None:
-            return pid, version, OK_AFTER_RETRY
-    return None, None, TRANSIENT_PROBE_FAILED
+        pong = p.ping(0.3)
+        if pong.pid is not None:
+            return pong, OK_AFTER_RETRY
+    return _ipc.NO_PONG, TRANSIENT_PROBE_FAILED

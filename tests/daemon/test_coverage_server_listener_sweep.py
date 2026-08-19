@@ -67,14 +67,19 @@ class _Router:
 
 def test_process_request_ping_and_query_parse(monkeypatch):
     handler = SimpleNamespace()
-    process_request = listener_mod._make_process_request(handler)
+    facade_state = listener_mod.FacadeState()
+    facade_state.set(_ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990))
+    process_request = listener_mod._make_process_request(handler, facade_state)
     conn = _HttpConn()
 
     monkeypatch.setattr(listener_mod.os, "getpid", lambda: 2468)
     ping = process_request(conn, SimpleNamespace(path="/__ping__?x=1", headers={}))
     assert ping.status.value == 200
     assert ping.headers["Content-Type"] == "application/json"
-    assert _ipc.parse_pong(ping.body.encode()) == (2468, listener_mod.__version__)
+    pong = _ipc.parse_pong(ping.body.encode())
+    assert (pong.pid, pong.version) == (2468, listener_mod.__version__)
+    # The pong is the ONLY facade advertisement: it must carry the live endpoint.
+    assert pong.facade == _ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990)
 
     allowed = process_request(
         conn,
@@ -104,7 +109,7 @@ async def test_open_server_unix_bind(monkeypatch, tmp_path):
     monkeypatch.setattr(listener_mod._ipc, "sock_path", lambda: tmp_path / "daemon.sock")
     monkeypatch.setattr(listener_mod.os, "stat", lambda path: SimpleNamespace(st_mode=0o100600))
 
-    unix = await listener_mod._open_server(handler)
+    unix = await listener_mod._open_server(handler, listener_mod.FacadeState())
 
     assert unix.kind == "unix"
     assert calls[0][0] == "unix"
@@ -119,7 +124,8 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     monkeypatch.setattr(
         listener_mod._ipc,
         "ping_status_async",
-        lambda timeout: asyncio.sleep(0, result=(999, listener_mod.__version__)),
+        lambda timeout: asyncio.sleep(
+            0, result=_ipc.PongInfo(pid=999, version=listener_mod.__version__)),
     )
     assert await listener_mod.run_serve(Config(backend="env")) == 1
     err = capsys.readouterr().err
@@ -148,14 +154,18 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     monkeypatch.setattr(
         listener_mod._ipc,
         "ping_status_async",
-        lambda timeout: asyncio.sleep(0, result=(None, None)),
+        lambda timeout: asyncio.sleep(0, result=_ipc.NO_PONG),
     )
     monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: cleanup_calls.append("cleanup"))
     monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: cleanup_calls.append(f"pid:{pid}"))
     monkeypatch.setattr(listener_mod, "_cleanup_orphan_cdp_chrome", lambda: cleanup_calls.append("orphans"))
     monkeypatch.setattr(listener_mod, "_wire_logging", lambda: None)
     monkeypatch.setattr(listener_mod, "install_json_logging_if_requested", lambda: None)
-    monkeypatch.setattr(listener_mod, "_open_server", lambda handler: asyncio.sleep(0, result=server))
+    monkeypatch.setattr(
+        listener_mod,
+        "_open_server",
+        lambda handler, facade_state: asyncio.sleep(0, result=server),
+    )
     monkeypatch.setattr(listener_mod, "RelayServer", BadRelay)
 
     cfg = Config(backend="extension")

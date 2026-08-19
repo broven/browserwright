@@ -82,6 +82,12 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
         "alive": st.alive,
         "probe_state": st.probe_state,
         "pid": st.pid,
+        # The Playwright facade: the door `page`/`context`/`snapshot()` come
+        # through. Emitted because `st` already carries it and its absence used
+        # to be invisible here — a daemon whose facade never bound reported all
+        # green while every browser-driving call failed. Additive to schema 3.
+        "facade": st.facade,
+        "facade_error": st.facade_error,
         "recommended": _pick_recommended([_asdict(r) for r in results]),
         "backends": [_asdict(r) for r in results],
     }

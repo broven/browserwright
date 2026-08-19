@@ -197,7 +197,8 @@ async def run_serve(cfg: Config) -> int:
     # answers, refuse to start a second copy of ourselves (enforces the
     # "at most one global daemon" invariant) — but if the ping comes back
     # negative, we cleanup the dead socket file and proceed.
-    existing_pid, existing_version = await _ipc.ping_status_async(timeout=1.0)
+    existing = await _ipc.ping_status_async(timeout=1.0)
+    existing_pid, existing_version = existing.pid, existing.version
     if existing_pid is not None:
         version_hint = ""
         if existing_version and existing_version != __version__:
@@ -299,7 +300,8 @@ async def run_serve(cfg: Config) -> int:
     _ipc.write_pid(os.getpid())
 
     handler = _ClientHandler(daemon, cfg)
-    server = await _open_server(handler)
+    facade_state = FacadeState()
+    server = await _open_server(handler, facade_state)
 
     # issue #15 (2.4): watch our own control socket. If another `serve` (or a
     # manual `rm`) removes/replaces it, self-exit so we release the relay/facade
@@ -356,13 +358,19 @@ async def run_serve(cfg: Config) -> int:
     # socket. It resolves the daemon's upstream Chrome (cdp backend) and
     # transparently bridges raw browser-level CDP — the existing client path is
     # untouched. The skill layer's heredoc `page`/`context` connect through it,
-    # so it is ON unless `facade_port == 0` (explicit disable). The bound ws is
-    # advertised via the `_ipc` facade discovery file so the skill layer can
-    # `connect_over_cdp` without parsing logs. A bind failure here is non-fatal:
-    # we log + continue serving the agent path.
+    # so it is ON unless `facade_port == 0` (explicit disable). The outcome —
+    # bound endpoint, or the reason there is none — is published to
+    # `FacadeState`, which `/__ping__` answers from. A bind failure here is
+    # non-fatal: we log, record the reason, and keep serving the agent path.
     facade: PlaywrightFacade | None = None
     facade_port = cfg.resolved_facade_port()
-    if facade_port is not None:
+    if facade_port is None:
+        facade_info = _ipc.FacadeInfo.unavailable(
+            "Playwright facade disabled (--facade-port 0 / BD_FACADE_PORT=0 / "
+            "facade_port = 0 in config.toml)")
+        logger.info("playwright facade disabled by config; "
+                    "`page`/`context` will refuse with that reason")
+    else:
         try:
             # PR2: for the extension backend the facade bridges through the
             # daemon's shared relay (started just above). Pass a getter so the
@@ -376,21 +384,33 @@ async def run_serve(cfg: Config) -> int:
                                       relay_getter=_shared_relay,
                                       daemon=daemon)
             bound = await facade.start()
-            # Advertise the bound host so `status`/skill discovery report a
+            # Advertise the bound host so `status`/client discovery report a
             # reachable ws (loopback by default; a tailnet/LAN IP when
             # `--facade-host` opts in). Remote clients still get the real
             # incoming Host echoed back via the facade's HTTP bootstrap.
             facade_ws = f"ws://{cfg.facade_host}:{bound}/cdp"
-            # Advertise the bound ws so the skill layer can discover it (Phase C
-            # auto-enable). Best-effort: a write failure must not abort serving.
-            with contextlib.suppress(Exception):
-                _ipc.write_facade_file(facade_ws, bound)
+            facade_info = _ipc.FacadeInfo.bound(facade_ws, bound)
             logger.info("playwright facade started on port %d "
                         "(connect_over_cdp %s)", bound, facade_ws)
-        except OSError as e:
-            logger.warning("playwright facade failed to bind port %d: %r; "
-                           "continuing without it", facade_port, e)
+        except Exception as e:
+            # Non-fatal: keep serving the agent path. But the reason must
+            # SURVIVE — it is what `status`, `doctor` and the client-side
+            # `FacadeUnavailable` message all quote. A bind failure that only
+            # reaches the log is how "facade is null and nobody knows why"
+            # happens. Not just OSError: a vanished --facade-host interface,
+            # a websockets-internal error, anything — the agent path stays up
+            # and the facade's absence stays explainable.
             facade = None
+            facade_info = _ipc.FacadeInfo.unavailable(
+                f"facade failed to bind {cfg.facade_host}:{facade_port}: {e!r}")
+            logger.warning("playwright facade failed to bind %s:%d: %r; "
+                           "continuing without it",
+                           cfg.facade_host, facade_port, e)
+    # Publish the decided state to the live pong (`/__ping__`), which is the
+    # ONLY channel that advertises the facade. No discovery file: a file is a
+    # second copy, and this daemon shipped a three-day outage when /tmp reaped
+    # exactly that copy while the facade itself stayed healthy.
+    facade_state.set(facade_info)
 
     # The watchdog runs unconditionally: even when upstream idle-close is off
     # (cfg.idle_close_after None), it must still crash-reap dead executors
@@ -511,10 +531,33 @@ def _wire_logging() -> None:
 # ---- websockets server with single-client gate ----------------------------
 
 
-async def _open_server(handler: "_ClientHandler"):
+class FacadeState:
+    """The daemon's live answer to "what is the Playwright facade doing?".
+
+    A one-slot mutable holder, because the agent listener must bind BEFORE the
+    facade does (the facade needs the relay, which needs the listener up), yet
+    `/__ping__` has to answer with whatever the facade decided a moment later.
+    Starts as "not decided yet" so a ping landing in that window says so
+    instead of claiming the facade is broken.
+    """
+
+    def __init__(self) -> None:
+        self._info = _ipc.FacadeInfo.unavailable(
+            "daemon is still starting up; the Playwright facade has not "
+            "reported yet")
+
+    def get(self) -> _ipc.FacadeInfo:
+        return self._info
+
+    def set(self, info: _ipc.FacadeInfo) -> None:
+        self._info = info
+
+
+async def _open_server(handler: "_ClientHandler",
+                       facade_state: FacadeState):
     """Bind the listener with correct umask / file perms. The HTTP /__ping__
     path is intercepted here so stale-detect works without a ws upgrade."""
-    process_request = _make_process_request(handler)
+    process_request = _make_process_request(handler, facade_state)
 
     sock = _ipc.make_unix_socket()
     # Verify the 0600 perms — spec §6.2 promises it; failing loudly here is
@@ -535,12 +578,16 @@ async def _open_server(handler: "_ClientHandler"):
     return server
 
 
-def _make_process_request(handler: "_ClientHandler"):
+def _make_process_request(handler: "_ClientHandler",
+                          facade_state: "FacadeState"):
     """Intercept the HTTP handshake.
 
     One responsibility: `/__ping__` GET → return a 200 with
-    {"pong":true,"pid":N} so the stale-detect probe works *before* a ws
-    upgrade.
+    {"pong":true,"pid":N,"facade":{...}} so the stale-detect probe works
+    *before* a ws upgrade — and so every client learns the facade endpoint from
+    the daemon itself rather than from a file that can outlive or predecease
+    the truth. `facade_state` is read at REQUEST time, never captured, because
+    the facade binds after this closure is built.
 
     v0.3: the single-client gate from v0.2 is **gone**. Multiple clients
     connect concurrently; the router's sessionId/id translation keeps them
@@ -549,7 +596,7 @@ def _make_process_request(handler: "_ClientHandler"):
     def process_request(conn: ServerConnection, request) -> Any:
         path = request.path or "/"
         if path.startswith("/__ping__"):
-            body = _ipc.make_pong_body(os.getpid())
+            body = _ipc.make_pong_body(os.getpid(), facade_state.get())
             resp = conn.respond(http.HTTPStatus.OK, body.decode("utf-8"))
             resp.headers["Content-Type"] = "application/json"
             return resp
