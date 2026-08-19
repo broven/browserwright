@@ -755,3 +755,52 @@ def test_cross_heredoc_tab_reuse_extension(ext_autofacade_ready):
         assert _grep(r2.stdout, "GREW") == "True", "new_page() did not grow tabs"
     finally:
         _cleanup_session("extension", sid)
+
+
+def test_facade_survives_a_wiped_runtime_dir_cdp(cdp_autofacade_daemon):
+    """REGRESSION (2026-08-19 outage): the facade must stay usable after every
+    regular file in the runtime dir is deleted out from under the live daemon.
+
+    What happened: the facade endpoint was published to a
+    `browserwright-daemon.facade` discovery file under /tmp. macOS reaps
+    regular files there after three days — sockets survive, so the daemon kept
+    serving and the facade kept LISTENing while `status --json` reported
+    `facade: null` and EVERY `browserwright -s <id> -e ...` call died with
+    "facade discovery file absent". `doctor` was all green throughout.
+
+    The endpoint now lives only in the daemon's memory and is answered live
+    over `/__ping__`, so wiping the directory can't hide it. This test wipes
+    it exactly the way the reaper does (regular files only, socket untouched)
+    and then drives a real heredoc through the facade.
+    """
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _facade_ws = cdp_autofacade_daemon
+    sid = _seed_session(runtime_dir, "cdp")
+    extra = {"BD_SESSION": sid}
+
+    # Reproduce the reaper: unlink regular files, leave the unix socket alone.
+    wiped = []
+    for entry in Path(runtime_dir).iterdir():
+        if entry.is_file() and not entry.is_symlink():
+            entry.unlink()
+            wiped.append(entry.name)
+    assert wiped, f"nothing to wipe in {runtime_dir} — test would prove nothing"
+
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["TMPDIR"] = runtime_dir
+
+    try:
+        # 1. The daemon still advertises the facade: memory, not the filesystem.
+        assert _status_facade_ws(env) is not None, (
+            f"facade vanished from `status --json` after wiping {wiped}; "
+            "the endpoint is being read from a file again")
+
+        # 2. And it is actually usable: a real heredoc drives a real page.
+        res = run_skill(_REUSE_SCRIPT_1,
+                        backend="cdp", runtime_dir=runtime_dir, extra_env=extra)
+        assert res.returncode == 0, (
+            f"heredoc failed after wiping {wiped}: {res.stderr}")
+        assert _bound_target("cdp", sid), "heredoc bound no target"
+    finally:
+        _cleanup_session("cdp", sid)

@@ -24,6 +24,8 @@ import os
 import socket
 import stat
 import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -62,37 +64,6 @@ def log_path() -> Path:
 
 def pid_path() -> Path:
     return runtime_dir() / f"{_PREFIX}.pid"
-
-
-def facade_path() -> Path:
-    """Discovery file for the Playwright CDP facade.
-
-    Holds JSON ``{"ws": "ws://host:port/cdp", "port": N}`` written by the daemon
-    when the facade binds (Phase C). The skill layer reads this to
-    ``connect_over_cdp`` without parsing daemon logs or guessing the port. Lives
-    beside the socket/pid under XDG_RUNTIME_DIR so e2e isolation (a throwaway
-    XDG_RUNTIME_DIR) gives each test daemon its own discovery file."""
-    return runtime_dir() / f"{_PREFIX}.facade"
-
-
-def write_facade_file(ws_url: str, port: int) -> None:
-    """Atomic write (.tmp then os.replace) of the facade discovery file."""
-    fp = facade_path()
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    tmp = fp.with_name(fp.name + ".tmp")
-    tmp.write_text(json.dumps({"ws": ws_url, "port": port}))
-    os.replace(tmp, fp)
-
-
-def read_facade_file() -> tuple[str | None, int | None]:
-    """Return ``(ws_url, port)`` of the running daemon's facade, or
-    ``(None, None)`` when the file is absent/unreadable (no daemon / facade off).
-    """
-    try:
-        d = json.loads(facade_path().read_text())
-        return str(d["ws"]), int(d["port"])
-    except (FileNotFoundError, ValueError, KeyError, TypeError, OSError):
-        return None, None
 
 
 # ---- Phase B: per-session executor discovery -------------------------------
@@ -225,7 +196,7 @@ def write_executor_file(
     pid: int,
     executor_id: str | None = None,
 ) -> None:
-    """Atomic write of the executor discovery file (mirrors write_facade_file).
+    """Atomic write of the executor discovery file.
 
     Written by the executor once its socket is bound and the worker is ready,
     so a reader that sees the file can immediately connect."""
@@ -326,9 +297,13 @@ def endpoint_describe() -> dict:
 
 
 def cleanup_endpoint() -> None:
-    """Best-effort: nuke socket / pid / facade files. Called on graceful
-    shutdown and by `stop` before bind. Silent on missing files."""
-    paths = [sock_path(), pid_path(), facade_path()]
+    """Best-effort: nuke socket / pid files. Called on graceful shutdown and
+    by `stop` before bind. Silent on missing files.
+
+    The Playwright facade has no file here on purpose: its endpoint lives in the
+    daemon's memory and is answered live over `/__ping__`. A file would be a
+    second copy that can (and did) drift from the truth — see `FacadeInfo`."""
+    paths = [sock_path(), pid_path()]
     for p in paths:
         try:
             p.unlink()
@@ -347,45 +322,143 @@ def cleanup_endpoint() -> None:
 # `/__ping__` path is reserved for this — daemon's process_request returns a
 # 200 with body {"pong": true, "pid": N, "version": "..."}. A foreign listener
 # might 404 or send garbage; anything not matching counts as "stale."
+#
+# The pong also carries the Playwright facade's live endpoint. That endpoint used
+# to be published to a `browserwright-daemon.facade` discovery file, which made
+# it a SECOND copy of a fact the daemon already knew — and the copy drifted:
+# macOS reaps files under /tmp after three days, so a perfectly healthy facade
+# (port still LISTENing) became invisible to `status` and to every client, while
+# `doctor` stayed green. The endpoint is now answered live, from memory, by the
+# only process that can know it.
 
 
-def make_pong_body(pid: int) -> bytes:
+@dataclass(frozen=True)
+class FacadeInfo:
+    """The Playwright facade's state, as the daemon knows it right now.
+
+    Exactly one of the two cases holds, which is why this is a type and not
+    three loose optional fields:
+      - **bound**       — `ws`/`port` set, `error` None;
+      - **unavailable** — `error` set (why), `ws`/`port` None.
+    """
+
+    ws: str | None = None
+    port: int | None = None
+    error: str | None = None
+
+    @classmethod
+    def bound(cls, ws: str, port: int) -> "FacadeInfo":
+        return cls(ws=ws, port=port)
+
+    @classmethod
+    def unavailable(cls, reason: str) -> "FacadeInfo":
+        return cls(error=reason)
+
+    @property
+    def available(self) -> bool:
+        return bool(self.ws)
+
+    def to_wire(self) -> dict:
+        """The pong payload's `facade` object."""
+        return {"ws": self.ws, "port": self.port, "error": self.error}
+
+    @classmethod
+    def from_wire(cls, raw: object) -> "FacadeInfo | None":
+        """Parse a pong's `facade` object. None when the key is absent or
+        malformed — i.e. the daemon predates facade advertising."""
+        if not isinstance(raw, dict):
+            return None
+        ws = raw.get("ws")
+        port = raw.get("port")
+        error = raw.get("error")
+        ws = ws if isinstance(ws, str) and ws else None
+        port = port if isinstance(port, int) and 0 < port < 65536 else None
+        error = error if isinstance(error, str) and error else None
+        if ws is None and error is None:
+            return None
+        if ws is not None:
+            return cls(ws=ws, port=port)
+        return cls(error=error)
+
+
+@dataclass(frozen=True)
+class PongInfo:
+    """One `/__ping__` answer.
+
+    `pid is None` means nothing answered (no daemon / not ours). `facade is
+    None` means the daemon answered but is too old to advertise its facade —
+    distinct from a daemon that says "facade unavailable, here's why".
+    """
+
+    pid: int | None = None
+    version: str | None = None
+    facade: FacadeInfo | None = None
+
+
+#: The "nothing answered" pong, so callers never build it by hand.
+NO_PONG = PongInfo()
+
+
+
+def make_pong_body(pid: int, facade: "FacadeInfo | None" = None) -> bytes:
     """Daemon side: build the /__ping__ response body.
 
     Carries the daemon's package version so a client can detect a *stale*
     daemon (running older code than what's installed on disk) and auto-restart
     it — S6 (A2-a). A daemon too old to know about this field simply omits it;
     the parser treats a missing version as stale.
+
+    ``facade`` is the live :class:`FacadeInfo` (bound endpoint, or the reason
+    there is none). Omitted only by a daemon that has not decided yet; clients
+    read a missing key as "this daemon predates facade advertising".
     """
     from . import __version__
-    return json.dumps(
-        {"pong": True, "pid": pid, "version": __version__}).encode()
+    payload: dict = {"pong": True, "pid": pid, "version": __version__}
+    if facade is not None:
+        payload["facade"] = facade.to_wire()
+    return json.dumps(payload).encode()
 
 
-def parse_pong(body: bytes) -> tuple[int | None, str | None]:
-    """Client side: extract ``(pid, version)`` from a /__ping__ pong body.
+def parse_pong(body: bytes) -> PongInfo:
+    """Client side: extract a :class:`PongInfo` from a /__ping__ pong body.
 
-    Returns ``(None, None)`` for anything that isn't our pong shape. ``version``
-    is ``None`` when the daemon predates version-advertising — callers treat
-    that as stale (one needless restart on first upgrade beats silent failure).
+    Returns :data:`NO_PONG` for anything that isn't our pong shape.
+    ``version`` is ``None`` when the daemon predates version-advertising —
+    callers treat that as stale (one needless restart on first upgrade beats
+    silent failure). ``facade`` is ``None`` on a daemon that predates facade
+    advertising, which callers must NOT confuse with "facade unavailable".
     """
     try:
         payload = json.loads(body.decode("utf-8", errors="replace"))
     except (ValueError, UnicodeDecodeError):
-        return None, None
+        return NO_PONG
     if not isinstance(payload, dict) or payload.get("pong") is not True:
-        return None, None
+        return NO_PONG
     pid = payload.get("pid")
     if not isinstance(pid, int) or pid <= 0 or pid > (1 << 31):
-        return None, None
+        return NO_PONG
     version = payload.get("version")
     if not isinstance(version, str) or not version:
         version = None
-    return pid, version
+    return PongInfo(pid=pid, version=version,
+                    facade=FacadeInfo.from_wire(payload.get("facade")))
 
 
-async def ping_status_async(timeout: float = 1.0) -> tuple[int | None, str | None]:
-    """Async client-side ping returning ``(pid, version)``.
+#: The ping request line, shared by the async and blocking probes so the two
+#: can never drift into speaking different dialects.
+_PING_REQUEST = b"GET /__ping__ HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+
+def _pong_from_response(data: bytes) -> PongInfo:
+    """Split an HTTP response and parse its body. Shared by both probes."""
+    idx = data.find(b"\r\n\r\n")
+    if idx < 0:
+        return NO_PONG
+    return parse_pong(data[idx + 4:])
+
+
+async def ping_status_async(timeout: float = 1.0) -> PongInfo:
+    """Async client-side ping returning a :class:`PongInfo`.
 
     ``pid`` is None when the endpoint is not a live daemon (refused / wrong /
     no response). ``version`` is the daemon's advertised package version, or
@@ -395,7 +468,7 @@ async def ping_status_async(timeout: float = 1.0) -> tuple[int | None, str | Non
     belongs to a live daemon (=> exit 0, idempotent) or a stale corpse
     (=> unlink + bind fresh).
     """
-    none = (None, None)
+    none = NO_PONG
     try:
         p = sock_path()
         if not p.exists():
@@ -406,7 +479,7 @@ async def ping_status_async(timeout: float = 1.0) -> tuple[int | None, str | Non
         return none
     try:
         try:
-            writer.write(b"GET /__ping__ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            writer.write(_PING_REQUEST)
             await asyncio.wait_for(writer.drain(), timeout=timeout)
         except (BrokenPipeError, ConnectionResetError, OSError, asyncio.TimeoutError):
             # The peer closed/crashed mid-write — definitely not our daemon.
@@ -431,11 +504,8 @@ async def ping_status_async(timeout: float = 1.0) -> tuple[int | None, str | Non
             data += body
         except asyncio.TimeoutError:
             pass
-        idx = data.find(b"\r\n\r\n")
-        if idx < 0:
-            return none
         # Defensive parse, anything-not-our-shape = stale.
-        return parse_pong(data[idx + 4:])
+        return _pong_from_response(data)
     finally:
         try:
             writer.close()
@@ -448,26 +518,71 @@ async def ping_async(timeout: float = 1.0) -> int | None:
     """Async client-side ping. Returns the daemon's reported PID, or None
     when the endpoint is not a live daemon. Thin wrapper over
     :func:`ping_status_async` for callers that only care about liveness/pid."""
-    pid, _version = await ping_status_async(timeout=timeout)
-    return pid
+    return (await ping_status_async(timeout=timeout)).pid
 
 
-def ping_status_sync(timeout: float = 1.0) -> tuple[int | None, str | None]:
-    """Synchronous ``(pid, version)`` probe for CLI paths without a running
-    loop. Returns ``(None, None)`` when nothing answers."""
-    coro = ping_status_async(timeout=timeout)
+def ping_status_sync(timeout: float = 1.0) -> PongInfo:
+    """Synchronous probe. Returns :data:`NO_PONG` when nothing answers.
+
+    Deliberately implemented with a BLOCKING socket rather than
+    ``asyncio.run(ping_status_async(...))``: callers include the Playwright
+    handle, which resolves on the executor's worker thread — and that thread
+    runs Playwright's own thread-bound event loop, where ``asyncio.run`` raises
+    ``RuntimeError``. The old wrapper swallowed that into "no daemon", i.e. the
+    exact silent-failure shape this module is being cured of. The pong is plain
+    HTTP precisely so it can be spoken without a loop.
+    """
+    p = sock_path()
     try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        coro.close()
-        return None, None
+        if not p.exists():
+            return NO_PONG
+    except OSError:
+        return NO_PONG
+    deadline = time.monotonic() + timeout
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(str(p))
+        sock.sendall(_PING_REQUEST)
+        # Read until the headers are complete, exactly like the async probe:
+        # stopping at the blank line means a peer that answers and then holds
+        # the connection open costs us nothing. Waiting for EOF instead would
+        # burn the whole timeout on every call.
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < 4096:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(1024)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+        # The body usually rides along in the same packet; give it one short
+        # grace read when it does not.
+        if b"\r\n\r\n" in data:
+            try:
+                sock.settimeout(min(0.2, max(0.0, deadline - time.monotonic())))
+                data += sock.recv(1024)
+            except (OSError, socket.timeout):
+                pass
+        return _pong_from_response(data)
+    except (OSError, socket.timeout):
+        return NO_PONG
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def ping_sync(timeout: float = 1.0) -> int | None:
     """Synchronous variant for CLI status / stop paths that don't already
     have an event loop running. Returns the daemon's PID, or None."""
-    pid, _version = ping_status_sync(timeout=timeout)
-    return pid
+    return ping_status_sync(timeout=timeout).pid
 
 
 # ---- socket bind helper -----------------------------------------------------

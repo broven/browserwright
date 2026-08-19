@@ -43,7 +43,7 @@ class _StubProbe(DaemonProbe):
         self.probed_ports = []
 
     def ping(self, timeout):
-        return (None, None)
+        return _ipc.NO_PONG
 
     def socket_present(self):
         return self._socket_present
@@ -60,9 +60,6 @@ class _StubProbe(DaemonProbe):
 
     def endpoint(self):
         return {"schema_version": 1, "transport": "unix", "path": "/dev/null"}
-
-    def facade(self):
-        return (None, None)
 
     def sleep(self, seconds):
         pass  # skip the retry backoff

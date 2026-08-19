@@ -74,7 +74,9 @@ def test_status_list_and_stop_error_branches(monkeypatch, capsys, tmp_path):
     # a real daemon holding the default relay/facade ports on the dev machine.
     class _DeadProbe(DaemonProbe):
         def ping(self, timeout):
-            return (None, None)
+            from browserwright.daemon import _ipc
+
+            return _ipc.NO_PONG
 
         def socket_present(self):
             return False
