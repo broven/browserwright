@@ -52,21 +52,20 @@ def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
     from browserwright.daemon import _ipc
 
     monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout: _ipc.NO_PONG)
-    monkeypatch.setattr(
-        _ipc,
-        "endpoint_describe",
-        lambda: {"transport": "unix", "path": "/tmp/missing.sock", "host": None, "port": None, "token": None},
-    )
-    monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "missing.sock")
+    monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:19991")
     assert cli_mod._cmd_status(SimpleNamespace(json=True), Config()) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["alive"] is False
-    assert payload["endpoint"]["path"] == "/tmp/missing.sock"
+    # The endpoint is reported even when nothing answers — knowing WHERE we
+    # looked is half of an actionable "not running".
+    assert payload["endpoint"]["url"] == "http://127.0.0.1:19991"
+    assert payload["endpoint"]["explicit"] is True
+    assert payload["cdp_surface"] is None
     assert payload["probe_state"] == "not_running"
 
 
 def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):
-    """A daemon whose socket file survives but that never answers, with its
+    """A daemon whose pid file survives but that never answers, with its
     ports free: `transient_probe_failed`, and the retry loop really ran."""
     from browserwright.daemon.probe import DaemonProbe
 
@@ -81,7 +80,7 @@ def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):
             calls.append(timeout)
             return _ipc.NO_PONG
 
-        def socket_present(self):
+        def daemon_traces(self):
             return True
 
         # Hermetic: the real probe would reach the developer's own daemon on the
@@ -90,8 +89,9 @@ def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):
             return []
 
         def endpoint(self):
-            return {"transport": "unix", "path": str(sock),
-                    "host": None, "port": None, "token": None}
+            return {"schema_version": 1, "transport": "tcp",
+                    "url": "http://127.0.0.1:19990", "explicit": False,
+                    "source": "default"}
 
         def sleep(self, seconds):
             pass

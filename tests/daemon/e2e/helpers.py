@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .conftest import (
-    TEST_EXT_PORT,
     TEST_CDP_PORT,
+    TEST_EXT_PORT,
+    published_endpoint,
     scrubbed_env,
 )
 
@@ -29,10 +30,14 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
     """Invoke `browserwright` with the given heredoc-style Python script.
 
     Single-global-daemon: the skill reaches the *test* daemon (not the
-    developer's) via `XDG_RUNTIME_DIR` (the fixed socket lives there) — there is
-    no `BD_NAME` anymore. The ledger record carries only the session's
-    `backend`; the daemon routes per session. Relay/cdp upstream isolation is
-    via `BD_EXTENSION_PORT` / `BD_CDP_PORT`.
+    developer's) via `BW_DAEMON_URL`, read out of the endpoint state file the
+    daemon that owns `runtime_dir` published when it bound (ADR-0011). Deriving
+    it from the directory rather than hardcoding a port keeps the harness's
+    long-standing contract — *`runtime_dir` identifies the daemon* — so a test
+    that spins up its own daemon on its own endpoint port needs no change here.
+    The ledger record carries only the session's `backend`; the daemon routes
+    per session. Relay/cdp upstream isolation is via `BD_EXTENSION_PORT` /
+    `BD_CDP_PORT`.
 
     Args:
         script: Python source the skill REPL will execute (heredoc body).
@@ -60,10 +65,14 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
 
     env = scrubbed_env()
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
-    # Point the skill at the test daemon's fixed socket via its runtime dir.
+    # The runtime dir carries the executor sockets, the pid file and — since
+    # ADR-0011 — the endpoint the daemon published when it bound.
     if runtime_dir is not None:
         env["XDG_RUNTIME_DIR"] = runtime_dir
         env["TMPDIR"] = runtime_dir
+        url = published_endpoint(runtime_dir)
+        if url is not None:
+            env["BW_DAEMON_URL"] = url
     # Isolated BS_HOME per backend (ledger + memory).
     env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / backend)
     # Bypass proxy for localhost
@@ -85,6 +94,14 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
         env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
     if extra_env:
         env.update(extra_env)
+    if not env.get("BW_DAEMON_URL"):
+        # Refuse to run un-addressed: with no endpoint pinned the skill would
+        # resolve the DEFAULT (:19990) — the developer's own daemon — and drive
+        # their real browser. A caller that wiped the runtime dir on purpose
+        # must pass the URL in `extra_env`.
+        raise RuntimeError(
+            "run_skill has no BW_DAEMON_URL: pass a `runtime_dir` whose daemon "
+            "published its endpoint, or set BW_DAEMON_URL in `extra_env`")
 
     # P1 session model: inline `browserwright <<PY` refuses to run unless a
     # ledger session is explicitly in scope. E2E helpers create a lightweight

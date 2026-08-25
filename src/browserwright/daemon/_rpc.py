@@ -1,21 +1,20 @@
-"""One-shot ``BrowserwrightDaemon.*`` JSON-RPC over a transient control socket.
+"""One-shot ``BrowserwrightDaemon.*`` JSON-RPC over the control surface.
 
-This is the *downstream* client the CLI uses for every non-streaming verb:
-open a unix ws to the running daemon, send one request, read the matching
-response, close. It knows nothing about argparse, exit codes, or printing —
-:mod:`browserwright.daemon.cli` owns those.
+This is the *downstream* client the CLI uses for every non-streaming verb: open
+a ws to the running daemon's ``/control`` surface (ADR-0011), send one request,
+read the matching response, close. It knows nothing about argparse, exit codes,
+or printing — :mod:`browserwright.daemon.cli` owns those.
 
-Why this isn't ``mode_b_client``: that module (Layer 2) discovers the endpoint
-by shelling out to ``browserwright-daemon status --json`` and then hands a
-``ws+unix://`` *sentinel URL* to the skill's long-lived ``CDPSession``. It never
-sends a JSON-RPC frame itself, and it depends on the CLI rather than the other
-way round. Reusing it here would invert the layering (see CONTEXT.md, "Layer 1 /
-Layer 2") and re-enter the CLI as a subprocess to talk to a socket we can open
-directly. So: two clients, two jobs, both intentional.
+Why this isn't ``mode_b_client``: that module (Layer 2) owns a *long-lived*
+``CDPSession`` for the skill and never sends a JSON-RPC frame itself. Reusing it
+here would invert the layering (see CONTEXT.md, "Layer 1 / Layer 2"). So: two
+clients, two jobs, both intentional. They do now agree on the address, because
+both resolve it through :mod:`browserwright.daemon_url`.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 from .errors import DaemonError, Unavailable
@@ -45,13 +44,8 @@ async def call(cfg, method: str, params: dict,
     ``_require_browser_session`` boundary check).
     """
     import websockets
-    from urllib.parse import quote
 
-    from . import _ipc
-
-    session_q = (
-        f"&session={quote(str(browser_session), safe='')}"
-        if browser_session else "")
+    from ..daemon_url import daemon_endpoint
 
     async def _drain_until_response(ws) -> dict:
         for _ in range(MAX_DRAIN_FRAMES):
@@ -62,18 +56,28 @@ async def call(cfg, method: str, params: dict,
         raise DaemonError(
             f"{method} no id=1 response after {MAX_DRAIN_FRAMES} frames")
 
-    path = _ipc.sock_path()
-    if not path.exists():
-        raise Unavailable("no daemon running")
-    async with websockets.unix_connect(
-        str(path),
-        uri=f"ws://localhost/?client={client_label}{session_q}",
-        compression=None,
-    ) as ws:
+    ep = daemon_endpoint()
+    url = ep.ws("/control", client=client_label, session=browser_session)
+    ws_cm = websockets.connect(
+        url, compression=None, proxy=None, open_timeout=timeout,
+        # CDP replies on the control surface carry screenshots; keep the limit
+        # the unix listener used rather than the websockets 1 MiB default.
+        max_size=100 * 1024 * 1024,
+    )
+    try:
+        ws = await ws_cm.__aenter__()
+    except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
+        # A refused connect is "no daemon" — the same condition the socket-file
+        # existence check used to stand in for, now observed directly.
+        raise Unavailable(f"no daemon answered at {ep.url}: {e}") from e
+    try:
         await ws.send(json.dumps({
             "id": 1, "method": method, "params": params,
         }))
         msg = await _drain_until_response(ws)
+    finally:
+        with contextlib.suppress(Exception):
+            await ws_cm.__aexit__(None, None, None)
     if "error" in msg:
         err = msg["error"] or {}
         raise DaemonError(

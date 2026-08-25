@@ -1,7 +1,7 @@
-"""WebSocket listener + lifecycle orchestrator.
+"""Daemon lifecycle orchestrator + the endpoint's control-surface handler.
 
 This module wires together:
-  - `_ipc` (socket file / ping)
+  - `_ipc` (runtime files / ping)
   - `state` (DaemonState)
   - `upstream` (the Upstream protocol and its adapters)
   - `proxy` (Router)
@@ -10,25 +10,24 @@ Spec §8.5: the listener task accepts clients, the upstream-lifecycle task
 opens/closes the upstream ws lazily, and the keepalive task is built into
 CdpUpstream (heartbeat) + websockets server (ws-level pings).
 
-v0.2 single-client model: the second ws upgrade is rejected with HTTP 503
-+ a clear body. spec §9.2.
+ADR-0011: this module no longer *binds* anything client-facing. The one TCP
+endpoint lives in `facade.py`; `run_serve` builds it and hands it
+`_ClientHandler.serve_one` as the `/control` handler.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import http
 import json
 import logging
 import os
 import signal
 import sys
 import time
-from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import websockets
-from websockets.asyncio.server import ServerConnection, unix_serve
+from websockets.asyncio.server import ServerConnection
 
 from .. import _ipc
 from .. import __version__
@@ -158,45 +157,17 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
                        held, pid)
 
 
-async def _control_socket_watchdog(sock_ident: tuple, stop: asyncio.Event,
-                                   *, interval: float = 2.0) -> None:
-    """Self-exit when our control socket disappears or is replaced by a
-    different inode — i.e. another daemon took over, or the socket was removed
-    (issue #15, 2.4). Setting ``stop`` runs the normal graceful shutdown, which
-    releases the relay/facade ports instead of lingering as a port-holding
-    zombie. A single stat error is ignored (transient FS hiccup); only a
-    definitive gone/replaced verdict self-exits."""
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-            return  # stop was set elsewhere (signal / another watchdog)
-        except asyncio.TimeoutError:
-            pass
-        try:
-            st = os.stat(_ipc.sock_path())
-        except FileNotFoundError:
-            logger.warning("control socket removed; self-exiting to release "
-                           "ports (issue #15)")
-            stop.set()
-            return
-        except OSError:
-            continue  # transient — don't self-exit on one error
-        if (st.st_dev, st.st_ino) != sock_ident:
-            logger.warning("control socket replaced (another daemon took over); "
-                           "self-exiting to release ports (issue #15)")
-            stop.set()
-            return
-
-
 async def run_serve(cfg: Config) -> int:
     """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code.
 
     There is exactly one global daemon on a fixed socket — no instance name.
     """
-    # Stale-detect: ping any existing endpoint before binding. If something
-    # answers, refuse to start a second copy of ourselves (enforces the
-    # "at most one global daemon" invariant) — but if the ping comes back
-    # negative, we cleanup the dead socket file and proceed.
+    # Stale-detect: ping the endpoint before binding. If something answers,
+    # refuse to start a second copy of ourselves (enforces the "at most one
+    # global daemon" invariant). ADR-0011 re-keyed this from the control socket
+    # file onto TCP: `/__ping__` on the configured port is the liveness probe,
+    # and the port bind below is the mutual-exclusion primitive — a socket file
+    # could go stale behind our back, an EADDRINUSE cannot.
     existing = await _ipc.ping_status_async(timeout=1.0)
     existing_pid, existing_version = existing.pid, existing.version
     if existing_pid is not None:
@@ -300,19 +271,52 @@ async def run_serve(cfg: Config) -> int:
     _ipc.write_pid(os.getpid())
 
     handler = _ClientHandler(daemon, cfg)
-    facade_state = FacadeState()
-    server = await _open_server(handler, facade_state)
 
-    # issue #15 (2.4): watch our own control socket. If another `serve` (or a
-    # manual `rm`) removes/replaces it, self-exit so we release the relay/facade
-    # ports instead of lingering as a port-holding zombie.
-    sock_watch_task: asyncio.Task | None = None
+    # ADR-0011: the daemon's ONE client-facing door. Everything downstream —
+    # the CLI, the skill client, the executor data plane and a raw Playwright
+    # `connect_over_cdp` — arrives here, on `/control`, `/exec` and `/cdp`
+    # respectively. It is bound FIRST because its bind is now the mutual
+    # exclusion between daemons (the control socket file that used to play that
+    # role is gone), and a failure to bind it is fatal: unlike the old facade
+    # there is no other path left to keep serving.
+    endpoint_port = cfg.resolved_facade_port()
     try:
-        _st = os.stat(_ipc.sock_path())
-        sock_watch_task = asyncio.create_task(
-            _control_socket_watchdog((_st.st_dev, _st.st_ino), stop))
-    except OSError:
-        pass
+        # For the extension backend the cdp surface bridges through the
+        # daemon's shared relay (started just below). Pass a getter so it
+        # resolves the LIVE relay per client connection — the relay may be
+        # (re)bound across the daemon's lifetime, and is not up yet here.
+        def _shared_relay() -> RelayServer | None:
+            return shared_context.holder.relay
+
+        endpoint = PlaywrightFacade(cfg=cfg, port=endpoint_port,
+                                    host=cfg.facade_host,
+                                    relay_getter=_shared_relay,
+                                    daemon=daemon,
+                                    control_handler=handler.serve_one)
+        bound = await endpoint.start()
+    except Exception as e:  # noqa: BLE001 - a bind failure of any shape is fatal
+        hint = ""
+        if isinstance(e, OSError) and endpoint_port:
+            hint = (
+                f" — port {endpoint_port} is held by another process. Run "
+                f"`lsof -nP -iTCP:{endpoint_port} -sTCP:LISTEN` to find it, "
+                f"then `browserwright-daemon restart` (reclaims a stale "
+                f"browserwright daemon) or kill that pid."
+            )
+        print(
+            f"browserwright-daemon failed to bind endpoint "
+            f"{cfg.facade_host}:{endpoint_port}: {e}{hint}",
+            file=sys.stderr,
+        )
+        _ipc.cleanup_endpoint()
+        return 2
+    endpoint_url = f"http://{cfg.facade_host}:{bound}"
+    # Publish the URL we actually bound. This is the ONLY way a client can find
+    # a daemon told to bind port 0 (the per-test isolation scheme), and it is
+    # ranked below every configured source in `daemon_url` precedence, so a
+    # stale file can cost at most one failed ping.
+    _ipc.write_endpoint_state(endpoint_url)
+    logger.info("endpoint started at %s (control/cdp/exec)", endpoint_url)
 
     # v0.4: for the extension shared context, start the relay ws server eagerly
     # so `browserwright-daemon doctor` can probe `__status__` even before any
@@ -345,72 +349,11 @@ async def run_serve(cfg: Config) -> int:
                 f"browserwright-daemon failed to bind extension relay: {e}{hint}",
                 file=sys.stderr,
             )
-            server.close()
-            try:
-                await server.wait_closed()
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                await endpoint.stop()
             _ipc.cleanup_endpoint()
             return 2
 
-    # Playwright facade (Phase C: auto-enabled by default). Bind an ADDITIONAL
-    # Playwright-facing CDP ws+HTTP endpoint layered beside the agent unix
-    # socket. It resolves the daemon's upstream Chrome (cdp backend) and
-    # transparently bridges raw browser-level CDP — the existing client path is
-    # untouched. The skill layer's heredoc `page`/`context` connect through it,
-    # so it is ON unless `facade_port == 0` (explicit disable). The outcome —
-    # bound endpoint, or the reason there is none — is published to
-    # `FacadeState`, which `/__ping__` answers from. A bind failure here is
-    # non-fatal: we log, record the reason, and keep serving the agent path.
-    facade: PlaywrightFacade | None = None
-    facade_port = cfg.resolved_facade_port()
-    if facade_port is None:
-        facade_info = _ipc.FacadeInfo.unavailable(
-            "Playwright facade disabled (--facade-port 0 / BD_FACADE_PORT=0 / "
-            "facade_port = 0 in config.toml)")
-        logger.info("playwright facade disabled by config; "
-                    "`page`/`context` will refuse with that reason")
-    else:
-        try:
-            # PR2: for the extension backend the facade bridges through the
-            # daemon's shared relay (started just above). Pass a getter so the
-            # facade resolves the LIVE relay per client connection — it may be
-            # (re)bound across the daemon's lifetime.
-            def _shared_relay() -> RelayServer | None:
-                return shared_context.holder.relay
-
-            facade = PlaywrightFacade(cfg=cfg, port=facade_port,
-                                      host=cfg.facade_host,
-                                      relay_getter=_shared_relay,
-                                      daemon=daemon)
-            bound = await facade.start()
-            # Advertise the bound host so `status`/client discovery report a
-            # reachable ws (loopback by default; a tailnet/LAN IP when
-            # `--facade-host` opts in). Remote clients still get the real
-            # incoming Host echoed back via the facade's HTTP bootstrap.
-            facade_ws = f"ws://{cfg.facade_host}:{bound}/cdp"
-            facade_info = _ipc.FacadeInfo.bound(facade_ws, bound)
-            logger.info("playwright facade started on port %d "
-                        "(connect_over_cdp %s)", bound, facade_ws)
-        except Exception as e:
-            # Non-fatal: keep serving the agent path. But the reason must
-            # SURVIVE — it is what `status`, `doctor` and the client-side
-            # `FacadeUnavailable` message all quote. A bind failure that only
-            # reaches the log is how "facade is null and nobody knows why"
-            # happens. Not just OSError: a vanished --facade-host interface,
-            # a websockets-internal error, anything — the agent path stays up
-            # and the facade's absence stays explainable.
-            facade = None
-            facade_info = _ipc.FacadeInfo.unavailable(
-                f"facade failed to bind {cfg.facade_host}:{facade_port}: {e!r}")
-            logger.warning("playwright facade failed to bind %s:%d: %r; "
-                           "continuing without it",
-                           cfg.facade_host, facade_port, e)
-    # Publish the decided state to the live pong (`/__ping__`), which is the
-    # ONLY channel that advertises the facade. No discovery file: a file is a
-    # second copy, and this daemon shipped a three-day outage when /tmp reaped
-    # exactly that copy while the facade itself stayed healthy.
-    facade_state.set(facade_info)
 
     # The watchdog runs unconditionally: even when upstream idle-close is off
     # (cfg.idle_close_after None), it must still crash-reap dead executors
@@ -426,29 +369,20 @@ async def run_serve(cfg: Config) -> int:
         logger.info("browserwright-daemon shutdown requested")
         await _graceful_shutdown(daemon)
     finally:
-        if sock_watch_task is not None:
-            sock_watch_task.cancel()
-            with contextlib.suppress(Exception):
-                await sock_watch_task
         if idle_task is not None:
             idle_task.cancel()
             with contextlib.suppress(Exception):
                 await idle_task
-        # Phase A1: stop the Playwright facade if it bound.
-        if facade is not None:
-            with contextlib.suppress(Exception):
-                await facade.stop()
         # Stop every context's relay (only the extension shared context has
         # one today, but iterate so a future cdp-with-relay can't leak).
         for ctx in daemon.all_contexts():
             if ctx.holder.relay is not None:
                 with contextlib.suppress(Exception):
                     await ctx.holder.relay.stop()
-        server.close()
-        try:
-            await server.wait_closed()
-        except Exception:
-            pass
+        # The endpoint goes last: it is the only client-facing transport, so
+        # closing it earlier would drop in-flight teardown replies.
+        with contextlib.suppress(Exception):
+            await endpoint.stop()
         _ipc.cleanup_endpoint()
     return 0
 
@@ -528,80 +462,7 @@ def _wire_logging() -> None:
         pass
 
 
-# ---- websockets server with single-client gate ----------------------------
-
-
-class FacadeState:
-    """The daemon's live answer to "what is the Playwright facade doing?".
-
-    A one-slot mutable holder, because the agent listener must bind BEFORE the
-    facade does (the facade needs the relay, which needs the listener up), yet
-    `/__ping__` has to answer with whatever the facade decided a moment later.
-    Starts as "not decided yet" so a ping landing in that window says so
-    instead of claiming the facade is broken.
-    """
-
-    def __init__(self) -> None:
-        self._info = _ipc.FacadeInfo.unavailable(
-            "daemon is still starting up; the Playwright facade has not "
-            "reported yet")
-
-    def get(self) -> _ipc.FacadeInfo:
-        return self._info
-
-    def set(self, info: _ipc.FacadeInfo) -> None:
-        self._info = info
-
-
-async def _open_server(handler: "_ClientHandler",
-                       facade_state: FacadeState):
-    """Bind the listener with correct umask / file perms. The HTTP /__ping__
-    path is intercepted here so stale-detect works without a ws upgrade."""
-    process_request = _make_process_request(handler, facade_state)
-
-    sock = _ipc.make_unix_socket()
-    # Verify the 0600 perms — spec §6.2 promises it; failing loudly here is
-    # better than silently exposing the socket.
-    st = os.stat(_ipc.sock_path())
-    if (st.st_mode & 0o777) != 0o600:
-        logger.warning("unexpected sock perms %o", st.st_mode & 0o777)
-    server = await unix_serve(
-        handler.serve_one,
-        sock=sock,
-        process_request=process_request,
-        max_size=100 * 1024 * 1024,
-        compression=None,
-        ping_interval=20,
-        ping_timeout=20,
-    )
-    logger.info("listening on %s", _ipc.sock_path())
-    return server
-
-
-def _make_process_request(handler: "_ClientHandler",
-                          facade_state: "FacadeState"):
-    """Intercept the HTTP handshake.
-
-    One responsibility: `/__ping__` GET → return a 200 with
-    {"pong":true,"pid":N,"facade":{...}} so the stale-detect probe works
-    *before* a ws upgrade — and so every client learns the facade endpoint from
-    the daemon itself rather than from a file that can outlive or predecease
-    the truth. `facade_state` is read at REQUEST time, never captured, because
-    the facade binds after this closure is built.
-
-    v0.3: the single-client gate from v0.2 is **gone**. Multiple clients
-    connect concurrently; the router's sessionId/id translation keeps them
-    cleanly separated.
-    """
-    def process_request(conn: ServerConnection, request) -> Any:
-        path = request.path or "/"
-        if path.startswith("/__ping__"):
-            body = _ipc.make_pong_body(os.getpid(), facade_state.get())
-            resp = conn.respond(http.HTTPStatus.OK, body.decode("utf-8"))
-            resp.headers["Content-Type"] = "application/json"
-            return resp
-        return None  # allow upgrade
-    return process_request
+# ---- request-path helpers --------------------------------------------------
 
 
 def _parse_query(path: str) -> dict[str, str]:

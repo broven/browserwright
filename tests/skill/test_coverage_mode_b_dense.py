@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import json
-import socket
 import threading
 from collections import deque
-from types import SimpleNamespace
 
 import pytest
 
@@ -17,109 +15,90 @@ class _Proc:
         self.stderr = stderr
 
 
-def test_discover_normalizes_status_shapes_and_socket_fallback(tmp_path, monkeypatch):
+def test_discover_reports_the_resolved_endpoint(monkeypatch):
+    """ADR-0011: discovery is URL resolution, not a socket-file hunt."""
     from browserwright.mode_b_client import ModeBClient
-    import browserwright.mode_b_client as mb
 
-    nested = {
-        "alive": True,
-        "endpoint": {"transport": "unix", "path": "/tmp/bw.sock", "extra": "drop"},
-        "version": "ignored",
-    }
-    monkeypatch.setattr(mb.subprocess, "run", lambda *a, **k: _Proc(stdout=json.dumps(nested)))
-    assert ModeBClient().discover() == {"transport": "unix", "path": "/tmp/bw.sock"}
-
-    # status says "not alive" but the well-known socket path exists → fallback.
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    sock = runtime / "browserwright-daemon.sock"
-    sock.touch()
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
-    monkeypatch.setattr(mb.subprocess, "run", lambda *a, **k: _Proc(stdout=json.dumps({"alive": False})))
-    assert ModeBClient().discover() == {"transport": "unix", "path": str(sock)}
-
-
-def test_discover_ignores_bad_status_json_and_raises_without_socket(tmp_path, monkeypatch):
-    from browserwright.errors import DaemonUnavailable
-    from browserwright.mode_b_client import ModeBClient
-    import browserwright.mode_b_client as mb
-
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing-runtime"))
-    monkeypatch.setattr(mb.subprocess, "run", lambda *a, **k: _Proc(stdout="{bad json"))
-
-    with pytest.raises(DaemonUnavailable, match="no Mode B endpoint"):
-        ModeBClient().discover()
-
-
-def test_ping_socket_branches_close_on_failure(monkeypatch):
-    from browserwright.mode_b_client import ModeBClient
-    import browserwright.mode_b_client as mb
-
-    instances = []
-
-    class _FakeSocket:
-        fail_unix = True
-
-        def __init__(self, family, kind):
-            self.family = family
-            self.kind = kind
-            self.timeout = None
-            self.connected_to = None
-            self.closed = False
-            instances.append(self)
-
-        def settimeout(self, timeout):
-            self.timeout = timeout
-
-        def connect(self, address):
-            self.connected_to = address
-            if self.family == socket.AF_UNIX and self.fail_unix:
-                raise OSError("socket gone")
-
-        def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(mb.socket, "socket", _FakeSocket)
+    monkeypatch.setenv("BW_DAEMON_URL", "http://10.0.0.7:19990")
     client = ModeBClient()
+    assert client.discover() == {"transport": "tcp",
+                                 "url": "http://10.0.0.7:19990"}
+    assert client.explicit is True
 
-    assert client._ping({"transport": "unix", "path": "/tmp/missing.sock"}) is False
-    assert instances[-1].timeout == 1.5
-    assert instances[-1].closed is True
 
-    _FakeSocket.fail_unix = False
-    assert client._ping({"transport": "unix", "path": "/tmp/live.sock"}) is True
-    assert instances[-1].connected_to == "/tmp/live.sock"
-    assert instances[-1].closed is True
+def test_discover_default_endpoint_is_not_explicit(monkeypatch, tmp_path):
+    """No configured source => the local default, and auto-start stays on."""
+    from browserwright.mode_b_client import ModeBClient
+
+    monkeypatch.delenv("BW_DAEMON_URL", raising=False)
+    monkeypatch.delenv("BD_CONFIG", raising=False)
+    # An empty runtime dir has no endpoint state file to fall back to.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    client = ModeBClient()
+    assert client.discover() == {"transport": "tcp",
+                                 "url": "http://127.0.0.1:19990"}
+    assert client.explicit is False
+
+
+def test_ping_is_the_http_pong_probe(monkeypatch):
+    from browserwright.daemon import _ipc
+    from browserwright.mode_b_client import ModeBClient
+
+    seen = []
+
+    def fake_ping(timeout=1.0):
+        seen.append(timeout)
+        return _ipc.PongInfo(pid=4242, version="9.9.9")
+
+    monkeypatch.setattr(_ipc, "ping_status_sync", fake_ping)
+    client = ModeBClient()
+    assert client.is_alive() is True
+    assert client.running_daemon_version() == "9.9.9"
+    assert seen  # the probe actually ran
+
+    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
+    assert client.is_alive() is False
+    assert client.running_daemon_version() is None
+
+
+def test_explicit_endpoint_never_spawns_or_restarts(monkeypatch, capsys):
+    """The ADR-0011 rule: a daemon someone named is not ours to manage."""
+    from browserwright.mode_b_client import ModeBClient
+
+    monkeypatch.setenv("BW_DAEMON_URL", "http://10.0.0.7:19990")
+    client = ModeBClient()
+    spawned = []
+    monkeypatch.setattr(client, "installed_daemon_version", lambda: "2.0.0")
+    monkeypatch.setattr(client, "running_daemon_version", lambda: "1.0.0")
+    monkeypatch.setattr(
+        client, "_stop_daemon", lambda: spawned.append("stop"))
+
+    assert client.ensure_version_coherent() is False
+    assert spawned == []
+    # The skew is still reported — silently driving a mismatched daemon is
+    # exactly the pothole `ensure_version_coherent` exists to prevent.
+    assert "will not restart it" in capsys.readouterr().err
 
 
 def test_ws_url_caches_until_invalidated_and_carries_session_query(monkeypatch):
     from browserwright.mode_b_client import ModeBClient
 
+    monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:19990")
     client = ModeBClient()
     client._session_id = "s-42"
-    endpoints = [
-        {"transport": "unix", "path": "/tmp/first.sock"},
-        {"transport": "unix", "path": "/tmp/second.sock"},
-    ]
-    calls = []
 
-    def discover():
-        calls.append("discover")
-        return endpoints.pop(0)
-
-    monkeypatch.setattr(client, "discover", discover)
-
-    assert client.ws_url(client_label="first") == "ws+unix:///tmp/first.sock?client=first&session=s-42"
-    assert client.ws_url(client_label="second") == "ws+unix:///tmp/first.sock?client=first&session=s-42"
-    assert calls == ["discover"]
+    assert client.ws_url(client_label="first") == (
+        "ws://127.0.0.1:19990/control?client=first&session=s-42")
+    # Cached: the label of the second call is ignored until invalidate().
+    assert client.ws_url(client_label="second") == (
+        "ws://127.0.0.1:19990/control?client=first&session=s-42")
 
     client.invalidate()
+    monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:29990")
     assert client.ws_url(client_label="second") == (
-        "ws+unix:///tmp/second.sock?client=second&session=s-42"
-    )
-    assert calls == ["discover", "discover"]
-    assert client._endpoint == "/tmp/second.sock"
-    assert client._transport == "unix"
+        "ws://127.0.0.1:29990/control?client=second&session=s-42")
+    assert client._endpoint == "http://127.0.0.1:29990"
+    assert client._transport == "tcp"
 
 
 def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
@@ -129,7 +108,6 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     outputs = deque(
         [
             _Proc(stdout=json.dumps({"backend": "cdp"})),
-            _Proc(stdout=json.dumps({"version": "1.2.3"})),
             _Proc(stdout="browserwright-daemon 9.8.7\n"),
         ]
     )
@@ -144,7 +122,6 @@ def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
     client._session_id = "s-1"
 
     assert client.get_backend_info() == {"backend": "cdp"}
-    assert client.running_daemon_version() == "1.2.3"
     assert client.installed_daemon_version() == "9.8.7"
     assert commands[0][0] == [
         "browserwright-daemon", "backend-info", "--json", "--session", "s-1",
@@ -159,7 +136,6 @@ def test_cli_info_methods_tolerate_bad_outputs_and_timeouts(monkeypatch):
     outputs = deque(
         [
             _Proc(returncode=1, stdout="{}"),
-            _Proc(stdout=json.dumps({"version": ""})),
             _Proc(returncode=1, stdout="browserwright-daemon 1.0.0"),
         ]
     )
@@ -171,7 +147,6 @@ def test_cli_info_methods_tolerate_bad_outputs_and_timeouts(monkeypatch):
     client = ModeBClient()
 
     assert client.get_backend_info() is None
-    assert client.running_daemon_version() is None
     assert client.installed_daemon_version() is None
 
 
@@ -294,42 +269,37 @@ def test_resolve_session_requires_explicit_arg_even_with_env(tmp_bs_home, monkey
         session_ctx.resolve_session()
 
 
-def test_open_unix_websocket_uses_synthetic_http_upgrade(monkeypatch):
+def test_cdp_session_opens_one_plain_ws_transport(monkeypatch):
+    """ADR-0011 deleted the `ws+unix://` sentinel and its AF_UNIX adapter."""
     import importlib
 
     cdp = importlib.import_module("browserwright.cdp")
 
-    raw = SimpleNamespace(
-        timeout=None,
-        connected_to=None,
-        settimeout=lambda timeout: setattr(raw, "timeout", timeout),
-        connect=lambda path: setattr(raw, "connected_to", path),
-        setsockopt=lambda *args: None,
-    )
-    ws_connect_calls = []
+    assert not hasattr(cdp, "_open_unix_websocket")
+    assert not hasattr(cdp, "_UnixSocketAdapter")
 
-    monkeypatch.setattr(cdp._sock if hasattr(cdp, "_sock") else socket, "socket", lambda *a, **k: raw)
+    calls = []
+
+    class _FakeWS:
+        def __iter__(self):
+            return iter(())
 
     def fake_ws_connect(url, **kwargs):
-        ws_connect_calls.append((url, kwargs))
-        return "ws-object"
+        calls.append((url, kwargs))
+        return _FakeWS()
 
     monkeypatch.setattr(cdp, "ws_connect", fake_ws_connect)
-
-    assert cdp._open_unix_websocket(
-        "ws+unix:///tmp/browserwright.sock?client=skill-s1&session=1",
-        connect_timeout=0.25,
-    ) == "ws-object"
-    # GH #18: the connect-phase timeout must be CLEARED before handing the
-    # socket to websockets — otherwise it leaks into steady state as a per-recv
-    # read timeout and a slow RPC reply (> connect_timeout) drops the transport
-    # with "no close frame received or sent". Liveness is ws keepalive's job.
-    assert raw.timeout is None
-    assert raw.connected_to == "/tmp/browserwright.sock"
-    assert ws_connect_calls[0][0] == "ws://browserwright/?client=skill-s1&session=1"
-    assert isinstance(ws_connect_calls[0][1]["sock"], cdp._UnixSocketAdapter)
-    assert ws_connect_calls[0][1]["proxy"] is None
-    assert ws_connect_calls[0][1]["compression"] is None
+    sess = cdp.CDPSession(
+        "ws://127.0.0.1:19990/control?client=skill-s1&session=1",
+        connect_timeout=0.25)
+    try:
+        url, kwargs = calls[0]
+        assert url == "ws://127.0.0.1:19990/control?client=skill-s1&session=1"
+        assert kwargs["proxy"] is None
+        assert kwargs["compression"] is None
+        assert kwargs["open_timeout"] == 0.25
+    finally:
+        sess.close()
 
 
 def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():

@@ -69,23 +69,23 @@ def test_status_list_and_stop_error_branches(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(platforms, "proc_start_time", fake_proc_start)
     assert cli._cmd_stop(_ns(timeout=0), Config()) == 0
 
-    # Isolate the control socket to a non-existent path so the issue #15 (2.1)
-    # port-held-zombie probe is skipped — otherwise this unit test would pick up
-    # a real daemon holding the default relay/facade ports on the dev machine.
+    # A probe that sees no daemon and no leftover traces, so the issue #15
+    # (2.1) port-held-zombie branch is skipped — otherwise this unit test would
+    # pick up a real daemon holding the default relay/endpoint ports on the dev
+    # machine.
     class _DeadProbe(DaemonProbe):
         def ping(self, timeout):
             from browserwright.daemon import _ipc
 
             return _ipc.NO_PONG
 
-        def socket_present(self):
+        def daemon_traces(self):
             return False
 
         def endpoint(self):
-            return {"transport": "unix", "path": str(tmp_path / "dead.sock")}
-
-        def facade(self):
-            return (None, None)
+            return {"schema_version": 1, "transport": "tcp",
+                    "url": "http://127.0.0.1:19990", "explicit": False,
+                    "source": "default"}
 
     assert cli._cmd_status(_ns(json=False), Config(),
                            probe=_DeadProbe(Config())) == 2
@@ -145,15 +145,11 @@ def test_backend_info_attach_and_rpc_success_paths(monkeypatch, capsys, tmp_path
     assert attach_calls[-1][1]["browser_session"] == "bw-s"
     monkeypatch.setattr(cli, "_rpc_via_ws", real_rpc_via_ws)
 
-    monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "daemon.sock")
-
     rpc_ws = _AsyncWs([
         {"method": "noise"},
         {"id": 1, "result": {"ok": True}},
     ])
-    sock = tmp_path / "daemon.sock"
-    sock.write_text("")
-    monkeypatch.setattr(websockets, "unix_connect", lambda *a, **kw: rpc_ws)
+    monkeypatch.setattr(websockets, "connect", lambda *a, **kw: rpc_ws)
     assert asyncio.run(cli._rpc_via_ws(
         Config(), "BrowserwrightDaemon.test", {"x": 1},
         client_label="sweep", timeout=0.01,
@@ -168,10 +164,11 @@ def test_backend_info_attach_and_rpc_success_paths(monkeypatch, capsys, tmp_path
 
 
 def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
-    from browserwright.daemon import _ipc
     import websockets
 
-    monkeypatch.setattr(_ipc, "sock_path", lambda: tmp_path / "absent.sock")
+    # Nothing listens on the suite's pinned (dead) endpoint, so a connect
+    # refusal is what "no daemon running" looks like now — there is no socket
+    # file whose absence could stand in for it.
     assert cli._cmd_attach_active(_ns(json=False, session="bw-s"), Config()) == 2
     with pytest.raises(Unavailable):
         asyncio.run(cli._rpc_via_ws(
@@ -179,10 +176,7 @@ def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
             client_label="sweep",
         ))
 
-    sock = tmp_path / "daemon.sock"
-    sock.write_text("")
-    monkeypatch.setattr(_ipc, "sock_path", lambda: sock)
-    monkeypatch.setattr(websockets, "unix_connect", lambda *a, **kw: _AsyncWs([
+    monkeypatch.setattr(websockets, "connect", lambda *a, **kw: _AsyncWs([
         {"id": 1, "error": {"message": "boom", "code": -32000}},
     ]))
     with pytest.raises(DaemonError, match="boom"):
@@ -191,7 +185,7 @@ def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
             client_label="sweep",
         ))
 
-    monkeypatch.setattr(websockets, "unix_connect", lambda *a, **kw: _AsyncWs([
+    monkeypatch.setattr(websockets, "connect", lambda *a, **kw: _AsyncWs([
         {"id": 1, "result": "not-a-dict"},
     ]))
     with pytest.raises(DaemonError, match="non-dict"):
@@ -201,11 +195,11 @@ def test_rpc_attach_error_paths(monkeypatch, capsys, tmp_path):
         ))
 
     err_ws = _AsyncWs([{"id": 1, "error": {"message": "attach boom"}}])
-    monkeypatch.setattr(websockets, "unix_connect", lambda *a, **kw: err_ws)
+    monkeypatch.setattr(websockets, "connect", lambda *a, **kw: err_ws)
     assert cli._cmd_attach_active(_ns(json=False, session="bw-s"), Config()) == 1
 
     captured = capsys.readouterr()
-    assert captured.err.count("no daemon running") >= 1
+    assert captured.err.count("no daemon answered at") >= 1
     assert "attach-active failed:" in captured.err
     assert "attach boom" in captured.err
 

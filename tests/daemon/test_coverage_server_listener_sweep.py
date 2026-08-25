@@ -65,57 +65,46 @@ class _Router:
         self.drained += 1
 
 
-def test_process_request_ping_and_query_parse(monkeypatch):
-    handler = SimpleNamespace()
-    facade_state = listener_mod.FacadeState()
-    facade_state.set(_ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990))
-    process_request = listener_mod._make_process_request(handler, facade_state)
+def test_endpoint_process_request_ping_origin_and_unknown_path(monkeypatch):
+    """ADR-0011 moved `/__ping__`, Origin validation and path dispatch onto the
+    one endpoint server. All three are decided before any ws upgrade."""
+    from browserwright.daemon.server import facade as facade_mod
+
+    endpoint = facade_mod.PlaywrightFacade(cfg=Config(), port=0)
     conn = _HttpConn()
 
-    monkeypatch.setattr(listener_mod.os, "getpid", lambda: 2468)
-    ping = process_request(conn, SimpleNamespace(path="/__ping__?x=1", headers={}))
+    monkeypatch.setattr(facade_mod.os, "getpid", lambda: 2468)
+    ping = endpoint._process_request(
+        conn, SimpleNamespace(path="/__ping__?x=1", headers={}))
     assert ping.status.value == 200
     assert ping.headers["Content-Type"] == "application/json"
     pong = _ipc.parse_pong(ping.body.encode())
     assert (pong.pid, pong.version) == (2468, listener_mod.__version__)
-    # The pong is the ONLY facade advertisement: it must carry the live endpoint.
-    assert pong.facade == _ipc.FacadeInfo.bound("ws://127.0.0.1:19990/cdp", 19990)
 
-    allowed = process_request(
-        conn,
-        SimpleNamespace(
-            path="/ws?client=ok",
-            headers={"Origin": "https://web.example"},
-        ),
-    )
-    assert allowed is None
+    # Each ws surface is allowed through when no Origin is present...
+    for path in ("/cdp", "/control", "/exec"):
+        assert endpoint._process_request(
+            conn, SimpleNamespace(path=f"{path}?client=ok", headers={})) is None
+
+    # ...and refused outright when one is, on every surface. Nothing that
+    # legitimately reaches this endpoint runs in a browser.
+    for path in ("/cdp", "/control", "/exec"):
+        denied = endpoint._process_request(
+            conn,
+            SimpleNamespace(path=path,
+                            headers={"Origin": "https://web.example"}))
+        assert denied.status.value == 403
+
+    unknown = endpoint._process_request(
+        conn, SimpleNamespace(path="/nope", headers={}))
+    assert unknown.status.value == 404
+
+
+def test_parse_query_keeps_first_value_and_drops_empties():
     assert listener_mod._parse_query("/ws?client=a&client=b&empty=&q=x%20y") == {
         "client": "a",
         "q": "x y",
     }
-
-
-@pytest.mark.asyncio
-async def test_open_server_unix_bind(monkeypatch, tmp_path):
-    calls: list[tuple[str, dict]] = []
-    handler = SimpleNamespace(serve_one=object())
-
-    async def fake_unix_serve(*args, **kwargs):
-        calls.append(("unix", kwargs))
-        return SimpleNamespace(kind="unix")
-
-    monkeypatch.setattr(listener_mod, "unix_serve", fake_unix_serve)
-    monkeypatch.setattr(listener_mod._ipc, "make_unix_socket", lambda: "unix-sock")
-    monkeypatch.setattr(listener_mod._ipc, "sock_path", lambda: tmp_path / "daemon.sock")
-    monkeypatch.setattr(listener_mod.os, "stat", lambda path: SimpleNamespace(st_mode=0o100600))
-
-    unix = await listener_mod._open_server(handler, listener_mod.FacadeState())
-
-    assert unix.kind == "unix"
-    assert calls[0][0] == "unix"
-    assert calls[0][1]["sock"] == "unix-sock"
-    assert calls[0][1]["max_size"] == 100 * 1024 * 1024
-    assert calls[0][1]["process_request"] is not None
 
 
 @pytest.mark.asyncio
@@ -132,16 +121,19 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     assert "already running (pid 999)" in err
     assert "browserwright-daemon status" in err
 
-    class FakeServer:
-        def __init__(self):
-            self.closed = False
-            self.waited = False
+    class FakeEndpoint:
+        """Stands in for the one TCP endpoint, which binds before the relay."""
 
-        def close(self):
-            self.closed = True
+        def __init__(self, **kwargs):
+            cleanup_calls.append("endpoint")
+            self.stopped = False
 
-        async def wait_closed(self):
-            self.waited = True
+        async def start(self):
+            return 19990
+
+        async def stop(self):
+            self.stopped = True
+            cleanup_calls.append("endpoint-stop")
 
     class BadRelay:
         def __init__(self, *, host, port):
@@ -150,7 +142,6 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
         async def start(self):
             raise OSError("busy")
 
-    server = FakeServer()
     monkeypatch.setattr(
         listener_mod._ipc,
         "ping_status_async",
@@ -158,24 +149,59 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     )
     monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: cleanup_calls.append("cleanup"))
     monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: cleanup_calls.append(f"pid:{pid}"))
+    monkeypatch.setattr(listener_mod._ipc, "write_endpoint_state", lambda url: cleanup_calls.append(f"state:{url}"))
     monkeypatch.setattr(listener_mod, "_cleanup_orphan_cdp_chrome", lambda: cleanup_calls.append("orphans"))
     monkeypatch.setattr(listener_mod, "_wire_logging", lambda: None)
     monkeypatch.setattr(listener_mod, "install_json_logging_if_requested", lambda: None)
-    monkeypatch.setattr(
-        listener_mod,
-        "_open_server",
-        lambda handler, facade_state: asyncio.sleep(0, result=server),
-    )
+    monkeypatch.setattr(listener_mod, "PlaywrightFacade", FakeEndpoint)
     monkeypatch.setattr(listener_mod, "RelayServer", BadRelay)
 
     cfg = Config(backend="extension")
     cfg.backends.extension.port = 22345
 
     assert await listener_mod.run_serve(cfg) == 2
-    assert server.closed is True
-    assert server.waited is True
-    assert cleanup_calls == ["cleanup", "orphans", f"pid:{listener_mod.os.getpid()}", "relay:127.0.0.1:22345", "cleanup"]
+    # The endpoint binds FIRST (its bind is the mutual exclusion between
+    # daemons), publishes its URL, and is stopped again when the relay cannot
+    # come up — a daemon with no relay would serve an extension backend that
+    # can never connect.
+    assert cleanup_calls == [
+        "cleanup", "orphans", f"pid:{listener_mod.os.getpid()}",
+        "endpoint", "state:http://127.0.0.1:19990",
+        "relay:127.0.0.1:22345", "endpoint-stop", "cleanup",
+    ]
     assert "failed to bind extension relay" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_run_serve_endpoint_bind_failure_is_fatal(monkeypatch, capsys):
+    """The endpoint is the only client-facing door: no bind, no daemon.
+
+    Contrast the pre-ADR-0011 facade, whose bind failure was non-fatal because
+    the unix control socket kept serving the agent path. There is no second
+    path left to fall back to.
+    """
+    monkeypatch.setattr(
+        listener_mod._ipc, "ping_status_async",
+        lambda timeout: asyncio.sleep(0, result=_ipc.NO_PONG))
+    monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: None)
+    monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: None)
+    monkeypatch.setattr(listener_mod, "_cleanup_orphan_cdp_chrome", lambda: None)
+    monkeypatch.setattr(listener_mod, "_wire_logging", lambda: None)
+    monkeypatch.setattr(listener_mod, "install_json_logging_if_requested", lambda: None)
+
+    class RefusedEndpoint:
+        def __init__(self, **kwargs):
+            pass
+
+        async def start(self):
+            raise OSError("address already in use")
+
+    monkeypatch.setattr(listener_mod, "PlaywrightFacade", RefusedEndpoint)
+
+    assert await listener_mod.run_serve(Config(backend="extension")) == 2
+    err = capsys.readouterr().err
+    assert "failed to bind endpoint" in err
+    assert "lsof -nP -iTCP:19990" in err
 
 
 @pytest.mark.asyncio

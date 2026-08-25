@@ -29,7 +29,7 @@ from .probe import daemon_status_async
 # "does the CLI work" — which it does with no daemon process at all — and the
 # blob had no liveness field to consult. v3 adds the same probe `status` uses:
 # top-level `alive` / `probe_state` / `pid` (DaemonStatus wire fields). The
-# liveness probe is local (socket ping + socket-file/port observations), zero
+# liveness probe is local (endpoint ping + pid-file/port observations), zero
 # ws side effects, so it keeps the §9.4 contract.
 SCHEMA_VERSION = 3
 
@@ -51,7 +51,7 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
 
     Liveness first (issue #28): the blob carries the same probe `status` uses
     (``alive`` / ``probe_state`` / ``pid``) so skill-side checks can fail on a
-    down daemon. Run before the backend gather — its socket observations are
+    down daemon. Run before the backend gather — its endpoint observations are
     sequential I/O. Zero ws side effects either way.
     """
     if probe_ws:
@@ -82,12 +82,14 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
         "alive": st.alive,
         "probe_state": st.probe_state,
         "pid": st.pid,
-        # The Playwright facade: the door `page`/`context`/`snapshot()` come
-        # through. Emitted because `st` already carries it and its absence used
-        # to be invisible here — a daemon whose facade never bound reported all
-        # green while every browser-driving call failed. Additive to schema 3.
-        "facade": st.facade,
-        "facade_error": st.facade_error,
+        # The endpoint, and its cdp surface: the door `page`/`context`/
+        # `snapshot()` come through. Emitted because `st` already carries them
+        # and their absence used to be invisible here — a daemon whose facade
+        # never bound reported all green while every browser-driving call
+        # failed. `facade` is the pre-ADR-0011 name, kept for wire compat.
+        "endpoint": st.endpoint,
+        "cdp_surface": st.cdp_surface,
+        "facade": st.cdp_surface,
         "recommended": _pick_recommended([_asdict(r) for r in results]),
         "backends": [_asdict(r) for r in results],
     }

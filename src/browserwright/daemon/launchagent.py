@@ -367,15 +367,29 @@ def _live_daemon_version(cfg) -> str | None:
 
 
 def _stop_incumbent(timeout: float) -> dict:
-    """Stop whatever currently answers our control socket. Mirrors `_cmd_stop`.
+    """Stop whatever currently answers our endpoint. Mirrors `_cmd_stop`.
 
-    Safe by construction with respect to issue #44 B: the control socket lives
-    under *our* runtime dir, so anything answering it is our daemon by
-    definition. (#44 B is about the relay *ports*, where a stranger's daemon can
-    hold 19989 without owning our socket — that case is caught by the version
-    check in :func:`restart`'s verification instead, where refusing is right.)
+    This used to be safe by construction: the control socket lived under *our*
+    runtime dir, so anything answering it was our daemon by definition. ADR-0011
+    replaced that socket with a URL, and a URL can name another machine — where
+    the pid on the pong is a pid over there. The caller (:func:`restart`) is a
+    LaunchAgent operation on this machine anyway, so an endpoint that is not
+    locally signalable (see `DaemonEndpoint.is_locally_signalable`) is refused
+    outright rather than signalled. A LOCAL daemon bound to a tailnet IP stays
+    stoppable — it publishes its endpoint into our runtime dir, which is what
+    makes it ours.
+
+    (Issue #44 B is a different case — the relay *ports*, where a stranger's
+    daemon can hold 19989 without being ours. That one is caught by the version
+    check in :func:`restart`'s verification, where refusing is right.)
     """
     from . import _ipc, platforms, supervise
+    from ..daemon_url import daemon_endpoint, not_ours_to_signal_message
+
+    endpoint = daemon_endpoint()
+    if not endpoint.is_locally_signalable:
+        raise LaunchAgentError(
+            not_ours_to_signal_message(endpoint, "restart"), exit_code=3)
 
     pid = _ipc.ping_sync(timeout=1.0)
     if pid is None:

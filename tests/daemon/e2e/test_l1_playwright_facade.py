@@ -45,6 +45,8 @@ def e2e_cdp_facade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
     env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
+    # ADR-0011: clients in this subtree talk to THIS daemon's endpoint.
+    env["BW_DAEMON_URL"] = f"http://127.0.0.1:{TEST_FACADE_PORT}"
     env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "cdp")
     env["BD_CONFIG"] = ""
 

@@ -37,7 +37,11 @@ def daemon_doctor() -> dict:
     failure returns a synthetic ``schema_version:1`` blob explaining why."""
     cmd = ["browserwright-daemon", "doctor", "--json"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        # ADR-0011: report on the daemon THIS process is addressed at, not the
+        # one the child CLI would default to.
+        from .daemon_url import child_env
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                              env=child_env())
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         return {
             "schema_version": 1,
@@ -152,35 +156,31 @@ def doctor_checks() -> dict:
                 "update browserwright-daemon to match browserwright",
             )
 
-    # 3. facade — the Playwright door. Every `page` / `context` / `snapshot()`
-    #    call connects through it, so a live daemon whose facade never bound (or
-    #    was disabled) means 100% of browser-driving calls fail. That state used
-    #    to be completely invisible here: the discovery file it was published to
-    #    got reaped out of /tmp, `doctor` said all green, and every `-e`/`-f`
-    #    invocation failed with an unexplained FacadeUnavailable. It is a `fail`,
-    #    same tier as a down daemon, because the practical consequence is the
-    #    same. Skipped when the daemon is down — that is already reported above,
-    #    and one root cause should not print as two failures.
+    # 3. cdp surface — the Playwright door. Every `page` / `context` /
+    #    `snapshot()` call connects through it. ADR-0011 collapsed it onto the
+    #    daemon's one endpoint, so it can no longer be separately absent: a
+    #    daemon that could not bind that port does not start. The check
+    #    therefore reports the *address* rather than adjudicating existence, and
+    #    only fails when a live daemon reports no surface at all — which now
+    #    means a daemon too old to speak this shape.
     if not synthetic and info.get("alive") is not False:
-        facade = info.get("facade")
-        if isinstance(facade, dict) and facade.get("ws"):
-            add("facade", "pass",
-                f"Playwright facade at {facade['ws']}", "")
-        elif "facade" in info:
-            reason = (info.get("facade_error")
-                      or "the daemon reports no Playwright facade")
+        surface = info.get("cdp_surface") or info.get("facade")
+        if isinstance(surface, dict) and surface.get("ws"):
+            add("cdp_surface", "pass",
+                f"cdp surface at {surface['ws']}", "")
+        elif "cdp_surface" in info or "facade" in info:
             add(
-                "facade",
+                "cdp_surface",
                 "fail",
-                f"no Playwright facade: {reason}",
-                "restart the daemon (`browserwright-daemon restart`); if it was "
-                "started with `--facade-port 0`, drop that flag",
+                "the daemon reports no cdp surface",
+                "restart the daemon (`browserwright-daemon restart`)",
             )
         else:
-            # A pre-facade doctor blob. Can't observe it, so don't assert it.
-            add("facade", "warn",
-                "cannot verify the Playwright facade (doctor blob predates the "
-                "facade field)",
+            # A doctor blob too old to carry it. Can't observe it, so don't
+            # assert it.
+            add("cdp_surface", "warn",
+                "cannot verify the cdp surface (doctor blob predates the "
+                "field)",
                 "update browserwright-daemon to match browserwright")
 
     # 4. schema version sanity (catches a daemon too old to speak the blob)

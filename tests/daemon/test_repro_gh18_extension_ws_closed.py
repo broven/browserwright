@@ -85,8 +85,9 @@ def extension_daemon_no_extension():
     """An isolated extension-backend daemon with NO extension connected.
 
     Fully isolated from any developer/global daemon: a private
-    ``XDG_RUNTIME_DIR`` (→ its own unix socket) plus ephemeral relay + facade
-    ports. Yields ``(sock_path, bs_home)``."""
+    ``XDG_RUNTIME_DIR`` plus ephemeral relay + endpoint ports. ADR-0011 made
+    that isolation port-based, so the endpoint port IS the isolation.
+    Yields ``(endpoint_url, bs_home)``."""
     runtime_dir = tempfile.mkdtemp(prefix="bwg18")  # short base → AF_UNIX path fits
     bs_home = Path(runtime_dir) / "bs_home"
     bs_home.mkdir(parents=True, exist_ok=True)
@@ -99,6 +100,8 @@ def extension_daemon_no_extension():
         "BS_HOME": str(bs_home),
         "BD_CONFIG": "",  # ignore the developer's toml (ports/backend/relay_url)
         "BD_EXTENSION_PORT": str(relay_port),
+        # Point every client in this process tree at the isolated endpoint.
+        "BW_DAEMON_URL": f"http://127.0.0.1:{facade_port}",
         # Shrink the no-extension fast-fail wait so this fast-gate test doesn't
         # sit for the default 10s grace (we assert behavior, not the budget).
         "BW_EXT_READY_BUDGET_S": "0.3",
@@ -112,18 +115,18 @@ def extension_daemon_no_extension():
          "--facade-port", str(facade_port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
-    sock_path = Path(runtime_dir) / "browserwright-daemon.sock"
+    endpoint_url = f"http://127.0.0.1:{facade_port}"
     try:
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 pytest.fail(f"daemon exited early (code={proc.returncode})")
-            if sock_path.exists():
+            if _endpoint_answers(facade_port):
                 break
             time.sleep(0.05)
         else:
-            pytest.fail("isolated daemon never bound its socket")
-        yield str(sock_path), bs_home
+            pytest.fail("isolated daemon never bound its endpoint")
+        yield endpoint_url, bs_home
     finally:
         proc.terminate()
         with contextlib.suppress(subprocess.TimeoutExpired):
@@ -132,20 +135,39 @@ def extension_daemon_no_extension():
             proc.kill()
 
 
+def _endpoint_answers(port: int) -> bool:
+    """Whether the isolated daemon answers `/__ping__` on ``port`` yet.
+
+    The readiness signal moved from "the socket file appeared" to "the endpoint
+    answers", which is strictly stronger: a bound port that has not finished
+    starting up would have passed the old file check.
+    """
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+            s.sendall(b"GET /__ping__ HTTP/1.1\r\nHost: localhost\r\n"
+                      b"Connection: close\r\n\r\n")
+            return b'"pong"' in s.recv(4096)
+    except OSError:
+        return False
+
+
 def _clean_env() -> dict:
     import os
     # Drop inherited browserwright overrides that could leak ports/sockets in.
-    drop = {"BD_EXTENSION_PORT", "BD_FACADE_PORT", "BD_BACKEND", "BD_SESSION"}
+    drop = {"BD_EXTENSION_PORT", "BD_FACADE_PORT", "BD_BACKEND", "BD_SESSION",
+            "BW_DAEMON_URL"}
     return {k: v for k, v in os.environ.items() if k not in drop}
 
 
 def test_ensure_executor_no_extension_is_fast_and_actionable(
         extension_daemon_no_extension):
     """The reporter's exact RPC, against a real daemon with no extension."""
-    sock_path, bs_home = extension_daemon_no_extension
+    endpoint_url, bs_home = extension_daemon_no_extension
     sid = _seed_extension_session(bs_home)
 
-    sess = CDPSession(f"ws+unix://{sock_path}?session={sid}&client=gh18")
+    host_port = endpoint_url.split("//", 1)[1]
+    sess = CDPSession(f"ws://{host_port}/control?session={sid}&client=gh18")
     t0 = time.monotonic()
     with pytest.raises(CDPError) as exc:
         sess.send("BrowserwrightDaemon.ensureExecutor", bsSession=sid)

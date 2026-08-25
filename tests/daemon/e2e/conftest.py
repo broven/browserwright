@@ -52,32 +52,57 @@ TEST_CDP_FACADE_PORT = _PORTS["facade_cdp"]
 TEST_FACADE_L1_PORT = _PORTS["facade_l1"]
 TEST_FACADE_L1_EXT_PORT = _PORTS["facade_l1_ext"]
 TEST_AUTOFACADE_PORT = _PORTS["facade_autofacade"]
-# Single-global-daemon model: BD_NAME / `--name` are gone. The e2e harness now
-# isolates the test daemon from the developer's real daemon by pointing
-# XDG_RUNTIME_DIR at a throwaway temp dir (→ a distinct fixed socket path) and
-# overriding the relay port (BD_EXTENSION_PORT=<derived>). One daemon serves both
-# backends, routing per session by the ledger's immutable per-session backend.
+# Single-global-daemon model: BD_NAME / `--name` are gone. Isolation from the
+# developer's real daemon is by PORT (ADR-0011): each test daemon binds its own
+# endpoint (`--facade-port <derived>`) and its own relay (BD_EXTENSION_PORT),
+# and every client is pointed at that endpoint with `BW_DAEMON_URL`. The
+# throwaway XDG_RUNTIME_DIR still isolates the pid file, the executor sockets
+# and the daemon log. One daemon serves both backends, routing per session by
+# the ledger's immutable per-session backend.
 
 
 def _isolated_runtime_dir() -> str:
     """A fresh short temp dir for XDG_RUNTIME_DIR.
 
-    The daemon's fixed socket lives under XDG_RUNTIME_DIR, so a unique dir per
-    test run gives a unique socket — the e2e-isolation mechanism that replaced
-    BD_NAME. Kept short (/tmp) for the macOS AF_UNIX 104-byte sun_path budget.
+    Holds the daemon's pid file, its published endpoint state and the
+    per-session executor sockets. Kept short (/tmp) for the macOS AF_UNIX
+    104-byte sun_path budget, which the executor sockets still live under.
     """
     return tempfile.mkdtemp(prefix="bd-e2e-", dir="/tmp")
 
 
+def endpoint_url(port: int) -> str:
+    """The `BW_DAEMON_URL` for a test daemon bound on ``port``."""
+    return f"http://127.0.0.1:{port}"
+
+
+def published_endpoint(runtime_dir: str) -> str | None:
+    """The endpoint URL the daemon owning ``runtime_dir`` published, if any.
+
+    ADR-0011: a daemon writes the URL it actually bound next to its pid file.
+    Reading it here is what lets `run_skill` keep the harness's original
+    contract — the runtime dir identifies the daemon — without every caller
+    having to also know which port that daemon chose.
+    """
+    try:
+        data = json.loads(
+            (Path(runtime_dir) / "browserwright-daemon.endpoint").read_text())
+    except (OSError, ValueError):
+        return None
+    url = data.get("url") if isinstance(data, dict) else None
+    return url if isinstance(url, str) and url else None
+
+
 def scrubbed_env() -> dict[str, str]:
-    """Return os.environ with BD_*/BS_*/BU_* vars stripped.
+    """Return os.environ with BD_*/BS_*/BU_*/BW_* vars stripped.
 
     Prevents the user's shell environment from leaking into test
-    subprocesses (e.g. BD_CDP_PORT, BD_BACKEND).
-    Callers re-add only the vars they need for isolation.
+    subprocesses (e.g. BD_CDP_PORT, BD_BACKEND, and — since ADR-0011 —
+    BW_DAEMON_URL, which would silently redirect every client away from the
+    test daemon). Callers re-add only the vars they need for isolation.
     """
     return {k: v for k, v in os.environ.items()
-            if not k.startswith(("BD_", "BS_", "BU_"))}
+            if not k.startswith(("BD_", "BS_", "BU_", "BW_"))}
 
 
 def pytest_collection_modifyitems(config, items):
@@ -234,10 +259,12 @@ def e2e_daemon(e2e_artifacts_dir, tmp_path_factory):
 
     runtime_dir = _isolated_runtime_dir()
     env = os.environ.copy()
-    # Isolation: a unique XDG_RUNTIME_DIR → a unique fixed socket path, so the
-    # test daemon never collides with the developer's real daemon. (Replaces
-    # the old BD_NAME-suffixed socket.)
+    # Isolation: a unique XDG_RUNTIME_DIR for the pid file, executor sockets
+    # and log; the derived endpoint/relay ports below are what actually keep
+    # this daemon clear of the developer's real one.
     env["XDG_RUNTIME_DIR"] = runtime_dir
+    # ADR-0011: pin every client in this subtree to THIS daemon's endpoint.
+    env["BW_DAEMON_URL"] = endpoint_url(TEST_EXT_FACADE_PORT)
     env["TMPDIR"] = runtime_dir
     # Keep the daemon's session ledger aligned with helpers.run_skill(), which
     # seeds extension sessions under this isolated test home.
@@ -771,6 +798,8 @@ def e2e_cdp_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
+    # ADR-0011: pin every client in this subtree to THIS daemon's endpoint.
+    env["BW_DAEMON_URL"] = endpoint_url(TEST_CDP_FACADE_PORT)
     env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
     # Keep daemon-side session routing aligned with helpers.run_skill() for
     # CDP attach/create parity tests.

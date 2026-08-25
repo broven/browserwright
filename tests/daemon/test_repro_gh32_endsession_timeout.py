@@ -30,7 +30,7 @@ from urllib.parse import parse_qs
 import pytest
 import websockets
 
-from browserwright.daemon import _ipc, _rpc
+from browserwright.daemon import _rpc
 from browserwright.daemon.config import Config
 from browserwright.daemon.server.proxy import Router
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
@@ -101,13 +101,12 @@ async def test_gh32_slow_teardown_never_outlives_the_caller(
     from browserwright import session_registry
     from browserwright.daemon.server.executor_registry import ExecutorRegistry
 
-    # Isolate socket + executor discovery files from the real daemon. Like
-    # ``_ipc._runtime_dir``, use /tmp: AF_UNIX sun_path has a hard 104-byte
+    # Isolate executor discovery files from the real daemon. Like
+    # ``_ipc.runtime_dir``, use /tmp: AF_UNIX sun_path has a hard 104-byte
     # budget on macOS and pytest's tmp_path (under /private/var/folders) blows
     # it.
     runtime = Path(tempfile.mkdtemp(prefix="bw-gh32-", dir="/tmp"))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
-    sock = _ipc.sock_path()
     monkeypatch.setattr(
         session_registry, "get",
         lambda sid: {"id": sid, "backend": "extension", "name": "repro"},
@@ -121,14 +120,21 @@ async def test_gh32_slow_teardown_never_outlives_the_caller(
     registry = ExecutorRegistry()
     router.daemon = SimpleNamespace(executors=registry)
 
+    # ADR-0011: the control plane is a ws path on the one TCP endpoint, so the
+    # stand-in server is a TCP one on an ephemeral port, pinned for the client
+    # through `BW_DAEMON_URL`.
+    bound: asyncio.Future = asyncio.get_running_loop().create_future()
+
     async def serve():
-        async with websockets.unix_serve(
-            lambda conn: _serve_one(router, state, conn), str(sock),
-        ):
+        async with websockets.serve(
+            lambda conn: _serve_one(router, state, conn), "127.0.0.1", 0,
+        ) as server:
+            bound.set_result(server.sockets[0].getsockname()[1])
             await asyncio.Future()  # pragma: no cover - never returns
 
     server_task = asyncio.create_task(serve())
-    await asyncio.sleep(0.05)  # let the socket bind
+    port = await asyncio.wait_for(bound, timeout=5.0)
+    monkeypatch.setenv("BW_DAEMON_URL", f"http://127.0.0.1:{port}")
     try:
         # 1. Initiate: even with a client timeout far below the teardown
         #    duration, the caller gets a prompt answer — the mismatch is gone.

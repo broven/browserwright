@@ -92,18 +92,18 @@ def test_task_client_uses_shared_executor_lease_and_request(monkeypatch):
     monkeypatch.setattr(
         client,
         "_ensure_executor_lease",
-        lambda _sess: client.ExecutorLease("/tmp/task.sock", "executor-task"),
+        lambda _sess: client.ExecutorLease("sess-task", "executor-task"),
     )
     monkeypatch.setattr(client, "_connect", lambda *_args, **_kwargs: _Connection())
     monkeypatch.setattr(
         client,
-        "send_message",
+        "_send_frame",
         lambda _conn, payload: captured.setdefault("payload", payload),
     )
     monkeypatch.setattr(
         client,
-        "recv_message",
-        lambda _conn: protocol.ExecuteResponse(
+        "_recv_frame",
+        lambda _conn, timeout=None: protocol.ExecuteResponse(
             task_result_json='{"ok": true}'
         ).to_dict(),
     )

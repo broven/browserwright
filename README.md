@@ -56,10 +56,10 @@ browserwright-daemon doctor
 
 On macOS, `browserwright-daemon install` registers the daemon as a LaunchAgent
 at `~/Library/LaunchAgents/com.browserwright-daemon.plist`, starts it on login,
-and keeps the single daemon socket at:
+and keeps the single daemon endpoint at:
 
 ```bash
-${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock
+http://127.0.0.1:19990        # override with --facade-host / --facade-port
 ```
 
 Linux currently does not auto-install a service; run `browserwright-daemon serve`
@@ -151,7 +151,7 @@ browserwright session end --session=$sid
 
 A bare heredoc with no session/`BD_PORT` context exits 2 with guidance — the daemon is never silently shared.
 
-One global daemon serves every session (fixed socket `browserwright-daemon.sock`; no per-instance name). The session's backend is fixed at `session new` and never changes. On `extension` the session's "browser" is a Chrome **tab group** (named after the session) inside the user's real Chrome; `session end` closes the whole group. On `cdp` the daemon launches and owns a dedicated, isolated Chrome (profile `bs-s<id>`) that dies with the session. **Isolation caveat:** cdp sessions get isolated profiles (separate cookies/storage), but extension tab groups isolate only the *tab set* — all extension sessions share the user's one profile, so they share cookies/login/origin storage with each other and with the user.
+One global daemon serves every session (one TCP endpoint, default `http://127.0.0.1:19990`; no per-instance name). The session's backend is fixed at `session new` and never changes. On `extension` the session's "browser" is a Chrome **tab group** (named after the session) inside the user's real Chrome; `session end` closes the whole group. On `cdp` the daemon launches and owns a dedicated, isolated Chrome (profile `bs-s<id>`) that dies with the session. **Isolation caveat:** cdp sessions get isolated profiles (separate cookies/storage), but extension tab groups isolate only the *tab set* — all extension sessions share the user's one profile, so they share cookies/login/origin storage with each other and with the user.
 
 ### Two invocation forms
 
@@ -181,19 +181,48 @@ browserwright task wikipedia.org/lookup --title="Wikipedia"
 Interactive wizard: `browserwright install` — walks the decision tree and writes your pick.
 
 **Scaling `env` to N profiles:** one daemon has one shared upstream, so drive N
-external profiles with N isolated daemons — each with its own `XDG_RUNTIME_DIR`
-(distinct socket), `--facade-port`, and `BD_CDP_WS`, one `env` session apiece.
+external profiles with N isolated daemons — each with its own `XDG_RUNTIME_DIR`,
+its own `--facade-port` (the endpoint, and the thing clients address with
+`BW_DAEMON_URL`), and `BD_CDP_WS`, one `env` session apiece.
 See [docs/session-workspaces.md](docs/session-workspaces.md) §"Env Backend".
 
-**Reaching the facade from another machine (Tailscale/LAN):** the Playwright
-facade binds `127.0.0.1` by default and is *never* exposed off-box unless you
-opt in. Pass `--facade-host <tailnet-ip>` (or `BD_FACADE_HOST` / `facade_host`
-in config.toml; `0.0.0.0` to bind all interfaces) and a remote client can
-`connect_over_cdp("http://<tailnet-ip>:19990/cdp")` — the facade's
+**Driving this machine's browser from another machine (ADR-0011):** the daemon
+serves one TCP endpoint (default `127.0.0.1:19990`) carrying every client-facing
+surface — the CLI/skill control plane, the executor data plane, and the
+Playwright-compatible CDP face. Bind it somewhere the other machine can reach
+and point a client at it with one URL:
+
+```bash
+# On the machine with the browser (bind a tailnet IP, never a public one):
+browserwright-daemon serve --backend extension --facade-host <tailnet-ip>
+
+# On the other machine — the FULL surface, not just raw CDP:
+export BW_DAEMON_URL=http://<tailnet-ip>:19990
+browserwright -s <session-id> -e "print(page.title())"
+```
+
+`BW_DAEMON_URL` (or `--daemon-url`, or `daemon_url` in config.toml) is the only
+address there is. A plain Playwright client can still take the cdp surface
+directly: `connect_over_cdp("http://<tailnet-ip>:19990/cdp")` — the
 `/json/version` bootstrap rewrites the advertised `webSocketDebuggerUrl` from
 the request's `Host` header, so the ws URL points back at the address the
-client actually used. No auth is added, so only bind an interface you trust
-(a Tailscale IP is private to your tailnet).
+client actually used.
+
+> **No auth. Read this before binding anything.** The endpoint runs arbitrary
+> Python and drives your real browser, and there is **no** application-layer
+> authentication — the security boundary is entirely the network layer. Bind
+> only an interface you trust (a Tailscale IP is private to your tailnet; an
+> SSH tunnel is equally fine). Anyone who can reach the port owns the browser
+> and can execute code as you. Binding a public interface is unsupported.
+> Origin validation rejects browser-originated connections, which is protection
+> against a web page reaching it — not against a person on the network.
+
+**Setting the URL explicitly turns off daemon auto-start.** With `BW_DAEMON_URL`
+(or the flag, or the config key) set — even to `127.0.0.1` — a failed connection
+is an error rather than a cue to spawn a local daemon: that daemon is yours to
+manage, may be on another machine, and a local one would quietly serve a
+different browser. Only the unconfigured default keeps the old auto-start and
+version-skew restart behavior.
 
 **Remote clients own one tab group each (extension backend, ADR-0010):** a
 connection without `?session=` is auto-scoped to its own private tab group —
@@ -218,8 +247,8 @@ browserwright userscript remove <id>
 ### The heredoc surface
 
 Browser driving is **real synchronous Playwright**. Every heredoc gets the
-following names injected, already connected through the daemon's Playwright
-CDP facade:
+following names injected, already connected through the daemon endpoint's cdp
+surface:
 
 - **`page`** — a Playwright `Page` bound to the session's current tab, **reused
   across heredocs**. Navigate it in place (`page.goto`, `page.locator`,
@@ -250,7 +279,7 @@ Full catalogue and guidance in `skill/SKILL.md`.
 
 ```bash
 browserwright-daemon doctor                  # which backends are live, why each is/isn't usable
-browserwright-daemon status --json           # daemon liveness + endpoint + facade port
+browserwright-daemon status --json           # daemon liveness + endpoint URL + cdp surface
 browserwright doctor                         # skill-side health
 ```
 

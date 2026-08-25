@@ -1,8 +1,10 @@
 # browserwright-daemon
 
-**一个长驻的全局 daemon**，把 Chrome 的多种"远程调试入口"统一抽象成一个本地 CDP 代理。它监听固定的 unix socket（`${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`），同时服务多个 session：extension session 共享一条 relay upstream（用户日常 Chrome），cdp session 各自拿到 daemon 启动并持有的隔离 Chrome。上层（`browserwright` skill CLI、固化脚本等）只连 daemon socket，不关心底层是 `--remote-debugging-port` 还是浏览器插件 relay。
+**一个长驻的全局 daemon**，把 Chrome 的多种"远程调试入口"统一抽象成一个本地 CDP 代理。它监听**一个 TCP endpoint**（默认 `http://127.0.0.1:19990`，见 ADR-0011），同时服务多个 session：extension session 共享一条 relay upstream（用户日常 Chrome），cdp session 各自拿到 daemon 启动并持有的隔离 Chrome。上层（`browserwright` skill CLI、固化脚本等）只连这一个 endpoint（用 `BW_DAEMON_URL` / `--daemon-url` / toml `daemon_url` 寻址），不关心底层是 `--remote-debugging-port` 还是浏览器插件 relay。endpoint 按 ws path 分三个 sub-surface：`/control`（CLI/skill 控制面）、`/exec`（executor 数据面）、`/cdp`（Playwright 兼容的 CDP 面，旧称 facade）。
 
-daemon 只有长驻的 `serve` 模式：所有调用方（skill、固化脚本）都连 daemon socket，daemon 代理 CDP 流量。（旧的一次性 resolver 用法 `browserwright-daemon url`（Mode A）已移除；需要外部脚本直连时用 Playwright facade `ws://127.0.0.1:19990/cdp`。）
+daemon 只有长驻的 `serve` 模式：所有调用方（skill、固化脚本）都连这一个 endpoint，daemon 代理 CDP 流量。（旧的一次性 resolver 用法 `browserwright-daemon url`（Mode A）已移除；需要外部脚本直连时用 cdp surface `ws://127.0.0.1:19990/cdp`。）
+
+**远程使用**：把 endpoint 绑到别的机器能到达的网卡（`--facade-host <tailnet-ip>`），另一台机器 `export BW_DAEMON_URL=http://<tailnet-ip>:19990` 即可用完整的 CLI/skill/executor 面。**没有任何应用层认证**——安全边界完全是网络层（默认 loopback；远程请走 Tailscale/SSH 隧道），细节见 `docs/adr/0011-single-tcp-endpoint.md`。显式配置了 URL（哪怕是 localhost）就不再自动拉起/重启 daemon：那不是我们的进程。
 
 ## Why
 
@@ -63,7 +65,7 @@ $ browserwright-daemon doctor
 | 命令 | 作用 |
 |---|---|
 | `browserwright-daemon serve` | 运行单全局 daemon（shared extension relay + per-session cdp） |
-| `browserwright-daemon status [--json]` | 报告 daemon 存活状态、socket endpoint、facade 端口 |
+| `browserwright-daemon status [--json]` | 报告 daemon 存活状态、endpoint URL、cdp surface |
 | `browserwright-daemon stop` / `restart` | 停止 / 重启 daemon（已注册 LaunchAgent 时 launchd 会自动拉起；restart 走 LaunchAgent） |
 | `browserwright-daemon doctor` | 详细诊断每个 backend 状态（端口、文件路径、HTTP 响应等） |
 | `browserwright-daemon logs [-f]` | 打印 log 文件路径或 tail 之 |
@@ -99,7 +101,7 @@ $ browserwright-daemon doctor
    写入 `~/Library/LaunchAgents/com.browserwright-daemon.plist` 并 `launchctl load`。daemon 会：
    - 每次登录自动启动（`RunAtLoad`）
    - **任何退出都会被 launchd 自动重启**（`KeepAlive`，`SuccessfulExit=true` + `Crashed=true`）——正常退出（包括 `stop`、控制 socket watchdog 自退）和崩溃都算；这样优雅退出 0 不会被 launchd 当成“任务完成、永不复活”（issue #39）。防 crash-loop 在 `serve` 层（启动时回收 stale 端口，issue #15 2.2），launchd 侧只负责复活
-   - 本地 unix socket 永远在 `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`（全局唯一、无 name 后缀；第二个 daemon 起不来——stale-detect 拒绝）
+   - 本地 endpoint 永远在 `BW_DAEMON_URL` 解析出的那一个地址（默认 `http://127.0.0.1:19990`；全局唯一——第二个 daemon 起不来：`/__ping__` stale-detect 先拒绝，端口 EADDRINUSE 兜底）
    - relay ws server 永远在 `ws://127.0.0.1:19989`（扩展通过此连）
 
    注意：被 LaunchAgent 监管的 daemon，`stop` 只是临时停止——launchd 会在 ~10 秒后复活它。要**永久**停掉：`browserwright-daemon uninstall`（或 `launchctl unload ~/Library/LaunchAgents/com.browserwright-daemon.plist`）。前台 `serve`（未注册 LaunchAgent）不受影响，`stop` 照常永久停止。
@@ -184,11 +186,18 @@ port = 9222
 # 默认 19989 是为了跟 playwriter (19988) 共存；如需进一步避冲突再调整
 relay_url = "ws://127.0.0.1:19989"
 
-# Playwright facade 的绑定 host/port（默认 127.0.0.1:19990，loopback，绝不会误暴露）。
-# 想让别的机器（例如经 Tailscale）`connect_over_cdp` 进来时，把 facade_host 设成
-# 对应网卡 IP 或 0.0.0.0。优先级：CLI `--facade-host` > `BD_FACADE_HOST` > 此 toml key。
+# endpoint 的绑定 host/port（默认 127.0.0.1:19990，loopback，绝不会误暴露）。
+# 名字仍是 facade_*（ADR-0011 只退休了这个词，没改 key）。想让别的机器（例如经
+# Tailscale）连进来时，把 facade_host 设成对应网卡 IP 或 0.0.0.0。
+# 优先级：CLI `--facade-host` > `BD_FACADE_HOST` > 此 toml key。
 facade_host = "127.0.0.1"
 facade_port = 19990
+
+# 本机的客户端去连哪个 daemon。默认 http://127.0.0.1:19990。
+# 优先级：CLI `--daemon-url` > `BW_DAEMON_URL` > 此 toml key > daemon 自己发布的
+# endpoint 状态文件 > 默认值。前三个属于"显式配置"，一旦显式配置就不再自动拉起
+# 或重启 daemon（连不上直接报错）。
+# daemon_url = "http://100.72.20.32:19990"
 ```
 
 > **fallback_chain 已撤掉**：v0.1 README 曾文档化 `fallback_chain = [...]`
@@ -212,8 +221,9 @@ MVP 阶段 config 文件不是必须的——所有项都有合理默认值，en
 | `BD_CONFIG` | 覆盖默认 config 文件路径 |
 | `BD_PORT` | `BD_CDP_PORT` 的 deprecated alias。之前用户把 `BD_PORT=9444` 当作 cdp port 设，daemon silently 默认 9222 撞用户 Chrome。现在 `BD_PORT` 没设 `BD_CDP_PORT` 时按 alias 生效 + stderr 打 deprecation warning |
 | `BD_EXTENSION_PORT` | extension backend relay ws server 的绑定端口（v0.5.3 起）。优先级：CLI `--extension-port` > `BD_EXTENSION_PORT` > toml `[backends.extension].port` > 默认 19989。默认就避开 playwriter 的 19988；e2e 测试用它隔离（29989）|
-| `BD_FACADE_PORT` | Playwright facade 的绑定端口。优先级：CLI `--facade-port` > `BD_FACADE_PORT` > toml `facade_port` > 默认 19990。`0` = 显式关闭 facade |
-| `BD_FACADE_HOST` | Playwright facade 的绑定 host（默认 `127.0.0.1`，loopback）。优先级：CLI `--facade-host` > `BD_FACADE_HOST` > toml `facade_host` > 默认。设成 Tailscale/LAN IP 或 `0.0.0.0` 让别的机器 `connect_over_cdp` 进来；facade 的 `/json/version` 会按请求的 `Host` 头回填 `webSocketDebuggerUrl`，远端拿到的就是它自己用的地址 |
+| `BD_FACADE_PORT` | endpoint 的绑定端口。优先级：CLI `--facade-port` > `BD_FACADE_PORT` > toml `facade_port` > 默认 19990。`0` = 让 OS 随机分配（测试隔离用；ADR-0011 之后不再表示"关闭"——endpoint 是唯一入口，关了等于没有 daemon） |
+| `BW_DAEMON_URL` | 客户端去连的 daemon endpoint URL（唯一一个 `BW_` 前缀的变量）。优先级：CLI `--daemon-url` > `BW_DAEMON_URL` > toml `daemon_url` > daemon 发布的状态文件 > `http://127.0.0.1:19990`。显式配置 ⇒ 不自动拉起/重启 daemon |
+| `BD_FACADE_HOST` | endpoint 的绑定 host（默认 `127.0.0.1`，loopback）。优先级：CLI `--facade-host` > `BD_FACADE_HOST` > toml `facade_host` > 默认。设成 Tailscale/LAN IP 或 `0.0.0.0` 让别的机器 `connect_over_cdp` 进来；cdp surface 的 `/json/version` 会按请求的 `Host` 头回填 `webSocketDebuggerUrl`，远端拿到的就是它自己用的地址 |
 | `BD_LAUNCH_CHROME_ALLOW_DEFAULT_PROFILE` | EXPERT ESCAPE：绕过 launch-chrome 拒绝用户 default profile 的 guard。truthy 值 `1`/`true`/`yes`/`on`/`y`（case-insensitive）unlock。**仅当你完全理解会永久暴露日常 Chrome 给 CDP popup hazard 时** |
 | `BD_LOG_JSON` | `1` / `true` / `yes` → daemon log 输出 JSON 行（`{ts, level, logger, msg, extra?, exc_info?}`），方便日志聚合器消费。默认 plaintext |
 

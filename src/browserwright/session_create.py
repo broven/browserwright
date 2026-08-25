@@ -40,12 +40,26 @@ def _free_port() -> int:
         s.close()
 
 
+def _daemon_child_env() -> dict:
+    """Environment for a child ``browserwright-daemon``.
+
+    ADR-0011: these helpers reach the daemon by *shelling out*, and a
+    `--daemon-url` flag lives only in this process's memory. Without this the
+    child would resolve the default endpoint — so a command could pass the
+    explicit-endpoint liveness gate here and then stop, spawn or tear down a
+    session on an entirely different daemon.
+    """
+    from .daemon_url import child_env
+    return child_env()
+
+
 def _spawn_detached(cmd: list[str]) -> int:
     """Start a long-lived background process detached from this one; return pid."""
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True,
+        env=_daemon_child_env(),
     )
     return proc.pid
 
@@ -56,7 +70,8 @@ def _run(cmd: list[str], timeout: float = 10.0) -> int:
     caller keeps the ledger row for retry, and the retry joins the daemon-side
     teardown (issue #32 initiate contract)."""
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=timeout).returncode
+        return subprocess.run(cmd, capture_output=True, timeout=timeout,
+                              env=_daemon_child_env()).returncode
     except FileNotFoundError:
         # The daemon CLI binary is missing from PATH — an environment problem.
         return 1
@@ -68,15 +83,14 @@ def _run(cmd: list[str], timeout: float = 10.0) -> int:
 
 
 def _daemon_is_running() -> bool:
-    """True iff a daemon answers on this XDG_RUNTIME_DIR's socket right now.
+    """True iff a daemon answers the resolved endpoint right now.
 
     Deliberately does not care about version match — callers use it to decide
     whether teardown has anything to talk to, not whether to upgrade.
     """
     from .daemon import _ipc
     try:
-        pid, _version = _ipc.ping_status_sync(timeout=1.0)
-        return pid is not None
+        return _ipc.ping_status_sync(timeout=1.0).pid is not None
     except Exception:
         return False
 
@@ -118,20 +132,36 @@ def _reap_executor_locally(session_id: str) -> dict | None:
 
 
 def _ensure_daemon_running() -> None:
-    """Make sure the ONE global daemon is up; spawn ``serve`` detached if not.
+    """Make sure a daemon is serving the resolved endpoint.
 
-    There is no ``--name`` anymore — a single fixed-socket daemon serves every
-    session. ``serve`` itself stale-detects an already-running daemon and exits
-    1, so spawning unconditionally is safe (a redundant spawn is a no-op), but
-    we ping first to avoid the churn.
+    Two regimes, and the split is ADR-0011's central rule:
+
+    - **unconfigured default endpoint** — the local daemon is ours. Spawn
+      ``serve`` detached when nothing answers, and stop-then-respawn when what
+      answers runs a different version than the installed package. ``serve``
+      itself refuses to start beside a live daemon, so a redundant spawn is a
+      no-op; we ping first only to avoid the churn.
+    - **explicitly configured endpoint** (``--daemon-url`` / ``$BW_DAEMON_URL``
+      / the toml key) — hands off. That daemon belongs to whoever configured the
+      URL, may be on another machine, and starting a *local* one here would bind
+      a different address and quietly drive the wrong browser. Nothing answering
+      is an error the caller must see, so we raise it.
     """
     from .daemon import _ipc
+    from .daemon_url import daemon_endpoint, unreachable_message
+    from .errors import DaemonUnavailable
     from .version import package_version
+
+    ep = daemon_endpoint()
+    if ep.explicit:
+        if _ipc.ping_status_sync(timeout=2.0).pid is None:
+            raise DaemonUnavailable(unreachable_message(ep))
+        return
     try:
-        pid, running_version = _ipc.ping_status_sync(timeout=1.0)
-        if pid is not None and running_version == package_version():
+        pong = _ipc.ping_status_sync(timeout=1.0)
+        if pong.pid is not None and pong.version == package_version():
             return  # already running the installed version
-        if pid is not None:
+        if pong.pid is not None:
             _run(["browserwright-daemon", "stop"])
     except Exception:
         pass
@@ -230,7 +260,8 @@ def attach_active(record: dict, *, json_out: bool = False) -> str:
     cmd = ["browserwright-daemon", "attach-active", "--session", sid, "--json"]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15.0)
+            cmd, capture_output=True, text=True, timeout=15.0,
+            env=_daemon_child_env())
     except subprocess.TimeoutExpired:
         from .errors import DaemonUnavailable
 

@@ -18,7 +18,7 @@ not actionable — spend your effort shrinking it to a runnable case, not on pro
 Report a bug when browserwright violates its own documented contract:
 
 - A primitive, CLI verb, the daemon, the extension backend, or the Playwright
-  facade **crashes, hangs, times out, or returns a wrong result** vs. what
+  daemon endpoint **crashes, hangs, times out, or returns a wrong result** vs. what
   `browserwright --print-skill` says it should do.
 - A tool traceback surfaces from browserwright's own code (not your script's
   logic error).
