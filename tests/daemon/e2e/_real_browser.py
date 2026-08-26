@@ -194,15 +194,20 @@ def launch_cft_with_extension(
 class DaemonHandle:
     proc: subprocess.Popen
     ext_port: int
-    runtime_dir: str   # XDG_RUNTIME_DIR the daemon's fixed socket lives under
+    runtime_dir: str   # XDG_RUNTIME_DIR the daemon's pid/executor files live under
     log_path: Path
 
 
 def scrubbed_env() -> dict[str, str]:
-    """Return os.environ with BD_*/BS_*/BU_* vars stripped."""
+    """Return os.environ with BD_*/BS_*/BU_*/BW_* vars stripped.
+
+    `BW_` matters since ADR-0011: an inherited `BW_DAEMON_URL` would point
+    every client in the test subtree at whatever daemon the developer's shell
+    was configured for.
+    """
     return {
         k: v for k, v in os.environ.items()
-        if not k.startswith(("BD_", "BS_", "BU_"))
+        if not k.startswith(("BD_", "BS_", "BU_", "BW_"))
     }
 
 
@@ -217,6 +222,7 @@ def port_free(port: int) -> bool:
 
 def spawn_daemon(
     ext_port: int,
+    endpoint_port: int,
     runtime_dir: str,
     log_path: Path,
     *,
@@ -224,18 +230,23 @@ def spawn_daemon(
 ) -> DaemonHandle:
     """Spawn ``browserwright-daemon serve`` and wait until /__status__ responds.
 
-    Single-global-daemon: isolation is via ``runtime_dir`` (XDG_RUNTIME_DIR →
-    distinct fixed socket) + the relay port, NOT a ``--name``."""
-    if not port_free(ext_port):
-        raise RuntimeError(
-            f"port {ext_port} already in use; another daemon running? "
-            f"lsof -i :{ext_port}"
-        )
+    Single-global-daemon: isolation is by PORT (ADR-0011). ``endpoint_port`` is
+    REQUIRED and has no default on purpose — the default would be 19990, the
+    developer's own daemon, and binding it is now fatal rather than a
+    non-fatal facade failure. ``runtime_dir`` still isolates the pid file, the
+    executor sockets and the log."""
+    for port, what in ((ext_port, "relay"), (endpoint_port, "endpoint")):
+        if not port_free(port):
+            raise RuntimeError(
+                f"{what} port {port} already in use; another daemon running? "
+                f"lsof -i :{port}"
+            )
 
     run_env = env or scrubbed_env()
     run_env["XDG_RUNTIME_DIR"] = runtime_dir
     run_env["TMPDIR"] = runtime_dir
     run_env["BD_EXTENSION_PORT"] = str(ext_port)
+    run_env["BW_DAEMON_URL"] = f"http://127.0.0.1:{endpoint_port}"
     run_env["BD_CONFIG"] = ""
 
     log_fh = open(log_path, "wb")
@@ -245,6 +256,7 @@ def spawn_daemon(
             "serve",
             "--backend", "extension",
             "--extension-port", str(ext_port),
+            "--facade-port", str(endpoint_port),
             "-v",
         ],
         stdout=log_fh,

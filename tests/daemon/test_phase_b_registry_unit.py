@@ -792,7 +792,7 @@ def _router_with_client():
 
 
 @pytest.mark.asyncio
-async def test_ensure_executor_verb_returns_socket():
+async def test_ensure_executor_verb_confirms_readiness():
     router, client, captured = _router_with_client()
 
     class _Daemon:
@@ -818,8 +818,10 @@ async def test_ensure_executor_verb_returns_socket():
             }
         ),
     )
+    # ADR-0011: readiness + instance identity. The executor socket is a
+    # daemon-internal detail now; the client reaches it through `/exec`.
     assert captured[client.client_id][-1]["result"] == {
-        "exec_sock": "/tmp/bw-exec-sess.sock",
+        "ready": True,
         "executor_id": "executor-sess",
     }
 
@@ -943,8 +945,7 @@ async def test_ensure_executor_launches_upstream_before_registry():
     assert order == ["ensure_upstream", "registry.ensure"], (
         "ensureExecutor must launch the upstream (cdp Chrome) BEFORE spawning "
         "the executor")
-    assert captured[client.client_id][-1]["result"] == {
-        "exec_sock": "/tmp/bw-exec-sess.sock"}
+    assert captured[client.client_id][-1]["result"] == {"ready": True}
 
 
 @pytest.mark.asyncio

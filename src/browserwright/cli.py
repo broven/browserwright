@@ -56,6 +56,12 @@ Usage:
 
   browserwright version [--json | check]
   browserwright --print-skill            (alias: print-skill)
+
+Global option (valid before or after any subcommand):
+  --daemon-url URL   reach the daemon at URL instead of http://127.0.0.1:19990.
+                     Equivalent to $BW_DAEMON_URL or the `daemon_url` config
+                     key. Setting it explicitly also means browserwright will
+                     never auto-start or restart that daemon.
 """
 
 TASK_HELP = """Usage:
@@ -865,7 +871,11 @@ def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int
     daemon_cmd = ["browserwright-daemon", "userscript"]
     if session_id:
         daemon_cmd += ["--session", session_id]
-    result = subprocess.run([*daemon_cmd, *fwd])
+    # ADR-0011: forward this process's resolved endpoint, or the child CLI
+    # would push/remove userscripts on whichever daemon its own default
+    # resolves to.
+    from .daemon_url import child_env
+    result = subprocess.run([*daemon_cmd, *fwd], env=child_env())
     if result.returncode != 0:
         # Push failed — don't reload/screenshot a stale state. Surface the
         # push failure so the agent fixes the script first.
@@ -1013,8 +1023,35 @@ def _extension_relay_status() -> dict | None:
         return None
 
 
+def _split_daemon_url(argv: list[str]) -> list[str]:
+    """Pull a global ``--daemon-url <url>`` out of argv and record it.
+
+    Handled here rather than per-subcommand because it is not a command's
+    argument: it says which daemon this whole invocation talks to (ADR-0011),
+    and every path below — session lookup, executor, `page` — has to agree.
+    Recorded process-wide in `daemon_url`, which is the single resolver.
+    """
+    from .daemon_url import set_cli_daemon_url
+
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--daemon-url" and i + 1 < len(argv):
+            set_cli_daemon_url(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--daemon-url="):
+            set_cli_daemon_url(arg.split("=", 1)[1])
+            i += 1
+            continue
+        out.append(arg)
+        i += 1
+    return out
+
+
 def main(argv: Optional[list[str]] = None) -> None:
-    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = _split_daemon_url(list(sys.argv[1:] if argv is None else argv))
 
     # `--print-skill` is a flag (leading dash) but is a real command, not help;
     # intercept it before the help check below.

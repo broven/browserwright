@@ -2,16 +2,17 @@
 
 This document is the short, load-bearing reference for browserwright's session
 workspace model. Read it before changing session routing, backend selection,
-tab creation, Playwright facade behavior, or teardown semantics.
+tab creation, cdp-surface behavior, or teardown semantics.
 
 ## Core Model
 
 A browserwright session is the browser workspace assigned to one code agent. The
 session id is the isolation key that travels through the Layer 2 CLI, daemon
-IPC, Playwright facade, and ledger. A session's backend is chosen at
+the daemon endpoint's three surfaces, and the ledger. A session's backend is chosen at
 `browserwright session new` time and is immutable for the life of that session.
 
-There is one global daemon on the fixed `browserwright-daemon.sock` socket. The
+There is one global daemon behind one TCP endpoint (default
+`http://127.0.0.1:19990`, ADR-0011). The
 daemon serves multiple sessions at once and routes each explicit session by
 reading the ledger record for that session. Do not reintroduce per-session
 daemon names, `BD_NAME`, or backend selection based on client environment once a
@@ -30,7 +31,7 @@ The word "workspace" is backend-specific:
 Each session has at most one resident executor process, and that executor is
 the session's only Playwright controller. Browser-driving `-e` code, CLI tasks,
 inline `run_task()`, and userscript verification must reuse its live
-`page`/`context` instead of opening a second Playwright facade connection.
+`page`/`context` instead of opening a second cdp-surface connection.
 Requests are FIFO; there is no second executor running concurrently inside one
 session. Explicit `context.new_page()` remains the intentional way for that one
 controller to create another tab.
@@ -72,7 +73,7 @@ Hard invariants:
   inside that session's group.
 - Probe tabs and real user-work tabs are not separate workspaces; they belong to
   the same group.
-- **Sessionless raw CDP clients get an auto group (ADR-0010):** a facade
+- **Sessionless raw CDP clients get an auto group (ADR-0010):** a cdp-surface
   connection without `?session=` still owns exactly one private tab group
   (`<label>-BWauto-<hex>`, `?label=` sets the prefix) and is scoped to it —
   it can only see/operate its own tabs. The group is created on first use and
@@ -182,7 +183,7 @@ extension-backed daemon hosts these alongside the user's real Chrome.
 > **This replaced an N-isolated-daemons fleet.** Until #38 the endpoint came
 > from the process-global `BD_CDP_WS` / `BD_CDP_URL`, so one daemon could reach
 > exactly one external browser, and N profiles meant N daemons each with its own
-> `XDG_RUNTIME_DIR`, `--facade-port` and endpoint variable. If you find that
+> `XDG_RUNTIME_DIR`, `--facade-port` (its endpoint) and endpoint variable. If you find that
 > recipe anywhere, it is stale — those variables are no longer read at all.
 
 This is the substrate for the probe→site-memory→batch pattern: an Opus probe
@@ -199,11 +200,12 @@ context:
 - `cdp` sessions use a per-session `UpstreamContext`, created lazily from the
   ledger record.
 
-The Playwright facade has backend-specific behavior:
+The endpoint's **cdp surface** (what the retired term *facade* named) has
+backend-specific behavior:
 
-- For `cdp`, the facade is a byte-for-byte browser-level CDP
+- For `cdp`, it is a byte-for-byte browser-level CDP
   passthrough to the session's real Chrome / external CDP endpoint.
-- For `extension`, the facade is a synthesis layer over the extension relay. It
+- For `extension`, it is a synthesis layer over the extension relay. It
   maps browser-level CDP concepts onto the session's tab group and must refresh
   group state before creating targets.
 
@@ -269,7 +271,7 @@ session even when the executor survived the startup sweep.
 - Assuming extension tab groups isolate login/storage. They do not.
 - Using `--name` as a durable identity key. Use `session_id`; use numeric
   `group_id` for extension group recovery.
-- Letting a stale facade-cached group id decide where to create a tab. Refresh
+- Letting a stale cdp-surface-cached group id decide where to create a tab. Refresh
   from relay memory and ledger before tab creation.
 - Closing an attached browser on `session end`.
 
@@ -283,7 +285,8 @@ session even when the executor survived the startup sweep.
   `group_id` runtime data.
 - `src/browserwright/daemon/server/daemon.py` routes sessions to the shared
   context or per-session `cdp` contexts.
-- `src/browserwright/daemon/server/facade.py` routes Playwright facade clients.
+- `src/browserwright/daemon/server/facade.py` is the endpoint server: it routes
+  `/cdp`, `/control` and `/exec` clients.
 - `src/browserwright/daemon/server/facade_extension.py` implements the
   extension-only Playwright synthesis layer.
 - `src/browserwright/daemon/server/extension_upstream.py` and

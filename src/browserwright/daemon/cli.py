@@ -44,6 +44,13 @@ from .errors import ChromeBinaryNotFound, DaemonError, Unavailable, UserError
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # Record before anything resolves an endpoint (config.load included). The
+    # config path matters here too: `daemon_url` may live in the toml that
+    # `--config` names, and reading it from a different file than the rest of
+    # the config would address a different daemon than we configured.
+    from ..daemon_url import set_cli_config_path, set_cli_daemon_url
+    set_cli_daemon_url(getattr(args, "daemon_url", None))
+    set_cli_config_path(getattr(args, "config", None))
     handler = _DISPATCH.get(args.cmd)
     if handler is None:
         parser.print_help(sys.stderr)
@@ -90,6 +97,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "(extension relay, cdp, or an env-supplied CDP endpoint)."
         ),
     )
+    # ADR-0011: the one address every subcommand uses to reach a daemon. Tops
+    # $BW_DAEMON_URL and the toml `daemon_url` key. On `serve` it is NOT the
+    # bind config (that is --facade-host/--facade-port); it only says which
+    # daemon the *client* subcommands talk to.
+    p.add_argument(
+        "--daemon-url", type=str, default=None, metavar="URL",
+        help=("reach the daemon at this endpoint (default "
+              "http://127.0.0.1:19990). Equivalent to $BW_DAEMON_URL or the "
+              "`daemon_url` config key. Setting it explicitly also means "
+              "browserwright will never auto-start or restart that daemon."))
     sub = p.add_subparsers(dest="cmd", metavar="<subcommand>")
 
     # serve (v0.2)
@@ -445,8 +462,26 @@ def _cmd_stop(args, cfg: Config) -> int:
 
     Death is measured by the *ping*, not by the process table: a daemon that has
     stopped answering has stopped serving, which is all `stop` promises.
+
+    **Refused for a remote endpoint (ADR-0011).** The whole mechanism rests on
+    "the pid the endpoint reports is a pid on this machine", which was
+    guaranteed while the endpoint was a unix socket in our own runtime dir and
+    is not guaranteed by a URL. Point `BW_DAEMON_URL` at another host and that
+    pid means nothing here — the start-time guard only compares against the
+    LOCAL process table, so it would happily confirm and then signal whatever
+    unrelated local process holds that number. See
+    `DaemonEndpoint.is_locally_signalable` for why the test is the endpoint's
+    *source* rather than its host: a daemon we started here can perfectly well
+    be bound to a tailnet IP, and stopping it from its own machine must work.
     """
     from . import _ipc, platforms, supervise
+    from ..daemon_url import daemon_endpoint, not_ours_to_signal_message
+
+    endpoint = daemon_endpoint()
+    if not endpoint.is_locally_signalable:
+        print(f"error: {not_ours_to_signal_message(endpoint, 'stop')}",
+              file=sys.stderr)
+        return 3
 
     pid = _ipc.ping_sync(timeout=1.0)
     if pid is None:
@@ -544,9 +579,9 @@ def _cmd_status(args, cfg: Config, *, probe=None) -> int:
         print(json.dumps(st.to_dict(), sort_keys=True))
     elif st.alive:
         print(f"daemon alive (pid {st.pid})")
-        print(f"  socket: {st.endpoint['path']}")
-        if st.facade:
-            print(f"  facade: {st.facade['ws']}")
+        print(f"  endpoint: {st.endpoint['url']}")
+        if st.cdp_surface:
+            print(f"  cdp:      {st.cdp_surface['ws']}")
     elif st.probe_state == PORT_HELD:
         held = f" (pid {st.port_holder_pid})" if st.port_holder_pid else ""
         print("daemon unresponsive but holding its ports"

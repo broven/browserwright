@@ -26,7 +26,7 @@ driven by one resident **executor**.
  │  ledger ──► session ──► UpstreamContext { state · Router · holder }   │
  │                                    │                                  │
  │  executor (one per session)        │ upstream                         │
- │  facade  (Playwright's door)       │                                  │
+ │  endpoint (/control · /exec · /cdp) │                                 │
  └────────────────────────────────────┼──────────────────────────────────┘
                                       ▼
                         extension relay ──► user's Chrome
@@ -39,8 +39,8 @@ driven by one resident **executor**.
 
 ### session
 The unit of isolation, and the only durable identity. One code agent gets one
-session. The session id travels through the Layer 2 CLI, daemon IPC, the
-Playwright facade, and the ledger.
+session. The session id travels through the Layer 2 CLI, all three endpoint surfaces, and
+the ledger.
 
 **Trap:** a session's `--name` is a *human label*, not an identity key — names
 need not be unique. The stable key is the session id. On extension the two are
@@ -141,13 +141,19 @@ session still closes its own tab group, and the executor is reaped on every
 backend regardless of owner.
 
 ### daemon
-The single global process listening on
-`${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`. It serves all sessions at
-once. There is exactly one; per-session daemon names are gone (see *Retired*).
+The single global process serving one **endpoint** — by default
+`http://127.0.0.1:19990`. It serves all sessions at once. There is exactly one;
+per-session daemon names are gone (see *Retired*).
+
+**Trap:** "exactly one" is enforced by the endpoint's TCP bind, not by a file.
+A second `serve` pings `/__ping__` first and refuses politely; if it races past
+that, `EADDRINUSE` stops it. The control socket file that used to carry both
+jobs is gone, and with it the watchdog that self-exited a daemon whose socket
+was replaced — there is nothing left to replace.
 
 ### downstream
 Everything that connects **into** the daemon: the CLI, the skill client, a
-Playwright client on the facade. Downstream must never branch on backend —
+Playwright client on the cdp surface. Downstream must never branch on backend —
 all backend divergence is absorbed inside the daemon.
 
 ### upstream
@@ -187,14 +193,50 @@ code, CLI tasks, inline `run_task()`, userscript verification — reuses its liv
 that exact executor and waits for confirmed process death. Tabs survive;
 executor `state` does not, and `finally` blocks are not guaranteed.
 
-### facade
-The CDP-speaking server (default port **19990**) that Playwright's
-`connect_over_cdp` connects to. For `cdp` it is a byte-for-byte
-passthrough. For `extension` it is a *synthesis* layer that maps browser-level
-CDP concepts onto the session's tab group.
+**Trap:** its unix socket is **daemon-internal**. Clients reach it through the
+endpoint's `/exec` relay, and `ensureExecutor` answers with readiness plus an
+`executor_id`, never a path. A socket path is meaningless from another machine,
+which is exactly what made remote use impossible before ADR-0011.
+
+### endpoint
+The daemon's **single TCP front door** (default `http://127.0.0.1:19990`) — the
+only way any downstream reaches the daemon, local or remote (ADR-0011). One
+server, three sub-surfaces, dispatched by ws path:
+
+| surface | path | who speaks it |
+|---|---|---|
+| **cdp surface** | `/cdp` | Playwright / puppeteer `connect_over_cdp` |
+| **control surface** | `/control` | the CLI and the skill client (`?session=` + `BrowserwrightDaemon.*` verbs) |
+| **exec-relay surface** | `/exec` | the executor data plane, relayed by the daemon |
+
+Plus HTTP: `/json/version`, `/json`, `/json/list` (CDP bootstrap) and
+`/__ping__` (liveness). Anything else is a 4xx.
+
+The **cdp surface** is what the retired term *facade* named. For `cdp` it is a
+byte-for-byte passthrough; for `extension` it is a *synthesis* layer mapping
+browser-level CDP concepts onto the session's tab group.
 
 **Trap:** that synthesis exists only because the relay is not a native CDP
 server. Never copy it into the raw-CDP paths.
+
+**Trap — there is no authentication, and that is a decision, not an
+oversight.** The endpoint grants arbitrary code execution; the security
+boundary is entirely the network layer (loopback by default, a tailnet or SSH
+tunnel for remote), plus Origin validation rejecting browser-originated ws
+upgrades. Weighed against a `0600` token file and rejected knowingly — see
+ADR-0011 before "fixing" it.
+
+**Trap — the address is one URL, and configuring it explicitly changes
+behavior.** `BW_DAEMON_URL` / `--daemon-url` / toml `daemon_url`, defaulting to
+`http://127.0.0.1:19990`. An explicitly configured URL — *even localhost* —
+means the client will never auto-start or restart that daemon: it is someone
+else's process, possibly on another machine. Only the unconfigured default
+keeps auto-start.
+
+**Trap — a daemon restart severs live `/exec` data planes.** The daemon owns
+both ends of that relay now. Before ADR-0011 the client dialed the executor's
+socket directly and the plane survived a daemon restart; today it does not, and
+the client surfaces that as `ExecutorUnavailable`.
 
 ### Router
 The frame-routing engine (`daemon/server/proxy.py`). Owns request-id rewriting,
@@ -283,10 +325,10 @@ and a second anchor would be that trap a third time.
 ### ghost target
 A synthesized CDP `targetInfo` for an extension tab. The extension backend has
 no real CDP targets, so the relay fabricates them (`make_target_info`) for both
-the agent path and the facade.
+the control surface and the cdp surface.
 
 ### Layer 1 / Layer 2
-Layer 1 = `src/browserwright/daemon/` — the daemon, backends, relay, facade.
+Layer 1 = `src/browserwright/daemon/` — the daemon, backends, relay, endpoint.
 Layer 2 = the rest of `src/browserwright/` — the agent CLI, sessions,
 primitives, site skills, memory.
 
@@ -321,7 +363,10 @@ table with no timestamp, so a hung daemon is indistinguishable from an idle one.
 
 | Term | Status |
 |---|---|
-| `BD_NAME` / `--name` as a *daemon* name | Gone. Daemon isolation is `XDG_RUNTIME_DIR` (distinct socket dir). |
+| `BD_NAME` / `--name` as a *daemon* name | Gone. Daemon isolation is the endpoint port (`--facade-port` + `BW_DAEMON_URL`). |
+| `facade` | Retired into **endpoint / cdp surface** (ADR-0011). The `--facade-port` / `--facade-host` / `BD_FACADE_*` / `facade_port` knobs keep their names as the *endpoint's* bind config. |
+| the unix control socket (`browserwright-daemon.sock`) | Deleted with the facade. One TCP endpoint, `/control` path. Its `--facade-port 0` "disable" value is gone too: `0` now means an ephemeral port. |
+| `ensureExecutor` returning `exec_sock` | Gone. It returns `{ready, executor_id}`; the data plane is the endpoint's `/exec` relay. |
 | `--name` as an identity key | It is a human label only. Use session id, or `group_id` for extension recovery. |
 | `_owned` / `_borrowed` tab sets | Being deleted — group membership (`chrome.tabs.query({groupId})`) is the single source of truth. |
 | Querying a tab group by title | Gone from `background.js`. Titles are user-editable and not unique; key on numeric `groupId`. |

@@ -643,14 +643,19 @@ class SessionVerbsMixin:
     async def _handle_ensure_executor(
         self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
-        """Phase B (Fork 2 control plane): lazily spawn the session's persistent
-        executor and return its data-plane socket path.
+        """Control plane: lazily spawn the session's executor and confirm it.
 
         The daemon OWNS the executor lifecycle (Fork 1a): it spawns the
-        subprocess if absent (single-flight per session — no double-spawn),
-        waits for it to bind + write its `_ipc` discovery file, and returns
-        ``{exec_sock}``. The thin heredoc client then connects DIRECTLY to that
-        socket to ship code (bulk data never touches this event loop)."""
+        subprocess if absent (single-flight per session — no double-spawn) and
+        waits for it to bind + write its `_ipc` discovery file.
+
+        ADR-0011 changed what comes back. This used to return ``{exec_sock}``,
+        a local unix socket path the client dialed directly — meaningless from
+        another machine, which is precisely what made remote use impossible.
+        The answer is now a **readiness confirmation** plus the executor's
+        instance identity (which the client still needs, to ask for the reap of
+        that exact process). The socket itself is a daemon-internal detail; the
+        data plane rides the endpoint's `/exec` relay."""
         session = await self._require_browser_session(
             client, req_id, "BrowserwrightDaemon.ensureExecutor", params)
         if session is None:
@@ -690,15 +695,15 @@ class SessionVerbsMixin:
             ensure_with_preflight = getattr(
                 registry, "ensure_with_preflight", None)
             if callable(ensure_with_preflight):
-                sock_path = await ensure_with_preflight(session, preflight)
+                await ensure_with_preflight(session, preflight)
             else:
                 await preflight()
-                sock_path = await registry.ensure(session)
+                await registry.ensure(session)
         except Exception as e:  # noqa: BLE001
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"ensureExecutor failed: {e!r}"))
             return
-        result = {"exec_sock": sock_path}
+        result = {"ready": True}
         get_handle = getattr(registry, "get", None)
         handle = get_handle(session) if callable(get_handle) else None
         executor_id = getattr(handle, "executor_id", None)

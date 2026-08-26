@@ -28,10 +28,11 @@ EXPECTED_TOP_KEYS = {
     "schema_version", "recommended", "backends",
     # v3 (issue #28): daemon-liveness probe, same fields as `status --json`.
     "alive", "probe_state", "pid",
-    # The Playwright facade, and why it is missing when it is. Additive to
-    # schema 3: a facade that never bound used to be invisible here, so doctor
-    # reported all green while every browser-driving call failed.
-    "facade", "facade_error",
+    # ADR-0011: the one endpoint and its cdp surface — the door every
+    # browser-driving call comes through. Their absence used to be invisible
+    # here, so doctor reported all green while every such call failed.
+    # `facade` is the pre-ADR-0011 name of `cdp_surface`, kept for wire compat.
+    "endpoint", "cdp_surface", "facade",
 }
 KNOWN_UX_COSTS = {"none", "banner", "extension-permission"}
 
@@ -45,7 +46,7 @@ def _no_live_daemon(monkeypatch):
 
 
 def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
-                   pid=None, facade=None, facade_error=None):
+                   pid=None, cdp_surface=None):
     async def _fake(cfg, *, probe=None):
         return DaemonStatus(
             alive=alive,
@@ -53,9 +54,10 @@ def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
             pid=pid,
             port_holder_pid=None,
             version=None,
-            endpoint={"transport": "unix", "path": "/dev/null"},
-            facade=facade,
-            facade_error=facade_error,
+            endpoint={"schema_version": 1, "transport": "tcp",
+                      "url": "http://127.0.0.1:19990", "explicit": False,
+                      "source": "default"},
+            cdp_surface=cdp_surface,
         )
 
     monkeypatch.setattr(doctor_mod, "daemon_status_async", _fake)

@@ -175,7 +175,7 @@ async def test_extension_ready_proceeds_to_spawn():
     reply = cap.sent[client.client_id][-1]
     assert reply["id"] == 7
     assert "result" in reply, f"expected a result, got {reply!r}"
-    assert reply["result"]["exec_sock"] == "/tmp/bw-exec-246.sock"
+    assert reply["result"]["ready"] is True
     # Relay was already ready → no readiness wait; normal open + spawn ran.
     assert relay.wait_calls == 0
     assert cap.prepare_calls == 1
@@ -193,7 +193,7 @@ async def test_cdp_skips_extension_fastfail():
 
     reply = cap.sent[client.client_id][-1]
     assert "result" in reply, f"expected a result, got {reply!r}"
-    assert reply["result"]["exec_sock"] == "/tmp/bw-exec-246.sock"
+    assert reply["result"]["ready"] is True
     assert cap.ensure_calls == 1
     assert cap.prepare_calls == 1
     assert registry.ensure_calls == 1

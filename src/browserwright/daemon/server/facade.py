@@ -1,22 +1,32 @@
-"""Playwright-facing CDP facade (Task #tab-handle-model, phase A1).
+"""The daemon's single TCP **endpoint** (ADR-0011).
 
-A **separate, additive** ws+HTTP server that lets a real Playwright client speak
-browser-level CDP to the daemon-resolved Chrome via
-`chromium.connect_over_cdp("ws://127.0.0.1:<facade_port>/cdp")`.
+One ws+HTTP server on one port (default 19990) is the only way any downstream
+reaches the daemon, local or remote. The path on the ws upgrade selects one of
+three sub-surfaces:
 
-Why a new endpoint (not the existing unix-socket client path)?
+  - **`/cdp` — the cdp surface.** What this module used to be *called* the
+    facade: the Playwright/puppeteer-compatible browser-level CDP face a client
+    reaches with `chromium.connect_over_cdp("ws://127.0.0.1:19990/cdp")`.
+    Byte-identical semantics to before, including `?session=` scoping and the
+    ADR-0010 sessionless auto-group.
+  - **`/control` — the control surface.** The CLI/skill control plane
+    (`?session=&client=` + `BrowserwrightDaemon.*` verbs), which replaced the
+    unix-socket listener. Handled by `listener._ClientHandler.serve_one`,
+    injected here as `control_handler`.
+  - **`/exec` — the exec-relay surface.** The executor data plane
+    (`exec_relay.py`). Clients no longer dial an executor's socket.
 
-  - The agent client path (listener.py) is a unix socket on POSIX speaking the
-    `?session=<id>` + `BrowserwrightDaemon.*` translation protocol. Playwright
-    can neither connect to a unix socket nor go through the per-session
-    sessionId rewriting — it drives **raw** browser-level CDP
-    (`Target.setAutoAttach` / `Browser.getVersion` / flat sessions).
-  - playwriter exposes exactly this shape: a Hono ws on a TCP port plus a
-    `/json/version` route returning `webSocketDebuggerUrl` so the CDP client
-    can bootstrap (`research/playwright-over-extension-bridge.md`). We mirror
-    that bootstrap shape.
+Plus the HTTP routes: `/json/version`, `/json`, `/json/list` (CDP bootstrap) and
+`/__ping__` (liveness + version, the stale-detect probe that used to be spoken
+over the unix socket). Any other path is a 4xx.
 
-Two backends, two transports (the consumer is always a real Playwright client):
+Security (ADR-0011, deliberate): no application-layer auth. The boundary is the
+network layer — loopback by default, a tunnel/tailnet for remote — plus Origin
+validation on every ws upgrade, since nothing that legitimately dials this
+endpoint is a browser page.
+
+Two backends behind the cdp surface (the consumer is always a real Playwright
+client):
 
   - **cdp** (PR1): the daemon owns the cdp Chrome, which already speaks real
     browser-level CDP — so the facade is a transparent byte-for-byte
@@ -34,8 +44,9 @@ Two backends, two transports (the consumer is always a real Playwright client):
     that Playwright's `connect_over_cdp` discovery needs. The bridge needs the
     daemon's shared relay, so the facade is constructed with a `relay_getter`.
 
-The facade NEVER touches the existing `DaemonState` / `Router` translation
-tables: it is a parallel transport. The unix-socket agent path is untouched.
+The cdp surface NEVER touches the `DaemonState` / `Router` translation tables
+the control surface uses: they are two protocols sharing one port, not one
+protocol.
 """
 from __future__ import annotations
 
@@ -44,18 +55,22 @@ import contextlib
 import http
 import json
 import logging
+import os
 import re
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse
 
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
-from .. import __version__
+from .. import _ipc
 from ..config import DEFAULT_FACADE_PORT, Config
+from .. import __version__
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
+from ..._executor.protocol import _MAX_FRAME
 from .daemon import Daemon, UnknownSessionError, UpstreamContext
+from .exec_relay import serve_exec_relay
 from .facade_extension import ExtensionFacadeBridge
 from .relay import RelayServer
 from .upstream import _localhost_bypass_proxy
@@ -66,27 +81,50 @@ logger = logging.getLogger(__name__)
 # DEFAULT_FACADE_PORT now lives in ``config`` (no import cycle there) and is
 # re-exported here for the existing call sites / tests that import it from this
 # module.
-__all__ = ["DEFAULT_FACADE_PORT", "PlaywrightFacade", "FACADE_WS_PATH"]
+__all__ = ["DEFAULT_FACADE_PORT", "PlaywrightFacade", "EndpointServer",
+           "FACADE_WS_PATH", "CDP_PATH", "CONTROL_PATH", "EXEC_PATH",
+           "PING_PATH"]
 
-# The ws path a CDP client connects to once it has read /json/version. The
-# value is cosmetic (we passthrough regardless of path) but kept stable so the
-# advertised webSocketDebuggerUrl and the served endpoint agree.
-FACADE_WS_PATH = "/cdp"
+#: The three ws sub-surfaces of the one endpoint (ADR-0011). The path is the
+#: dispatch key — nothing else distinguishes them on the wire.
+CDP_PATH = "/cdp"
+CONTROL_PATH = "/control"
+EXEC_PATH = "/exec"
+#: HTTP liveness probe. Replaces the unix socket-file ping.
+PING_PATH = "/__ping__"
+
+#: Back-compat alias for the cdp surface's path, which the advertised
+#: `webSocketDebuggerUrl` must keep agreeing with.
+FACADE_WS_PATH = CDP_PATH
+
+_WS_PATHS = (CDP_PATH, CONTROL_PATH, EXEC_PATH)
+
+#: `/exec` carries whole executor frames, whose own cap is 256 MiB
+#: (`_executor/protocol._MAX_FRAME`). The ws server's `max_size` must be at
+#: least that or a legal executor response would be dropped as oversized —
+#: which is why this is the endpoint-wide limit and not the old 100 MiB.
+_MAX_WS_SIZE = _MAX_FRAME
 
 
 class PlaywrightFacade:
-    """A TCP ws server that bridges a Playwright `connect_over_cdp` client to
-    the daemon-resolved (cdp) Chrome's real browser-level CDP.
+    """The daemon's one TCP endpoint: `/cdp`, `/control`, `/exec` + HTTP routes.
 
     Lifecycle mirrors `RelayServer`: ``start()`` binds (returns the bound port,
-    useful with ``port=0`` in tests); ``stop()`` closes everything cleanly.
+    useful with ``port=0``, which is how per-test daemons get an isolated
+    endpoint); ``stop()`` closes everything cleanly.
+
+    ``control_handler`` is `listener._ClientHandler.serve_one` — injected rather
+    than imported so this module keeps knowing nothing about the Router.
     """
 
     def __init__(self, *, cfg: Config, port: int = DEFAULT_FACADE_PORT,
                  host: str = "127.0.0.1",
                  relay_getter: Callable[[], RelayServer | None] | None = None,
-                 daemon: Daemon | None = None):
+                 daemon: Daemon | None = None,
+                 control_handler: Callable[[ServerConnection],
+                                           Awaitable[None]] | None = None):
         self._cfg = cfg
+        self._control_handler = control_handler
         self._port = port
         self._host = host
         self._server: Any = None
@@ -122,16 +160,17 @@ class PlaywrightFacade:
             ping_interval=20,
             ping_timeout=20,
             # CDP `Page.captureScreenshot` returns base64 blobs far above the
-            # websockets 1 MiB default — match the listener/relay limits.
-            max_size=100 * 1024 * 1024,
+            # websockets 1 MiB default, and `/exec` carries whole executor
+            # frames — see `_MAX_WS_SIZE`.
+            max_size=_MAX_WS_SIZE,
         )
         for sock in self._server.sockets:
             sa = sock.getsockname()
             if isinstance(sa, tuple) and len(sa) >= 2:
                 self._port = sa[1]
                 break
-        logger.info("playwright facade listening on ws://%s:%d%s",
-                    self._host, self._port, FACADE_WS_PATH)
+        logger.info("endpoint listening on http://%s:%d (%s)",
+                    self._host, self._port, ", ".join(_WS_PATHS))
         if self._relay_getter is not None:
             self._reaper_task = asyncio.create_task(self._auto_reaper_loop())
         return self._port
@@ -185,15 +224,58 @@ class PlaywrightFacade:
         # http bootstrap form works, not just the direct `ws://.../cdp` form.
         if len(path) > 1:
             path = path.rstrip("/")
+        if path == PING_PATH:
+            # Liveness + version, answered before any upgrade. This is what
+            # `serve` cold-start, `status`, `stop` and every client's
+            # reachability check probe — it replaced the unix socket file, and
+            # a successful bind of this port is now the mutual-exclusion
+            # primitive that the socket file used to be.
+            body = _ipc.make_pong_body(os.getpid()).decode("utf-8")
+            resp = conn.respond(http.HTTPStatus.OK, body)
+            resp.headers["Content-Type"] = "application/json"
+            return resp
         session_id = self._session_for_request(request)
         authority = self._authority_from_request(request)
         if path == "/json/version":
             return self._http_json(conn, self._version_payload(session_id, authority))
         if path in ("/json", "/json/list"):
             return self._http_json(conn, self._list_payload(session_id, authority))
-        # Anything else (e.g. the /cdp ws upgrade) falls through to the ws
-        # handler. Return None to allow the upgrade.
-        return None
+        if path in _WS_PATHS:
+            denial = self._origin_denial(conn, request)
+            if denial is not None:
+                return denial
+            return None  # allow the upgrade; `_handle_client` dispatches on path
+        return conn.respond(
+            http.HTTPStatus.NOT_FOUND,
+            f"unknown browserwright endpoint path {path!r}; "
+            f"expected one of {', '.join(_WS_PATHS)}, {PING_PATH}, "
+            "/json/version, /json, /json/list\n")
+
+    def _origin_denial(self, conn: ServerConnection, request):
+        """Anti-CSRF: refuse any ws upgrade that carries an `Origin` header.
+
+        ADR-0011 chose the network layer as the whole security boundary, which
+        makes this check the one thing standing between a page the user happens
+        to have open and full code execution. It can be absolute here, unlike
+        the relay's (`relay.py` §A.4, the model for this): the relay must admit
+        `chrome-extension://` because that is exactly who dials it, whereas
+        NOTHING that legitimately reaches this endpoint runs in a browser — the
+        CLI, the skill client and Playwright's CDP transport all send no Origin.
+        So any non-empty Origin is a browser, and a browser here is an attack.
+        """
+        try:
+            origin = (request.headers.get("Origin", "")
+                      or request.headers.get("origin", ""))
+        except (AttributeError, KeyError):
+            origin = ""
+        if not origin:
+            return None
+        logger.warning("endpoint: refusing ws upgrade with Origin %r "
+                       "(anti-CSRF)", origin)
+        return conn.respond(
+            http.HTTPStatus.FORBIDDEN,
+            "browserwright endpoint refuses browser-originated connections "
+            "(anti-CSRF): no Origin header is allowed on a ws upgrade\n")
 
     def _http_json(self, conn: ServerConnection, payload: Any):
         body = json.dumps(payload)
@@ -289,7 +371,30 @@ class PlaywrightFacade:
             return None
         return self._daemon.context_for_required(session_id)
 
+    @staticmethod
+    def _path_for_connection(conn: ServerConnection) -> str:
+        path = urlparse(conn.request.path or "/").path or "/"
+        return path.rstrip("/") if len(path) > 1 else path
+
     async def _handle_client(self, conn: ServerConnection) -> None:
+        """Dispatch one accepted ws upgrade to its sub-surface (ADR-0011)."""
+        path = self._path_for_connection(conn)
+        if path == CONTROL_PATH:
+            if self._control_handler is None:
+                with contextlib.suppress(Exception):
+                    await conn.close(
+                        code=1011, reason="control surface not wired")
+                return
+            await self._control_handler(conn)
+            return
+        if path == EXEC_PATH:
+            await serve_exec_relay(
+                conn, daemon=self._daemon,
+                session_id=self._session_for_connection(conn))
+            return
+        await self._handle_cdp_surface(conn)
+
+    async def _handle_cdp_surface(self, conn: ServerConnection) -> None:
         """One Playwright client connected. For the extension backend, bridge
         through the shared relay with target-event synthesis (PR2); otherwise
         resolve the cdp Chrome's real CDP ws and pump frames byte-for-byte."""
@@ -537,3 +642,10 @@ class PlaywrightFacade:
         except Exception as e:  # noqa: BLE001
             logger.debug("facade pump %s ended: %r", label, e)
             return
+
+
+#: ADR-0011 name for what this class now is. `PlaywrightFacade` stays as the
+#: class's own name (it is spelled in a lot of call sites and tests), but new
+#: code should read `EndpointServer` — the object serves three surfaces, only
+#: one of which is Playwright's.
+EndpointServer = PlaywrightFacade

@@ -1,8 +1,8 @@
 """Liveness observations for the single global daemon.
 
 Two callers ask the same question — "is there a half-alive daemon holding the
-relay/facade ports?" — and answer it from the same two facts: the control socket
-is dead, and the ports are held by a *confirmed* browserwright process. They
+relay/endpoint ports?" — and answer it from the same two facts: `/__ping__` is
+silent, and the ports are held by a *confirmed* browserwright process. They
 differ only in what they do next.
 
   `status`  (`cli._cmd_status` → :func:`daemon_status`)  reports it.
@@ -39,12 +39,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: ``ok_after_retry``                    — silent at first, answered within the
 #:                                          retry window (a busy daemon, not a
 #:                                          dead one).
-#: ``not_running``                       — no answer and no socket file.
-#: ``transient_probe_failed``            — socket file present, still no answer,
-#:                                          but nothing holds the TCP ports.
-#: ``port_held_by_unresponsive_process`` — socket file present, no answer, and
-#:                                          the relay/facade ports ARE held. The
-#:                                          half-alive daemon. Actionable:
+#: ``not_running``                       — no answer and nothing holding a port.
+#: ``transient_probe_failed``            — a pid file is present, still no
+#:                                          answer, but nothing holds the ports.
+#: ``port_held_by_unresponsive_process`` — no answer, and the relay/endpoint
+#:                                          ports ARE held. The half-alive
+#:                                          daemon. Actionable:
 #:                                          `browserwright-daemon restart`.
 OK = "ok"
 OK_AFTER_RETRY = "ok_after_retry"
@@ -63,11 +63,16 @@ class DaemonStatus:
     port_holder_pid: int | None
     version: str | None
     endpoint: dict
-    facade: dict | None
-    #: Why there is no facade, straight from the daemon. Set exactly when
-    #: `facade` is None and the daemon answered — the missing half of the old
-    #: "facade: null, no idea why" report.
-    facade_error: str | None = None
+    #: The cdp surface of that endpoint, as `{ws, port}` — what a Playwright
+    #: client passes to `connect_over_cdp`. `None` when no daemon answered.
+    #:
+    #: ADR-0011 made this derived rather than reported: there is one port and
+    #: one server, so a live daemon has a live cdp surface by construction.
+    #: Before the collapse the facade was a *separate* listener that could fail
+    #: to bind on its own, which is why this used to be accompanied by a
+    #: `facade_error` explaining its absence. That state no longer exists — a
+    #: daemon that cannot bind this port does not start at all.
+    cdp_surface: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -81,15 +86,10 @@ class DaemonStatus:
             "port_holder_pid": self.port_holder_pid,
             "version": self.version,
             "endpoint": self.endpoint,
-            # Playwright facade discovery (Phase C). None when the facade is
-            # disabled, failed to bind, or the daemon predates auto-enable. The
-            # client layer reads this to `connect_over_cdp` the heredoc
-            # `page`/`context`.
-            "facade": self.facade,
-            # Populated whenever `facade` is None on a live daemon: the daemon's
-            # own words for why. Answered live over `/__ping__` — there is no
-            # discovery file to go missing behind our back.
-            "facade_error": self.facade_error,
+            "cdp_surface": self.cdp_surface,
+            # Wire-compatible alias: `facade` was this field's name before the
+            # term retired, and `status --json` is consumed by scripts.
+            "facade": self.cdp_surface,
         }
 
 
@@ -112,8 +112,7 @@ class DaemonProbe:
     def ping(self, timeout: float) -> "_ipc.PongInfo":
         """The daemon's ``/__ping__`` answer as an ``_ipc.PongInfo``.
 
-        Carries pid, version AND the live facade state — one round trip, one
-        source of truth. Returns ``_ipc.NO_PONG`` when nothing answers.
+        Carries pid and version. Returns ``_ipc.NO_PONG`` when nothing answers.
         """
         from . import _ipc
         return _ipc.ping_status_sync(timeout=timeout)
@@ -130,10 +129,25 @@ class DaemonProbe:
         """
         return await asyncio.to_thread(self.ping, timeout)
 
-    def socket_present(self) -> bool:
-        """Whether the control socket *file* exists (it outlives a crashed daemon)."""
+    def daemon_traces(self) -> bool:
+        """Whether a daemon left traces that outlive a crash.
+
+        ADR-0011 deleted the control socket file, which is what this used to
+        look at. The **pid file** plays the same role: present but silent means
+        "a daemon died here", which is the state worth re-probing and then
+        classifying as half-alive.
+
+        Deliberately NOT the endpoint state file, even though it is also
+        daemon-written and also outlives a crash: that file is a *pointer to an
+        address*, and anything may legitimately write one to redirect a client
+        (the test suite does exactly that). Reading it as evidence of a corpse
+        would send every probe into the port-held branch.
+        """
         from . import _ipc
-        return _ipc.sock_path().exists()
+        try:
+            return _ipc.pid_path().exists()
+        except OSError:
+            return False
 
     def daemon_ports(self) -> list[int]:
         """The relay + facade TCP ports this cfg says a daemon would bind."""
@@ -187,12 +201,12 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
     probe_state = OK if pid is not None else NOT_RUNNING
     port_holder_pid = None
 
-    if pid is None and p.socket_present():
+    if pid is None and p.daemon_traces():
         pong, probe_state = _retry_then_classify(p)
         pid, version = pong.pid, pong.version
         if probe_state == TRANSIENT_PROBE_FAILED:
-            # Still unresponsive, but its socket file is present — a half-alive
-            # daemon may be holding the relay/facade ports. Report the truth
+            # Still unresponsive, but a daemon left traces — a half-alive
+            # daemon may be holding the relay/endpoint ports. Report the truth
             # instead of a bare "not_running" that loops the user through
             # restarts that crash on EADDRINUSE.
             ports = p.daemon_ports()
@@ -201,29 +215,23 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
                 port_holder_pid = (p.confirmed_stale_holder(ports)
                                    or p.live_pid_file_pid())
 
-    # The facade is whatever the daemon just said it is. `pong.facade is None`
-    # means the daemon predates facade advertising — reported as "unknown", not
-    # as a healthy or a broken facade.
-    facade = pong.facade
-    facade_dict = ({"ws": facade.ws, "port": facade.port}
-                   if (pid is not None and facade is not None and facade.available)
-                   else None)
-    facade_error = None
-    if pid is not None and facade_dict is None:
-        facade_error = (
-            facade.error if facade is not None and facade.error
-            else (f"daemon {version or 'of unknown version'} does not advertise "
-                  "its Playwright facade; restart it with "
-                  "`browserwright-daemon restart` after upgrading"))
+    # The cdp surface is derived, not reported: one endpoint, one server, so a
+    # daemon that answered has one. Built from the SAME resolved URL the ping
+    # just used, so `status` can never name an address it did not probe.
+    endpoint_info = p.endpoint()
+    cdp_surface = None
+    if pid is not None:
+        from ..daemon_url import daemon_endpoint
+        ep = daemon_endpoint()
+        cdp_surface = {"ws": ep.ws("/cdp"), "port": ep.port}
     return DaemonStatus(
         alive=pid is not None,
         probe_state=probe_state,
         pid=pid,
         port_holder_pid=port_holder_pid,
         version=version,
-        endpoint=p.endpoint(),
-        facade=facade_dict,
-        facade_error=facade_error,
+        endpoint=endpoint_info,
+        cdp_surface=cdp_surface,
     )
 
 
@@ -239,7 +247,7 @@ def daemon_status(cfg, *, probe: DaemonProbe | None = None) -> DaemonStatus:
 
 
 def _retry_then_classify(p: DaemonProbe):
-    """Re-ping a silent daemon whose socket file is present.
+    """    Re-ping a silent daemon that left traces behind.
 
     A daemon mid-GC / mid-reconnect can miss one 1s ping and still be perfectly
     alive, so a single miss must not be reported as death.

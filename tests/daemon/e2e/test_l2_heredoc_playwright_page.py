@@ -36,6 +36,7 @@ from .conftest import (
     TEST_AUTOFACADE_PORT,
     TEST_CDP_PORT,
     _isolated_runtime_dir,
+    endpoint_url,
 )
 from .helpers import run_skill
 from .test_l2_multisession import (
@@ -120,6 +121,8 @@ def cdp_autofacade_daemon(e2e_chrome_cdp, e2e_artifacts_dir):
     env["TMPDIR"] = runtime_dir
     env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
     env["BD_FACADE_PORT"] = str(TEST_AUTOFACADE_PORT)
+    # ADR-0011: clients in this subtree talk to THIS daemon's endpoint.
+    env["BW_DAEMON_URL"] = f"http://127.0.0.1:{TEST_AUTOFACADE_PORT}"
     env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / "cdp")
     env["BD_CONFIG"] = ""
 
@@ -374,6 +377,7 @@ def _run_execute(script: str, *, sid: str, runtime_dir: str,
     env["BS_HOME"] = str(Path(__file__).resolve().parent
                          / "_bs_home" / "extension")
     env["BD_EXTENSION_PORT"] = str(TEST_EXT_PORT)
+    env["BW_DAEMON_URL"] = endpoint_url(TEST_EXT_FACADE_PORT)
     env["BD_CONFIG"] = ""
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
@@ -789,6 +793,7 @@ def test_facade_survives_a_wiped_runtime_dir_cdp(cdp_autofacade_daemon):
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["TMPDIR"] = runtime_dir
+    env["BW_DAEMON_URL"] = f"http://127.0.0.1:{TEST_AUTOFACADE_PORT}"
 
     try:
         # 1. The daemon still advertises the facade: memory, not the filesystem.
@@ -797,8 +802,13 @@ def test_facade_survives_a_wiped_runtime_dir_cdp(cdp_autofacade_daemon):
             "the endpoint is being read from a file again")
 
         # 2. And it is actually usable: a real heredoc drives a real page.
-        res = run_skill(_REUSE_SCRIPT_1,
-                        backend="cdp", runtime_dir=runtime_dir, extra_env=extra)
+        # The endpoint has to be supplied here: this test just deleted the
+        # file `run_skill` would normally read it from, which is the point —
+        # the daemon must still be usable without it.
+        res = run_skill(_REUSE_SCRIPT_1, backend="cdp",
+                        runtime_dir=runtime_dir,
+                        extra_env={**extra,
+                                   "BW_DAEMON_URL": env["BW_DAEMON_URL"]})
         assert res.returncode == 0, (
             f"heredoc failed after wiping {wiped}: {res.stderr}")
         assert _bound_target("cdp", sid), "heredoc bound no target"

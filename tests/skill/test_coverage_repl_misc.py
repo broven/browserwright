@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import socket
 import threading
 from pathlib import Path
 
@@ -131,10 +130,7 @@ def test_executor_control_plane_uses_browserwright_session_param():
     class _CDP:
         def send(self, method, **kwargs):
             calls.append((method, kwargs))
-            return {
-                "exec_sock": "/tmp/bw-exec.sock",
-                "executor_id": "executor-cdp-7",
-            }
+            return {"ready": True, "executor_id": "executor-cdp-7"}
 
     sess = type(
         "Sess",
@@ -145,7 +141,9 @@ def test_executor_control_plane_uses_browserwright_session_param():
         },
     )()
 
-    assert exec_client.ensure_executor(sess) == "/tmp/bw-exec.sock"
+    # ADR-0011: the lease is an identity + a readiness confirmation. No
+    # socket path crosses the wire — the data plane is the daemon's `/exec`.
+    assert exec_client.ensure_executor(sess) == "executor-cdp-7"
     assert calls == [
         (
             "BrowserwrightDaemon.ensureExecutor",
@@ -298,26 +296,17 @@ def test_errors_serialize_reprs_unjsonable_attributes():
     }
 
 
-def test_cdp_unix_socket_adapter_ignores_tcp_options_and_delegates():
-    from browserwright.cdp import _UnixSocketAdapter
+def test_cdp_has_no_unix_transport_left():
+    """ADR-0011 hard cut: one ws transport, so the AF_UNIX adapter is gone.
 
-    class RawSocket:
-        def __init__(self):
-            self.calls = []
-            self.marker = "raw"
+    Asserted by absence on purpose — the adapter existed only to absorb the
+    `TCP_NODELAY` that websockets sets on a caller-supplied socket, so its
+    reappearance would mean a second client transport had crept back in.
+    """
+    import browserwright.cdp as cdp
 
-        def setsockopt(self, level, optname, value):
-            self.calls.append((level, optname, value))
-            return "delegated"
-
-    raw = RawSocket()
-    adapter = _UnixSocketAdapter(raw)
-
-    assert adapter.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True) is None
-    assert raw.calls == []
-    assert adapter.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) == "delegated"
-    assert raw.calls == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    assert adapter.marker == "raw"
+    assert not hasattr(cdp, "_UnixSocketAdapter")
+    assert not hasattr(cdp, "_open_unix_websocket")
 
 
 def test_cdp_read_loop_routes_responses_and_events():

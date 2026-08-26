@@ -511,14 +511,21 @@ def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, caps
 
     calls = []
 
-    def fake_run(argv):
-        calls.append(argv)
+    def fake_run(argv, **kwargs):
+        # ADR-0011: the forward carries this process's resolved endpoint in the
+        # child's env, so accept (and record) kwargs.
+        calls.append((argv, kwargs))
         return SimpleNamespace(returncode=7)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
+    monkeypatch.setenv("BW_DAEMON_URL", "http://100.72.20.32:19990")
     assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 7
-    assert calls == [["browserwright-daemon", "userscript", "push", "script.js"]]
+    argv, kwargs = calls[0]
+    assert argv == ["browserwright-daemon", "userscript", "push", "script.js"]
+    # The child must target the daemon THIS process is addressed at, not
+    # whatever its own default would resolve to.
+    assert kwargs["env"]["BW_DAEMON_URL"] == "http://100.72.20.32:19990"
     assert capsys.readouterr().out == ""
 
 

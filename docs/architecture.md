@@ -14,13 +14,13 @@ skill/                    Agent-facing skill shell (points at `browserwright --p
         ↓
 src/browserwright/        Layer 2: agent CLI, sessions, primitives, site skills, memory
         ↓
-src/browserwright/daemon/ Layer 1: the global daemon — CDP proxy, backends, extension relay,
-        ↓                 Playwright facade
+src/browserwright/daemon/ Layer 1: the global daemon — one TCP endpoint (control / exec /
+        ↓                 cdp surfaces), CDP proxy, backends, extension relay
 Chrome (daily via extension relay / daemon-owned isolated via cdp / external via env)
 ```
 
-- **One long-lived global daemon** on the fixed socket
-  `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`. It serves all sessions
+- **One long-lived global daemon** behind one TCP endpoint (default
+  `http://127.0.0.1:19990`; ADR-0011). It serves all sessions
   at once: extension sessions share one relay upstream (the user's real
   Chrome), each cdp session gets its own daemon-owned Chrome, env sessions
   bind to an externally-owned CDP endpoint.
@@ -74,8 +74,7 @@ who just cloned the repo on a machine where:
   (e.g. via `uv tool install browserwright`)
 - the user's daily Chrome has the unpacked extension loaded against the
   global daemon on `ws://127.0.0.1:19989/`
-- the global daemon socket lives at
-  `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock`
+- the global daemon endpoint lives at `http://127.0.0.1:19990`
 
 Goal: do all development and verification from THIS worktree without
 touching any of the above.
@@ -85,7 +84,7 @@ touching any of the above.
 | Surface | Global default | Risk if you don't isolate |
 |---|---|---|
 | CLI binary | `~/.local/bin/browserwright{,-daemon}` | invoking `browserwright …` runs the global one against your code |
-| Daemon socket | `${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock` (single fixed name) | two daemons cannot share it — the second refuses to start |
+| Daemon endpoint | `127.0.0.1:19990` | two daemons cannot share the port — the second refuses to start |
 | Extension relay port | `127.0.0.1:19989` | starting a second relay there steals connections from the global extension |
 | CDP port | `9222` (Chrome's default) | a stray `--remote-debugging-port=9222` collides with your daily Chrome and pops Allow dialogs |
 | Daemon TOML config | `~/.config/browserwright-daemon/config.toml` (override with `BD_CONFIG`) | inherited backend / port settings leak into your dev daemon |
@@ -124,16 +123,20 @@ which port is which:
 |---|---|---|---|
 | extension relay port | 19989 | 29989 | `BD_EXTENSION_PORT` / `--extension-port` |
 | cdp port | 9222 | 29990 | `BD_CDP_PORT` / `--port` |
-| Playwright facade port | 19990 | 29993 (extension) / 29994 (cdp) | `--facade-port` / `BD_FACADE_PORT` |
-| Playwright facade host | `127.0.0.1` (loopback) | tailnet/LAN IP or `0.0.0.0` to reach off-box | `--facade-host` / `BD_FACADE_HOST` |
-| daemon socket dir | `${XDG_RUNTIME_DIR:-/tmp}` | `$(mktemp -d)` | `XDG_RUNTIME_DIR` |
+| daemon endpoint port | 19990 | per-worktree derived (see `_e2e_ports.py`) | `--facade-port` / `BD_FACADE_PORT` |
+| daemon endpoint host | `127.0.0.1` (loopback) | tailnet/LAN IP or `0.0.0.0` to reach off-box | `--facade-host` / `BD_FACADE_HOST` |
+| which daemon a client talks to | `http://127.0.0.1:19990` | the test daemon's endpoint URL | `BW_DAEMON_URL` / `--daemon-url` |
+| runtime dir (pid, executor sockets, log) | `${XDG_RUNTIME_DIR:-/tmp}` | `$(mktemp -d)` | `XDG_RUNTIME_DIR` |
 | daemon TOML config | `~/.config/browserwright-daemon/config.toml` | none | `BD_CONFIG=""` |
 | skill home | `~/.browserwright/` | tmpdir | `BS_HOME` |
 
-The daemon's socket name is fixed (`browserwright-daemon.sock`), so the
-**only** way to isolate the socket is to point `XDG_RUNTIME_DIR` at a
-throwaway directory. That replaced the old `BD_NAME` / `--name` flag —
-do not try to bring those back, they no longer exist.
+Isolation is **port-based** (ADR-0011): give the test daemon its own
+`--facade-port` and point every client at it with `BW_DAEMON_URL`. Pointing
+`XDG_RUNTIME_DIR` at a throwaway directory still isolates the pid file, the
+per-session executor sockets and the log — and the daemon publishes the
+endpoint it bound there, which is how the e2e helpers find it without
+hardcoding a port. Both replaced the old `BD_NAME` / `--name` flag — do not
+try to bring those back, they no longer exist.
 
 ### Step 3: run the fast mocked suite (no Chrome, no daemon, no extension)
 
@@ -369,10 +372,10 @@ src/browserwright/
 │   ├── _rpc.py           ← one-shot BrowserwrightDaemon.* RPC over the control socket
 │   ├── probe.py          ← daemon liveness observations, shared by `status` + `serve`
 │   ├── supervise.py      ← the one graceful→forced process-termination loop
-│   ├── _stale.py         ← detect + reclaim a half-alive daemon's relay/facade ports
+│   ├── _stale.py         ← detect + reclaim a half-alive daemon's relay/endpoint ports
 │   ├── launchagent.py    ← macOS service registration (install / uninstall / restart)
 │   ├── relay_status.py   ← the relay's /__status__ endpoint, fetched from one place
-│   └── server/           ← listener, Router/proxy, relay, facade, executor registry
+│   └── server/           ← endpoint server, listener/Router, relay, exec relay, executor registry
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
 tests/

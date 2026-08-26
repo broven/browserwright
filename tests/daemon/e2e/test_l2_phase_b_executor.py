@@ -290,6 +290,9 @@ def test_daemon_restart_cold_starts_fresh_executor_cdp(
         env["TMPDIR"] = runtime_dir
         env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
         env["BD_FACADE_PORT"] = str(TEST_AUTOFACADE_PORT)
+        # ADR-0011: the `stop` below and the client calls after the respawn must
+        # target THIS daemon, not whatever :19990 happens to be.
+        env["BW_DAEMON_URL"] = f"http://127.0.0.1:{TEST_AUTOFACADE_PORT}"
         env["BS_HOME"] = str(_BS_HOME_CDP)
         env["BD_CONFIG"] = ""
         subprocess.run(["browserwright-daemon", "stop"],

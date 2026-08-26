@@ -6,11 +6,10 @@ against an injected ``page`` (and ``context``). The handle:
   - **connects lazily**: nothing happens until the first attribute access on
     ``page`` / ``context``. A pure ``memory()`` / site-skill call never opens
     a browser connection (see :class:`_LazyHandle`).
-  - **connects through the daemon facade**: it asks the running daemon for its
-    facade ws URL over ``/__ping__`` (``_ipc.ping_status_sync`` → the same
-    answer ``browserwright-daemon status`` prints as ``facade.ws``) and
-    ``chromium.connect_over_cdp`` to it. The facade drives both the cdp and
-    extension backends.
+  - **connects through the daemon's cdp surface**: it resolves the daemon
+    endpoint (``browserwright.daemon_url``), confirms a daemon is there with the
+    cheap ``/__ping__`` probe, and ``chromium.connect_over_cdp``s to
+    ``<endpoint>/cdp``. That surface drives both the cdp and extension backends.
   - **binds ``page`` to the session's current tab**: it resolves the session's
     ``current_target_id`` (ledger fast-path via ``ensure_session_target``) and
     selects the Playwright ``Page`` whose CDP ``targetId`` matches it. If the
@@ -28,8 +27,8 @@ call ``page.close()`` / ``context.close()``.
 
 Sync API only: inline execution is a standalone process with no running asyncio
 loop, so we use ``playwright.sync_api``. The session's daemon client
-(``mode_b_client`` over a unix socket) is plain sockets, not asyncio — so there
-is no loop conflict with Playwright's sync driver.
+(``mode_b_client``) uses the synchronous websockets client, not asyncio — so
+there is no loop conflict with Playwright's sync driver.
 """
 from __future__ import annotations
 
@@ -44,16 +43,17 @@ _PAGE_BIND_POLL_INTERVAL_S = 0.05
 
 
 class FacadeUnavailable(BrowserwrightError):
-    """The Playwright facade ws could not be discovered/connected.
+    """The daemon's cdp surface could not be reached.
 
-    The daemon answers this live over ``/__ping__``, so the message carries the
-    daemon's OWN reason (disabled by config, bind failure, still starting up)
-    rather than a guess. The generic fix below is only the fallback for the
-    case where no daemon answered at all."""
+    ADR-0011 collapsed this to one cause. The cdp surface used to be a separate
+    listener that could be disabled or fail to bind while the daemon kept
+    serving, so this error carried the daemon's own reason for its absence.
+    There is one port now: if a daemon answers, the surface is there; if none
+    answers, that is the whole story."""
 
-    default_fix = ("ensure the daemon is running (`browserwright-daemon "
-                   "status --json` should show a non-null `facade.ws`; the "
-                   "facade is on by default). Do not pass `--facade-port 0`.")
+    default_fix = ("ensure the daemon is running and reachable at the endpoint "
+                   "(`browserwright-daemon status --json` should show `alive`; "
+                   "set BW_DAEMON_URL if it lives on another machine).")
 
 
 def _current_browserwright_session_id() -> str | None:
@@ -74,36 +74,28 @@ def _with_session_query(ws_url: str, session_id: str | None) -> str:
 
 
 def _facade_ws_url(*, session_id: str | None = None) -> str:
-    """Ask the running daemon for its facade ws URL.
+    """The cdp-surface ws URL for this session.
 
-    The daemon is the only thing that knows whether the facade bound, on which
-    host/port, or why it did not — so we ask it, every time, over the cheap
-    ``/__ping__`` HTTP probe. There is deliberately no cached copy on disk: the
-    previous design published a `browserwright-daemon.facade` file, macOS reaped
-    it out of /tmp after three days, and a perfectly healthy facade became
-    invisible to every client while `doctor` reported all green.
-
-    Raises :class:`FacadeUnavailable`, distinguishing the three real causes:
-    no daemon, a daemon too old to advertise, and a daemon that says why.
+    Derived from the resolved endpoint rather than asked for: with one port
+    there is nothing to discover. We still ping, because "the URL is well-formed"
+    and "a daemon is listening on it" are different facts and only the second
+    one produces a usable connection — reporting the difference here is what
+    keeps the failure legible instead of surfacing as a Playwright timeout.
     """
     from ..daemon import _ipc
+    from ..daemon_url import daemon_endpoint, unreachable_message
 
     if session_id is None:
         session_id = _current_browserwright_session_id()
+    ep = daemon_endpoint()
     pong = _ipc.ping_status_sync()
     if pong.pid is None:
+        if ep.explicit:
+            raise FacadeUnavailable(unreachable_message(ep))
         raise FacadeUnavailable(
-            "no daemon is running, so there is no Playwright facade to connect "
-            "to (start it with `browserwright-daemon start`)")
-    if pong.facade is None:
-        raise FacadeUnavailable(
-            f"daemon {pong.version or 'of unknown version'} does not advertise "
-            "its Playwright facade — it predates live facade discovery. "
-            "Restart it after upgrading: `browserwright-daemon restart`")
-    if not pong.facade.available:
-        raise FacadeUnavailable(
-            f"the daemon has no Playwright facade: {pong.facade.error}")
-    return _with_session_query(pong.facade.ws, session_id)
+            f"no daemon is answering at {ep.url}, so there is no browser to "
+            "connect to (start it with `browserwright-daemon start`)")
+    return _with_session_query(ep.ws("/cdp"), session_id)
 
 
 def _session_scoped_ws_url(ws_url: str, session_id: str | None) -> str:

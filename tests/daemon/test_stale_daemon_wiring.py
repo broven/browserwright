@@ -14,9 +14,7 @@ starts a real half-alive daemon.
 """
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 from types import SimpleNamespace
 
 from browserwright.daemon import _ipc, _stale, cli
@@ -31,13 +29,13 @@ def _ns(**kw):
 
 
 class _StubProbe(DaemonProbe):
-    """A daemon that never answers, with scriptable ports and socket file."""
+    """A daemon that never answers, with scriptable ports and crash traces."""
 
     retry_window = 0.05  # the retry loop is real; just don't dawdle in it
 
-    def __init__(self, *, socket_present, ports=(), holder=None):
+    def __init__(self, *, daemon_traces, ports=(), holder=None):
         super().__init__(Config())
-        self._socket_present = socket_present
+        self._daemon_traces = daemon_traces
         self._ports = list(ports)
         self._holder = holder
         self.probed_ports = []
@@ -45,8 +43,8 @@ class _StubProbe(DaemonProbe):
     def ping(self, timeout):
         return _ipc.NO_PONG
 
-    def socket_present(self):
-        return self._socket_present
+    def daemon_traces(self):
+        return self._daemon_traces
 
     def daemon_ports(self):
         return list(self._ports)
@@ -59,7 +57,9 @@ class _StubProbe(DaemonProbe):
         return self._holder
 
     def endpoint(self):
-        return {"schema_version": 1, "transport": "unix", "path": "/dev/null"}
+        return {"schema_version": 1, "transport": "tcp",
+                "url": "http://127.0.0.1:19990", "explicit": False,
+                "source": "default"}
 
     def sleep(self, seconds):
         pass  # skip the retry backoff
@@ -69,9 +69,9 @@ class _StubProbe(DaemonProbe):
 
 
 def test_cmd_status_reports_port_held_zombie(capsys):
-    # Socket file present (a half-alive daemon left it) but nothing answers,
-    # and lsof names a confirmed browserwright process on the ports.
-    probe = _StubProbe(socket_present=True, ports=[29971, 29972], holder=4242)
+    # Pid file present (a half-alive daemon left it) but nothing answers, and
+    # lsof names a confirmed browserwright process on the ports.
+    probe = _StubProbe(daemon_traces=True, ports=[29971, 29972], holder=4242)
 
     rc = cli._cmd_status(_ns(json=True), Config(), probe=probe)
 
@@ -82,10 +82,10 @@ def test_cmd_status_reports_port_held_zombie(capsys):
     assert rc == 2
 
 
-def test_cmd_status_not_running_when_no_socket_file(capsys):
-    # No socket file → the port-held probe must NOT fire (don't pick up an
+def test_cmd_status_not_running_when_no_daemon_traces(capsys):
+    # No pid file → the port-held probe must NOT fire (don't pick up an
     # unrelated daemon holding the default ports).
-    probe = _StubProbe(socket_present=False, ports=[29971])
+    probe = _StubProbe(daemon_traces=False, ports=[29971])
 
     rc = cli._cmd_status(_ns(json=True), Config(), probe=probe)
 
@@ -103,7 +103,7 @@ def test_cmd_status_falls_back_to_live_pid_file_when_lsof_blind(capsys):
         def live_pid_file_pid(self):
             return 777
 
-    probe = _Blind(socket_present=True, ports=[29971], holder=None)
+    probe = _Blind(daemon_traces=True, ports=[29971], holder=None)
 
     rc = cli._cmd_status(_ns(json=True), Config(), probe=probe)
 
@@ -201,58 +201,17 @@ def test_reclaim_noop_when_ports_free():
     assert probe.holder_lookups == []  # never even looked for a holder
 
 
-# ---- 2.4: control-socket watchdog self-exits --------------------------------
+# ---- 2.4: the control-socket watchdog is gone (ADR-0011) --------------------
+#
+# It self-exited the daemon when its socket file was removed or replaced, so a
+# superseded daemon released the relay/endpoint ports instead of squatting on
+# them (issue #15 2.4). With the socket deleted there is nothing to watch, and
+# nothing to fix: two daemons can no longer coexist at all, because the second
+# one's endpoint bind fails with EADDRINUSE. The mutual exclusion moved from a
+# file to the port itself.
 
 
-async def test_watchdog_self_exits_on_socket_removal(monkeypatch, tmp_path):
-    sock = tmp_path / "d.sock"
-    sock.write_text("")
-    monkeypatch.setattr(_ipc, "sock_path", lambda: sock)
-    st = sock.stat()
-    stop = asyncio.Event()
-    task = asyncio.create_task(
-        listener._control_socket_watchdog(
-            (st.st_dev, st.st_ino), stop, interval=0.05))
-
-    await asyncio.sleep(0.15)
-    assert not stop.is_set()  # socket present → still serving
-
-    sock.unlink()
-    await asyncio.wait_for(task, timeout=2)
-    assert stop.is_set()  # gone → self-exit requested
-
-
-async def test_watchdog_self_exits_on_socket_replacement(monkeypatch, tmp_path):
-    sock = tmp_path / "d.sock"
-    sock.write_text("")
-    monkeypatch.setattr(_ipc, "sock_path", lambda: sock)
-    st = sock.stat()
-    stop = asyncio.Event()
-    task = asyncio.create_task(
-        listener._control_socket_watchdog(
-            (st.st_dev, st.st_ino), stop, interval=0.05))
-
-    await asyncio.sleep(0.15)
-    assert not stop.is_set()
-
-    # Atomically replace with a different inode (another daemon rebound it).
-    other = tmp_path / "other.sock"
-    other.write_text("new")
-    os.replace(other, sock)
-    await asyncio.wait_for(task, timeout=2)
-    assert stop.is_set()
-
-
-async def test_watchdog_stays_quiet_while_socket_stable(monkeypatch, tmp_path):
-    sock = tmp_path / "d.sock"
-    sock.write_text("")
-    monkeypatch.setattr(_ipc, "sock_path", lambda: sock)
-    st = sock.stat()
-    stop = asyncio.Event()
-    task = asyncio.create_task(
-        listener._control_socket_watchdog(
-            (st.st_dev, st.st_ino), stop, interval=0.05))
-    await asyncio.sleep(0.25)  # several poll cycles, socket unchanged
-    assert not stop.is_set()
-    stop.set()  # normal shutdown path
-    await asyncio.wait_for(task, timeout=2)
+def test_the_control_socket_watchdog_is_gone():
+    assert not hasattr(listener, "_control_socket_watchdog")
+    assert not hasattr(_ipc, "sock_path")
+    assert not hasattr(_ipc, "make_unix_socket")

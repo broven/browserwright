@@ -229,21 +229,29 @@ class Config:
     # Precedence mirrors facade_port: CLI `--facade-host` > `BD_FACADE_HOST` env
     # > toml `facade_host` > DEFAULT_FACADE_HOST.
     facade_host: str = DEFAULT_FACADE_HOST
+    # ADR-0011: the URL downstreams use to REACH a daemon (the read side of the
+    # same endpoint `facade_host`/`facade_port` binds). Resolved by
+    # `browserwright.daemon_url`; carried here so daemon-side code can read the
+    # decision without re-deriving it. `daemon_url_explicit` is the load-bearing
+    # half — an explicitly configured URL disables every auto-start/restart.
+    daemon_url: str = ""
+    daemon_url_explicit: bool = False
     backends: BackendsConfig = field(default_factory=BackendsConfig)
 
-    def resolved_facade_port(self) -> int | None:
-        """Collapse the tri-state ``facade_port`` to a bind decision.
+    def resolved_facade_port(self) -> int:
+        """The TCP port the single endpoint binds.
 
-        Returns the port to bind the Playwright facade on, or ``None`` when the
-        facade should NOT be bound:
-          - ``facade_port is None``  -> ``DEFAULT_FACADE_PORT`` (auto-enable).
-          - ``facade_port == 0``     -> ``None`` (explicitly disabled).
-          - ``facade_port > 0``      -> that port (explicit override).
+        ADR-0011 made this the daemon's ONLY client-facing door, so there is no
+        longer a "disabled" value: ``0`` now means *bind an ephemeral port* (the
+        OS picks; the daemon publishes the result to its endpoint state file),
+        which is what per-test daemon isolation runs on now that isolation is
+        port-based rather than socket-path-based.
+          - ``facade_port is None``  -> ``DEFAULT_FACADE_PORT``.
+          - ``facade_port == 0``     -> 0, i.e. ephemeral.
+          - ``facade_port > 0``      -> that port.
         """
         if self.facade_port is None:
             return DEFAULT_FACADE_PORT
-        if self.facade_port == 0:
-            return None
         return self.facade_port
 
 
@@ -451,5 +459,14 @@ def load(
     if cli_facade_host is not None:
         # CLI `--facade-host` tops env / toml.
         cfg.facade_host = cli_facade_host
+
+    # ADR-0011 endpoint URL. Precedence (CLI `--daemon-url` > `BW_DAEMON_URL` >
+    # toml `daemon_url` > the running daemon's state file > default) lives in
+    # one module so the daemon and every client can never disagree about where
+    # the endpoint is.
+    from ..daemon_url import daemon_endpoint
+    _ep = daemon_endpoint(env=e)
+    cfg.daemon_url = _ep.url
+    cfg.daemon_url_explicit = _ep.explicit
 
     return cfg

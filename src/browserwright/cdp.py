@@ -24,72 +24,6 @@ from websockets.sync.client import connect as ws_connect
 from .errors import CDPError
 
 
-class _UnixSocketAdapter:
-    """Wrap an ``AF_UNIX`` socket so ``setsockopt(IPPROTO_TCP, ...)`` becomes
-    a no-op. websockets unconditionally calls
-    ``sock.setsockopt(socket.IPPROTO_TCP, TCP_NODELAY, True)`` after
-    receiving a user-provided socket — which AF_UNIX doesn't support and
-    raises ``OSError: [Errno 102]``. Everything else delegates straight
-    through.
-    """
-
-    __slots__ = ("_s",)
-
-    def __init__(self, s):
-        self._s = s
-
-    def setsockopt(self, level, optname, value):
-        import socket as _sock
-        if level == _sock.IPPROTO_TCP:
-            return None  # silently ignore — unix sockets have no TCP layer
-        return self._s.setsockopt(level, optname, value)
-
-    def __getattr__(self, name):
-        return getattr(self._s, name)
-
-
-def _open_unix_websocket(ws_unix_url: str, *, connect_timeout: float):
-    """Open a ws connection over a unix socket. ``ws_unix_url`` has the form
-    ``ws+unix:///path/to/sock?client=skill-repl``. websockets supports this
-    via ``sock=`` + ``server_hostname=`` overrides, but we wrap the AF_UNIX
-    socket in ``_UnixSocketAdapter`` to absorb the unconditional
-    ``TCP_NODELAY`` set the library performs.
-    """
-    import socket as _sock
-    from urllib.parse import urlparse, urlunparse
-
-    parsed = urlparse(ws_unix_url)
-    path = parsed.path
-    query = parsed.query
-    raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-    raw.settimeout(connect_timeout)
-    raw.connect(path)
-    # CRITICAL: clear the connect-phase timeout before handing the socket to
-    # websockets. `settimeout(connect_timeout)` only bounds `connect()`; if it
-    # leaks into steady state it becomes a per-recv read timeout, so any RPC
-    # whose reply takes longer than `connect_timeout` (e.g. the extension
-    # `ensureExecutor` blocking on a slow upstream open) makes the socket
-    # read time out and websockets tears the connection down as
-    # "ConnectionClosedError: no close frame received or sent" — surfacing the
-    # confusing `ws closed` error instead of the real RPC result/timeout.
-    # Liveness is websockets' job (ping_interval/ping_timeout), not a stray
-    # connect deadline. Reset to blocking so reads wait for real frames.
-    raw.settimeout(None)
-    sock = _UnixSocketAdapter(raw)
-    # Build a synthetic ws:// URL for the upgrade handshake; websockets parses
-    # this for the HTTP path + Host header.
-    upgrade_url = urlunparse(("ws", "browserwright", "/", "", query, ""))
-    return ws_connect(
-        upgrade_url,
-        sock=sock,
-        server_hostname="browserwright",
-        open_timeout=connect_timeout,
-        max_size=64 * 1024 * 1024,
-        proxy=None,
-        compression=None,  # daemon disables permessage-deflate (§6.3)
-    )
-
-
 def _rpc_error_fix(method: str, err: object) -> str:
     """Recovery hint for a JSON-RPC error returned over the wire. A ``-32601``
     ("method not found") almost always means the running daemon is older than
@@ -129,23 +63,19 @@ class CDPSession:
         # commonly run inside shells that point those at a SOCKS proxy for
         # their normal browsing, and routing CDP through one would fail in
         # confusing ways. browserwright-daemon-implementer flagged this.
-        if ws_url.startswith("ws+unix://"):
-            # Mode B: connect to the daemon's unix socket, then upgrade as
-            # if it were a ws:// localhost endpoint. We hand websockets a
-            # pre-connected socket via ``sock=`` and a stand-in HTTP URL.
-            self._ws = _open_unix_websocket(ws_url, connect_timeout=connect_timeout)
-        else:
-            # ``compression=None`` matches the Mode B daemon contract (which
-            # disables permessage-deflate) and is also fine for direct CDP:
-            # Chrome's browser-level ws doesn't benefit from deflate on
-            # localhost. ``proxy=None`` keeps $ALL_PROXY out of loopback.
-            self._ws = ws_connect(
-                ws_url,
-                open_timeout=connect_timeout,
-                max_size=64 * 1024 * 1024,
-                proxy=None,
-                compression=None,
-            )
+        # ADR-0011: one transport. The daemon endpoint and a raw browser CDP
+        # endpoint are both plain ``ws://``, so there is no branch left here —
+        # the `ws+unix://` sentinel and its AF_UNIX adapter went with the unix
+        # control socket. ``compression=None`` matches the daemon contract
+        # (which disables permessage-deflate) and is also fine for direct CDP:
+        # Chrome's browser-level ws doesn't benefit from deflate on localhost.
+        self._ws = ws_connect(
+            ws_url,
+            open_timeout=connect_timeout,
+            max_size=64 * 1024 * 1024,
+            proxy=None,
+            compression=None,
+        )
         self._lock = threading.Lock()
         self._next_id = 1
         self._inflight: dict[int, dict] = {}

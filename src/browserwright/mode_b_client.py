@@ -1,9 +1,9 @@
-"""Mode B daemon client — long-lived socket connection (spec §10 v0.2, §D).
+"""Mode B daemon client — long-lived connection to the daemon endpoint.
 
-Mode B is the v0.2 happy path:
+Mode B is the happy path:
 
-  - Skill connects to a running ``browserwright-daemon serve`` instance via its
-    unix-socket endpoint.
+  - Skill connects to a running ``browserwright-daemon serve`` instance over the
+    daemon's one TCP endpoint, on its **control surface** (ADR-0011).
   - Standard CDP commands are tunnelled through. ``BrowserwrightDaemon.*`` RPCs
     (``getActiveTab``, ``disconnect``, ``subscribeFocus``, ``uiState``) are
     answered by the daemon itself, not forwarded upstream.
@@ -15,30 +15,35 @@ as its sole daemon client (Mode A — the one-shot subprocess resolver — was
 removed; the skill always talks to a running daemon over its socket).
 
 Discovery:
-  - Endpoint path comes from ``browserwright-daemon status --json`` (or directly
-    ``${XDG_RUNTIME_DIR:-/tmp}/browserwright-daemon.sock``).
-  - On connect, the client appends ``?client=skill-repl&session=<id>`` to the URL.
+  - The endpoint URL comes from :mod:`browserwright.daemon_url` — ``--daemon-url``
+    / ``$BW_DAEMON_URL`` / the toml ``daemon_url`` key / the running daemon's
+    state file / ``http://127.0.0.1:19990``. No subprocess, no socket path.
+  - On connect, the client opens
+    ``ws://<host>:<port>/control?client=skill-repl&session=<id>``.
 
-The CDPSession transport connects to our Mode B unix endpoint (translated to
-``ws+unix://``). :func:`client_for_session` builds the client from a resolved
-ledger record; ``DaemonUnavailable`` surfaces lazily when no daemon socket is
-reachable.
+**Explicitly configured endpoint ⇒ hands off.** When the URL came from a flag,
+the env or the config file, this client never spawns a daemon and never
+restarts one over a version skew: a daemon at an address someone chose — even
+`127.0.0.1` — is not ours to manage, and on another machine we could not
+restart it anyway. Only the unconfigured default keeps the old auto-start and
+version-coherence behavior.
+
+:func:`client_for_session` builds the client from a resolved ledger record;
+``DaemonUnavailable`` surfaces lazily when no daemon answers.
 """
 from __future__ import annotations
 
 import json
-import os
-import socket
 import subprocess
-from pathlib import Path
 from typing import Any, Optional
 
+from .daemon_url import (
+    DaemonEndpoint,
+    child_env,
+    daemon_endpoint,
+    unreachable_message,
+)
 from .errors import DaemonUnavailable
-
-
-def _default_socket_path() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    return Path(base) / "browserwright-daemon.sock"
 
 
 class ModeBClient:
@@ -49,7 +54,7 @@ class ModeBClient:
 
     def __init__(self) -> None:
         self._endpoint: Optional[str] = None
-        self._transport: Optional[str] = None  # always "unix"
+        self._transport: Optional[str] = None  # always "tcp"
         self._cached_ws: Optional[str] = None
         # client label sent on the ws query string for daemon observability;
         # session-bound clients override this with ``skill-s<id>``.
@@ -61,50 +66,32 @@ class ModeBClient:
 
     # ---- endpoint discovery ---------------------------------------------
 
+    def endpoint(self) -> DaemonEndpoint:
+        """The resolved daemon endpoint (URL + whether it was configured)."""
+        return daemon_endpoint()
+
+    @property
+    def explicit(self) -> bool:
+        """Whether the endpoint was named by a human.
+
+        The gate on every auto-start/auto-restart in this class. See the module
+        docstring."""
+        return self.endpoint().explicit
+
     def discover(self) -> dict:
-        """Return ``{"transport": "unix", "path": ...}``. Probes the daemon's
-        ``status --json`` first; falls back to direct path inspection so we
-        still work when the daemon CLI is on a slow path."""
-        try:
-            proc = subprocess.run(
-                ["browserwright-daemon", "status", "--json"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                info = json.loads(proc.stdout)
-                if info.get("alive"):
-                    return self._normalize_endpoint_info(info)
-        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
-            pass
+        """Return ``{"transport": "tcp", "url": ...}`` for the endpoint.
 
-        # Fallback: just look at the well-known socket path.
-        sock_path = _default_socket_path()
-        if sock_path.exists():
-            return {"transport": "unix", "path": str(sock_path)}
-        raise DaemonUnavailable("no Mode B endpoint — the daemon is not running")
-
-    @staticmethod
-    def _normalize_endpoint_info(info: dict) -> dict:
-        # `status --json` may nest the transport details or flatten them; be
-        # tolerant of both shapes daemon-implementer may ship.
-        out = dict(info)
-        if "endpoint" in info and isinstance(info["endpoint"], dict):
-            out.update(info["endpoint"])
-        out.pop("alive", None)
-        # Drop everything outside our known schema so callers don't pin on it.
-        return {k: out[k] for k in ("transport", "path", "name") if k in out}
+        Pure resolution — no probe, no subprocess. Whether anything is actually
+        listening is :meth:`is_alive`'s question."""
+        ep = self.endpoint()
+        return {"transport": "tcp", "url": ep.url}
 
     # ---- connect probe + ws_url ----------------------------------------
 
     def is_alive(self) -> bool:
-        """Cheap reachability check. Returns True iff the daemon's socket
-        accepts a `ping`-style request."""
+        """Cheap reachability check: does the endpoint answer ``/__ping__``?"""
         try:
-            ep = self.discover()
-        except DaemonUnavailable:
-            return False
-        try:
-            return self._ping(ep)
+            return self._ping()
         except OSError:
             return False
 
@@ -121,23 +108,21 @@ class ModeBClient:
             time.sleep(interval)
         return False
 
-    def _ping(self, ep: dict) -> bool:
-        """Open a short-lived raw socket to the daemon endpoint and verify
-        it's responsive. We avoid a CDP request because the upstream may
-        not be open yet — we just want to know the daemon's accept loop is
-        live."""
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(1.5)
-        try:
-            s.connect(ep["path"])
-        except OSError:
-            s.close()
-            return False
-        s.close()
-        return True
+    def _ping(self) -> bool:
+        """HTTP ``GET /__ping__`` against the endpoint.
+
+        Deliberately not a CDP request: the upstream browser may not be open
+        yet, and all we want to know is that the daemon's accept loop is live
+        and is *ours* (the pong shape is what proves the second half)."""
+        from .daemon import _ipc
+        return _ipc.ping_status_sync(timeout=1.5).pid is not None
+
+    def unreachable_error(self) -> DaemonUnavailable:
+        """The error to raise when nothing answered an explicit endpoint."""
+        return DaemonUnavailable(unreachable_message(self.endpoint()))
 
     def ws_url(self, *, client_label: Optional[str] = None) -> str:
-        """Return a ``ws+unix://`` URL the ``CDPSession`` can open.
+        """Return the control-surface ws URL the ``CDPSession`` opens.
 
         Caches the result; call ``invalidate()`` to force a re-resolve (e.g.
         after a 1011 close).
@@ -146,18 +131,14 @@ class ModeBClient:
             client_label = self._client_label
         if self._cached_ws:
             return self._cached_ws
-        ep = self.discover()
+        ep = self.endpoint()
         # Session-bound clients carry ``?session=<id>`` — the daemon dispatcher
-        # routes on this (not on the client label). Without it an cdp session
+        # routes on this (not on the client label). Without it a cdp session
         # resolves to None → the shared (extension) context.
-        session_q = f"&session={self._session_id}" if self._session_id else ""
-        # websockets.sync.client.connect doesn't support ws+unix:// natively;
-        # we hand it a pre-built socket via the `sock=` kwarg instead.
-        # Return a sentinel URL the CDPSession layer recognises.
-        url = f"ws+unix://{ep['path']}?client={client_label}{session_q}"
+        url = ep.ws("/control", client=client_label, session=self._session_id)
         self._cached_ws = url
-        self._endpoint = ep.get("path")
-        self._transport = ep["transport"]
+        self._endpoint = ep.url
+        self._transport = "tcp"
         return url
 
     def invalidate(self) -> None:
@@ -185,6 +166,9 @@ class ModeBClient:
             proc = subprocess.run(
                 cmd,
                 capture_output=True, text=True, timeout=5,
+                # The child must ask the SAME daemon we are talking to; a
+                # `--daemon-url` flag does not propagate on its own (ADR-0011).
+                env=child_env(),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -203,27 +187,19 @@ class ModeBClient:
     # version skew up front and restart the daemon so it picks up the new code.
 
     def running_daemon_version(self) -> Optional[str]:
-        """Version the *running* daemon advertises via ``status --json``.
+        """Version the *running* daemon advertises on its ``/__ping__`` pong.
+
+        Read straight off the endpoint rather than by shelling out to
+        ``browserwright-daemon status --json``: a ``--daemon-url`` flag does not
+        reach a child process's environment, so the subprocess would happily
+        report the *local* daemon's version while we are talking to a remote one.
 
         Returns ``None`` when the daemon isn't reachable OR is too old to
         advertise a version. A missing version is deliberately indistinguishable
         from "no daemon" here; the coherence guard disambiguates via
         :meth:`is_alive`."""
-        try:
-            proc = subprocess.run(
-                ["browserwright-daemon", "status", "--json"],
-                capture_output=True, text=True, timeout=3,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return None
-        try:
-            info = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return None
-        v = info.get("version")
-        return v if isinstance(v, str) and v else None
+        from .daemon import _ipc
+        return _ipc.ping_status_sync(timeout=1.5).version
 
     def installed_daemon_version(self) -> Optional[str]:
         """Version of the ``browserwright-daemon`` package installed on disk, read
@@ -265,6 +241,11 @@ class ModeBClient:
         kill the daemon. Callers that know the backend the old daemon was
         serving (see ``ensure_version_coherent``) pass it through so the
         replacement keeps serving the same backend."""
+        if self.explicit:
+            # ADR-0011: an endpoint someone configured is a daemon someone else
+            # manages. Spawning a local one here would bind a *different*
+            # address and silently serve the wrong browser.
+            return
         cmd = ["browserwright-daemon", "serve"]
         if backend:
             cmd += ["--backend", backend]
@@ -287,7 +268,25 @@ class ModeBClient:
           - the installed version can't be determined (can't compare safely).
 
         Generic by construction: it never inspects RPC methods or specific
-        version strings — any future skew is handled the same way."""
+        version strings — any future skew is handled the same way.
+
+        ADR-0011: also a no-op against an **explicitly configured** endpoint. A
+        remote daemon is not ours to stop, and `browserwright-daemon stop` here
+        would signal whatever local daemon happens to exist instead — the wrong
+        process, on the wrong machine. We warn and keep going; a real skew then
+        surfaces as the usual actionable ``-32601`` message."""
+        if self.explicit:
+            import sys
+            installed = self.installed_daemon_version()
+            running = self.running_daemon_version()
+            if installed and running and running != installed:
+                print(
+                    f"warning: the daemon at {self.endpoint().url} runs "
+                    f"{running} but this client is {installed}. Because the "
+                    "endpoint was configured explicitly, browserwright will "
+                    "not restart it — restart it yourself on that machine.",
+                    file=sys.stderr)
+            return False
         installed = self.installed_daemon_version()
         if installed is None:
             return False

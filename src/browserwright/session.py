@@ -85,8 +85,26 @@ class Session:
             if self._cdp is not None and not self._cdp._closed:
                 return self._cdp
             url = self._resolve_ws_url()
-            self._cdp = CDPSession(url)
+            try:
+                self._cdp = CDPSession(url)
+            except OSError as e:
+                # Nothing is listening on the endpoint. ADR-0011 made this a
+                # first-class outcome rather than a transport hiccup: the URL
+                # may name another machine, and when it was configured
+                # explicitly we deliberately did NOT start a daemon. A bare
+                # "Connection refused" leaves the agent with no idea which
+                # address failed or why nothing was started, so say both.
+                raise self._unreachable(url, e) from e
             return self._cdp
+
+    def _unreachable(self, url: str, cause: BaseException) -> DaemonUnavailable:
+        from .daemon_url import daemon_endpoint, unreachable_message
+
+        endpoint = daemon_endpoint()
+        if endpoint.explicit:
+            return DaemonUnavailable(f"{unreachable_message(endpoint)} ({cause})")
+        return DaemonUnavailable(
+            f"no browserwright daemon answered at {url}: {cause}")
 
     def _resolve_ws_url(self) -> str:
         """Ask the underlying daemon client for a CDP ws URL.

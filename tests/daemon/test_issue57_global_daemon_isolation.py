@@ -14,25 +14,46 @@ import pytest
 
 
 def test_runtime_dir_is_not_the_real_one():
-    """Vector B: `_ipc.cleanup_endpoint()` unlinks the socket in this dir.
+    """Vector B: the runtime dir owns the pid + endpoint-state files.
 
-    Pointed at the default `/tmp`, that deletes the live daemon's control socket
-    and its watchdog self-exits with status 0 — a death that looks like a clean
-    shutdown (issue #15 2.4).
+    Pointed at the default `/tmp`, a test's `cleanup_endpoint()` would delete
+    the live daemon's files, and its resolution would find the live daemon's
+    published endpoint.
     """
     from browserwright.daemon import _ipc
 
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     assert runtime, "the autouse wall should have set XDG_RUNTIME_DIR"
     assert Path(runtime) != Path("/tmp")
-    assert _ipc.sock_path() != Path("/tmp/browserwright-daemon.sock")
+    assert _ipc.pid_path() != Path("/tmp/browserwright-daemon.pid")
 
 
 def test_runtime_dir_is_short_enough_for_af_unix():
-    """`sun_path` is 104 bytes on macOS, which is why this is not `tmp_path`."""
+    """`sun_path` is 104 bytes on macOS, which is why this is not `tmp_path`.
+
+    The client-facing socket is gone (ADR-0011) but the per-session executor
+    sockets still live here, so the budget still binds.
+    """
     from browserwright.daemon import _ipc
 
-    assert len(str(_ipc.sock_path()).encode()) < 104
+    assert len(str(_ipc.executor_sock_path("some-session")).encode()) < 104
+
+
+def test_the_endpoint_the_suite_resolves_is_not_the_real_one():
+    """ADR-0011 vector B: isolation is port-based now.
+
+    Nothing in the fast gate may resolve to `http://127.0.0.1:19990` — that is
+    the developer's daemon, and an `is_alive()` landing there would silently
+    couple a unit test to a live browser.
+    """
+    from browserwright.daemon_url import daemon_endpoint
+
+    ep = daemon_endpoint()
+    assert ep.url != "http://127.0.0.1:19990"
+    # ...and not by way of an *explicit* source, which would also change the
+    # auto-start regime the tests exercise.
+    assert ep.explicit is False
+    assert ep.source == "state_file"
 
 
 def test_cold_start_entry_points_are_neutralised():
