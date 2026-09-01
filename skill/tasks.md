@@ -1,11 +1,23 @@
-# Saving a flow as a reusable task
+# The site-skill directory
 
-A "task" is a per-site Python file that bundles a reusable browser flow with metadata. The runtime is filesystem-driven — drop the right files in the right place and `browserwright task <site>/<name>` works immediately. No registry, no scaffolding command — **you author the file yourself with the `Write` tool**.
+Site knowledge lives in one directory per site. It holds two things that work
+together: **memory** (what you learned about the site) and **tasks** (flows you
+solidified into replayable Python).
 
-## Storage layout
+> **The `.py` task contract lives in `browserwright --print-skill`**, under
+> *Reusable Flows: tasks* — the file template, every metadata constant, the
+> `run(args, ctx)` injection contract, and when to solidify a flow at all. That
+> output is generated from the installed package, so it can never disagree with
+> the binary you are running. Read it there, not here.
+>
+> This file covers the rest of the directory: the layout around the task file,
+> the `memory.md` frontmatter that powers discovery, and the procedure for
+> creating a site folder from scratch.
+
+## Layout
 
 ```
-~/.browserwright/site-skills/<eTLD+1>/
+site-skills/<eTLD+1>/
   SKILL.md          # one-line site summary, lists tasks
   memory.md         # frontmatter (site, host_patterns, aliases) + free notes
   tasks/
@@ -13,45 +25,30 @@ A "task" is a per-site Python file that bundles a reusable browser flow with met
     <name2>.py
 ```
 
-Three roots are searched in order: `./site-skills/` (CWD, git-trackable), then `$BS_HOME/site-skills/` (default `~/.browserwright/site-skills/`), then the bundled starter. Write to the second one unless the user wants the task version-controlled with the project.
+The site directory name is the eTLD+1 stem — `news.ycombinator.com` →
+`ycombinator.com`, `shop.example.co.uk` → `example.co.uk` — with a short-alias
+override table for a handful of hosts where the algorithmic name is unhelpful
+(`mail.google.com` → `gmail`, `www.zhipin.com` → `boss-zhipin`).
+`bootstrap_site(host)` picks the right stem for you and creates the folder, so
+you rarely need to compute it by hand.
 
-## Task file template
+The three roots and their precedence are described in the generated doc. In
+short: project-local `./site-skills/` shadows `$BS_HOME/site-skills/` shadows
+the bundled starter set.
 
-`~/.browserwright/site-skills/<site>/tasks/<name>.py`:
+## memory.md
 
-```python
-"""One-line description of what this task does."""
-
-ARGS = {
-    "query": {"type": "str", "required": True, "desc": "Search term"},
-    "lang":  {"type": "str", "required": False, "default": "en", "desc": "Language code"},
-}
-OUTPUT = "{title: str, url: str}"
-TAGS = ["search", "example"]
-REQUIRES_LOGIN = False
-ESTIMATED_DURATION_SEC = 5
-LAST_VERIFIED = "2026-05-25"
-
-def run(args, ctx=None):
-    # `page` / `context` / `snapshot` are injected by the runtime — the same
-    # Playwright surface inline execution gets (also on ctx: ctx.page / ctx.context).
-    page.goto(f"https://example.com/search?q={args['query']}", wait_until="load")
-    return {"title": page.title(), "url": page.url}
-```
-
-Module-level constants are all optional except `ARGS` and `run`. The runtime imports the file with `importlib`, injects the Playwright `page` / `context` / `snapshot` (lazily — a task that never touches them opens no browser), validates args against `ARGS`, then calls `run(args, ctx)`. If you define `OUTPUT_SCHEMA`, the runtime validates `run()`'s return shape against it. `ctx.memory` is the parsed frontmatter of the site's `memory.md`; `ctx.page` / `ctx.context` / `ctx.snapshot` mirror the injected globals.
-
-## Site memory.md template
-
-Site memory is not only for saved tasks. During ordinary browsing, if you learn stable reusable facts about a host, call `remember(host_or_url, text, section=...)`; it creates this file lazily. Keep notes short and sanitized.
-
-`~/.browserwright/site-skills/<site>/memory.md`:
+Not only for saved tasks — during ordinary browsing, `remember(host_or_url,
+text, section=...)` lazily creates this file. Keep notes short and sanitized;
+`remember()` refuses writes that trip a redaction tripwire (high-entropy
+strings, `Bearer` tokens, cookie/session keys, absolute user paths, card
+numbers) and tells you which one fired on stderr.
 
 ```markdown
 ---
 site: example.com
 host_patterns: [example.com, www.example.com]
-aliases: [example, ex]
+aliases: [example, ex, 例子]
 last_updated: 2026-05-19
 ---
 
@@ -65,15 +62,27 @@ Anti-bot, rate limits, layouts that differ logged-in vs anonymous.
 - task 'search' created 2026-05-19
 ```
 
-`host_patterns` and `aliases` power query-based discovery (`browserwright list-tasks --query=...`).
+Frontmatter is load-bearing, the prose body is not:
 
-## Procedure
+- `host_patterns` — every hostname that should resolve to this directory.
+- `aliases` — natural-language handles. These, plus the task's own `TAGS` and
+  docstring, are what `browserwright list-tasks --query="..."` matches against,
+  so write the words a user would actually say (including in their language).
+- `site` / `last_updated` — identity and staleness.
 
-1. Confirm with the user that the flow is worth saving. Agree on a name like `<site>/<task>`.
-2. Use the `Write` tool to create:
-   - `~/.browserwright/site-skills/<site>/tasks/<name>.py` — template above, with the actual REPL code substituted in.
-   - `~/.browserwright/site-skills/<site>/memory.md` if the site folder didn't exist.
-   - `~/.browserwright/site-skills/<site>/SKILL.md` if missing — one line per task is enough.
-3. Run `browserwright task <site>/<name>` once to verify it works end to end.
+The parsed frontmatter is handed to a task as `ctx.memory`, so selectors you
+record here can be read by the task instead of hardcoded twice.
 
-The filesystem is the database — there is no save/scaffold command. Write the files directly with the `Write` tool, then run `browserwright task <site>/<name>` to confirm.
+## Creating a site folder from scratch
+
+1. Agree with the user that the flow is worth saving, and on a name — `<site>/<task>`.
+2. Write the files with the `Write` tool. The filesystem is the database; there
+   is no save or scaffold command.
+   - `tasks/<name>.py` — per the generated doc's template, with your actual
+     working REPL code substituted in.
+   - `memory.md` if the site folder is new — template above.
+   - `SKILL.md` if missing — a title line, a sentence on the site, and one
+     bullet per task is enough.
+3. Run `browserwright task <site>/<name>` once, end to end, before telling the
+   user it exists. A task that was never executed as a task is not verified;
+   the injected-globals surface differs from what you had in the REPL scratchpad.
