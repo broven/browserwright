@@ -64,7 +64,8 @@ import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
 from .. import _ipc
-from ..config import DEFAULT_FACADE_PORT, Config
+from ..config import (DEFAULT_FACADE_PORT, LOOPBACK_HOST, Config,
+                      needs_loopback_cobind)
 from .. import __version__
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
@@ -128,6 +129,14 @@ class PlaywrightFacade:
         self._port = port
         self._host = host
         self._server: Any = None
+        # A bind to a *specific* non-loopback IP (the documented remote-access
+        # setup, `--facade-host <tailnet-ip>`) does not listen on 127.0.0.1 at
+        # all, which silently breaks every LOCAL client — they resolve the
+        # loopback default when the endpoint state file is not visible to them
+        # (different XDG_RUNTIME_DIR, sandboxed /tmp, another user). Remote
+        # access must not cost local access, so we additionally bind loopback
+        # on the same port and serve both from one handler.
+        self._loopback_server: Any = None
         # PR2: for the extension backend the facade has no resolvable upstream
         # ws — it bridges through the daemon's shared RelayServer. The listener
         # passes a getter (the relay is created during run_serve startup, and
@@ -149,12 +158,12 @@ class PlaywrightFacade:
 
     # ---- lifecycle -------------------------------------------------------
 
-    async def start(self) -> int:
-        """Bind the facade ws+HTTP server. Returns the actually-bound port."""
-        self._server = await serve(
+    async def _serve_on(self, host: str, port: int) -> Any:
+        """Bind one ws+HTTP listener for this facade on ``host:port``."""
+        return await serve(
             self._handle_client,
-            self._host,
-            self._port,
+            host,
+            port,
             process_request=self._process_request,
             compression=None,
             ping_interval=20,
@@ -164,6 +173,16 @@ class PlaywrightFacade:
             # frames — see `_MAX_WS_SIZE`.
             max_size=_MAX_WS_SIZE,
         )
+
+    async def start(self) -> int:
+        """Bind the facade ws+HTTP server. Returns the actually-bound port.
+
+        When ``host`` names a specific non-loopback address, loopback is bound
+        as a SECOND listener on the same port so local clients keep working
+        (see ``_loopback_server``). That co-bind is best-effort: it must never
+        turn a working remote bind into a fatal startup failure.
+        """
+        self._server = await self._serve_on(self._host, self._port)
         for sock in self._server.sockets:
             sa = sock.getsockname()
             if isinstance(sa, tuple) and len(sa) >= 2:
@@ -171,6 +190,32 @@ class PlaywrightFacade:
                 break
         logger.info("endpoint listening on http://%s:%d (%s)",
                     self._host, self._port, ", ".join(_WS_PATHS))
+        if needs_loopback_cobind(self._host):
+            try:
+                self._loopback_server = await self._serve_on(
+                    LOOPBACK_HOST, self._port)
+                logger.info(
+                    "endpoint also listening on http://%s:%d "
+                    "(loopback co-bind so local clients keep working)",
+                    LOOPBACK_HOST, self._port)
+            except OSError as e:
+                # Someone else holds loopback:port, or the ephemeral port the
+                # primary bind won is taken on loopback. Remote clients still
+                # work; local ones need an explicit endpoint. Say so loudly —
+                # this is exactly the failure mode that reads as "the daemon
+                # is running but nothing can reach it".
+                self._loopback_server = None
+                logger.warning(
+                    "endpoint could NOT also bind %s:%d (%s) — LOCAL clients "
+                    "that resolve the loopback default will fail to connect. "
+                    "Point them at http://%s:%d via $BW_DAEMON_URL.",
+                    LOOPBACK_HOST, self._port, e, self._host, self._port)
+            logger.warning(
+                "endpoint is bound to non-loopback %s — it is reachable from "
+                "every host that can route there, and it drives a real "
+                "browser with no application-layer auth (ADR-0011). Keep it "
+                "on a trusted tunnel/tailnet only.",
+                self._host)
         if self._relay_getter is not None:
             self._reaper_task = asyncio.create_task(self._auto_reaper_loop())
         return self._port
@@ -192,10 +237,14 @@ class PlaywrightFacade:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._sessions.clear()
-        self._server.close()
-        with contextlib.suppress(Exception):
-            await self._server.wait_closed()
+        for srv in (self._server, self._loopback_server):
+            if srv is None:
+                continue
+            srv.close()
+            with contextlib.suppress(Exception):
+                await srv.wait_closed()
         self._server = None
+        self._loopback_server = None
 
     @property
     def port(self) -> int:

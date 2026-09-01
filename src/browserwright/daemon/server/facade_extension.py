@@ -94,8 +94,19 @@ _RUNTIME_REENABLE_PAUSE = 0.05
 # Instead of skipping the announce permanently we re-check for a short window
 # (the binding lands milliseconds later); a tab that never becomes visible
 # (a foreign tab) expires without an announce — the scope check still gates.
-_VISIBILITY_RETRY_COUNT = 5
-_VISIBILITY_RETRY_INTERVAL = 0.1
+#
+# BUG B: this window used to be 5 x 0.1s = 0.5s, which was the real ceiling on
+# a cold bind. It has to outlast an extension MV3 service-worker wake-up (the
+# `scoped_target_infos` round trip goes to the SW), and it must not expire
+# before the CLIENT's bind budget — otherwise the daemon quietly stops trying
+# while the client is still waiting, and the tab is never announced for the
+# life of the bridge, which is exactly what surfaced as a 100%-reproducible
+# `PageBindTimeout` with a leaked tab per attempt. 30 x 0.2s = 6s sits under
+# the 10s client budget (`repl.playwright_handle._PAGE_BIND_TIMEOUT_S`) with
+# room for the round trip. Cost on the happy path is zero: the loop returns on
+# the first successful check, and a foreign tab is idle waiting, not work.
+_VISIBILITY_RETRY_COUNT = 30
+_VISIBILITY_RETRY_INTERVAL = 0.2
 
 
 # Synthetic browserContextId for synthesized page targets. The extension backend

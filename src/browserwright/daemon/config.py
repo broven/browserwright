@@ -35,6 +35,49 @@ DEFAULT_FACADE_PORT = 19990
 # interface (e.g. `0.0.0.0` or a specific tailnet IP) for remote CDP clients.
 DEFAULT_FACADE_HOST = "127.0.0.1"
 
+#: The loopback address every local client falls back to (`DEFAULT_DAEMON_URL`
+#: in `daemon_url.py` is built from it).
+LOOPBACK_HOST = "127.0.0.1"
+
+#: Hosts whose bind ALREADY covers loopback, so no second listener is needed:
+#: loopback itself, and the two wildcards.
+_LOOPBACK_COVERING_HOSTS = frozenset({
+    "", "0.0.0.0", "::", "::0", "*",
+})
+
+
+def needs_loopback_cobind(host: str) -> bool:
+    """Whether binding *host* leaves 127.0.0.1 unserved.
+
+    A bind to a **specific** address listens on that address only — binding
+    `100.72.20.32` (the documented `--facade-host <tailnet-ip>` remote-access
+    setup) means `127.0.0.1:19990` is genuinely not listening, so every local
+    client that resolves the loopback default gets ECONNREFUSED while the
+    daemon is demonstrably up. The endpoint state file is supposed to bridge
+    that, but it is a best-effort channel (an unreadable or differently-rooted
+    `XDG_RUNTIME_DIR` silently falls through to the default). Remote access
+    must not cost local access, so the facade co-binds loopback whenever this
+    returns True.
+
+    Wildcards (`0.0.0.0`, `::`) and loopback itself already serve 127.0.0.1.
+    """
+    text = (host or "").strip()
+    if text.lower() in _LOOPBACK_COVERING_HOSTS:
+        return False
+    if text.lower() in ("localhost", "localhost."):
+        return False
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(text.strip("[]"))
+    except ValueError:
+        # A hostname we cannot classify without resolving. Co-binding loopback
+        # is harmless (it fails soft) and is the safer default.
+        return True
+    if addr.is_loopback or addr.is_unspecified:
+        return False
+    return True
+
 
 def check_name(name: str) -> str:
     """Path-traversal guard for filesystem-bound names (e.g. `--profile`)."""

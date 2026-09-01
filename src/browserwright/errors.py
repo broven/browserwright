@@ -43,9 +43,19 @@ class PageBindTimeout(BrowserwrightError):
 
     exit_code = 3
     retryable = True
+    # BUG B: `retryable` has to be honest. A retry only helps when the daemon
+    # was still going to announce the tab — a cold/reconnecting extension
+    # service worker is exactly that case, and the bind budget
+    # (`$BW_PAGE_BIND_TIMEOUT`) is the knob for it. If retries do NOT help, the
+    # extension side is not answering at all, and `session reset` will not
+    # change that — say what to check instead of looping the user.
     default_fix = (
-        "retry the same browserwright command; if it persists, run "
-        "`browserwright session reset <id>` and retry"
+        "retry the same browserwright command (a cold extension service worker "
+        "can miss the bind window; raise it with `export "
+        "BW_PAGE_BIND_TIMEOUT=30`). If EVERY retry fails, the extension is not "
+        "answering: check `browserwright doctor` and that the browserwright "
+        "extension is enabled and its Chrome window is open, then "
+        "`browserwright session reset <id>`"
     )
 
     def __init__(

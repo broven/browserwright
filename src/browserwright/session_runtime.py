@@ -388,9 +388,17 @@ def resolve_current_target(sess) -> dict:
         return {"targetId": tabs[0]["targetId"], "url": tabs[0]["url"],
                 "title": tabs[0]["title"], "accuracy": "unknown"}
     # 4. Empty session — open a fresh working tab (NOT adopt).
+    #
+    # `opened: True` marks the tab as CREATED BY THIS CALL, which is the only
+    # thing that distinguishes it from the reuse paths above. Callers that can
+    # fail after this point (`repl.playwright_handle.bind_current_page`) need
+    # it to know whether a failure of theirs leaves a user-visible tab behind
+    # that nobody else will ever claim — steps 1-3 hand back a tab the session
+    # already owned, and closing one of those on a failed bind would destroy
+    # the agent's actual working tab.
     opened = open_session_tab(sess, "about:blank",
                               skip_post_attach_commands=True)
-    return opened | {"accuracy": "unknown"}
+    return opened | {"accuracy": "unknown", "opened": True}
 
 
 def eval_js(sess, expression: str, *, await_promise: bool = False) -> Any:
