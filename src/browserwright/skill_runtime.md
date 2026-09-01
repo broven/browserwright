@@ -373,8 +373,41 @@ Reusable flows belong in site-skill tasks. A task's `run(args, ctx)` receives th
 
 ```bash
 browserwright list-tasks
+browserwright list-tasks --query="search the web"
 browserwright -s "$sid" task wikipedia.org/lookup --title="Browser automation"
 ```
+
+**Look before you improvise.** Run `list-tasks` before hand-writing a flow for a site. A saved task replays a known-good path instead of re-deriving it from a fresh snapshot.
+
+**Solidify when the flow repeats.** Write a task once either of these is true, without waiting to be asked:
+
+- You have driven the same site flow twice, or the user asks for something they will plainly ask for again — a recurring report, a standing search, a routine form.
+- You just spent several snapshot/click rounds working out a path that a URL template plus two selectors can now replay directly.
+
+Author it with the `Write` tool; the runtime is filesystem-driven and there is no scaffolding command. Put the file at `$BS_HOME/site-skills/<eTLD+1>/tasks/<name>.py` (default `~/.browserwright/site-skills/...`), or at `./site-skills/...` in the CWD when the user wants it version-controlled with the project. Reads consult project-local `./site-skills/` first, then `$BS_HOME/site-skills/`, then the bundled starter set — first hit per site name wins, so a project task shadows a personal one. `remember()` and `bootstrap_site()` write to `./site-skills/` when that directory already exists and to `$BS_HOME` otherwise.
+
+```python
+"""One-line description — this becomes the task's listed summary."""
+
+ARGS = {
+    "query": {"type": "str", "required": True, "desc": "Search term"},
+    "lang":  {"type": "str", "required": False, "default": "en", "desc": "Language code"},
+}
+OUTPUT = "{title: str, url: str}"
+TAGS = ["search"]
+REQUIRES_LOGIN = False
+ESTIMATED_DURATION_SEC = 5
+LAST_VERIFIED = "2026-05-25"   # ISO date you last saw this actually work
+
+def run(args, ctx=None):
+    # `page` / `context` / `snapshot` are injected — same surface as inline code.
+    page.goto(f"https://example.com/search?q={args['query']}", wait_until="load")
+    return {"title": page.title(), "url": page.url}
+```
+
+Only `ARGS` and `run` are required; the rest is metadata `list-tasks` ranks and displays. The runtime imports the file, injects `page` / `context` / `snapshot` lazily (a task that never touches them opens no browser), validates the call against `ARGS`, then calls `run(args, ctx)`. Define `OUTPUT_SCHEMA` and the return shape is validated too. `ctx.memory` is the parsed frontmatter of that site's `memory.md`, so a task can read the selectors you recorded with `remember()`.
+
+Keep the two halves in sync. The note you write with `remember()` is what makes a task cheap to repair when the site changes, and `LAST_VERIFIED` is what tells the next agent whether to trust it. Set `BROKEN_SINCE = "<ISO date>"` instead of deleting a task you found broken and could not fix.
 
 ## Non-browser Helpers
 
