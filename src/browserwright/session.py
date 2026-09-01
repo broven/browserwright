@@ -98,13 +98,18 @@ class Session:
             return self._cdp
 
     def _unreachable(self, url: str, cause: BaseException) -> DaemonUnavailable:
-        from .daemon_url import daemon_endpoint, unreachable_message
+        from .daemon_url import (daemon_endpoint, local_unreachable_fix,
+                                 unreachable_message)
 
         endpoint = daemon_endpoint()
         if endpoint.explicit:
             return DaemonUnavailable(f"{unreachable_message(endpoint)} ({cause})")
+        # BUG A: the class default fix ("start the daemon") is actively
+        # misleading here — the daemon is usually running, just bound to a host
+        # this client did not resolve. Diagnose the divergence instead.
         return DaemonUnavailable(
-            f"no browserwright daemon answered at {url}: {cause}")
+            f"no browserwright daemon answered at {url}: {cause}",
+            fix=local_unreachable_fix(endpoint))
 
     def _resolve_ws_url(self) -> str:
         """Ask the underlying daemon client for a CDP ws URL.

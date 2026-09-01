@@ -476,6 +476,14 @@ def end(record: dict) -> str:
             f"kept for retry.{hint}")
     if record.get("owner") == "create":
         msg = f"session {sid} ended; the browser it launched was closed."
+    elif record.get("backend") == "extension":
+        # BUG B: the `attach` wording below is a cdp story — it claims nothing
+        # in the browser was touched, while the daemon has just closed every
+        # tab in this session's tab group. Reporting "left untouched" for a
+        # teardown that closes tabs is how a leaked tab and a torn-down one
+        # became indistinguishable to the user.
+        msg = (f"session {sid} ended; its tab group was closed. Your Chrome "
+               f"is still running — only this session's tabs were touched.")
     else:
         msg = (f"session {sid} ended. The browser is still running — you "
                f"attached to it, so it was left untouched.")

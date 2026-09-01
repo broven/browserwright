@@ -972,7 +972,12 @@ def test_session_create_end_extension_passes_no_group_id(tmp_bs_home, monkeypatc
     assert calls == [
         ["browserwright-daemon", "end-session", "--session", sid],
     ]
+    # The browser survives, but the session's TABS do not — say both. The old
+    # text reused the cdp-attach line ("left untouched"), which described a
+    # teardown that had not happened (BUG B).
     assert "still running" in message
+    assert "tab group was closed" in message
+    assert "left untouched" not in message
     assert reg.get(sid) is None
 
 

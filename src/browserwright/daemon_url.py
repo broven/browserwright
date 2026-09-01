@@ -244,6 +244,54 @@ _SOURCE_LABEL = {
 }
 
 
+def local_unreachable_fix(ep: DaemonEndpoint) -> str:
+    """The `fix` for "nothing answered" on a NON-explicitly-configured endpoint.
+
+    The class default — "start the single global daemon: `browserwright-daemon
+    serve`" — is a dead end whenever the daemon is already running, which is
+    the common case here: the daemon bound a *specific* non-loopback host
+    (`--facade-host <tailnet-ip>`) and this client resolved something else. So
+    name the real divergence instead of guessing.
+    """
+    published = _from_state_file()
+    normalized = _normalize(published) if published else None
+
+    if ep.source == "default" and normalized and normalized != ep.url:
+        return (
+            f"a daemon published {normalized} in its endpoint state file, but "
+            f"this client resolved the built-in default {ep.url} — they "
+            f"disagree. Point the client at it (`export {ENV_VAR}="
+            f"{normalized}`), or rebind the daemon so loopback is served too "
+            "(`browserwright-daemon install --facade-host 0.0.0.0` then "
+            "`browserwright-daemon restart`)."
+        )
+    if ep.source == "state_file":
+        host_note = ""
+        if not ep.is_loopback:
+            host_note = (
+                f" That endpoint is bound to the non-loopback host "
+                f"{ep.host}, so it is only reachable over that interface — if "
+                "it is down (VPN/tailnet off), nothing local can reach the "
+                "daemon."
+            )
+        return (
+            f"the running daemon published {ep.url} but nothing answered "
+            f"there.{host_note} Check it with `browserwright-daemon status` "
+            "and `lsof -nP -iTCP:"
+            f"{ep.port} -sTCP:LISTEN`, then `browserwright-daemon restart`. "
+            "If the daemon is up, the state file is stale."
+        )
+    return (
+        f"nothing is listening on the default endpoint {ep.url}. Check "
+        f"`browserwright-daemon status`; if a daemon IS running it is bound "
+        "elsewhere (see `--facade-host`) — point this client at it with "
+        f"${ENV_VAR}. Otherwise start one: `browserwright-daemon serve`. "
+        f"Note `lsof -nP -iTCP:{ep.port} -sTCP:LISTEN` shows a foreign holder "
+        "of the port (a proxy such as Surge can answer HTTP on it without a "
+        "daemon behind it)."
+    )
+
+
 def not_ours_to_signal_message(ep: DaemonEndpoint, action: str) -> str:
     """Why a local signal-based ``action`` is refused for a remote endpoint."""
     return (

@@ -32,13 +32,45 @@ there is no loop conflict with Playwright's sync driver.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 from ..errors import BrowserwrightError, PageBindTimeout
 
-_PAGE_BIND_TIMEOUT_S = 2.0
+logger = logging.getLogger(__name__)
+
+
+def _page_bind_timeout_s() -> float:
+    """How long to wait for Playwright to expose the agent-resolved tab.
+
+    BUG B: this was a hardcoded 2.0s, which is shorter than an extension MV3
+    service worker takes to wake up. When the SW is cold — or has just
+    reconnected to the relay, which happens routinely between commands — the
+    daemon's announce lands well after the budget, the bind fails, and the
+    caller is told to retry a command whose only real problem was being asked
+    too early. A wait measured in seconds costs nothing on the happy path (the
+    announce normally lands in milliseconds and the loop returns immediately),
+    while the old budget turned a slow wake-up into a hard failure.
+
+    Override with ``BW_PAGE_BIND_TIMEOUT`` (seconds) for a very slow machine.
+    """
+    import os
+
+    raw = (os.environ.get("BW_PAGE_BIND_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return _PAGE_BIND_TIMEOUT_S
+
+
+#: The bind budget when nothing overrides it. Tests monkeypatch this name.
+_PAGE_BIND_TIMEOUT_S = 10.0
 _PAGE_BIND_POLL_INTERVAL_S = 0.05
 
 
@@ -250,14 +282,18 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     # Resolve/create + persist the session's current tab via the agent path.
     info = resolve_current_target(sess)
     target_id = info.get("targetId") if isinstance(info, dict) else None
+    # Did THIS call open the tab? Only step 4 of `resolve_current_target` sets
+    # it, so a reused tab is never mistaken for one we may discard.
+    we_opened_it = bool(info.get("opened")) if isinstance(info, dict) else False
 
+    budget = _page_bind_timeout_s()
     if target_id:
         page = _wait_for_target_page(
             context,
             sess,
             target_id,
             info.get("url"),
-            timeout=_PAGE_BIND_TIMEOUT_S,
+            timeout=budget,
         )
         if page is not None:
             return patch_page_goto(page)
@@ -267,10 +303,48 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     # second target merely because the facade has not exposed the first one to
     # Playwright yet: that splits the ledger and Playwright views and is the
     # source of duplicate user-visible tabs.
+    #
+    # BUG B: a tab THIS call opened and then failed to bind has no owner —
+    # `PageBindTimeout` is advertised as retryable, so the caller retries,
+    # `resolve_current_target` finds no usable tab again and opens another.
+    # Whether the previous one survives depends on `session end` later finding
+    # it in the session's tab group, which is precisely what is unreliable when
+    # the announce failed. No user-visible leak has been observed; this closes
+    # the window rather than fixing a confirmed one. Roll our own creation back
+    # before raising.
+    if we_opened_it and target_id:
+        _discard_unbindable_tab(sess, target_id)
     raise PageBindTimeout(
         target_id=target_id or "",
-        timeout=_PAGE_BIND_TIMEOUT_S,
+        timeout=budget,
     )
+
+
+def _discard_unbindable_tab(sess: Any, target_id: str) -> None:
+    """Close a tab we opened but could not bind, and clear its ledger binding.
+
+    Strictly best-effort: the bind already failed, and a failure to clean up
+    must not replace ``PageBindTimeout`` (which names the real problem) with a
+    teardown error. Worst case we are back to the old leak.
+
+    Clearing the durable binding matters as much as closing the tab: leaving
+    the ledger pointed at a tab that is gone makes the NEXT call take the
+    recovery path against a dead target instead of opening a clean one.
+    """
+    from ..session_runtime import close_session_tab, persist_target
+
+    try:
+        close_session_tab(sess, target_id=target_id)
+    except Exception:  # noqa: BLE001 - see docstring: never mask the bind error
+        logger.warning("could not close unbindable tab %s", target_id,
+                       exc_info=True)
+    try:
+        if getattr(sess, "current_target_id", None) == target_id:
+            sess.current_target_id = None
+        persist_target(None, sess=sess)
+    except Exception:  # noqa: BLE001 - best-effort
+        logger.warning("could not clear binding for unbindable tab %s",
+                       target_id, exc_info=True)
 
 
 def _wait_for_target_page(

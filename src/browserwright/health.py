@@ -183,6 +183,17 @@ def doctor_checks() -> dict:
                 "field)",
                 "update browserwright-daemon to match browserwright")
 
+    # 3b. endpoint_reachable — can a LOCAL client actually dial the endpoint?
+    #     BUG A: check 3 above only *reports* the advertised address, so a
+    #     daemon bound to a specific non-loopback host (`--facade-host
+    #     <tailnet-ip>`) read as a clean bill of health while every local
+    #     client failed with ECONNREFUSED on 127.0.0.1. Doctor has to dial, not
+    #     echo — a health check that cannot observe the reported failure is the
+    #     gap, not a passing check.
+    if not synthetic and info.get("alive") is not False:
+        for check in _endpoint_reachability_checks():
+            add(**check)
+
     # 4. schema version sanity (catches a daemon too old to speak the blob)
     sv = info.get("schema_version")
     if not synthetic:
@@ -299,3 +310,73 @@ def doctor_checks() -> dict:
         "checks": checks,
         "raw": info,
     }
+
+
+def _probe_tcp(host: str, port: int, *, timeout: float = 1.5) -> str | None:
+    """``None`` when a TCP connect succeeds, else a short reason."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return None
+    except OSError as e:
+        return e.strerror or str(e)
+
+
+def _endpoint_reachability_checks() -> list[dict]:
+    """Dial the resolved endpoint AND loopback; report the divergence.
+
+    Two distinct failures hide behind "the daemon is running":
+      - the endpoint the client resolves answers nothing at all;
+      - it answers, but loopback (what every client falls back to when the
+        endpoint state file is not visible) does not.
+    The second is BUG A, and it is invisible unless you actually connect.
+    """
+    from .daemon_url import daemon_endpoint
+
+    try:
+        ep = daemon_endpoint()
+    except Exception:  # noqa: BLE001 - doctor must never raise
+        return []
+
+    resolved_err = _probe_tcp(ep.host, ep.port)
+    if resolved_err is not None:
+        return [{
+            "name": "endpoint_reachable",
+            "status": "fail",
+            "message": (f"nothing answered at {ep.host}:{ep.port} "
+                        f"(the endpoint resolved from {ep.source})"),
+            "fix": ("check `browserwright-daemon status` and `lsof -nP -iTCP:"
+                    f"{ep.port} -sTCP:LISTEN`, then `browserwright-daemon "
+                    "restart`"),
+        }]
+
+    if ep.is_loopback:
+        return [{
+            "name": "endpoint_reachable",
+            "status": "pass",
+            "message": f"endpoint answers at {ep.host}:{ep.port}",
+            "fix": "",
+        }]
+
+    loopback_err = _probe_tcp("127.0.0.1", ep.port)
+    if loopback_err is None:
+        return [{
+            "name": "endpoint_reachable",
+            "status": "pass",
+            "message": (f"endpoint answers at {ep.host}:{ep.port} and on "
+                        "127.0.0.1"),
+            "fix": "",
+        }]
+    return [{
+        "name": "endpoint_reachable",
+        "status": "fail",
+        "message": (f"the daemon answers at {ep.host}:{ep.port} but NOT on "
+                    f"127.0.0.1:{ep.port} ({loopback_err}) — any local client "
+                    "that cannot read the endpoint state file will fail to "
+                    "connect"),
+        "fix": ("rebind so loopback is served too: `browserwright-daemon "
+                "install --facade-host 0.0.0.0` then `browserwright-daemon "
+                "restart`; or point clients at it with "
+                f"`export BW_DAEMON_URL=http://{ep.host}:{ep.port}`"),
+    }]
