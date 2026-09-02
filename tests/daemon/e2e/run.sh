@@ -91,6 +91,26 @@ if [ "$has_path" -eq 0 ]; then
   set -- tests/daemon/e2e/ "$@"
 fi
 
+# ADR-0012 rule 4: an e2e run must not measurably slow a production session.
+# The ports are isolated, the CPU is not — on 2026-09-02 a run with 20
+# executors + 31 children starved a production executor's cold start. So ask
+# the MACHINE-GLOBAL daemon (the one on PATH, not this worktree's) whether
+# anyone is mid-task, with the same gate `restart` uses, and refuse while
+# they are. `E2E_FORCE=1` overrides for a human who has decided otherwise.
+if [ "${E2E_FORCE:-}" != "1" ] && command -v browserwright-daemon >/dev/null 2>&1; then
+  if activity=$(env -u XDG_RUNTIME_DIR -u TMPDIR -u BS_HOME -u BW_DAEMON_URL \
+        -u BD_EXTENSION_PORT -u BD_FACADE_PORT -u BD_CDP_PORT \
+        -u BD_FACADE_HOST -u BD_CONFIG \
+        browserwright-daemon activity 2>/dev/null); then
+    :
+  elif [ $? -eq 4 ]; then
+    echo "run.sh: refusing to start e2e — the machine-global daemon is serving live sessions:" >&2
+    echo "$activity" | sed 's/^/    /' >&2
+    echo "run.sh: wait for them to finish, or E2E_FORCE=1 to run anyway (ADR-0012 rule 4)." >&2
+    exit 4
+  fi
+fi
+
 # Test deps live in the `dev` dependency-group (PEP 735), which uv installs by
 # default — no `--extra test` (that extra doesn't exist).
 exec uv run python -m pytest "$@"

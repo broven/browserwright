@@ -422,8 +422,15 @@ def _endpoint_host_port() -> tuple[str, int]:
     return ep.host, ep.port
 
 
-async def ping_status_async(timeout: float = 1.0) -> PongInfo:
+async def ping_status_async(timeout: float = 1.0, *, host: str | None = None,
+                            port: int | None = None) -> PongInfo:
     """Async client-side ping returning a :class:`PongInfo`.
+
+    ``host`` / ``port`` override the resolved endpoint. `serve` passes the
+    port it is about to bind (ADR-0012 rule 6): what "already running" must
+    mean is "someone holds MY port", not "someone answers the address this
+    shell happens to resolve" — the latter made an isolated dev daemon defer
+    to the machine-global one and, worse, made `stop` reach it.
 
     ``pid`` is None when the endpoint is not a live daemon (refused / wrong /
     no response). ``version`` is the daemon's advertised package version, or
@@ -433,7 +440,10 @@ async def ping_status_async(timeout: float = 1.0) -> PongInfo:
     this endpoint (=> refuse to start a second copy).
     """
     none = NO_PONG
-    host, port = _endpoint_host_port()
+    if host is None or port is None:
+        rhost, rport = _endpoint_host_port()
+        host = rhost if host is None else host
+        port = rport if port is None else port
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=timeout)
@@ -483,8 +493,10 @@ async def ping_async(timeout: float = 1.0) -> int | None:
     return (await ping_status_async(timeout=timeout)).pid
 
 
-def ping_status_sync(timeout: float = 1.0) -> PongInfo:
+def ping_status_sync(timeout: float = 1.0, *, host: str | None = None,
+                     port: int | None = None) -> PongInfo:
     """Synchronous probe. Returns :data:`NO_PONG` when nothing answers.
+    ``host`` / ``port`` override the resolved endpoint (see the async twin).
 
     Deliberately implemented with a BLOCKING socket rather than
     ``asyncio.run(ping_status_async(...))``: callers include the Playwright
@@ -494,7 +506,10 @@ def ping_status_sync(timeout: float = 1.0) -> PongInfo:
     exact silent-failure shape this module is being cured of. The pong is plain
     HTTP precisely so it can be spoken without a loop.
     """
-    host, port = _endpoint_host_port()
+    if host is None or port is None:
+        rhost, rport = _endpoint_host_port()
+        host = rhost if host is None else host
+        port = rport if port is None else port
     deadline = time.monotonic() + timeout
     try:
         sock = socket.create_connection((host, port), timeout=timeout)

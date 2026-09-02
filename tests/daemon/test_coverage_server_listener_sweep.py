@@ -113,7 +113,7 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     monkeypatch.setattr(
         listener_mod._ipc,
         "ping_status_async",
-        lambda timeout: asyncio.sleep(
+        lambda timeout, **kw: asyncio.sleep(
             0, result=_ipc.PongInfo(pid=999, version=listener_mod.__version__)),
     )
     assert await listener_mod.run_serve(Config(backend="env")) == 1
@@ -145,7 +145,7 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     monkeypatch.setattr(
         listener_mod._ipc,
         "ping_status_async",
-        lambda timeout: asyncio.sleep(0, result=_ipc.NO_PONG),
+        lambda timeout, **kw: asyncio.sleep(0, result=_ipc.NO_PONG),
     )
     monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: cleanup_calls.append("cleanup"))
     monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: cleanup_calls.append(f"pid:{pid}"))
@@ -182,7 +182,7 @@ async def test_run_serve_endpoint_bind_failure_is_fatal(monkeypatch, capsys):
     """
     monkeypatch.setattr(
         listener_mod._ipc, "ping_status_async",
-        lambda timeout: asyncio.sleep(0, result=_ipc.NO_PONG))
+        lambda timeout, **kw: asyncio.sleep(0, result=_ipc.NO_PONG))
     monkeypatch.setattr(listener_mod._ipc, "cleanup_endpoint", lambda: None)
     monkeypatch.setattr(listener_mod._ipc, "write_pid", lambda pid: None)
     monkeypatch.setattr(listener_mod, "_cleanup_orphan_cdp_chrome", lambda: None)

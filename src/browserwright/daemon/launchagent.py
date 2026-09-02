@@ -194,6 +194,25 @@ def install(*, extension_port: int | None,
     if path.exists() and not force:
         raise LaunchAgentError(
             f"{path} already exists. Use --force to replace.", 1)
+    carried: dict = {}
+    # `--facade-host ""` is the explicit way back to loopback-only: an empty
+    # host means "no host argument" and is NOT carried forward from the
+    # previous plist.
+    reset_host = facade_host is not None and str(facade_host).strip() == ""
+    if reset_host:
+        facade_host = None
+    if path.exists():
+        # No flag given → keep what the installed plist says (rule 3).
+        previous = plist_serve_args(path)
+        if extension_port is None and "extension_port" in previous:
+            extension_port = previous["extension_port"]
+            carried["extension_port"] = extension_port
+        if facade_host is None and not reset_host and "facade_host" in previous:
+            facade_host = previous["facade_host"]
+            carried["facade_host"] = facade_host
+        if facade_port is None and "facade_port" in previous:
+            facade_port = previous["facade_port"]
+            carried["facade_port"] = facade_port
     path.parent.mkdir(parents=True, exist_ok=True)
     os.makedirs(os.path.expanduser(LOG_DIR), exist_ok=True)
     content = build_plist(extension_port=extension_port,
@@ -222,6 +241,8 @@ def install(*, extension_port: int | None,
         "facade_host": facade_host,
         "facade_port": facade_port,
     }
+    if carried:
+        payload["carried_from_previous_plist"] = carried
     if unload_err.strip():
         payload["unload_warning"] = unload_err.strip()
     return payload
@@ -316,6 +337,34 @@ def plist_program(path: Path) -> str | None:
     if isinstance(args, list) and args and isinstance(args[0], str):
         return args[0]
     return None
+
+
+def plist_serve_args(path: Path) -> dict:
+    """The ``--extension-port`` / ``--facade-host`` / ``--facade-port`` values
+    an installed plist passes to ``serve``. Missing keys are absent; an
+    unreadable plist yields ``{}``.
+
+    ADR-0012 rule 3: the plist is generated, never hand-edited — so a
+    regeneration (`install --force` with no flags) must carry these forward,
+    or the tailnet bind that remote use depends on silently disappears.
+    """
+    import plistlib
+
+    try:
+        data = plistlib.loads(path.read_bytes())
+        args = list(data["ProgramArguments"])
+    except Exception:  # noqa: BLE001 — a damaged plist yields no defaults
+        return {}
+    out: dict = {}
+    names = {"--extension-port": "extension_port",
+             "--facade-port": "facade_port",
+             "--facade-host": "facade_host"}
+    for i, a in enumerate(args):
+        key = names.get(str(a))
+        if key and i + 1 < len(args):
+            raw = str(args[i + 1])
+            out[key] = int(raw) if key != "facade_host" and raw.isdigit() else raw
+    return out
 
 
 def expected_version(path: Path, fallback: str) -> str:
