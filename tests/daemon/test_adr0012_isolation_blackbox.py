@@ -221,6 +221,8 @@ def test_upgrade_global_rechecks_activity_before_same_version_extension_reload(
     global_bin = home / ".local" / "bin"
     calls = tmp_path / "calls.log"
     activity_count = tmp_path / "activity-count"
+    canonical_tmp = tmp_path / "canonical-global-tmp"
+    canonical_tmp.mkdir()
     home.mkdir()
 
     _executable(
@@ -258,7 +260,10 @@ esac
         f"#!/bin/sh\nprintf 'uv %s\\n' \"$*\" >> {calls!s}\nexit 0\n",
     )
     _executable(fake_path / "uname", "#!/bin/sh\necho Linux\n")
-    _executable(fake_path / "getconf", "#!/bin/sh\necho /global/tmp/\n")
+    _executable(
+        fake_path / "getconf",
+        f"#!/bin/sh\necho {canonical_tmp!s}/\n",
+    )
     script = _upgrade_global_script(fake_repo).replace(
         "ext_changed=0", "ext_changed=1", 1)
 
@@ -353,6 +358,15 @@ exit 99
         fake_path / "getconf",
         "#!/bin/sh\n[ \"$1\" = DARWIN_USER_TEMP_DIR ] || exit 2\n"
         f"echo {canonical_tmp!s}/\n",
+    )
+    # Keep this black-box test focused on orchestration.  The production task
+    # uses Python for JSON projection and a bounded relay-reconnect poll; a
+    # deterministic stand-in avoids turning that intentional 20-second poll
+    # into the subprocess test's own 20-second timeout on Linux CI.
+    _executable(
+        fake_path / "python3",
+        f"#!/bin/sh\ncat >/dev/null\n"
+        f"case \"${{2-}}\" in *version*) echo {running_version} ;; esac\n",
     )
     home.mkdir(exist_ok=True)
     polluted = {
