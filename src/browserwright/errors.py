@@ -33,9 +33,22 @@ class PageLoadFailed(BrowserwrightError):
         "check the URL and network with http_get(url)"
     )
 
-    def __init__(self, url: str = "", reason: str = "", fix: str = ""):
-        self.url, self.reason = url, reason
-        super().__init__(f"page load failed: {url} ({reason})", fix=fix)
+    def __init__(
+        self,
+        url: str = "",
+        reason: str = "",
+        fix: str = "",
+        detail: str = "",
+    ):
+        # `detail` carries the ORIGINAL exception type + message. Without it a
+        # caller only ever sees our own coarse `reason` bucket, which is how a
+        # whole batch of CDP/relay failures once got reported as "network" with
+        # no way left to tell what actually broke. Never drop it.
+        self.url, self.reason, self.detail = url, reason, detail
+        message = f"page load failed: {url} ({reason})"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message, fix=fix)
 
 
 class PageBindTimeout(BrowserwrightError):
