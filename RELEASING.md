@@ -376,28 +376,91 @@ set small.
 
 Generating the OAuth pair (official path, [Web Store API docs](https://developer.chrome.com/docs/webstore/using_webstore_api)):
 
+> Google moved these pages out of *APIs & Services* into **Google Auth
+> Platform**. `console.cloud.google.com/apis/credentials/consent` no longer
+> shows the publishing status; the links below are the current ones.
+
 1. [Google Cloud console](https://console.cloud.google.com) → create/select a
    project → enable the **Chrome Web Store API**.
-2. **OAuth consent screen** → External → fill app info; add your email as a
-   **test user**.
-3. **Credentials** → Create credentials → **OAuth client ID** → app type
-   **Desktop app** → note `client_id` / `client_secret`.
-4. In a browser (logged into the CWS developer account — **2FA must be on**),
-   authorize and grab the code:
+2. [**Audience**](https://console.cloud.google.com/auth/audience) → set
+   **Publishing status** to **In production**. Do this *before* step 4 and do
+   not stop at "Testing with myself as a test user" — see the warning below;
+   that shortcut is what expires the token every 7 days. If the page says the
+   OAuth configuration is incomplete, finish the
+   [**Branding**](https://console.cloud.google.com/auth/branding) page first
+   (app name, support email, developer contact) — `Publish app` stays disabled
+   until it is complete.
+3. [**Clients**](https://console.cloud.google.com/auth/clients) → Create client
+   → app type **Desktop app** → note `client_id` / `client_secret`.
+4. Authorize in a browser logged into the CWS developer account (**2FA must be
+   on**). The old `urn:ietf:wg:oauth:2.0:oob` flow is **discontinued** — use a
+   loopback redirect and let something listen on that port:
 
+   ```bash
+   PORT=8765
+   open "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&scope=https://www.googleapis.com/auth/chromewebstore&access_type=offline&prompt=consent&client_id=$CLIENT_ID&redirect_uri=http://localhost:$PORT"
    ```
-   https://accounts.google.com/o/oauth2/auth?response_type=code&scope=https://www.googleapis.com/auth/chromewebstore&client_id=$CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob
-   ```
+
+   `access_type=offline` and `prompt=consent` are both required: without them
+   the response carries an access token but **no** `refresh_token`. A Desktop
+   client accepts any loopback port with no allow-listing.
+
+   The browser lands on `http://localhost:$PORT/?code=…`. If nothing is
+   listening it shows a connection error — the code is still in the address
+   bar, but Chrome rewrites the tab's URL to `chrome-error://chromewebdata/`,
+   so anything reading the URL programmatically loses it. Have a listener
+   running before you click.
 
 5. Exchange the code for a refresh token:
 
    ```bash
    curl "https://oauth2.googleapis.com/token" -d \
-     "client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code=$CODE&grant_type=authorization_code&redirect_uri=urn:ietf:wg:oauth:2.0:oob"
+     "client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code=$CODE&grant_type=authorization_code&redirect_uri=http://localhost:$PORT"
    ```
 
-   Store the `refresh_token` from the response as `CWS_REFRESH_TOKEN`. It
-   authorizes store publishes until revoked.
+   Store the `refresh_token` from the response as `CWS_REFRESH_TOKEN`.
+
+### When the store publish fails with `invalid_grant`
+
+```
+CWS token exchange failed: error='invalid_grant'
+                     description='Token has been expired or revoked.'
+```
+
+The refresh token is dead. **The usual cause is the OAuth app sitting in
+`Testing`**: Google expires those refresh tokens after **7 days**, no matter
+how recently they were used. v0.17.2 failed exactly 7 days after the v0.17.0
+release that last used the token.
+
+Check [Audience](https://console.cloud.google.com/auth/audience) → **Publishing
+status**. If it says `Testing`, hit **Publish app** to move it to
+`In production`, *then* regenerate — a token minted while still in Testing is
+another 7-day token. In production the refresh token lasts until it is revoked,
+the client secret is rotated, or it goes 6 months unused.
+
+Then redo steps 4-5 above and update the `CWS_REFRESH_TOKEN` secret. Do **not**
+cut a new tag to retry the publish — see below.
+
+### Retrying a failed store publish without cutting a tag
+
+`publish-cws` skips itself when `chrome-extension/` is unchanged between the
+two most recent tags. That check compares *tags to each other*, not to what the
+store actually has, so **one failed publish makes every later release skip too**
+— quietly, with a green build, leaving the store pinned to the last version
+that got through.
+
+Retry the exact tag instead:
+
+```bash
+gh workflow run release.yml -f cws_tag=v0.17.2
+```
+
+This runs `publish-cws` alone. `publish-pypi`, `publish-extension` and
+`publish-npm` are guarded to `push` events and cannot fire from a dispatch, so
+there is no risk of republishing a release. The dispatch checks out the named
+tag, rejects a pre-release or a tag that does not exist, and forces the
+unchanged-extension gate open — publishing an "unchanged" extension is the
+whole point when the previous attempt never landed.
 
 ### Store & pre-releases
 
