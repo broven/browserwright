@@ -154,9 +154,16 @@ def test_fix_names_the_divergence_instead_of_saying_start_the_daemon(
     (tmp_path / "browserwright-daemon.endpoint").write_text(
         json.dumps({"url": "http://100.72.20.32:19990", "pid": 31305}))
 
-    from browserwright.daemon_url import local_unreachable_fix
+    import browserwright.daemon_url as du
+    from browserwright.daemon._ipc import EndpointProbe
 
-    fix = local_unreachable_fix(
+    # The daemon really was up on the tailnet address in the report; the
+    # diagnosis probes it and finds it (ADR-0013 rule 3).
+    monkeypatch.setattr(du, "probe", lambda host, port, timeout=1.5: EndpointProbe(
+        kind="ours" if host == "100.72.20.32" else "refused",
+        host=host, port=port, pid=31305, version="0.17.1"))
+
+    fix = du.local_unreachable_fix(
         _endpoint("http://127.0.0.1:19990", "default"))
     assert "browserwright-daemon serve" not in fix
     assert "100.72.20.32:19990" in fix
@@ -174,24 +181,52 @@ def test_fix_for_a_stale_non_loopback_state_file_explains_the_interface(
 
     fix = local_unreachable_fix(
         _endpoint("http://100.72.20.32:19990", "state_file"))
-    assert "non-loopback" in fix
-    assert "100.72.20.32" in fix
-    assert "restart" in fix
+    # ADR-0013 rule 3: the text reports what the probes found (nothing at
+    # the published address, nothing on loopback) and points at doctor /
+    # the log — it never tells an agent to restart a daemon it could not
+    # even reach.
+    assert "100.72.20.32:19990" in fix
+    assert "nothing is listening" in fix
+    assert "restart" not in fix
+    assert "browserwright doctor" in fix
 
 
-def test_fix_with_no_daemon_at_all_still_tells_you_to_start_one(
+def test_fix_with_no_daemon_at_all_points_at_the_on_demand_start(
         monkeypatch, tmp_path):
-    """No state file, nothing running: `serve` IS the right answer again."""
+    """No state file, nothing running: the default endpoint starts a daemon
+    on demand, so the fix explains why that did not happen (doctor, logs)
+    rather than telling the agent to `serve` one (ADR-0013 rule 3)."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
 
     from browserwright.daemon_url import local_unreachable_fix
 
     fix = local_unreachable_fix(
         _endpoint("http://127.0.0.1:19990", "default"))
-    assert "browserwright-daemon serve" in fix
-    # ...and it warns about the port-squatting proxy that produced the
-    # confusing 503 in the original report.
+    assert "browserwright-daemon serve" not in fix
+    assert "on demand" in fix
+    assert "browserwright-daemon logs" in fix
+
+
+def test_fix_names_a_foreign_responder_on_the_port(monkeypatch, tmp_path):
+    """The 2026-09-01 shape: a proxy (Surge) answered 503 on 127.0.0.1:19990.
+    The old text said "nothing answered … then restart"; the agent restarted
+    a healthy daemon. Now the probe's HTTP status and Server header are in
+    the message and the next step is to find the squatter, not restart."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    import browserwright.daemon_url as du
+    from browserwright.daemon._ipc import EndpointProbe
+
+    monkeypatch.setattr(du, "probe", lambda host, port, timeout=1.5: EndpointProbe(
+        kind="foreign", host=host, port=port,
+        status_line="HTTP/1.1 503 Service Unavailable", server="Surge/5.0"))
+
+    fix = du.local_unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
+    assert "something other than browserwright" in fix
+    assert "503" in fix
+    assert "Surge/5.0" in fix
     assert "lsof" in fix
+    assert "restart" not in fix
+    assert "serve" not in fix
 
 
 def test_session_unreachable_carries_the_actionable_fix(monkeypatch, tmp_path):

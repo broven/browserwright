@@ -15,26 +15,7 @@ browserwright-daemon version check
 browserwright-daemon status --json
 ```
 
-If `version check` reports an extension mismatch after installing the matching package:
-
-1. Diagnose first, restart second. Run `browserwright doctor` and
-   `browserwright-daemon status --json` to see what is actually mismatched;
-   the extension may already be current.
-2. Restart the daemon only when the daemon itself is stale: with a LaunchAgent
-   daemon use `browserwright-daemon restart` (it refuses while sessions are
-   active — end or `session reset` them first), or for a foreground daemon
-   `browserwright-daemon stop` followed by the normal `serve` command.
-3. Only if the EXTENSION is stale do you reload it, and only with your eyes
-   open: `browserwright-daemon extension reload` destroys the extension's
-   service worker, and Chrome does not always restart it. The command now
-   verifies the SW comes back and fails loudly if it does not. If it fails,
-   open `chrome://extensions`, click reload on the browserwright extension, or
-   restart the browser, then re-run `browserwright doctor`.
-
-Never reach for `restart --force` as an agent: it kills every session's live
-executor state (`page`/`context`/variables) and the refusal message tells you
-which sessions to end or reset first. `--force` exists only for the
-maintainer's `upgrade-global` tooling.
+If `version check` reports an extension mismatch after installing the matching package, run `browserwright doctor` and `browserwright-daemon status --json` to see what is actually mismatched; the extension may already be current. A stale *daemon* is replaced automatically by the next command against the default endpoint. A stale *extension* is the one case that needs a reload, and `browserwright-daemon extension reload` is guarded: it destroys the extension's service worker, Chrome does not always restart it, and the command verifies the worker comes back and fails loudly if it does not. If it fails, ask the user to reload the extension at `chrome://extensions` or restart the browser, then re-run `browserwright doctor`.
 
 **Store-installed extensions differ:** the Chrome Web Store build auto-updates and `chrome.runtime.reload()` cannot change its version, so the daemon skips its drift-driven reload request for store installs (it reports `install_source=store` in status/doctor). A store extension behind the daemon resolves itself when a matching version is published to the store; until then `doctor` shows a cosmetic version-mismatch warning, and sessions still work.
 
@@ -54,6 +35,17 @@ browserwright session end --session=$sid
 ```
 
 Use `--backend=extension` for the user's daily Chrome. Use `--backend=cdp --create` for an isolated Chrome that the daemon owns. Use `--backend=cdp --attach=<port|url>` to bind to a browser someone else owns — a local port, or a `ws://`/`wss://`/`http://` endpoint for an anti-detect, fingerprint or cloud profile; ending the session never closes it. Each attached session carries its own endpoint, so one daemon can drive many external browsers at once.
+
+## When A Call Fails
+
+There is one recovery path, and it starts with reading, not restarting:
+
+1. **Read the error's `fix` line.** Every browserwright error carries one, and since ADR-0013 it is a diagnosis, not a guess: an unreachable endpoint tells you whether nothing is listening, another program answered on the port, or the daemon is on a different address.
+2. **`browserwright doctor`** when the fix line is not enough. It probes the daemon, the endpoint, and the extension, and names the layer that is down.
+3. **`browserwright session reset <id>`** when doctor is green but the session's tab or executor is gone. It recycles only that session's executor; tabs, the tab group, and the ledger row stay. `browserwright session attach-active` adopts the tab the user is looking at instead.
+4. **Report** if the same error survives one reset. Do not keep retrying.
+
+Never do these as an agent: `browserwright-daemon restart` or `restart --force` (it severs every other agent's live session on this machine, and a client that could not connect has no evidence the daemon is at fault), `browserwright-daemon serve` (a launchd-managed daemon is already running; a second copy exits "already running"), or `session new` to escape an error (a new session opens a new tab against the same broken layer, and the ledger grew to 640 sessions that way once). Restarting the daemon is a human's call, made after reading `browserwright-daemon logs`.
 
 ### Adopting the page the user is looking at
 

@@ -30,7 +30,7 @@ Usage:
   browserwright -s <session-id> [--env NAME ...] -f script.py
   browserwright -s <session-id> [--env NAME ...] --code-stdin < script.py
 
-  browserwright session new --backend=<extension|cdp|env> --name=SESSION_LABEL [--create | --attach=PORT]
+  browserwright session new --backend=<extension|cdp> --name=SESSION_LABEL [--reuse] [--create | --attach=PORT]
   browserwright session reset <id>
   browserwright session end --session=ID
   browserwright session attach-active [--session=ID | -s ID] [--json]
@@ -756,7 +756,7 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
                       file=sys.stderr)
                 return 1
             print("usage: browserwright session new --backend=<extension|cdp> "
-                  "--name=SESSION_LABEL [--create | --attach=<port|url>]",
+                  "--name=SESSION_LABEL [--reuse] [--create | --attach=<port|url>]",
                   file=sys.stderr)
             print("--name is a short task-specific session label. Extension sessions "
                   "use it as the Chrome tab group title; cdp sessions use it only to "
@@ -769,11 +769,16 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
             sid = session_create.new(
                 backend=backend, create=bool(kw.get("create")),
                 attach=kw.get("attach"), name=kw.get("name"),
+                reuse=bool(kw.get("reuse")),
             )
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return 1
-        print(f"OK: session {sid} created", file=sys.stderr)
+        if session_create.last_new_reused == sid:
+            print(f"OK: reusing session {sid} (--reuse matched an existing "
+                  f"{backend} session named {kw.get('name')!r})", file=sys.stderr)
+        else:
+            print(f"OK: session {sid} created", file=sys.stderr)
         print(sid)  # token-frugal: bare id
         return 0
 

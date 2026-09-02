@@ -78,20 +78,74 @@ def _launchagent_installed() -> bool:
     return _LAUNCHAGENT_PLIST.exists()
 
 
-def _daemon_fix(info: dict) -> str:
-    """Recovery action for a down daemon (issue #28).
+def _launchd_state() -> dict:
+    """What launchd knows about the daemon job: ``{state, pid, last_exit}``.
 
-    A half-alive daemon (``port_held_by_unresponsive_process``) always needs
-    ``restart`` to reclaim its ports. Otherwise: ``restart`` when a LaunchAgent
-    is installed (launchd owns the socket), plain ``serve`` when not.
+    Parsed from ``launchctl print``; every field is None when launchd cannot
+    be asked (not macOS, job not loaded). Kept as its own probe so tests pin
+    it without a launchd.
+    """
+    import os
+    import re
+    import subprocess
+
+    out: dict = {"state": None, "pid": None, "last_exit": None}
+    try:
+        res = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/com.browserwright-daemon"],
+            capture_output=True, text=True, timeout=3.0)
+    except (OSError, subprocess.SubprocessError):
+        return out
+    if res.returncode != 0:
+        return out
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if m := re.match(r"state = (\w+)", line):
+            out["state"] = out["state"] or m.group(1)
+        elif m := re.match(r"pid = (\d+)", line):
+            out["pid"] = int(m.group(1))
+        elif m := re.match(r"last exit code = (.+)", line):
+            out["last_exit"] = m.group(1).strip()
+    return out
+
+
+def _daemon_fix(info: dict) -> str:
+    """Recovery action for a down daemon (issue #28, reworked for ADR-0013).
+
+    No branch tells an agent to restart or serve the daemon: a client that
+    only knows "not running" has no evidence a restart is the right move, and
+    the default endpoint's on-demand spawn (plus the stale-port reclaim it
+    runs first, issue #15) is the sanctioned start path. What doctor CAN do
+    is say who is responsible for the process and where its last words are.
     """
     from .daemon.probe import PORT_HELD
 
     if info.get("probe_state") == PORT_HELD:
-        return "reclaim the daemon's ports: `browserwright-daemon restart`"
+        return (
+            "the daemon's ports are held by a process that does not answer; "
+            "the next on-demand start reclaims ports from a stale browserwright "
+            "daemon by itself (issue #15). Re-run `browserwright doctor` in a "
+            "few seconds; if it is still held, `lsof -nP -iTCP:19990 "
+            "-sTCP:LISTEN` names the holder"
+        )
     if _launchagent_installed():
-        return "restart the LaunchAgent daemon: `browserwright-daemon restart`"
-    return "start the daemon: `browserwright-daemon serve`"
+        st = _launchd_state()
+        detail = ", ".join(
+            f"{k}={v}" for k, v in (("state", st.get("state")),
+                                    ("pid", st.get("pid")),
+                                    ("last exit", st.get("last_exit")))
+            if v is not None)
+        return (
+            "launchd manages the daemon (LaunchAgent installed"
+            + (f": {detail}" if detail else "") + ") and respawns it on its "
+            "own; read `browserwright-daemon logs` for why the last start "
+            "exited before assuming it is stuck"
+        )
+    return (
+        "no LaunchAgent is installed, so nothing keeps the daemon up; "
+        "`browserwright install` sets one up, and the default endpoint "
+        "starts a daemon on demand for the next command"
+    )
 
 
 def doctor_checks() -> dict:
@@ -127,8 +181,8 @@ def doctor_checks() -> dict:
             "daemon_cli",
             "fail",
             info.get("error") or "browserwright-daemon did not respond",
-            "install/start the daemon: ensure `browserwright-daemon` is on PATH "
-            "then `browserwright-daemon serve`",
+            "`browserwright-daemon` is not on PATH or did not answer; "
+            "`browserwright install` puts both binaries in place",
         )
     else:
         add("daemon_cli", "pass", "browserwright-daemon CLI answered doctor", "")
@@ -173,7 +227,9 @@ def doctor_checks() -> dict:
                 "cdp_surface",
                 "fail",
                 "the daemon reports no cdp surface",
-                "restart the daemon (`browserwright-daemon restart`)",
+                "the running daemon is older than the installed package "
+                "(`browserwright version check`); the next command against "
+                "the default endpoint replaces it",
             )
         else:
             # A doctor blob too old to carry it. Can't observe it, so don't
@@ -241,8 +297,8 @@ def doctor_checks() -> dict:
                 "backend",
                 "fail",
                 "daemon reported no backends",
-                "start a backend: load the extension or "
-                "create an cdp session after `browserwright-daemon serve`",
+                "start a backend: load the extension, or create a cdp session "
+                "(`browserwright session new --backend=cdp --create --name=…`)",
             )
 
     # 6. extension/relay specific: if an extension backend exists but is
@@ -341,14 +397,13 @@ def _endpoint_reachability_checks() -> list[dict]:
 
     resolved_err = _probe_tcp(ep.host, ep.port)
     if resolved_err is not None:
+        from .daemon_url import local_unreachable_fix
         return [{
             "name": "endpoint_reachable",
             "status": "fail",
             "message": (f"nothing answered at {ep.host}:{ep.port} "
                         f"(the endpoint resolved from {ep.source})"),
-            "fix": ("check `browserwright-daemon status` and `lsof -nP -iTCP:"
-                    f"{ep.port} -sTCP:LISTEN`, then `browserwright-daemon "
-                    "restart`"),
+            "fix": local_unreachable_fix(ep),
         }]
 
     if ep.is_loopback:
@@ -375,8 +430,9 @@ def _endpoint_reachability_checks() -> list[dict]:
                     f"127.0.0.1:{ep.port} ({loopback_err}) — any local client "
                     "that cannot read the endpoint state file will fail to "
                     "connect"),
-        "fix": ("rebind so loopback is served too: `browserwright-daemon "
-                "install --facade-host 0.0.0.0` then `browserwright-daemon "
-                "restart`; or point clients at it with "
-                f"`export BW_DAEMON_URL=http://{ep.host}:{ep.port}`"),
+        "fix": ("point local clients at it with "
+                f"`export BW_DAEMON_URL=http://{ep.host}:{ep.port}`; the "
+                "durable fix is a LaunchAgent that serves loopback too "
+                "(`browserwright-daemon install --facade-host 0.0.0.0`, a "
+                "maintainer step — it replaces the running daemon)"),
     }]

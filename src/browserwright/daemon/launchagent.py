@@ -478,6 +478,10 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
     want = expected_version(path, __version__)
 
     before = job_state()
+    from . import _ipc
+    _ipc.log_lifecycle(
+        "restart", pid_before=before.get("pid"), forced=bool(force),
+        initiator=_ipc.describe_initiator("restart"))
     stopped = _stop_incumbent(timeout)
 
     launchctl("unload", str(path))

@@ -331,8 +331,10 @@ class ModeBClient:
         if ModeBClient.is_stale_method_error(error):
             return (
                 f"the running daemon doesn't have method {method!r} — it is "
-                f"likely stale (older than the installed code). Restart it with "
-                f"`browserwright-daemon stop && browserwright-daemon serve`."
+                f"likely stale (older than the installed code). The next "
+                f"command against the default endpoint replaces a stale daemon "
+                f"automatically; `browserwright version check` shows both "
+                f"versions."
             )
         if isinstance(error, dict) and error.get("message"):
             return str(error["message"])

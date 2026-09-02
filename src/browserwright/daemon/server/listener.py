@@ -171,18 +171,22 @@ async def run_serve(cfg: Config) -> int:
     existing = await _ipc.ping_status_async(timeout=1.0)
     existing_pid, existing_version = existing.pid, existing.version
     if existing_pid is not None:
+        # ADR-0012 rule 5: launchd KeepAlive respawns us into this branch
+        # every few seconds for as long as another daemon holds the endpoint
+        # (87k lines of it on the maintainer's machine). Collapse repeats to
+        # one summary per minute, and say who asked for this start.
         version_hint = ""
         if existing_version and existing_version != __version__:
             version_hint = (
                 f" (running {existing_version}, installed {__version__}; "
                 "use `browserwright-daemon stop` or `browserwright-daemon restart`)"
             )
-        print(
-            f"browserwright-daemon already running (pid {existing_pid}); "
-            f"try `browserwright-daemon status` or "
-            f"`browserwright-daemon restart`{version_hint}",
-            file=sys.stderr,
-        )
+        line = _ipc.note_already_running(existing_pid)
+        if line is not None:
+            _ipc.stderr_line(
+                f"{line}; this start was initiated by "
+                f"{_ipc.initiator_from_env()}; try `browserwright-daemon "
+                f"status` or `browserwright-daemon restart`{version_hint}")
         return 1
     _ipc.cleanup_endpoint()
     # issue #15 (2.2): the control-socket ping above was negative, but a
@@ -234,8 +238,11 @@ async def run_serve(cfg: Config) -> int:
     # `ps` answers "who is waiting"; this answers "on what line". Armed before
     # anything can hang, and a no-op until someone signals.
     install_sigusr1_traceback("daemon")
-    logger.info("browserwright-daemon %s starting (backend=%s)",
-                __version__, cfg.backend or "extension")
+    logger.info("browserwright-daemon %s starting (backend=%s pid=%d "
+                "initiator=%s)", __version__, cfg.backend or "extension",
+                os.getpid(), _ipc.initiator_from_env())
+    _ipc.log_lifecycle("start", pid=os.getpid(), version=__version__,
+                       initiator=_ipc.initiator_from_env())
 
     # Phase 2: one global daemon holding many upstream contexts. The shared
     # context is the real-browser upstream (cfg.backend, default extension);
@@ -303,11 +310,9 @@ async def run_serve(cfg: Config) -> int:
                 f"then `browserwright-daemon restart` (reclaims a stale "
                 f"browserwright daemon) or kill that pid."
             )
-        print(
+        _ipc.stderr_line(
             f"browserwright-daemon failed to bind endpoint "
-            f"{cfg.facade_host}:{endpoint_port}: {e}{hint}",
-            file=sys.stderr,
-        )
+            f"{cfg.facade_host}:{endpoint_port}: {e}{hint}")
         _ipc.cleanup_endpoint()
         return 2
     endpoint_url = f"http://{cfg.facade_host}:{bound}"
@@ -345,10 +350,8 @@ async def run_serve(cfg: Config) -> int:
                     f"`browserwright-daemon restart` (reclaims a stale "
                     f"browserwright daemon) or kill that pid."
                 )
-            print(
-                f"browserwright-daemon failed to bind extension relay: {e}{hint}",
-                file=sys.stderr,
-            )
+            _ipc.stderr_line(
+                f"browserwright-daemon failed to bind extension relay: {e}{hint}")
             with contextlib.suppress(Exception):
                 await endpoint.stop()
             _ipc.cleanup_endpoint()
@@ -454,9 +457,14 @@ def _wire_logging() -> None:
             "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
         root = logging.getLogger()
         root.setLevel(logging.INFO)
-        # Also keep a console echo when stderr is a TTY (foreground serve).
-        if sys.stderr.isatty():
-            root.addHandler(logging.StreamHandler(sys.stderr))
+        # Also echo to stderr. Under launchd that is the captured
+        # StandardErrorPath file; without a handler here, warnings fell
+        # through to logging's lastResort handler — undated, unlabelled,
+        # which is what the launchd log looked like (ADR-0012 rule 5).
+        echo = logging.StreamHandler(sys.stderr)
+        echo.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        root.addHandler(echo)
         root.addHandler(handler)
     except OSError:
         pass

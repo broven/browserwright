@@ -144,3 +144,17 @@ def never_touch_the_global_daemon(request, monkeypatch, isolated_runtime_dir):
                         lambda self, backend=None: None)
     # Layer 2: anything that still reaches a real spawn is a bug, not a leak.
     monkeypatch.setattr(session_create, "_spawn_detached", _forbidden)
+
+    # Vector B, second door (ADR-0013 rule 3): the endpoint *diagnosis* probes
+    # not only the resolved endpoint but the alternatives a local client
+    # could have meant — including the built-in default 127.0.0.1:19990,
+    # which the state-file pin above cannot redirect. Default every probe to
+    # "refused"; a test that wants a specific observation overrides
+    # `daemon_url.probe` itself.
+    from browserwright import daemon_url as _du
+    from browserwright.daemon._ipc import EndpointProbe as _EP
+
+    monkeypatch.setattr(
+        _du, "probe",
+        lambda host, port, timeout=1.5: _EP(kind="refused", host=host,
+                                            port=port, detail="stubbed"))

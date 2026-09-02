@@ -23,6 +23,7 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 from typing import Optional
@@ -165,6 +166,11 @@ def _ensure_daemon_running() -> None:
             _run(["browserwright-daemon", "stop"])
     except Exception:
         pass
+    initiator = _ipc.describe_initiator("auto-start")
+    _ipc.log_lifecycle("spawn", initiator=initiator)
+    # Stamped into this process's env so `_daemon_child_env()` carries it to
+    # the child; this CLI process is short-lived, so nothing else sees it.
+    os.environ[_ipc.INITIATOR_ENV] = initiator
     _spawn_detached(["browserwright-daemon", "serve"])
 
 
@@ -226,8 +232,9 @@ def reset_executor(record: dict) -> str:
         raise DaemonUnavailable(
             "session reset could not confirm that the old executor exited",
             fix=(
-                "check the global daemon is up with `browserwright-daemon status` "
-                "(start it with `browserwright-daemon serve` if not), then retry "
+                "check the global daemon with `browserwright-daemon status` "
+                "and `browserwright doctor` (the default endpoint starts one "
+                "on demand; doctor says why that did not happen), then retry "
                 f"`browserwright session reset {sid}`"
             ),
         )
@@ -306,9 +313,30 @@ def reap(*, idle_seconds: float) -> list[dict]:
     return pruned
 
 
+def find_reusable(*, backend: str, name: str) -> Optional[dict]:
+    """The most recent ledger session with this ``backend`` and ``name``.
+
+    ``session new --reuse`` (ADR-0013 rule 4) hands an agent back the session
+    it already has instead of a second one. A ledger row is the only
+    liveness we can check without the daemon; a session whose executor or
+    tab is gone is still *recoverable* (the next call rebinds), so every row
+    counts. ``session end`` removes the row, so an ended session is never
+    matched.
+    """
+    matches = [
+        r for r in reg.list_all()
+        if r.get("backend") == backend and r.get("name") == name
+    ]
+    return matches[-1] if matches else None
+
+
 def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
-        name: Optional[str] = None) -> str:
+        name: Optional[str] = None, reuse: bool = False) -> str:
     """Register a session and return its id.
+
+    With ``reuse`` and an existing session of the same backend and name, no
+    new row is allocated: the existing id is returned and
+    :data:`last_new_reused` records it, so the CLI can say so.
 
     - ``extension`` → an *attach* session sharing the one global daemon's
       relay-backed upstream; the tab group is created lazily on first use, so
@@ -336,6 +364,15 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     # Sweeping here means the first thing a user does after upgrading clears
     # them, not only a daemon restart.
     reg.migrate_legacy_backends()
+    global last_new_reused
+    last_new_reused = None
+    if reuse and backend in ("extension", "cdp"):
+        existing = find_reusable(backend=backend, name=name)
+        if existing is not None:
+            last_new_reused = str(existing["id"])
+            reg.touch(last_new_reused)
+            _ensure_daemon_running()
+            return last_new_reused
     if backend == "extension":
         sid = reg.allocate(backend="extension",
                            owner="attach", name=name)
@@ -362,6 +399,10 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         _ensure_daemon_running()
         return sid
     raise ValueError(_unknown_backend_message(backend))
+
+
+#: Set by :func:`new` — the id it handed back through ``reuse``, else None.
+last_new_reused: Optional[str] = None
 
 
 def _checked_attach(attach: object) -> tuple[Optional[int], Optional[str]]:
@@ -467,9 +508,10 @@ def end(record: dict) -> str:
         hint = ""
         if not _daemon_is_running():
             hint = (
-                " No daemon is answering on this XDG_RUNTIME_DIR. Start one "
-                "(`browserwright-daemon serve`) — using the same "
-                "XDG_RUNTIME_DIR — then run `session end` again."
+                " No daemon is answering on this XDG_RUNTIME_DIR; the default "
+                "endpoint starts one on demand for the next command "
+                "(`browserwright doctor` says why that is not happening). "
+                "Then retry ending this session."
             )
         raise DaemonUnavailable(
             f"session {sid} termination was incomplete; its ledger entry was "
