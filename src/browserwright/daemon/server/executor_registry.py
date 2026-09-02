@@ -71,9 +71,15 @@ class ExecutorHandle:
     tracking; PR1 only needs the pid + socket path + a spawn lock."""
 
     session_id: str
-    proc: subprocess.Popen
+    #: None for an ADOPTED executor (ADR-0013 rule 1): one this daemon did
+    #: not spawn but found alive at boot. Liveness then comes from the pid +
+    #: start-time fingerprint in the discovery record, not from `poll()`.
+    proc: subprocess.Popen | None
     sock_path: str
     executor_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    pid: int | None = None
+    start_time: str | None = None
+    adopted: bool = False
     # A spawned process owns the fixed session paths before it publishes its
     # discovery record. Keeping that provisional instance in the registry
     # makes every startup failure use the same exact-instance reaper as kill,
@@ -85,7 +91,22 @@ class ExecutorHandle:
     spawned_wall: float = field(default_factory=time.time)
 
     def is_alive(self) -> bool:
-        return self.proc.poll() is None
+        if self.proc is not None:
+            return self.proc.poll() is None
+        if self.pid is None or not _pid_alive(self.pid):
+            return False
+        if self.start_time is not None:
+            from ..platforms import proc_start_time
+            observed = proc_start_time(self.pid)
+            if observed != self.start_time:
+                return False  # pid recycled by an unrelated process
+        return True
+
+    def current_pid(self) -> int | None:
+        return self.proc.pid if self.proc is not None else self.pid
+
+    def exit_code(self) -> int | None:
+        return self.proc.returncode if self.proc is not None else None
 
     def idle_seconds(self, *, now: float | None = None) -> float:
         """Seconds since this executor last did work.
@@ -114,6 +135,9 @@ class ExecutorRegistry:
 
     def __init__(self) -> None:
         self._handles: dict[str, ExecutorHandle] = {}
+        #: ``(session_id, event, *, reason=..., executor_alive=...)`` — the
+        #: recovery state machine's `note`; None in bare unit tests.
+        self.on_event: Callable[..., object] | None = None
         # One lock per session id guards its spawn (the cdp `_open_lock`
         # equivalent — prevents the double-spawn race, Fork 1 risk).
         self._locks: dict[str, asyncio.Lock] = {}
@@ -193,7 +217,22 @@ class ExecutorRegistry:
             _ipc.cleanup_executor(session_id)
         handle = await self._spawn(session_id)
         self._handles[session_id] = handle
+        self._emit(session_id, "executor_ready", reason="executor cold-started")
         return handle.sock_path
+
+    def _emit(self, session_id: str, event: str, *, reason: str = "") -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(session_id, event, reason=reason,
+                          executor_alive=self._alive(session_id))
+        except Exception as e:  # noqa: BLE001 - reporting must never break the registry
+            logger.debug("executor event %s for %s not recorded: %r",
+                         event, session_id, e)
+
+    def _alive(self, session_id: str) -> bool:
+        h = self._handles.get(session_id)
+        return h is not None and h.is_alive()
 
     async def terminate_session(
         self,
@@ -385,6 +424,38 @@ class ExecutorRegistry:
 
     # ---- PR2 supervision ------------------------------------------------
 
+    def adopt(self, records: list[dict]) -> list[str]:
+        """Take ownership of executors a previous daemon left alive (ADR-0013
+        rule 1). Each record is what :func:`cleanup_orphan_executors` kept:
+        ``{session, pid, sock, executor_id, start_time}``. Returns the session
+        ids adopted. An adopted handle is `ready`, so the next `ensure` hands
+        out its socket instead of cold-spawning, and `/exec` dials the same
+        process — the agent's `state` survives the daemon swap."""
+        adopted: list[str] = []
+        for rec in records:
+            sid = str(rec.get("session") or "")
+            sock = rec.get("sock")
+            pid = rec.get("pid")
+            if not sid or not isinstance(sock, str) or not isinstance(pid, int):
+                continue
+            if sid in self._handles:
+                continue
+            handle = ExecutorHandle(
+                session_id=sid, proc=None, sock_path=sock,
+                executor_id=str(rec.get("executor_id") or uuid.uuid4().hex),
+                pid=pid, start_time=rec.get("start_time"), adopted=True)
+            if not handle.is_alive():
+                _ipc.cleanup_executor(sid)
+                continue
+            self._handles[sid] = handle
+            adopted.append(sid)
+            logger.info("adopted live executor for session %s (pid=%d, "
+                        "executor_id=%s) from the previous daemon",
+                        sid, pid, handle.executor_id)
+            self._emit(sid, "executor_ready",
+                       reason="executor adopted from the previous daemon")
+        return adopted
+
     async def kill(self, session_id: str) -> bool:
         """Reap the current exact executor before permitting replacement.
 
@@ -506,16 +577,17 @@ class ExecutorRegistry:
             except asyncio.CancelledError as e:
                 cancelled = e
         reap_task.result()
-        reaped = handle.proc.poll() is not None
+        reaped = not handle.is_alive()
         if reaped:
             if self._handles.get(session_id) is handle:
                 self._handles.pop(session_id, None)
             _ipc.cleanup_executor(session_id)
+            self._emit(session_id, "executor_reaped", reason="executor recycled")
         logger.info(
             "synchronously reaped executor for session %s "
             "(pid=%s, executor_id=%s, reaped=%s)",
             session_id,
-            handle.proc.pid,
+            handle.current_pid(),
             handle.executor_id,
             reaped,
         )
@@ -550,7 +622,9 @@ class ExecutorRegistry:
                 _ipc.cleanup_executor(session_id)
                 dead.append(session_id)
                 logger.info("reaped dead executor for session %s (code=%s)",
-                            session_id, handle.proc.returncode)
+                            session_id, handle.exit_code())
+                self._emit(session_id, "executor_exited",
+                           reason=f"executor exited on its own (code={handle.exit_code()})")
         return dead
 
     async def reap_idle(self, idle_after: float) -> list[str]:
@@ -621,6 +695,11 @@ def _terminate(handle: ExecutorHandle) -> None:
 def _terminate_and_wait(handle: ExecutorHandle) -> None:
     """Blocking reap used only through ``asyncio.to_thread``."""
     proc = handle.proc
+    if proc is None:
+        # Adopted (ADR-0013): no Popen; reap by pid with the start-time guard.
+        if handle.pid is not None:
+            terminate_orphan(handle.pid, handle.start_time, grace=_KILL_GRACE_S)
+        return
     if proc.poll() is not None:
         return
     _signal_terminate(proc)
@@ -689,21 +768,24 @@ class _quiet:
         return exc_type is not None and issubclass(exc_type, OSError)
 
 
-def cleanup_orphan_executors() -> None:
-    """Startup orphan-sweep (mirrors `listener._cleanup_orphan_cdp_chrome`).
+def cleanup_orphan_executors(*, adopt: bool = True) -> list[dict]:
+    """Startup sweep of `bw-exec-*` discovery files left by a prior daemon.
 
-    A hard daemon crash / SIGKILL leaves executor subprocesses running + their
-    `bw-exec-*.json` discovery files + `bw-exec-*.sock` sockets on disk. On the
-    next daemon start we: read each discovery file, SIGTERM the pid it names (if
-    that process is still alive), then unlink the stale socket + discovery file
-    so a fresh `ensureExecutor` cold-starts clean.
+    ADR-0013 rule 1 reversed what this does with a LIVE executor. It used to
+    SIGTERM every pid it found ("assume an empty world and enforce it"), which
+    is exactly why a daemon restart severed every session. Now a record whose
+    pid is alive AND whose start-time fingerprint matches is **kept** and
+    returned for :meth:`ExecutorRegistry.adopt`; only dead or unverifiable
+    records are cleaned up. ``adopt=False`` restores the old kill-everything
+    behaviour (used by `teardown`-style callers that really want a clean slate).
 
-    Conservative: we ONLY signal a pid we read from one of OUR discovery files —
-    we never scan the system process table. Every step is wrapped so a
-    permission error / race never crashes serve."""
+    Conservative: we ONLY read pids from OUR discovery files — we never scan
+    the system process table. Every step is wrapped so a permission error /
+    race never crashes serve."""
     runtime_dir = _ipc.runtime_dir()
     if not runtime_dir.is_dir():
-        return
+        return []
+    kept: list[dict] = []
     # C1: in-flight sidecars belong to processes we are about to signal below;
     # a leftover one would otherwise make `ps` report a call that ended when the
     # prior daemon died.
@@ -720,6 +802,7 @@ def cleanup_orphan_executors() -> None:
     for entry in runtime_dir.glob("bw-exec-*.json"):
         pid: int | None = None
         started: str | None = None
+        d: dict = {}
         try:
             import json
             d = json.loads(entry.read_text())
@@ -731,6 +814,19 @@ def cleanup_orphan_executors() -> None:
             started = raw_started if isinstance(raw_started, str) else None
         except (OSError, ValueError, TypeError):
             sock = None
+        session = d.get("session")
+        executor_id = d.get("executor_id")
+        valid_record = _valid_adoption_record(
+            session=session, sock=sock, executor_id=executor_id)
+        if adopt and valid_record and pid is not None and _adoptable(pid, started):
+            kept.append({
+                "session": session,
+                "pid": pid,
+                "sock": sock,
+                "executor_id": executor_id,
+                "start_time": started,
+            })
+            continue
         if pid is not None and not _terminate_orphan_and_wait(pid, started):
             # Fixed per-session paths cannot be reused while the old process
             # may still run its unconditional SIGTERM cleanup handler.
@@ -747,6 +843,37 @@ def cleanup_orphan_executors() -> None:
                 p.unlink()
             except (FileNotFoundError, IsADirectoryError, OSError):
                 pass
+    return kept
+
+
+def _valid_adoption_record(*, session, sock, executor_id) -> bool:
+    """Validate every durable identity used to adopt an executor."""
+    if not (isinstance(session, str) and session
+            and isinstance(sock, str) and sock
+            and isinstance(executor_id, str) and executor_id):
+        return False
+    try:
+        expected_sock = _ipc.executor_sock_path(session)
+        if _to_path(sock) != expected_sock or not expected_sock.is_socket():
+            return False
+        # Executor ids are generated as UUID hex.  Reject arbitrary discovery
+        # text so the identity later used for exact-instance reap is canonical.
+        return uuid.UUID(executor_id).hex == executor_id.lower()
+    except (ValueError, OSError):
+        return False
+
+
+def _adoptable(pid: int, start_time: str | None) -> bool:
+    """A live pid whose start-time fingerprint matches its discovery record.
+    Without a recorded fingerprint we cannot tell the executor from a recycled
+    pid, so the record is treated as unverifiable (reaped as before)."""
+    if not _pid_alive(pid):
+        return False
+    if start_time is None:
+        return False
+    from ..platforms import proc_start_time
+    observed = proc_start_time(pid)
+    return observed is not None and observed == start_time
 
 
 def _terminate_orphan_and_wait(pid: int, start_time: str | None = None) -> bool:

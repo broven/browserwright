@@ -60,15 +60,15 @@ class PageBindTimeout(BrowserwrightError):
     # was still going to announce the tab — a cold/reconnecting extension
     # service worker is exactly that case, and the bind budget
     # (`$BW_PAGE_BIND_TIMEOUT`) is the knob for it. If retries do NOT help, the
-    # extension side is not answering at all, and `session reset` will not
+    # extension side is not answering at all, and recycling an executor will not
     # change that — say what to check instead of looping the user.
     default_fix = (
         "retry the same browserwright command (a cold extension service worker "
         "can miss the bind window; raise it with `export "
         "BW_PAGE_BIND_TIMEOUT=30`). If EVERY retry fails, the extension is not "
         "answering: check `browserwright doctor` and that the browserwright "
-        "extension is enabled and its Chrome window is open, then "
-        "`browserwright session reset <id>`"
+        "extension is enabled and its Chrome window is open, then run "
+        "`browserwright recover --session <id>`"
     )
 
     def __init__(
@@ -106,11 +106,11 @@ class TabRebindFailed(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "the session's tab is gone and re-opening one failed; the browser or "
-        "the extension relay is likely unusable. Run `browserwright doctor` — "
-        "it names the layer that is down (extension not connected, daemon "
-        "not answering). Once doctor is green, `browserwright session reset "
-        "<id>` recycles this session's executor. Retrying the same call will "
-        "NOT help, and a new session would fail the same way"
+        "the extension relay is likely unusable. Run `browserwright recover "
+        "--session <id>` — it waits for the extension, re-attaches the tab "
+        "and keeps or restarts the executor, then names the layer that is "
+        "still broken. Retrying the same call will NOT help, and a new "
+        "session would fail the same way"
     )
 
     def __init__(self, reason: str = "", fix: str = ""):
@@ -191,9 +191,9 @@ class NetworkError(BrowserwrightError):
 class DaemonUnavailable(BrowserwrightError):
     exit_code = 2
     default_fix = (
-        "run `browserwright doctor`: it probes the endpoint and reports whether "
-        "the daemon is down, bound elsewhere, or shadowed by another program "
-        "on its port"
+        "run `browserwright recover --session <id>`: it probes the daemon "
+        "twice, starts the installed one if it is gone or stale, and reports "
+        "whether something else is answering on its port"
     )
 
     def __init__(self, detail: str = "", fix: str = ""):
@@ -286,11 +286,9 @@ def playwright_error_fix(exc: BaseException) -> str:
     if "frame detached" in lower or "target closed" in lower or "page closed" in lower:
         return (
             "the session's tab binding is gone (extension reloaded/updated, "
-            "daemon restarted, or the tab was closed). Run "
-            "`browserwright session reset` in the NEXT command to recycle the "
-            "executor (the session re-attaches automatically), or "
-            "`browserwright session attach-active` to adopt the tab you are "
-            "looking at, then retry"
+            "daemon was replaced, or the tab was closed). Run "
+            "`browserwright recover --session <id>`; it re-attaches or opens "
+            "the session tab and confirms the executor before you retry"
         )
     if "timeout" not in lower and exc_type != "TimeoutError":
         return ""

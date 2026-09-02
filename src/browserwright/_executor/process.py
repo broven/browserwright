@@ -269,6 +269,11 @@ class _Worker:
         self._active_globals: dict[str, Any] | None = None
         # The currently-armed facade-death handler (Fork 4).
         self._facade_death_handler: Any = None
+        # PID of the daemon whose facade produced the live Browser.  The sync
+        # Playwright driver does not dispatch ``disconnected`` while this
+        # worker is idle, so this out-of-band identity check detects a daemon
+        # replacement before we touch the stale context on the next call.
+        self._facade_daemon_pid: int | None = None
         # Persistent per-session state, injected by reference each call (Fork 5).
         self._state: dict[str, Any] = {}
         # One live-page holder shared by every injected view (snapshot /
@@ -425,7 +430,41 @@ class _Worker:
         constraint). Bind the session FIRST so ``current_session()`` /
         ``resolve_current_target()`` resolve the right ledger record."""
         if self._connected:
-            return
+            try:
+                from ..daemon import _ipc
+
+                current_daemon_pid = _ipc.ping_status_sync().pid
+            except Exception:  # noqa: BLE001 - the connect path reports details
+                current_daemon_pid = None
+            if (self._facade_daemon_pid is not None
+                    and current_daemon_pid != self._facade_daemon_pid):
+                self._on_facade_dead(self._browser)
+            # A resident executor is usually parked in ``queue.get`` between
+            # calls.  Playwright's sync driver only dispatches the browser
+            # ``disconnected`` event while a sync API call pumps its fiber, so
+            # a daemon swap can leave this flag stale until the next command.
+            # Pump once before trusting it; the armed callback then clears the
+            # old objects and this same call reconnects below.  Without this,
+            # the first post-swap command tries to bind on the dead context,
+            # times out, and the client reaps the adopted executor (losing
+            # persistent Python state).
+            try:
+                from ..repl.playwright_handle import drain_page_events
+
+                if self._context is not None:
+                    drain_page_events(self._context)
+            except Exception:  # noqa: BLE001 - liveness pump is best-effort
+                pass
+            if self._connected:
+                is_connected = getattr(self._browser, "is_connected", None)
+                try:
+                    alive = bool(is_connected()) if callable(is_connected) else True
+                except Exception:  # noqa: BLE001 - a failed probe is disconnected
+                    alive = False
+                if not alive:
+                    self._on_facade_dead()
+            if self._connected:
+                return
         from ..session import Session, set_session
         from ..session_ctx import resolve_session
 
@@ -494,6 +533,12 @@ class _Worker:
             # the previous call's list and the notice would vanish.
             warn=lambda m: self._call_warnings.append(m),
         )
+        try:
+            from ..daemon import _ipc
+
+            self._facade_daemon_pid = _ipc.ping_status_sync().pid
+        except Exception:  # noqa: BLE001 - browser connection itself is live
+            self._facade_daemon_pid = None
         self._arm_facade_death()
         # Issue #21: the live page must follow the session's current target
         # (``session_runtime.bind_target`` / ``open_session_tab`` /
@@ -692,8 +737,14 @@ class _Worker:
 
         The handler reference is retained for testability and lifecycle
         introspection."""
+        # Capture the exact connection this callback belongs to.  A
+        # disconnected event from the old daemon can be delivered late while
+        # the worker is already connecting a replacement Browser; that stale
+        # callback must not clear the newly assigned objects.
+        armed_browser = self._browser
+
         def handler(*_):
-            return self._on_facade_dead()
+            return self._on_facade_dead(armed_browser)
 
         try:
             self._browser.on("disconnected", handler)
@@ -701,14 +752,46 @@ class _Worker:
         except Exception:  # noqa: BLE001 - never let arming break cold-start
             self._facade_death_handler = None
 
-    def _on_facade_dead(self) -> None:
+    def _on_facade_dead(self, browser: Any | None = None) -> None:
+        """ADR-0013 rule 1: survive the daemon, reconnect lazily.
+
+        This used to ``os._exit(0)`` ("Fork 4"), which made every daemon
+        restart destroy every session's ``state``. Now the executor only
+        forgets its Playwright objects; the next call finds ``_connected``
+        False and re-runs :meth:`_connect_and_bind` on the same live driver —
+        the exact path a failed cold-start already retries. The replacement
+        daemon adopts this process from its discovery record, so the agent's
+        variables survive the swap. If no daemon comes back, the reconnect
+        fails with an actionable error and the flag stays False for the next
+        attempt; the daemon's idle reaper eventually retires us.
+
+        Fires on Playwright's driver thread; only flags and references are
+        touched here, never the (thread-affine) Playwright objects."""
+        if browser is not None and self._browser is not browser:
+            return
         sys.stderr.write(
             f"executor {self._session_id}: facade transport dropped "
-            "(daemon restart?); self-exiting for cold restart\n")
-        # os._exit so we don't run atexit/finalizers that might re-enter the
-        # (now dead) Playwright driver and hang. The daemon reaps us + cleans
-        # the discovery file; the next heredoc cold-starts a fresh executor.
-        os._exit(0)
+            "(daemon restart?); will reconnect on the next call\n")
+        self._connected = False
+        self._facade_death_handler = None
+        self._facade_daemon_pid = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._live_page_holder.page = None
+        # The session's control-plane socket to the old daemon is dead too;
+        # drop it so the rebind dials the replacement instead of a corpse.
+        try:
+            from ..session import current_session
+            sess = current_session()
+            close = getattr(sess, "close", None)
+            if callable(close):
+                close()
+            invalidate = getattr(getattr(sess, "daemon", None), "invalidate", None)
+            if callable(invalidate):
+                invalidate()
+        except Exception:  # noqa: BLE001 - best-effort; the rebind re-dials
+            pass
 
     def _execute(self, req: ExecuteRequest) -> ExecuteResponse:
         """Run one code blob in the persistent namespace, capturing stdout +
@@ -871,11 +954,9 @@ class _Worker:
                 "the session's tab binding is gone (extension "
                 "reloaded/updated, daemon restarted, or the tab was closed) "
                 f"and re-binding a fresh tab failed ({failure}). The "
-                "executor recycled itself; the NEXT command re-attaches the "
-                "session automatically. If the tab is gone for good, run "
-                f"`browserwright session reset -s {sid}` first, or "
-                f"`browserwright session attach-active -s {sid}` to adopt the "
-                "tab you are looking at, then retry."
+                "executor recycled itself. Run "
+                f"`browserwright recover --session {sid}`; it re-attaches or "
+                "opens the session tab and returns healthy before you retry."
             )
             return self._finish(
                 buf, error=error, exit_code=exit_code,

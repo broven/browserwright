@@ -36,6 +36,14 @@ Requests are FIFO; there is no second executor running concurrently inside one
 session. Explicit `context.new_page()` remains the intentional way for that one
 controller to create another tab.
 
+A daemon replacement is a handoff, not executor teardown. The replacing
+process writes a short-lived pid/start-time marker before SIGTERM; graceful
+shutdown leaves resident executors alive, and the replacement adopts only
+discovery records whose pid fingerprint, socket, and executor id validate.
+Their Python `state` survives and Playwright reconnects on the next call. A
+real `daemon stop`, request deadline, `reset`, or session end still reaps the
+executor deliberately.
+
 Cold binding has one authoritative target: the target resolved and persisted by
 the agent/session path. Playwright may need time to materialize its matching
 `Page`; wait for that exact mapping and fail with a retryable bind error if it
@@ -245,7 +253,7 @@ tombstone. A failed/partial teardown flips the phase back to `active` and
 installs no tombstone, so `endSession` retries resume (extension retry anchors
 are written before the first destructive browser write).
 
-**Daemon-death recovery (issue #40):** the daemon is the executor's owner, so
+**Daemon-death recovery (issues #40 and ADR-0013):** the daemon supervises the executor, so
 all of the above assumes a reachable daemon. When the daemon is unreachable,
 `session end`/`session reset` fall back to a daemon-independent local reap:
 Layer 2 reads the executor's on-disk discovery record (pid + start-time
@@ -257,10 +265,10 @@ unreachable daemon can never succeed, and the orphan otherwise blocks the
 next bind with a CDP attach conflict. The workspace is NOT torn down on this
 path (no daemon to close tabs/Chrome), which the CLI's success message says
 explicitly. When the daemon IS up, its teardown stays authoritative and the
-#32 retry/join semantics are unchanged. A restarted daemon additionally
-reaps a live record it has no `Popen` handle for (fingerprint-guarded, same
-as the sweep) instead of refusing, so `kill-executor`/`endSession` heal the
-session even when the executor survived the startup sweep.
+#32 retry/join semantics are unchanged. On boot, a daemon adopts a live,
+fingerprint-verified executor record rather than reaping it; later
+`kill-executor`/`endSession` can still terminate that adopted process without a
+`Popen` handle using the same fingerprint guard.
 
 ## Common Mistakes To Avoid
 

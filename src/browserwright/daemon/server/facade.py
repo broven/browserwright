@@ -250,6 +250,19 @@ class PlaywrightFacade:
     def port(self) -> int:
         return self._port
 
+    @property
+    def local_client_host(self) -> str:
+        """Address this instance actually made reachable to local clients.
+
+        A specific remote bind normally has a loopback co-listener.  If that
+        best-effort co-bind failed, publishing loopback would point clients at
+        the unrelated process that won the port, so publish the primary host
+        instead and let diagnosis explain the explicit override required.
+        """
+        if not needs_loopback_cobind(self._host) or self._loopback_server is not None:
+            return LOOPBACK_HOST
+        return self._host
+
     # ---- HTTP discovery (CDP bootstrap) ----------------------------------
 
     def _process_request(self, conn: ServerConnection, request) -> Any:

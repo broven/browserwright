@@ -67,11 +67,10 @@ def test_precheck_does_not_false_positive_on_attribute_names():
     assert _touches("d = {'k': 1}\nprint(d['k'])") is False
 
 
-def test_executor_unavailable_fix_mentions_reset():
+def test_executor_unavailable_fix_mentions_recover():
     err = ExecutorUnavailable("down")
 
-    assert "reset()" in err.fix
-    assert "session reset" in err.fix
+    assert "browserwright recover --session <id>" in err.fix
 
 
 def test_run_on_executor_touches_session_before_ensure(monkeypatch):
@@ -1286,6 +1285,91 @@ def test_ensure_cold_started_enters_driver_once_and_reuses_on_retry(monkeypatch)
     # Idempotent once connected.
     w._ensure_cold_started()
     assert connect["n"] == 2
+
+
+def test_ensure_cold_started_reconnects_when_daemon_pid_changed(monkeypatch):
+    """An idle sync-Playwright worker may not dispatch ``disconnected``.
+
+    The daemon PID is therefore the out-of-band generation check: a different
+    PID must invalidate the apparently-connected objects and reconnect during
+    this same call instead of returning through the stale fast path.
+    """
+    from types import SimpleNamespace
+
+    old_browser = object()
+    old_context = object()
+    w = _Worker("sess-daemon-swap")
+    w._connected = True
+    w._facade_daemon_pid = 111
+    w._browser = old_browser
+    w._context = old_context
+    w._page = object()
+    w._live_page_holder.page = w._page
+    # The driver itself survives the facade connection and must be reused.
+    w._pw_cm = object()
+    w._pw = object()
+
+    monkeypatch.setattr(
+        "browserwright.daemon._ipc.ping_status_sync",
+        lambda *args, **kwargs: SimpleNamespace(pid=222),
+    )
+    monkeypatch.setattr(
+        "browserwright.repl.playwright_handle.drain_page_events",
+        lambda _context: pytest.fail("the stale context must be cleared first"),
+    )
+    monkeypatch.setattr(
+        "browserwright.session_ctx.resolve_session",
+        lambda explicit=None: {"id": "sess-daemon-swap"},
+    )
+    monkeypatch.setattr(
+        "browserwright.session.Session", lambda *, record: object(),
+    )
+    monkeypatch.setattr("browserwright.session.set_session", lambda _session: None)
+
+    reconnects: list[tuple[object | None, object | None]] = []
+
+    def reconnect(self):
+        reconnects.append((self._browser, self._context))
+        self._browser = object()
+        self._context = object()
+
+    monkeypatch.setattr(_Worker, "_connect_and_bind", reconnect)
+
+    w._ensure_cold_started()
+
+    assert reconnects == [(None, None)]
+    assert w._connected is True
+    assert w._browser is not old_browser
+    assert w._context is not old_context
+
+
+def test_late_old_browser_disconnect_does_not_clear_replacement_objects():
+    """Each disconnect handler is scoped to the Browser that armed it."""
+    w = _Worker("sess-late-disconnect")
+    old_browser = _FakeBrowser()
+    w._browser = old_browser
+    w._arm_facade_death()
+    old_handler = old_browser.handlers["disconnected"][0]
+
+    new_browser = _FakeBrowser()
+    new_context = object()
+    new_page = object()
+    w._browser = new_browser
+    w._context = new_context
+    w._page = new_page
+    w._live_page_holder.page = new_page
+    w._facade_daemon_pid = 222
+    w._connected = True
+
+    # Playwright may deliver the old transport's event after replacement bind.
+    old_handler()
+
+    assert w._connected is True
+    assert w._facade_daemon_pid == 222
+    assert w._browser is new_browser
+    assert w._context is new_context
+    assert w._page is new_page
+    assert w._live_page_holder.page is new_page
 
 
 def test_run_does_not_cold_start_before_serving(monkeypatch):

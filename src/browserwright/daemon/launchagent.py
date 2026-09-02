@@ -507,30 +507,47 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
 
     from . import restart_guard
     from .. import __version__
+    # The LaunchAgent's binary, not the checkout invoking this command, defines
+    # the version a healthy incumbent must report (issue #57).
+    want = expected_version(path, __version__)
 
+    # ADR-0013 rule 5: restart is gated on DIAGNOSIS, not on session count.
+    # A daemon that answers its ping with the installed version is healthy;
+    # restarting it fixes nothing an agent could be seeing, and it is the
+    # move that on 2026-09-01 took out another agent's session. Name the
+    # per-session states and the verb that acts on them instead.
+    if not force:
+        verdict = daemon_self_check(cfg, expected_version=want)
+        if verdict["healthy"]:
+            states = _session_states_text(cfg)
+            raise LaunchAgentError(
+                f"refusing to restart: {verdict['detail']}. A healthy daemon "
+                "is not what is wrong.\n"
+                f"{states}"
+                "For a broken session run `browserwright recover --session "
+                "<id>`; `browserwright doctor` names the broken layer.", 4)
     activity = restart_guard.probe(cfg)
     if activity.blocked and not force:
         detail = "\n".join(f"  - {r}" for r in activity.reasons)
         raise LaunchAgentError(
-            "refusing to restart: the daemon is in use, and restarting it "
-            "kills every session's live executor state (tabs and session "
-            "records survive; `page` / `context` / your variables do not).\n"
+            "refusing to restart: the daemon needs replacement but is in use; "
+            "interrupting a mid-call session is not automatic.\n"
             f"{detail}\n"
-            "End or reset the sessions above first (`browserwright session "
-            "list`, `session end`, `session reset`), then re-run `restart`. "
-            "`--force` exists only for the maintainer's upgrade tooling; it "
-            "is not the recovery path for a working daemon.", 4)
+            "Wait for the calls to finish (`browserwright-daemon activity`), "
+            "then run the command again. A forced interruption is a human "
+            "decision, not a recovery instruction.", 4)
 
     # Resolve what "up to date" means BEFORE tearing anything down, so a plist
     # we cannot interrogate fails fast instead of after the daemon is already
     # stopped.
-    want = expected_version(path, __version__)
-
     before = job_state()
     from . import _ipc
     _ipc.log_lifecycle(
         "restart", pid_before=before.get("pid"), forced=bool(force),
         initiator=_ipc.describe_initiator("restart"))
+    incumbent_pid = before.get("pid")
+    if isinstance(incumbent_pid, int):
+        _ipc.request_executor_handoff(incumbent_pid)
     stopped = _stop_incumbent(timeout)
 
     launchctl("unload", str(path))
@@ -562,6 +579,85 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
     raise LaunchAgentError(_restart_failure_message(
         before=before, after=last, live_version=live_version,
         expected=want, timeout=timeout), 3)
+
+
+def daemon_self_check(cfg, *, expected_version: str | None = None) -> dict:
+    """The three automatic-restart criteria of ADR-0013 rule 2, each confirmed
+    by TWO consecutive probes so a transient glitch never triggers a restart.
+
+    Returns ``{"healthy": bool, "criterion": None|"gone"|"foreign"|
+    "version", "detail": str, "probes": [kind, kind]}``. ``healthy`` is True
+    only when both probes found our daemon on the expected version.
+    """
+    from . import _ipc
+    from .. import __version__
+    from ..daemon_url import DaemonEndpoint, daemon_endpoint
+    from .config import LOOPBACK_HOST, needs_loopback_cobind
+
+    want = expected_version or __version__
+    if cfg is None or not hasattr(cfg, "resolved_facade_port"):
+        ep = daemon_endpoint()
+    else:
+        host = str(getattr(cfg, "facade_host", LOOPBACK_HOST) or LOOPBACK_HOST)
+        # Wildcards and specific remote binds are locally reached through the
+        # co-bound loopback listener; a configured loopback/hostname is used
+        # verbatim.  The port must come from THIS command's cfg, never a stale
+        # global endpoint state file belonging to another dev instance.
+        probe_host = LOOPBACK_HOST if (
+            needs_loopback_cobind(host) or host in ("0.0.0.0", "::", "::0", "*")) else host
+        port = int(cfg.resolved_facade_port())
+        ep = DaemonEndpoint(url=f"http://{probe_host}:{port}",
+                            explicit=True, source="restart_config")
+    probes = [_ipc.probe_endpoint_sync(ep.host, ep.port, timeout=1.5)
+              for _ in range(2)]
+    kinds = [p.kind for p in probes]
+
+    def _classification(probe) -> tuple[str, str | None]:
+        if probe.kind == "ours":
+            return "ours", probe.version
+        if probe.kind in ("foreign", "garbage", "timeout"):
+            return "foreign", None
+        return "gone", None
+
+    conclusions = [_classification(p) for p in probes]
+    if conclusions[0] != conclusions[1]:
+        return {"healthy": False, "criterion": None,
+                "detail": ("two consecutive probes disagree "
+                           f"({conclusions[0]} then {conclusions[1]}); "
+                           "nothing is concluded from that"),
+                "probes": kinds}
+    p = probes[1]
+    if p.kind == "ours":
+        if p.version != want:
+            return {"healthy": False, "criterion": "version",
+                    "detail": (f"the daemon at {ep.host}:{ep.port} runs "
+                               f"{p.version}, installed is {want}"),
+                    "probes": kinds}
+        return {"healthy": True, "criterion": None,
+                "detail": (f"the daemon answers at {ep.host}:{ep.port} "
+                           f"(pid {p.pid}, version {p.version or 'unknown'}) "
+                           "on both probes"),
+                "probes": kinds}
+    if p.kind in ("foreign", "garbage", "timeout"):
+        return {"healthy": False, "criterion": "foreign",
+                "detail": p.describe(), "probes": kinds}
+    return {"healthy": False, "criterion": "gone",
+            "detail": p.describe(), "probes": kinds}
+
+
+def _session_states_text(cfg) -> str:
+    """Per-session recovery states from the running daemon, one line each,
+    for the restart refusal. Empty when the daemon cannot be asked."""
+    from . import restart_guard
+    snap = restart_guard._fetch_snapshot(cfg, timeout=2.0)  # noqa: SLF001
+    rows = (snap or {}).get("sessions") or []
+    lines = []
+    for row in rows:
+        rec = row.get("recovery") or {}
+        if rec:
+            lines.append(f"  - session {row.get('session_id')}: {rec.get('state')}"
+                         + (f" ({rec.get('reason')})" if rec.get("reason") else ""))
+    return ("Session states:\n" + "\n".join(lines) + "\n") if lines else ""
 
 
 def _restart_failure_message(*, before: dict, after: dict,

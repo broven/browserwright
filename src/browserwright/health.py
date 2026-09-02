@@ -343,6 +343,32 @@ def doctor_checks() -> dict:
             or "update browserwright-daemon, browserwright, and the Chrome extension to matching versions",
         )
 
+    # 6b. sessions — ADR-0013: which layer is broken per session. Read from
+    #     the daemon's status snapshot when a live daemon carries it.
+    sessions = info.get("sessions") if not synthetic else None
+    if isinstance(sessions, list):
+        described = [s for s in sessions if isinstance(s.get("recovery"), dict)]
+        broken = [s for s in sessions
+                  if isinstance(s.get("recovery"), dict)
+                  and s["recovery"].get("state") not in (None, "healthy")]
+        if broken:
+            lines = "; ".join(
+                f"{s.get('session_id')}={s['recovery'].get('state')} "
+                f"since={s['recovery'].get('since')}"
+                + (f" reason={s['recovery'].get('reason')}"
+                   if s['recovery'].get('reason') else "")
+                for s in broken)
+            add("sessions", "warn", f"session(s) not healthy: {lines}",
+                "`browserwright recover --session <id>` for the ones you use; "
+                "the state names the layer (extension / tab / executor)")
+        else:
+            add("sessions", "pass",
+                "; ".join(
+                    f"{s.get('session_id')}=healthy "
+                    f"since={s['recovery'].get('since')}"
+                    for s in described)
+                if described else "no sessions tracked", "")
+
     # 7. helper surface parses (local, deterministic): can we import the
     #    primitive surface agents actually call? A broken install / syntax
     #    error here would otherwise only show up mid-task.

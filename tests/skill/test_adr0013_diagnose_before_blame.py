@@ -225,7 +225,9 @@ def _agent_visible_sources() -> list[Path]:
     root = Path(browserwright.__file__).parent
     return [root / "errors.py", root / "health.py", root / "cdp.py",
             root / "session_create.py", root / "daemon_url.py",
-            root / "session.py", root / "mode_b_client.py"]
+            root / "session.py", root / "mode_b_client.py",
+            root / "_executor" / "client.py",
+            root / "_executor" / "process.py"]
 
 
 def test_agent_visible_remediation_text_has_no_banned_words():

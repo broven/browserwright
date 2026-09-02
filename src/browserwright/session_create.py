@@ -166,6 +166,9 @@ def _ensure_daemon_running() -> None:
         if pong.pid is not None and pong.version == package_version():
             return  # already running the installed version
         if pong.pid is not None:
+            # Version replacement, not an operator-requested stop: leave the
+            # resident executors for the new daemon to adopt (ADR-0013).
+            _ipc.request_executor_handoff(pong.pid)
             _run(["browserwright-daemon", "stop"])
     except Exception:
         pass

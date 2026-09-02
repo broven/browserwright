@@ -158,11 +158,10 @@ def _build_parser() -> argparse.ArgumentParser:
                                 "come up and report its version")
     p_restart.add_argument(
         "--force", action="store_true",
-        help=("restart even though sessions are actively being driven. A "
-              "restart kills every session's live executor state — tabs and "
-              "session records survive, `page` / `context` / variables do "
-              "not — so without this flag `restart` refuses while anyone is "
-              "working (issue #57)."))
+        help=("replace the daemon even while sessions are actively being "
+              "driven. Resident executor state is handed to the replacement, "
+              "but in-flight calls can be interrupted; this flag is for a "
+              "human operator only."))
 
     # status (v0.2)
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
@@ -316,6 +315,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ke.add_argument("--session", required=True,
                       help="the browserwright session id whose executor to reap")
+
+    # ADR-0013: the one recovery verb, one session, bounded ladder.
+    p_rec = sub.add_parser(
+        "recover",
+        help=("recover ONE session: wait for the extension, re-attach its tab, "
+              "keep or cold-start its executor; reports the state reached"))
+    p_rec.add_argument("--session", required=True,
+                       help="the browserwright session id to recover")
 
     # userscript — resident extension userscripts
     p_us = sub.add_parser("userscript", help="manage resident extension userscripts")
@@ -1158,6 +1165,9 @@ _FORWARDS: dict[str, _Forward] = {
         "BrowserwrightDaemon.killExecutor", "cli-kill-executor", 10.0,
         lambda a: {"session": a.session, "wait": True},
         validate=_require_reaped),
+    "recover": _Forward(
+        "BrowserwrightDaemon.recover", "cli-recover", 90.0,
+        lambda a: {"session": a.session}),
 }
 
 
@@ -1353,7 +1363,7 @@ def _pretty_ps(p: dict) -> None:
     sessions = p.get("sessions") or []
     if sessions:
         print(f"\nsessions  {len(sessions)}")
-        print(f"  {'SESSION':<22} {'PHASE':<12} RESULT")
+        print(f"  {'SESSION':<22} {'PHASE':<12} {'RECOVERY':<24} RESULT")
         for s in sessions:
             result = s.get("result") or {}
             ok = result.get("ok")
@@ -1361,8 +1371,11 @@ def _pretty_ps(p: dict) -> None:
             if isinstance(ok, bool):
                 summary = (f"ok={ok} closed={len(result.get('closed') or [])} "
                            f"failed={result.get('failed') or []}")
+            recovery = s.get("recovery") or {}
+            recovery_state = str(recovery.get("state") or "-")
             print(f"  {str(s.get('session_id'))[:22]:<22} "
-                  f"{str(s.get('phase') or 'active')[:12]:<12} {summary}")
+                  f"{str(s.get('phase') or 'active')[:12]:<12} "
+                  f"{recovery_state[:24]:<24} {summary}")
 
     executors = p.get("executors") or []
     print(f"\nexecutors  {len(executors)}")

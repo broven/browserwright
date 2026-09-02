@@ -134,7 +134,13 @@ class Daemon:
         # reap via the idle-watchdog, endSession kill in the endSession handler,
         # kill-all on graceful shutdown, orphan-sweep on startup.
         from .executor_registry import ExecutorRegistry
+        from .session_state import RecoveryStateMachine, ledger_persist
         self.executors = ExecutorRegistry()
+        # ADR-0013 rule 1: one recovery state per session, persisted into the
+        # ledger row. The registry, the relay and the recovery sweep report
+        # into it; `status`, `doctor` and `recover` read it.
+        self.recovery = RecoveryStateMachine(persist=ledger_persist)
+        self.executors.on_event = self.recovery.note
         # Injected factory `(backend, cfg, session_id) -> UpstreamContext`.
         # Lives in listener.py (it builds the _UpstreamHolder); injected to
         # avoid an import cycle.
@@ -156,6 +162,10 @@ class Daemon:
         # (endSession etc.) can reach the daemon to create/drop
         # an cdp context.
         shared_context.router.daemon = self  # type: ignore[attr-defined]
+
+    def executor_alive(self, session_id: str) -> bool:
+        handle = self.executors.get(str(session_id))
+        return handle is not None and handle.is_alive()
 
     def all_contexts(self) -> list[UpstreamContext]:
         """Shared context first, then every cdp context — used by shutdown /
@@ -338,6 +348,7 @@ class Daemon:
                                 and result.get("ok") is True):
                             self._session_results[session_id] = dict(result)
                             self._session_phases[session_id] = "ended"
+                            self._mark_session_ended(session_id)
                         else:
                             self._session_phases[session_id] = "active"
                 elif (reap.get("reaped") is True
@@ -345,6 +356,7 @@ class Daemon:
                         and result.get("ok") is True):
                     self._session_results[session_id] = dict(result)
                     self._session_phases[session_id] = "ended"
+                    self._mark_session_ended(session_id)
                 else:
                     self._session_phases[session_id] = "active"
                 return reap, result
@@ -365,8 +377,15 @@ class Daemon:
         if isinstance(result, dict) and result.get("ok") is True:
             self._session_results[session_id] = dict(result)
             self._session_phases[session_id] = "ended"
+            self._mark_session_ended(session_id)
         else:
             self._session_phases[session_id] = "active"
+
+    def _mark_session_ended(self, session_id: str) -> None:
+        """Drop recovery diagnosis when durable teardown reaches terminal."""
+        from .session_state import SESSION_ENDED
+
+        self.recovery.note(session_id, SESSION_ENDED)
 
     def _ensure_cdp_context(self, session_id: str, record: dict) -> UpstreamContext:
         """Get or create the per-session cdp context.

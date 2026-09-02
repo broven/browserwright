@@ -805,6 +805,8 @@ class ExtensionFacadeBridge:
             except Exception as e:  # noqa: BLE001
                 logger.warning("facade(ext) scoped replay failed: %r", e)
                 infos = []
+            logger.debug("facade(ext): replaying %d target(s) for session %s",
+                         len(infos), self._session_id)
             for info in infos:
                 target_id = info.get("targetId") if isinstance(info, dict) else None
                 tab_id = _tab_id_from_target_id(target_id) if isinstance(target_id, str) else None

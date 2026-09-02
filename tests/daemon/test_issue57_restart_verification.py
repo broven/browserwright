@@ -175,11 +175,24 @@ def test_restart_refuses_when_someone_is_working(harness):
         launchagent.restart(_Cfg(), timeout=1.0)
     msg = str(e.value)
     assert "refusing to restart" in msg
-    assert "--force" in msg
-    assert "session end" in msg and "session reset" in msg
+    assert "browserwright-daemon activity" in msg
+    assert "session end" not in msg and "session reset" not in msg
     assert "7 (idle 4s)" in msg
     assert e.value.exit_code == 4
     # And it must not have touched launchd at all.
+    assert harness["calls"] == []
+
+
+def test_restart_refuses_a_healthy_daemon_before_activity_or_launchd(
+        harness, monkeypatch):
+    monkeypatch.setattr(launchagent, "daemon_self_check", lambda cfg, **kw: {
+        "healthy": True, "criterion": None,
+        "detail": "the daemon answered twice", "probes": ["ours", "ours"],
+    })
+    with pytest.raises(LaunchAgentError) as exc:
+        launchagent.restart(_Cfg(), timeout=1.0)
+    assert exc.value.exit_code == 4
+    assert "browserwright recover --session <id>" in str(exc.value)
     assert harness["calls"] == []
 
 
