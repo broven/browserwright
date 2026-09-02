@@ -227,7 +227,11 @@ unforced `browserwright-daemon restart` → `browserwright-daemon extension
 reload` (after another activity check when extension bytes changed) →
 `browserwright-daemon version check --strict-daemon` → `pi update
 npm:@browserwright/pi` (pi extension, only when it is installed in pi's user
-settings). An already-healthy same-version daemon is an idempotent no-op: the
+settings), with only `@browserwright/pi` excluded from pnpm's
+minimum-release-age policy so a just-published 0.x minor is visible immediately
+without weakening the guard for its dependencies. The installed pi package
+version is then required to match the CLI version. An already-healthy
+same-version daemon is an idempotent no-op: the
 task detects the version match through `status --json` and skips restart
 entirely; reload, strict version verification, and pi
 update still run. All commands aimed at the global daemon clear inherited dev

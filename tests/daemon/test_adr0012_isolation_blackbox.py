@@ -289,12 +289,16 @@ esac
     ]
 
 
-@pytest.mark.parametrize(("running_version", "expects_restart"), [
-    ("1.2.3", False),
-    ("1.2.2", True),
+@pytest.mark.parametrize(("running_version", "expects_restart", "pi_manifest", "expected_rc", "reported"), [
+    ("1.2.3", False, '{"version":"1.2.3"}', 0, "1.2.3"),
+    ("1.2.2", True, '{"version":"1.2.3"}', 0, "1.2.3"),
+    ("1.2.3", False, '{"version":"1.2.2"}', 1, "1.2.2"),
+    ("1.2.3", False, None, 1, "unknown"),
+    ("1.2.3", False, "not json", 1, "unknown"),
 ])
 def test_upgrade_global_restarts_only_when_running_version_differs(
-        tmp_path, running_version, expects_restart):
+        tmp_path, running_version, expects_restart, pi_manifest, expected_rc,
+        reported):
     fake_path = tmp_path / "fake-path"
     fake_repo = tmp_path / "checkout"
     activated_bin = tmp_path / "activated-checkout" / ".venv" / "bin"
@@ -303,13 +307,14 @@ def test_upgrade_global_restarts_only_when_running_version_differs(
     canonical_tmp = tmp_path / "canonical-global-tmp"
     canonical_tmp.mkdir()
     calls = tmp_path / "calls.log"
-    observed_format = "%s|%s|%s|%s|%s|%s|%s|%s|%s"
+    observed_format = "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s"
     observed_args = " ".join([
         '"${BW_DAEMON_URL-unset}"', '"${BD_CONFIG-unset}"',
         '"${XDG_RUNTIME_DIR-unset}"', '"${TMPDIR-unset}"',
         '"${BS_HOME-unset}"', '"${BD_EXTENSION_PORT-unset}"',
         '"${BD_FACADE_PORT-unset}"', '"${BD_CDP_PORT-unset}"',
         '"${BD_FACADE_HOST-unset}"',
+        '"${PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE-unset}"',
     ])
     daemon = f"""#!/bin/sh
 printf 'global-daemon %s|{observed_format}\n' "$*" {observed_args} >> {calls!s}
@@ -353,6 +358,11 @@ exit 99
         fake_path / "uv",
         f"#!/bin/sh\nprintf 'uv %s\\n' \"$*\" >> {calls!s}\nexit 0\n",
     )
+    _executable(
+        fake_path / "pi",
+        f"#!/bin/sh\nprintf 'pi %s|age-exclude=%s\\n' \"$*\" "
+        f"\"${{PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE-unset}}\" >> {calls!s}\n",
+    )
     _executable(fake_path / "uname", "#!/bin/sh\necho Linux\n")
     _executable(
         fake_path / "getconf",
@@ -365,10 +375,20 @@ exit 99
     # into the subprocess test's own 20-second timeout on Linux CI.
     _executable(
         fake_path / "python3",
-        f"#!/bin/sh\ncat >/dev/null\n"
+        f"#!/bin/sh\n"
+        f"[ \"${{1-}}\" = -c ] && exec /usr/bin/python3 \"$@\"\n"
+        f"cat >/dev/null\n"
         f"case \"${{2-}}\" in *version*) echo {running_version} ;; esac\n",
     )
     home.mkdir(exist_ok=True)
+    pi_settings = home / ".pi" / "agent" / "settings.json"
+    pi_settings.parent.mkdir(parents=True)
+    pi_settings.write_text('{"packages":["npm:@browserwright/pi"]}')
+    pi_package = (home / ".pi" / "agent" / "npm" / "node_modules" /
+                  "@browserwright" / "pi" / "package.json")
+    if pi_manifest is not None:
+        pi_package.parent.mkdir(parents=True)
+        pi_package.write_text(pi_manifest)
     polluted = {
         "BW_DAEMON_URL": "http://127.0.0.1:43102",
         "BD_CONFIG": "/dev/config.toml",
@@ -397,13 +417,14 @@ exit 99
         env=env, cwd=REPO, timeout=20,
     )
 
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == expected_rc, proc.stderr
     lines = calls.read_text().splitlines()
     assert lines.count("preflight activity") == 1
     assert sum(line.startswith("global-daemon activity|") for line in lines) == 2
     assert any(line.startswith("global-daemon restart|") for line in lines) is expects_restart
     assert any(line.startswith("global-daemon status --json|") for line in lines)
     assert any(line.startswith("global-daemon extension reload|") for line in lines)
+    assert "pi update npm:@browserwright/pi|age-exclude=@browserwright/pi" in lines
     assert any(line.startswith("global-browserwright version check --strict-daemon|")
                for line in lines)
     assert any(line.startswith("global-daemon version check --strict-daemon|")
@@ -413,7 +434,9 @@ exit 99
         if line.startswith(("global-daemon ", "global-browserwright ")):
             assert line.endswith(
                 f"unset|unset|unset|{canonical_tmp!s}/|"
-                "unset|unset|unset|unset|unset")
+                "unset|unset|unset|unset|unset|unset")
+    if expected_rc:
+        assert f"Pi extension version {reported} does not match" in proc.stderr
 
 
 def _e2e_fake_environment(tmp_path: Path, *, daemon_rc: int) -> tuple[dict, Path, Path]:
