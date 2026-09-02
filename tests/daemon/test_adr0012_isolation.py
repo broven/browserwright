@@ -169,6 +169,8 @@ def test_upgrade_global_no_longer_forces_a_restart():
     assert code.index("activity 2>&1") < code.index("uv tool install browserwright")
     assert code.index("uv tool install browserwright") < code.index(
         'global_cmd "$global_daemon" restart')
+    assert "PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE='@browserwright/pi'" in code
+    assert 'pi_version" != "$installed_cli_version' in code
 
 
 def test_dev_link_never_writes_the_global_binary_names():

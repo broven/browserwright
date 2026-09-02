@@ -641,7 +641,17 @@ if command -v pi >/dev/null 2>&1; then
   if grep -q '"npm:@browserwright/pi"' "$HOME/.pi/agent/settings.json" 2>/dev/null; then
     echo ""
     echo "Updating pi extension @browserwright/pi (npm)..."
-    pi update npm:@browserwright/pi
+    # pnpm 11 may hold a just-published version behind its supply-chain
+    # minimum-release-age policy. Exclude only our own named package; keep the
+    # age guard intact for every transitive dependency in this resolution.
+    PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE='@browserwright/pi' \
+      pi update npm:@browserwright/pi
+    pi_pkg="$HOME/.pi/agent/npm/node_modules/@browserwright/pi/package.json"
+    pi_version="$(global_cmd python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$pi_pkg" 2>/dev/null || true)"
+    if [[ "$pi_version" != "$installed_cli_version" ]]; then
+      echo "Pi extension version ${pi_version:-unknown} does not match installed browserwright ${installed_cli_version}." >&2
+      exit 1
+    fi
   else
     echo "Skipping pi extension: npm:@browserwright/pi is not in pi user settings."
   fi
