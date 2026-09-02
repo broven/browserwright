@@ -58,13 +58,7 @@ async def test_serve_stale_detect_pings_its_own_port_not_the_resolved_endpoint(
 
 def test_stop_refuses_when_overridden_port_disagrees_with_resolved_endpoint(
         monkeypatch, capsys):
-    from browserwright.daemon import cli
     from browserwright.daemon_url import DaemonEndpoint
-
-    monkeypatch.setattr(
-        cli, "daemon_endpoint",
-        lambda: DaemonEndpoint(url="http://127.0.0.1:19990", explicit=False,
-                               source="default"), raising=False)
     import browserwright.daemon.cli as climod
     import browserwright.daemon_url as du
     monkeypatch.setattr(du, "daemon_endpoint", lambda **_k: DaemonEndpoint(
@@ -125,6 +119,14 @@ def test_install_force_without_flags_carries_the_installed_serve_args(
                                    facade_port=None, force=True)
     assert override["facade_host"] == "127.0.0.1"
     assert "carried_from_previous_plist" not in override
+
+    # the way back to loopback-only: an empty host is a reset, not "keep"
+    launchagent.install(extension_port=None, facade_host="100.72.20.32",
+                        facade_port=None, force=True)
+    reset = launchagent.install(extension_port=None, facade_host="",
+                                facade_port=None, force=True)
+    assert reset["facade_host"] is None
+    assert "--facade-host" not in plist.read_text()
 
 
 def test_plist_serve_args_survives_a_damaged_plist(tmp_path):

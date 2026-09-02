@@ -248,6 +248,14 @@ through `BW_DAEMON_INITIATOR`). ADR-0012 rule 5.
 daemon's own start line says `launchd`; the CLI's `LIFECYCLE restart` line
 just before it is the attribution.
 
+### activity gate
+The daemon's own answer to "would interrupting me hurt someone right now":
+in-flight relay calls, executors running code, pending router requests, and
+sessions touched within a window (`restart_guard.probe`, surfaced as
+`browserwright-daemon activity`, exit 4 = busy). `restart`, `upgrade-global`
+and the e2e runner all consult it and refuse while it says busy;
+`restart --force` is the only override, for humans. ADR-0012 rules 2 and 4.
+
 ### lifecycle event
 A daemon start / stop / restart / spawn, written as one `LIFECYCLE <event>`
 line into the daemon log (`_ipc.log_lifecycle`) by whichever process caused

@@ -100,6 +100,7 @@ fi
 if [ "${E2E_FORCE:-}" != "1" ] && command -v browserwright-daemon >/dev/null 2>&1; then
   if activity=$(env -u XDG_RUNTIME_DIR -u TMPDIR -u BS_HOME -u BW_DAEMON_URL \
         -u BD_EXTENSION_PORT -u BD_FACADE_PORT -u BD_CDP_PORT \
+        -u BD_FACADE_HOST -u BD_CONFIG \
         browserwright-daemon activity 2>/dev/null); then
     :
   elif [ $? -eq 4 ]; then

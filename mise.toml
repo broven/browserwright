@@ -38,10 +38,11 @@ run = "uv sync --extra ux"
 [tasks.dev]
 # No long-running dev server: browserwright is a CLI + background daemon + an
 # agent-facing skill, driven on demand. The local dev loop is `mise run install`
-# then exercise the CLI/REPL, or `mise run dev-link` to symlink this checkout
-# into your global PATH/skill dirs. See ONBOARD.md "Run it". Left without a
-# `run` on purpose so nobody hardcodes the wrong entrypoint.
-description = "No dev server — use the CLI/REPL after install, or `mise run dev-link`. See ONBOARD.md."
+# then exercise the CLI/REPL, or `mise run dev-link` + `mise run dev-chrome`
+# for an isolated dev daemon + Chrome for Testing (ADR-0012). See ONBOARD.md
+# "Run it". Left without a `run` on purpose so nobody hardcodes the wrong
+# entrypoint.
+description = "No dev server — use the CLI/REPL after install, or `mise run dev-link` (+ `dev-chrome`). See ONBOARD.md."
 
 # test — fast local gate (mocked; no real Chrome, no network). The heavy
 # real-Chrome e2e suite is a separate, opt-in task below.
@@ -218,7 +219,7 @@ echo "syncing deps with uv..."
 # Refuse to leave the old, dangerous links in place.
 for bin_name in browserwright browserwright-daemon; do
   dst="$LOCAL_BIN/$bin_name"
-  if [[ -L "$dst" && "$(readlink "$dst")" == "$REPO/.venv/"* ]]; then
+  if [[ -L "$dst" && "$(readlink "$dst")" == */.venv/bin/* ]]; then
     echo "removing $dst -> $(readlink "$dst") (a checkout must never be the global binary; reinstall with \\`uv tool install browserwright\\`)"
     rm -f "$dst"
   fi
@@ -265,6 +266,34 @@ never load the dev extension into the daily Chrome.
 No skill dir is linked: the skill text names the \\`browserwright\\` binary, so a
 dev-named skill would send agents to the global install anyway.
 MSG
+"""
+
+[tasks.dev-chrome]
+description = "Development only: launch Chrome for Testing with the unpacked extension patched to the dev relay port (ADR-0012 rule 1); pair with `browserwright-daemon-dev serve`"
+dir = "{{config_root}}"
+run = """
+set -euo pipefail
+DEV_EXT_PORT=${BROWSERWRIGHT_DEV_EXT_PORT:-21989}
+uv run python - "$DEV_EXT_PORT" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path("tests").resolve()))
+from daemon.e2e._patch_extension import patch_extension_dir
+from daemon.e2e._real_browser import find_cft_binary, launch_cft_with_extension
+
+port = int(sys.argv[1])
+cft = find_cft_binary()
+if cft is None:
+    sys.exit("Chrome for Testing not found; install it with: "
+             "npx @puppeteer/browsers install chrome@stable --path /tmp/chrome-for-testing")
+ext = patch_extension_dir(Path("chrome-extension"), relay_port=port)
+h = launch_cft_with_extension(cft, ext)
+print(f"Chrome for Testing pid={h.pid} cdp={h.ws_url} profile={h.profile_path}")
+print(f"extension (patched to relay port {port}): {ext}")
+print("It keeps running after this task exits; `kill <pid>` to close it. "
+      "Never load this extension into the daily Chrome.")
+PY
 """
 
 [tasks.reinstall]
@@ -409,13 +438,16 @@ fi
 # `browserwright-daemon restart --force` themselves, in a terminal. The
 # package and extension artifacts above are already in place, so re-running
 # this task once the sessions are idle finishes the job.
-restart_report="$(browserwright-daemon restart 2>&1)" || {
+restart_stderr="$(mktemp)"
+restart_report="$(browserwright-daemon restart 2>"$restart_stderr")" || {
   rc=$?
   echo "upgrade-global: the new package is installed but the daemon was NOT restarted:" >&2
-  echo "$restart_report" >&2
+  cat "$restart_stderr" >&2
+  rm -f "$restart_stderr"
   echo "upgrade-global: re-run when the sessions above are idle (browserwright-daemon activity), or restart by hand with --force if you accept interrupting them." >&2
   exit $rc
 }
+rm -f "$restart_stderr"
 echo "$restart_report"
 python3 - "$restart_report" <<'PY'
 import json

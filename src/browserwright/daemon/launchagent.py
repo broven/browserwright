@@ -195,13 +195,19 @@ def install(*, extension_port: int | None,
         raise LaunchAgentError(
             f"{path} already exists. Use --force to replace.", 1)
     carried: dict = {}
+    # `--facade-host ""` is the explicit way back to loopback-only: an empty
+    # host means "no host argument" and is NOT carried forward from the
+    # previous plist.
+    reset_host = facade_host is not None and str(facade_host).strip() == ""
+    if reset_host:
+        facade_host = None
     if path.exists():
         # No flag given → keep what the installed plist says (rule 3).
         previous = plist_serve_args(path)
         if extension_port is None and "extension_port" in previous:
             extension_port = previous["extension_port"]
             carried["extension_port"] = extension_port
-        if facade_host is None and "facade_host" in previous:
+        if facade_host is None and not reset_host and "facade_host" in previous:
             facade_host = previous["facade_host"]
             carried["facade_host"] = facade_host
         if facade_port is None and "facade_port" in previous:

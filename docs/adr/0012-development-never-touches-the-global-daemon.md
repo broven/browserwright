@@ -92,8 +92,9 @@ Rules, one per leak found:
 3. **The LaunchAgent is generated, never hand-edited, and remote use is
    durable.** `browserwright-daemon install` owns the plist. Remote use over
    the tailnet is a real requirement, so `--facade-host <tailnet-ip>` stays
-   — but as an `install` argument that `install --force` without flags
-   carries forward from the installed plist (`plist_serve_args`), never as a
+   — but as an `install` argument that `install --force` carries forward
+   from the installed plist for every flag not given on the command line
+   (`plist_serve_args`; pass a flag to override just that one), never as a
    hand edit that the next regeneration silently drops. Two consequences
    for local clients: the facade co-binds loopback (PR #78), and the daemon
    **publishes the loopback address** in its endpoint state file, so a local
@@ -107,6 +108,11 @@ Rules, one per leak found:
    `restart` uses — and refuses with exit 4 while any session is mid-task.
    `E2E_FORCE=1` overrides for a human. The rule is still the outcome: an
    e2e run must not measurably slow a production session.
+5. **Every daemon start, stop, and restart is attributed.** The daemon log
+   gains timestamps and, for each lifecycle event, the initiator (launchd
+   spawn, CLI verb with its cwd and parent process, self-exit watchdog). This
+   is the evidence that was missing when this ADR was written; two
+   subagents and several hours were needed to reconstruct the table above.
 6. **`serve` and `stop` are keyed on their own port, not on whatever this
    shell resolves.** `serve` stale-detects against the port it is about to
    bind, on the address local clients use for it; `stop` refuses when the
@@ -114,11 +120,8 @@ Rules, one per leak found:
    names a different one. Found the hard way: an "isolated" shell with the
    port variables set but no `BW_DAEMON_URL` made `serve` defer to the
    global daemon and `stop` kill it.
-5. **Every daemon start, stop, and restart is attributed.** The daemon log
-   gains timestamps and, for each lifecycle event, the initiator (launchd
-   spawn, CLI verb with its cwd and parent process, self-exit watchdog). This
-   is the evidence that was missing when this ADR was written; two
-   subagents and several hours were needed to reconstruct the table above.
+   `stop` skips the guard when the override is port 0 (the per-test
+   "bind anywhere" scheme), where the state file is the only truth.
 
 ## What this does NOT change
 

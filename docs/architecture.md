@@ -101,10 +101,12 @@ uv sync --extra ux          # or just `uv sync`; uv fetches Python 3.11 itself
 ```
 
 That gives you `.venv/bin/browserwright` and `.venv/bin/browserwright-daemon`
-pinned to THIS checkout. Do **not** run `uv tool install` or
-`mise run dev-link` from here — both mutate `~/.local/bin/` and put the
-worktree on the global PATH. Stay inside the checkout and prefix every
-invocation with `uv run`:
+pinned to THIS checkout. Do **not** run `uv tool install` from here — it
+mutates `~/.local/bin/` and puts the worktree on the global PATH.
+`mise run dev-link` is safe: since ADR-0012 it installs `browserwright-dev` /
+`browserwright-daemon-dev` on an isolated runtime and never the global
+names. Otherwise stay inside the checkout and prefix every invocation with
+`uv run`:
 
 ```bash
 which browserwright                # ~/.local/bin/browserwright  (global)

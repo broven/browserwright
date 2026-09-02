@@ -35,7 +35,7 @@ To make your in-progress checkout the machine-global install (symlinks into
 `~/.local/bin` and the agent skill dirs):
 
 ```bash
-mise run dev-link    # development only; a broken checkout can break global agents
+mise run dev-link    # development only: installs `browserwright-dev` / `browserwright-daemon-dev` on an isolated runtime (ADR-0012)
 ```
 
 ## Task reference
@@ -54,7 +54,8 @@ mise run dev-link    # development only; a broken checkout can break global agen
 | `mise run format` | Apply `ruff format` repo-wide. Opt-in: the repo has never been format-clean, so this rewrites ~135 files — do it as its own commit, never inside an unrelated change |
 | `mise run build` | Build wheel/sdist (`uv build`) |
 | `mise run dev` | (no-op) no dev server — see step 2 |
-| `mise run dev-link` | Symlink this checkout into global PATH + skill dirs (dev only) |
+| `mise run dev-link` | Install this checkout as `browserwright-dev` / `browserwright-daemon-dev` with its own ports, runtime dir and ledger — never the global names (ADR-0012) |
+| `mise run dev-chrome` | Launch Chrome for Testing with the unpacked extension patched to the dev relay port (pair with `browserwright-daemon-dev serve`) |
 | `mise run upgrade-global` | Sync global install to PyPI latest + matching extension artifact + pi npm extension ([RELEASING.md](RELEASING.md)); production users install the extension from the Chrome Web Store instead |
 | `mise run version-check` | Verify package / skill / daemon / extension versions agree |
 
@@ -107,7 +108,7 @@ needed.
 ## Project skill note
 
 The root **`skill/`** directory is a **shipped product artifact** (packaged into
-the PyPI distribution and linked into agent skill dirs by `mise run dev-link`),
+the PyPI distribution and linked into agent skill dirs by the release install; `mise run dev-link` deliberately does not link it, ADR-0012),
 not a "skill for developing this repo." This repo therefore does **not** use the
 `.agents/skills/` ↔ `.claude/skills` symlink convention — there are no
 vendor-neutral repo-dev skills to share. Edit `skill/` to change the product

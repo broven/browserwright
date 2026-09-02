@@ -356,7 +356,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--facade-host", type=str, default=None, metavar="HOST",
         help=("bind the Playwright facade on this host (default 127.0.0.1 / "
               "loopback). Set a Tailscale/LAN IP or 0.0.0.0 to reach the "
-              "installed daemon's facade from another machine."))
+              "installed daemon's facade from another machine. With --force "
+              "and no flag, the installed plist's value is kept; pass "
+              "--facade-host '' to go back to loopback only."))
     p_inst.add_argument("--force", action="store_true",
                         help="replace an existing LaunchAgent with the same name")
 
