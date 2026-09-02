@@ -295,6 +295,8 @@ def test_upgrade_global_restarts_only_when_running_version_differs(
     activated_bin = tmp_path / "activated-checkout" / ".venv" / "bin"
     home = tmp_path / "home"
     global_bin = home / ".local" / "bin"
+    canonical_tmp = tmp_path / "canonical-global-tmp"
+    canonical_tmp.mkdir()
     calls = tmp_path / "calls.log"
     observed_format = "%s|%s|%s|%s|%s|%s|%s|%s|%s"
     observed_args = " ".join([
@@ -350,7 +352,7 @@ exit 99
     _executable(
         fake_path / "getconf",
         "#!/bin/sh\n[ \"$1\" = DARWIN_USER_TEMP_DIR ] || exit 2\n"
-        "echo /canonical/global-tmp/\n",
+        f"echo {canonical_tmp!s}/\n",
     )
     home.mkdir(exist_ok=True)
     polluted = {
@@ -396,7 +398,7 @@ exit 99
     for line in lines:
         if line.startswith(("global-daemon ", "global-browserwright ")):
             assert line.endswith(
-                "unset|unset|unset|/canonical/global-tmp/|"
+                f"unset|unset|unset|{canonical_tmp!s}/|"
                 "unset|unset|unset|unset|unset")
 
 

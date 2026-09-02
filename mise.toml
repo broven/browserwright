@@ -452,7 +452,7 @@ else
   cli_version="$installed_cli_version"
 
   prev_hash="$(hash_ext_dir "$EXT_TARGET")"
-  tmp_dir="$(mktemp -d)"
+  tmp_dir="$(global_cmd mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
   zip_path="$tmp_dir/browserwright-extension-${cli_version}.zip"
   unpack_dir="$tmp_dir/unpacked"
@@ -520,7 +520,7 @@ if payload.get("alive") is True and isinstance(payload.get("version"), str):
 PY
 )"
 fi
-restart_stderr="$(mktemp)"
+restart_stderr="$(global_cmd mktemp)"
 restart_rc=0
 restart_report=""
 if [[ "$running_version" == "$installed_cli_version" ]]; then
