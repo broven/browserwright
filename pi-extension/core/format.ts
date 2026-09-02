@@ -154,6 +154,20 @@ export function renderResults(result: ChainResult<SearchPayload>, query: string)
 		if (lines.length > 0) out.push("", "## Knowledge panel", ...lines);
 	}
 
+	if (results.length === 0) {
+		// Reaching the success path with no rows means the engine said so itself
+		// (see SearchPayload.noMatch) — everything else is rejected upstream. Say
+		// which it was, and say what to do next: the model's move here is to
+		// rewrite the query, not to conclude the tool is broken.
+		out.push(
+			"",
+			payload.noMatch
+				? "The search engine states that nothing matched this query. That is its answer, not a failure — " +
+					"widen the query before retrying: drop a `site:` path, a quoted phrase, or the least essential keywords."
+				: "No rows were extracted from the results page.",
+		);
+	}
+
 	if (results.length > 0) {
 		out.push("");
 		for (const row of results) {
@@ -171,7 +185,7 @@ export function renderResults(result: ChainResult<SearchPayload>, query: string)
 		out.push("## Related searches", payload.relatedSearches.join(" · "), "");
 	}
 
-	out.push("Use bw_web_fetch on a URL above to read it.");
+	if (results.length > 0) out.push("Use bw_web_fetch on a URL above to read it.");
 	return out.join("\n");
 }
 

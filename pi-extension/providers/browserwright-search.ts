@@ -246,6 +246,17 @@ function buildScript(query: string, limit: number, outPath: string, searchUrl: s
     return out.slice(0, 10);
   }, []);
 
+  // --- explicit "nothing matched" ---------------------------------------
+  // Google says this in prose on an otherwise ordinary page: no error, no
+  // interstitial, HTTP 200, zero rows. Reading the sentence is the only way to
+  // tell that empty list apart from the one a consent wall produces. Measured
+  // 2026-09-02 on a site:-with-path query, which is the shape that reaches zero
+  // most often.
+  const noMatch = attempt(() => {
+    const body = (document.body.innerText || '').toLowerCase();
+    return ['did not match any documents', 'no results found for'].some((n) => body.includes(n));
+  }, false);
+
   // --- related searches --------------------------------------------------
   // Scoped to #botstuff: the same href pattern at the top of the page is
   // Google's own tab bar ("Images", "News", "Past hour"), not a related query.
@@ -266,7 +277,7 @@ function buildScript(query: string, limit: number, outPath: string, searchUrl: s
     return out.slice(0, 10);
   }, []);
 
-  return { results, answerBox, knowledgeGraph, peopleAlsoAsk, relatedSearches };
+  return { results, answerBox, knowledgeGraph, peopleAlsoAsk, relatedSearches, noMatch };
 }`;
 
 	// json.dumps gives us correctly escaped Python string literals for free, so
@@ -310,6 +321,9 @@ function buildScript(query: string, limit: number, outPath: string, searchUrl: s
 		'            "knowledgeGraph": data.get("knowledgeGraph"),',
 		'            "peopleAlsoAsk": data.get("peopleAlsoAsk") or [],',
 		'            "relatedSearches": data.get("relatedSearches") or [],',
+		// Only ever consulted when rows is empty, but carried unconditionally so
+		// the shape of the payload does not depend on the outcome.
+		'            "noMatch": bool(data.get("noMatch")),',
 		"        }",
 		"        if not rows:",
 		// An interstitial parses fine and yields zero rows; say which kind it was.

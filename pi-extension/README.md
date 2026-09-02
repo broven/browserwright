@@ -228,8 +228,16 @@ legitimately inside raw HTML and inside search results *about* JavaScript.
 | field | applies to | note |
 |-------|-----------|------|
 | `minChars` | text payloads only | default 0 (off) |
-| `minResults` | list payloads only | an empty list is rejected regardless |
+| `minResults` | list payloads only | an empty list is rejected regardless, unless the engine asserted it |
 | `matches` | both | searched in the text, or in joined titles + snippets |
+
+The one exception is an **asserted** empty. When a search provider reports
+`noMatch: true` — Google says "did not match any documents" in prose, on an
+ordinary HTTP 200 page — the empty list is the engine's answer and is accepted,
+`minResults` included. Everything else empty is still rejected, because that is
+what a consent wall or a captcha looks like from here. Without the distinction a
+query the engine answered correctly reaches the model as `bw_web_search failed`,
+which reads as broken tooling rather than as a query worth rewriting.
 
 `minChars` is deliberately not applied to a list, and `minResults` not to text:
 the two floors measure different things, and applying both would reject a short

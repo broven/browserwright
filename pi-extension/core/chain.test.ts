@@ -294,6 +294,18 @@ describe("runChain over list payloads", () => {
 		assert.equal(result.attempts[0].reason, "no results");
 	});
 
+	it("returns an asserted empty as a success instead of failing the call", async () => {
+		// The regression this exists for: Google answering "did not match any
+		// documents" reached the model as `bw_web_search failed`, which reads as
+		// broken tooling rather than as a query worth rewriting.
+		const result = await searchRun({
+			executor: scripted({ finder: { ok: true, content: { results: [], noMatch: true } } }),
+		});
+		assert.equal(result.ok, true);
+		assert.equal(result.provider, "finder");
+		assert.equal(result.content?.results.length, 0);
+	});
+
 	it("enforces minResults per provider", async () => {
 		const strict = new Map<string, Provider>([
 			["finder", { ...(searchProviders.get("finder") as Provider), failWhen: { minResults: 3 } } as Provider],
@@ -500,6 +512,15 @@ describe("renderResults", () => {
 		const text = render({ results: [row(1)], peopleAlsoAsk: ["Why?"], relatedSearches: ["a", "b"] });
 		assert.match(text, /## People also ask\n- Why\?/);
 		assert.match(text, /## Related searches\na · b/);
+	});
+
+	it("explains an asserted empty as an answer and drops the fetch hint", () => {
+		const text = render({ results: [], noMatch: true });
+		assert.match(text, /# 0 results for "how to"/);
+		assert.match(text, /states that nothing matched/);
+		// Widening the query is the model's move here; there is no URL to fetch.
+		assert.match(text, /widen the query/);
+		assert.equal(text.includes("bw_web_fetch"), false);
 	});
 
 	it("omits every optional section when the query triggered none", () => {
