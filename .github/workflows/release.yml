@@ -4,6 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  # Manual re-run for the Chrome Web Store job alone. A failed CWS publish used
+  # to be unrecoverable without cutting a tag: the ext_changed gate compares the
+  # two most recent tags, so once a publish fails, every later release reports
+  # "chrome-extension/ unchanged" and silently skips — leaving the store pinned
+  # to the last version that actually made it through. This lets that one job be
+  # retried against an already-published tag. Only publish-cws honours it; the
+  # PyPI, npm and GitHub Release jobs are tag-only and never run from here.
+  workflow_dispatch:
+    inputs:
+      cws_tag:
+        description: "Existing tag to publish to the Chrome Web Store (e.g. v0.17.2)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,6 +25,7 @@ jobs:
   publish-pypi:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     environment:
       name: pypi
       url: https://pypi.org/project/browserwright/
@@ -79,6 +93,7 @@ jobs:
   publish-extension:
     name: Package Chrome extension
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     permissions:
       contents: write
 
@@ -138,6 +153,7 @@ jobs:
   publish-npm:
     name: Publish pi extension to npm
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     environment:
       name: npm
       url: https://www.npmjs.com/package/@browserwright/pi
@@ -220,16 +236,41 @@ jobs:
     # the store (see RELEASING.md "Store & pre-releases").
     name: Publish Chrome extension to Web Store
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.ref_name, '-') }}
+    # On a tag push, skip pre-releases. On a manual dispatch the tag comes from
+    # the input, so github.ref_name is the default branch and says nothing.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     environment:
       name: cws
+    env:
+      # One name for "the tag being published", so nothing downstream has to
+      # know whether this run came from a tag push or a manual dispatch.
+      CWS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.cws_tag || github.ref_name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
+          # On manual dispatch, build from the tag the operator named rather
+          # than the branch the dispatch ran on.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.cws_tag || github.ref }}
           # The extension-skip check diffs chrome-extension/ against the
           # previous release tag, which needs the full tag history.
           fetch-depth: 0
+
+      # Every later step reads the tag from here, so a dispatch and a tag push
+      # take the same path from this point on.
+      - name: Resolve the tag being published
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            t="${{ inputs.cws_tag }}"
+            git rev-parse -q --verify "refs/tags/$t" >/dev/null || {
+              echo "::error::tag '$t' does not exist in this repository"; exit 1; }
+            case "$t" in *-*) echo "::error::'$t' is a pre-release tag; the store takes only X.Y.Z"; exit 1;; esac
+          else
+            t="${GITHUB_REF_NAME}"
+          fi
+          echo "name=$t" >> "$GITHUB_OUTPUT"
+          echo "Publishing tag $t to the Chrome Web Store."
 
       # The store is a slow lane (one review cycle per version, item locked
       # while a review is pending). When a release did not touch
@@ -243,7 +284,12 @@ jobs:
       - name: Check whether chrome-extension changed
         id: ext_changed
         run: |
-          cur="${GITHUB_REF_NAME}"
+          cur="${{ steps.tag.outputs.name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch: publishing regardless of the tag-to-tag diff."
+            echo "run_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           prev="$(git tag --sort=-version:refname | sed -n 2p || true)"
           if [ -z "$prev" ]; then
             echo "No previous release tag; publishing."
@@ -269,7 +315,7 @@ jobs:
           import sys
           from pathlib import Path
 
-          tag = os.environ["GITHUB_REF_NAME"]
+          tag = os.environ["CWS_TAG"]
           match = re.fullmatch(
               r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
               r"(?:[a-zA-Z0-9_.!+-]+)?",
@@ -299,7 +345,7 @@ jobs:
       - name: Repackage with manifest at zip root (CWS shape)
         if: steps.ext_changed.outputs.run_changed == 'true'
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${CWS_TAG#v}"
           mkdir -p dist/cws
           cp -r chrome-extension "dist/cws/unpacked"
           cd dist/cws
@@ -358,7 +404,7 @@ jobs:
 
           token = open("/tmp/cws_token").read().strip()
           item_id = "${{ secrets.CWS_ITEM_ID }}"
-          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          version = os.environ["CWS_TAG"].lstrip("v")
           zip_path = f"dist/cws/browserwright-cws-{version}.zip"
 
           def call(url, method, body=b"", extra=None):
