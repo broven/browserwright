@@ -37,7 +37,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
-from ..errors import BrowserwrightError, PageBindTimeout
+from ..errors import BrowserwrightError, PageBindTimeout, TabRebindFailed
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +320,119 @@ def bind_current_page(context: Any, sess: Any) -> Any:
     )
 
 
+def page_is_dead(page: Any) -> bool:
+    """Is this bound ``Page`` a handle to a tab that no longer exists?
+
+    Issue #86. The bind used to be a one-shot: once a handle had a ``page``, it
+    never asked again, so a tab that died mid-session left every later call
+    failing in 1-4ms with ``TargetClosedError`` — forever, for the life of that
+    session. Detecting the dead handle is what lets the (already correct)
+    ``resolve_current_target`` recovery path be re-entered.
+
+    The probe is ``page.is_closed()`` — the flag Playwright sets when it
+    processes the target's destruction. It is LOCAL (no CDP round-trip), so it
+    is cheap enough to run before every call, and it is authoritative: it does
+    not fire for a page that is merely slow, busy, or in another context.
+
+    It is deliberately the ONLY probe. Inspecting ``context.pages`` instead
+    (empty, or missing this page) reads on the same condition — the field repro
+    left ``context.pages == []`` behind — but both spellings have false
+    positives a bare flag does not: a page can legitimately belong to a second
+    context, and a context can legitimately be observed before its pages
+    materialize. A false "dead" is expensive (it opens a replacement tab in the
+    user's browser and abandons a working one); a false "alive" costs nothing,
+    because the call then fails with the real ``TargetClosedError`` and the
+    reactive path rebinds from there. So anything unrecognised — a unit-test
+    double without the method, a probe that raises differently — is reported
+    ALIVE, and the reactive path is the backstop.
+    """
+    if page is None:
+        return True
+    is_closed = getattr(page, "is_closed", None)
+    if not callable(is_closed):
+        return False
+    try:
+        return bool(is_closed())
+    except Exception:  # noqa: BLE001 - a probe that raises means gone
+        return True
+
+
+def drain_page_events(context: Any, *, timeout: float = 0.001) -> None:
+    """Let Playwright process target events that queued while we were idle.
+
+    Issue #86's second half. ``page.is_closed()`` is fed by a channel event,
+    and the sync API only dispatches channel events while a sync call is in
+    flight — between two ``browserwright -s <id> -e ...`` invocations the
+    resident executor is parked in ``queue.get`` and nothing pumps. So a tab
+    that died while the session was idle leaves ``is_closed()`` reading False,
+    the pre-call probe sees a healthy page, and the caller eats one
+    ``TargetClosedError`` before the reactive path can rebind.
+
+    Draining first turns that lost call into a clean one. The budget is
+    deliberately ~1ms: this runs before EVERY executed call, and the queued
+    events are already sitting in the driver — the wait is only there to yield
+    to the dispatcher, not to wait for anything to arrive. Best-effort by
+    construction (``_pump_page_events`` swallows the timeout it is guaranteed
+    to hit on a quiet session).
+    """
+    _pump_page_events(context, timeout=timeout)
+
+
+def rebind_dead_page(context: Any, sess: Any) -> Any:
+    """Re-enter the bind discipline for a session whose tab died. ONE attempt.
+
+    Goes through :func:`bind_current_page` — i.e. ``resolve_current_target`` —
+    and NOT ``context.new_page()``, for exactly the reason the first bind does:
+    ``new_page`` opens a tab outside the session's tab group, which the agent
+    path cannot track (ledger drift → tab explosion). See
+    :func:`bind_current_page`'s docstring.
+
+    Raises :class:`~browserwright.errors.TabRebindFailed` when the rebind
+    itself fails, or when it hands back a page that is *also* already dead.
+    That second check is the loop bound: a browser that cannot hold a tab open
+    reports a distinct, terminal error instead of inviting another rebind.
+
+    The dead binding is DROPPED first — in memory and in the ledger — because
+    ``resolve_current_target`` would otherwise hand it straight back. Its step 2
+    (``ensure_session_target``'s ledger fast path) trusts ``cdp.attach(tid)`` to
+    fail for a closed tab; over the extension backend it does not, so recovery
+    returned the very target we are here to replace and the bind then timed out
+    against a tab that no longer exists. Measured, not reasoned: the e2e repro
+    resolved the same ``ext-tab-<id>`` that had just been removed. We know this
+    target is gone — that is the precondition of this function — so forgetting
+    it is not a guess. Everything below step 2 then does the right thing:
+    another live tab of the session if there is one, else a fresh tab opened in
+    the session's own group.
+    """
+    _forget_dead_binding(sess)
+    try:
+        page = bind_current_page(context, sess)
+    except Exception as e:  # noqa: BLE001 - re-raised as the distinct error
+        raise TabRebindFailed(f"{type(e).__name__}: {e}") from e
+    if page_is_dead(page):
+        raise TabRebindFailed(
+            "the replacement tab was already gone when it was bound")
+    return page
+
+
+def _forget_dead_binding(sess: Any) -> None:
+    """Drop the session's current-tab binding, in memory and in the ledger.
+
+    Best-effort by design: this runs on a recovery path, and a ledger write
+    that fails must not replace the rebind's own outcome with a bookkeeping
+    error. The worst case of a failed clear is the pre-existing behaviour —
+    recovery re-proposes the dead target and the bind times out.
+    """
+    try:
+        from ..session_runtime import persist_target
+
+        sess.current_target_id = None
+        persist_target(None, sess=sess)
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.warning("could not clear the dead tab binding before rebinding",
+                       exc_info=True)
+
+
 def _discard_unbindable_tab(sess: Any, target_id: str) -> None:
     """Close a tab we opened but could not bind, and clear its ledger binding.
 
@@ -568,11 +681,15 @@ class PlaywrightHandle:
         self._context: Any = None     # bound BrowserContext
         self._page: Any = None        # bound Page
         self._connected = False
+        # Issue #86 re-entrancy guard: `rebind_dead_page` resolves the tab
+        # through the agent path, which can touch `page`/`context` again.
+        self._rebinding = False
 
     # ---- lazy connect + bind --------------------------------------------
 
     def _ensure_connected(self) -> None:
         if self._connected:
+            self._rebind_if_dead()
             return
         try:
             from playwright.sync_api import sync_playwright
@@ -604,6 +721,32 @@ class PlaywrightHandle:
         self._context = context_for_browser(self._browser)
         self._page = bind_current_page(self._context, sess)
         self._connected = True
+
+    def _rebind_if_dead(self) -> None:
+        """Issue #86: revisit the bind when the bound tab has died.
+
+        ``_connected`` used to be set once and never cleared, so ``_page`` was
+        never re-resolved: a tab that went away left this handle answering
+        every call with ``TargetClosedError`` in 1-4ms for the rest of its
+        life. The recovery already existed one layer down
+        (``resolve_current_target`` reuses / recovers via the tab group / opens
+        a fresh tab in THIS session's group) — it was simply never re-entered.
+
+        Bounded by construction rather than by a counter: a rebind only runs
+        while the current page reads as dead, and `rebind_dead_page` refuses to
+        hand back a page that is dead on arrival. So a successful rebind ends
+        the condition, and an unsuccessful one raises ``TabRebindFailed``
+        instead of arming another attempt.
+        """
+        if self._rebinding or not page_is_dead(self._page):
+            return
+        from ..session import current_session
+
+        self._rebinding = True
+        try:
+            self._page = rebind_dead_page(self._context, current_session())
+        finally:
+            self._rebinding = False
 
     # ---- accessors (trigger the lazy connect) ---------------------------
 
