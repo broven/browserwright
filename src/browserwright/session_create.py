@@ -23,7 +23,6 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 from __future__ import annotations
 
 import json
-import os
 import socket
 import subprocess
 from typing import Optional
@@ -50,8 +49,12 @@ def _daemon_child_env() -> dict:
     explicit-endpoint liveness gate here and then stop, spawn or tear down a
     session on an entirely different daemon.
     """
+    from .daemon._ipc import INITIATOR_ENV
     from .daemon_url import child_env
-    return child_env()
+    out = child_env()
+    if _spawn_initiator:
+        out[INITIATOR_ENV] = _spawn_initiator
+    return out
 
 
 def _spawn_detached(cmd: list[str]) -> int:
@@ -166,11 +169,9 @@ def _ensure_daemon_running() -> None:
             _run(["browserwright-daemon", "stop"])
     except Exception:
         pass
-    initiator = _ipc.describe_initiator("auto-start")
-    _ipc.log_lifecycle("spawn", initiator=initiator)
-    # Stamped into this process's env so `_daemon_child_env()` carries it to
-    # the child; this CLI process is short-lived, so nothing else sees it.
-    os.environ[_ipc.INITIATOR_ENV] = initiator
+    global _spawn_initiator
+    _spawn_initiator = _ipc.describe_initiator("auto-start")
+    _ipc.log_lifecycle("spawn", initiator=_spawn_initiator)
     _spawn_detached(["browserwright-daemon", "serve"])
 
 
@@ -323,6 +324,10 @@ def find_reusable(*, backend: str, name: str) -> Optional[dict]:
     counts. ``session end`` removes the row, so an ended session is never
     matched.
     """
+    # "Usable" here means "in the ledger": the ledger is the only truth a
+    # client holds without the daemon, and daemon-side liveness (executor,
+    # tab, browser) is what the next call rebinds or what ADR-0013's state
+    # machine will adjudicate. `new()` rejects an empty name before this runs.
     matches = [
         r for r in reg.list_all()
         if r.get("backend") == backend and r.get("name") == name
@@ -403,6 +408,11 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
 
 #: Set by :func:`new` — the id it handed back through ``reuse``, else None.
 last_new_reused: Optional[str] = None
+
+#: The attribution the next on-demand `serve` spawn carries to the child
+#: (ADR-0012 rule 5). Read by :func:`_daemon_child_env`; never exported into
+#: this process's own environment.
+_spawn_initiator: Optional[str] = None
 
 
 def _checked_attach(attach: object) -> tuple[Optional[int], Optional[str]]:

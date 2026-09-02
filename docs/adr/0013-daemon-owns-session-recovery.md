@@ -1,8 +1,9 @@
 # The daemon owns one recovery state machine per session; agents get one recovery verb
 
-Status: proposed (2026-09-02). Decided in a grilling session; to be
-implemented after ADR-0012 removes the development-induced daemon churn, so
-that the remaining failures are the ones this ADR is for.
+Status: proposed (2026-09-02); rules 3 and 4 implemented (#92). Decided in a
+grilling session; the state machine (rules 1, 2, 5) is to be implemented after
+ADR-0012 removes the development-induced daemon churn, so that the remaining
+failures are the ones this ADR is for.
 
 ## Context
 

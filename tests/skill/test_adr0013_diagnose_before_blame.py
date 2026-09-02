@@ -96,6 +96,35 @@ def test_probe_reports_refused_when_nothing_listens():
     assert "nothing is listening" in pr.describe()
 
 
+def test_real_503_server_end_to_end_names_the_responder_without_banned_words(
+        monkeypatch, tmp_path):
+    """Spec #92 testing decision 1, unstubbed: a fake HTTP server answering
+    503 on the resolved endpoint produces a fix naming a non-browserwright
+    responder, with no banned word. Restores the real probe for this test."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    import browserwright.daemon_url as du
+    from browserwright.daemon._ipc import probe_endpoint_sync
+
+    monkeypatch.setattr(du, "probe", probe_endpoint_sync)
+    host, port, t = _serve_once(
+        b"HTTP/1.1 503 Service Unavailable\r\nServer: Surge/5.0\r\n"
+        b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+    # Pin the default candidate to a closed port so the diagnosis never
+    # dials the developer's daemon (the conftest wall's vector B).
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    dead_port = dead.getsockname()[1]
+    dead.close()
+    monkeypatch.setattr(du, "DEFAULT_DAEMON_URL", f"http://127.0.0.1:{dead_port}")
+
+    fix = du.local_unreachable_fix(_endpoint(f"http://{host}:{port}", "default"))
+    t.join(3.0)
+    assert "something other than browserwright" in fix
+    assert "503" in fix and "Surge/5.0" in fix
+    for word in BANNED:
+        assert word not in fix, word
+
+
 def _endpoint(url: str, source: str):
     from browserwright.daemon_url import DaemonEndpoint
     return DaemonEndpoint(url=url, explicit=(source in ("cli", "env", "toml")),

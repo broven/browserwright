@@ -1,6 +1,6 @@
 # Development never touches the global daemon, the global binary, or the daily Chrome
 
-Status: accepted (2026-09-02), not yet implemented. Tracking: #91 (rules 1–4), #89 (rule 5). Supersedes the partial
+Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 not yet implemented (#91). Supersedes the partial
 isolation in `tests/conftest.py` (kept) by extending the same rule to every
 developer-facing verb.
 
