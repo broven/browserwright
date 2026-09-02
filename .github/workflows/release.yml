@@ -319,10 +319,24 @@ jobs:
             -d "refresh_token=${{ secrets.CWS_REFRESH_TOKEN }}" \
             -d "grant_type=refresh_token" > /tmp/cws_token.json
           python - <<'PY'
-          import json
-          data = json.load(open("/tmp/cws_token.json"))
+          import json, sys
+          raw = open("/tmp/cws_token.json").read()
+          try:
+              data = json.loads(raw)
+          except json.JSONDecodeError:
+              # Not JSON at all (proxy page, empty body, HTML error). Print what
+              # actually came back — the old code assumed JSON and died first.
+              print(f"CWS token endpoint returned non-JSON ({len(raw)} bytes): {raw[:500]!r}", file=sys.stderr)
+              raise SystemExit(1)
           if "access_token" not in data:
-              print(f"CWS token exchange failed: {data}", file=sys.stderr)
+              # Google puts the reason in `error` / `error_description`; neither
+              # contains a secret, so both are safe to print. Naming them
+              # explicitly means an expired or revoked refresh token says so
+              # instead of arriving as an opaque failure.
+              err = data.get("error", "<no error field>")
+              desc = data.get("error_description", "<no description>")
+              print(f"CWS token exchange failed: error={err!r} description={desc!r}", file=sys.stderr)
+              print(f"full response keys: {sorted(data)}", file=sys.stderr)
               raise SystemExit(1)
           open("/tmp/cws_token", "w").write(data["access_token"])
           PY
