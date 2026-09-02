@@ -236,6 +236,7 @@ class RelayServer:
         )
         self._server: Any = None
         self._extensions: dict[str, _ExtensionConn] = {}
+        self._seen_install_ids: set[str] = set()
         # Monotonic connection epoch. A fresh extension hello may represent a
         # Chrome restart, where numeric tab/group ids can be recycled. Session
         # adapters use this to demote in-memory group bindings back to
@@ -260,7 +261,16 @@ class RelayServer:
         # (fresh SW after a reload/update, or a ws reconnect). The listener
         # uses it to re-attach extension sessions whose ghost table was lost
         # with the previous connection. Set by the listener.
-        self._on_extension_hello: Callable[[], Awaitable[None]] | None = None
+        self._on_extension_hello: (
+            Callable[..., Awaitable[None]] | None) = None
+        # GH#79: install_ids that have said hello to THIS daemon before, so a
+        # reconnect can be told apart from a first connect. background.js
+        # persists the id in `chrome.storage.local`, so it survives service
+        # worker restarts and extension reloads; a genuinely new id means a new
+        # profile or a reinstall, not a churning SW. Reading a session-scoped
+        # daemon.log without that distinction is what made the e2e harness's
+        # one-fresh-Chrome-per-test look like an extension reconnecting with a
+        # new id between commands (issue #79).
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -1265,11 +1275,37 @@ class RelayServer:
             )
             comparison = compare_versions(ext.browserwright_version or ext.version, __version__)
             ext.version_drift = comparison.drift.value
+            # GH#79: one live connection per install_id. A single MV3 service
+            # worker could dial the relay twice (a superseded socket's late
+            # `onclose` cleared the extension's module-level `ws`, so its
+            # `maintainLoop` opened a duplicate a tick later) and both sockets
+            # said `hello` with the same install_id. `_extensions` is keyed by
+            # install_id, so the re-key below silently evicts the older entry
+            # while its TCP connection stays ESTABLISHED — a ghost we keep
+            # app-pinging and can never route to. Close it explicitly instead.
+            # The extension-side fix is in `chrome-extension/background.js`,
+            # but it only reaches users when a new build ships to the Web
+            # Store, so the invariant is enforced here too.
+            superseded = [
+                other for other in self._extensions.values()
+                if other is not ext
+                and ext.install_id
+                and other.install_id == ext.install_id
+            ]
             # Re-key the extension by install_id (so multiple extensions don't
             # collide on temp_key collisions).
             self._extensions.pop(temp_key, None)
             self._extensions[ext.install_id or temp_key] = ext
             ext.hello_received.set()
+            for other in superseded:
+                logger.info(
+                    "superseding older relay connection for install_id=%s "
+                    "(the extension dialled twice)",
+                    ext.install_id,
+                )
+                asyncio.create_task(self._force_close_extension(
+                    other, reason="superseded by a newer connection from the "
+                                  "same install_id"))
             if ext.app_ping_task is None or ext.app_ping_task.done():
                 ext.app_ping_task = asyncio.create_task(self._app_ping_loop(ext))
             self._first_ready.set()
@@ -1298,8 +1334,14 @@ class RelayServer:
                     ext.browserwright_version or ext.version,
                     __version__,
                 )
+            first_seen = bool(
+                ext.install_id) and ext.install_id not in self._seen_install_ids
+            if ext.install_id:
+                self._seen_install_ids.add(ext.install_id)
             logger.info(
-                "extension hello: install_id=%s browser=%s version=%s protocol=%s",
+                "extension hello (%s): install_id=%s browser=%s version=%s "
+                "protocol=%s",
+                "first connect" if first_seen else "reconnect",
                 ext.install_id,
                 ext.browser,
                 ext.version,
@@ -1321,7 +1363,8 @@ class RelayServer:
             await self._maybe_reload_for_version_drift(ext)
             if self._on_extension_hello is not None:
                 try:
-                    await self._on_extension_hello()
+                    await self._on_extension_hello(
+                        install_id=ext.install_id, first_seen=first_seen)
                 except Exception as e:  # noqa: BLE001 - never break hello
                     logger.warning(
                         "extension hello callback failed: %r", e)

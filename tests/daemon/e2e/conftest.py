@@ -624,8 +624,12 @@ def _e2e_dump_artifacts_on_failure(request, e2e_artifacts_dir):
     failing test instead of handing you the whole session.
     """
     yield
-    rep = getattr(request.node, "rep_call", None)
-    if rep is not None and rep.failed:
+    # GH#79: `rep_call` alone misses the suite's most common failure. A fixture
+    # timeout ("extension never connected within Ns") is a **setup** error, so
+    # the tests that most need their daemon log used to dump nothing at all.
+    reps = [getattr(request.node, f"rep_{when}", None)
+            for when in ("setup", "call")]
+    if any(rep is not None and rep.failed for rep in reps):
         outdir = e2e_artifacts_dir / request.node.name
         outdir.mkdir(parents=True, exist_ok=True)
         env_lines = [f"{k}={v}" for k, v in sorted(os.environ.items())
@@ -646,18 +650,40 @@ def pytest_runtest_makereport(item, call):
     setattr(item, f"rep_{rep.when}", rep)
 
 
+#: Seconds `ext_ready` waits for a fresh Chrome's service worker to reach the
+#: relay. `BW_E2E_EXT_READY_TIMEOUT` overrides it.
+#:
+#: Measured (GH#79, 2026-09-01, isolated harness, fresh profile per launch,
+#: idle machine) *after* the cold-start storage fix: 3.9 / 5.2 / 6.4 / 6.5 /
+#: 6.6 / 7.2 s. On a machine also running other work the same code produced
+#: outliers of 17.9, 26.5 and 37.7 s, and the CDP forensics for those show the
+#: time going into the browser — the service-worker realm starts 3-8 s after
+#: launch and its loopback websocket then takes a further 8-19 s to open, with
+#: `hello` following within ~0.4 s of that. None of that is ours to shorten.
+#:
+#: So the old 25 s was simply below the browser's own cold-start distribution:
+#: it did not bound a browserwright defect, it truncated Chrome. The budget
+#: costs nothing on the happy path (the poll returns on first success); it is
+#: only paid when something is actually broken, and the failure message now
+#: says which thing.
+EXT_READY_TIMEOUT_S = 60.0
+
+
+def ext_ready_timeout() -> float:
+    return float(os.environ.get("BW_E2E_EXT_READY_TIMEOUT", EXT_READY_TIMEOUT_S))
+
+
 @pytest.fixture
-def ext_ready(e2e_daemon, e2e_chrome):
+def ext_ready(e2e_daemon, e2e_chrome, patched_ext_dir):
     """Block until the extension SW has connected to the daemon's relay.
 
-    Polls `/__status__` and asserts `extensions >= 1` within 25s. The budget
-    is generous on purpose: each test launches a FRESH Chrome for Testing, and
-    under load the MV3 service worker cold-start (extension load → SW boot →
-    ws dial) can take well past 10s — a tighter deadline turned into flaky
-    "extension never connected" errors on otherwise healthy runs.
-    On timeout, fails the test with the daemon log location.
+    Polls `/__status__` and asserts `extensions >= 1` within
+    `ext_ready_timeout()`. On timeout, fails the test with what the browser
+    itself said about its service worker (see `_sw_diagnosis`) and the daemon
+    log location.
     """
-    deadline = time.monotonic() + 25.0
+    budget = ext_ready_timeout()
+    deadline = time.monotonic() + budget
     last_status: dict | None = None
     while time.monotonic() < deadline:
         try:
@@ -672,9 +698,89 @@ def ext_ready(e2e_daemon, e2e_chrome):
             pass
         time.sleep(0.2)
     pytest.fail(
-        f"extension never connected within 25s; last status={last_status}; "
+        f"extension never connected within {budget:.0f}s; "
+        f"last status={last_status}; "
+        f"{_sw_diagnosis(e2e_chrome, patched_ext_dir)}; "
         f"daemon log: {e2e_daemon.log_path}"
     )
+
+
+#: What `_sw_diagnosis` asks the service worker about its own relay socket.
+#: `installId` is the tell: it is assigned inside `getInstallId()`, so a null
+#: id on an OPEN socket means `ws.onopen` is still parked on its first
+#: `chrome.storage.local` call — the GH#79 cold-start hang.
+_SW_RELAY_STATE_JS = """
+(() => {
+  try {
+    return {
+      hasWs: !!ws,
+      readyState: ws ? ws.readyState : -1,
+      installId: typeof installId === 'string' ? installId : null,
+      reconnectIdx: typeof reconnectIdx === 'number' ? reconnectIdx : null,
+      lastPongTs: typeof lastPongTs === 'number' ? lastPongTs : null,
+    };
+  } catch (e) { return {evalError: String(e)}; }
+})()
+"""
+
+
+def _sw_diagnosis(chrome, patched_ext_dir) -> str:
+    """Ask the browser why the extension has not appeared.
+
+    GH#79: "extension never connected" is several different failures wearing
+    one message, and none of them leaves a trace on the daemon side — the
+    daemon's evidence for all of them is identical silence. This asks Chrome
+    instead, and names which one it is:
+
+    * no `service_worker` target — the worker never started at all;
+    * a worker whose socket is not OPEN — it started but could not dial;
+    * a worker whose socket **is** OPEN with a null `installId` — the measured
+      cold-start defect: `onopen` parked on a `chrome.storage.local` call that
+      never settles, so `hello` was never sent and the daemon cannot see a
+      connection that is, at the TCP level, perfectly alive.
+
+    Best-effort throughout: a diagnosis that throws must not replace the real
+    failure.
+    """
+    try:
+        from browserwright.cdp import CDPSession
+
+        ext_id = _extension_id_from_path(patched_ext_dir)
+        cdp = CDPSession(chrome.ws_url)
+        try:
+            cdp.send("Target.setDiscoverTargets", discover=True)
+            targets = cdp.send("Target.getTargets").get("targetInfos", [])
+            prefix = f"chrome-extension://{ext_id}/"
+            workers = [t for t in targets if t.get("type") == "service_worker"
+                       and t.get("url", "").startswith(prefix)]
+            if not workers:
+                return (
+                    "Chrome has NO service_worker target for the extension: "
+                    "the worker never started (extension load / SW "
+                    "registration), so no dial was ever attempted")
+            session = cdp.attach(workers[0]["targetId"])
+            state = cdp.send(
+                "Runtime.evaluate", session=session, returnByValue=True,
+                awaitPromise=True, expression=_SW_RELAY_STATE_JS,
+            ).get("result", {}).get("value")
+        finally:
+            cdp.close()
+    except Exception as e:  # noqa: BLE001 - diagnosis only
+        return f"service-worker diagnosis unavailable ({e!r})"
+    if not isinstance(state, dict):
+        return f"the service worker exists but would not report its state: {state!r}"
+    if state.get("readyState") != 1:
+        return (
+            f"the service worker is running but its relay socket is not OPEN "
+            f"({state!r}): it could not reach the daemon")
+    if not state.get("installId"):
+        return (
+            f"the service worker's relay socket IS OPEN but it never sent "
+            f"`hello` ({state!r}): `onopen` is parked on chrome.storage — the "
+            "GH#79 cold-start hang")
+    return (
+        f"the service worker looks connected from its own side ({state!r}) — "
+        "the hello did not reach the daemon")
 
 
 def cdp_headless() -> bool:

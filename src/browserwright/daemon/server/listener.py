@@ -917,7 +917,9 @@ class _UpstreamHolder:
         # fallback for an adapter that reports nothing.
         await self.state.set_connected(ext.ws_url or "ext://relay")
 
-    async def _on_extension_hello(self) -> None:
+    async def _on_extension_hello(
+        self, *, install_id: str = "", first_seen: bool = False,
+    ) -> None:
         """A (auto-recovery): extension (re)connected with a fresh SW.
 
         A reloaded/updated SW reconnects with an EMPTY ``attachedTabs`` set,
@@ -957,9 +959,19 @@ class _UpstreamHolder:
                     continue
                 try:
                     await ext.recover_session(sid)
+                    # GH#79: say which of the two it was. This line used to
+                    # read "after extension reconnect" unconditionally — it
+                    # fires on EVERY hello, including the very first one from
+                    # a brand-new browser profile, and reading it in a
+                    # session-scoped e2e log is what made a fresh Chrome per
+                    # test look like a service worker churning between
+                    # commands.
                     logger.info(
-                        "auto-recovered session %s after extension reconnect",
-                        sid)
+                        "auto-recovered session %s after extension %s "
+                        "(install_id=%s)",
+                        sid,
+                        "first connect" if first_seen else "reconnect",
+                        install_id or "(unknown)")
                 except Exception:  # noqa: BLE001 - no group / empty group /
                     # still reconnecting -- the next hello retries.
                     pass

@@ -70,11 +70,61 @@ let daemonVersion = null;
 
 // ---- install id (stable across reloads) -----------------------------------
 
+// GH#79 (cold start): a `chrome.storage.local` call issued while the service
+// worker is still starting up can **never settle**. Not reject — hang. Measured
+// on a fresh profile: the ws is OPEN, the SW's event loop is healthy
+// (`setTimeout` fires in 65ms) and a *fresh* `storage.local.get` answers in
+// 2ms with the key already present, while the very first one — the one
+// `onopen` is awaiting — is still pending 25s later. `hello` was awaited behind
+// it, so the daemon saw no extension at all: `doctor` red, `wait_ready`
+// timeout, and the e2e fixture's "extension never connected within 25s". The
+// only recovery was the 45s `LEGACY_PONG_STALE_MS` staleness sweep, which
+// matches the 26s and 64s connect times measured before this fix.
+//
+// So every storage call on this path is bounded and retried. A retry is safe
+// and effective precisely because a *later* call answers immediately.
+const STORAGE_CALL_TIMEOUT_MS = 1000;
+const STORAGE_GET_ATTEMPTS = 5;
+//: How long, and how often, to keep trying to read a persisted id after a
+//: connection had to announce itself without one.
+const INSTALL_ID_REANNOUNCE_DELAY_MS = 2000;
+const INSTALL_ID_REANNOUNCE_ATTEMPTS = 6;
+
+//: Sentinel for "storage never answered". Distinct from `null` ("storage
+//: answered and there is no id yet"), because the difference decides whether
+//: minting a new id is safe: overwriting an id we simply could not read would
+//: make `install_id` unstable across restarts, which is the defect issue #79
+//: wrongly claimed already existed.
+const STORAGE_UNAVAILABLE = Symbol("storage-unavailable");
+
+async function readStoredInstallId() {
+  for (let attempt = 0; attempt < STORAGE_GET_ATTEMPTS; attempt += 1) {
+    const answer = await Promise.race([
+      chrome.storage.local.get(["installId"]).then(
+        (v) => ({ answered: true, id: (v && v.installId) || null }),
+        (e) => {
+          console.warn("[bd-relay] storage.get failed:", e);
+          return { answered: false };
+        },
+      ),
+      sleep(STORAGE_CALL_TIMEOUT_MS).then(() => ({ answered: false })),
+    ]);
+    if (answer.answered) return answer.id;
+  }
+  return STORAGE_UNAVAILABLE;
+}
+
 async function getInstallId() {
   if (installId) return installId;
-  const v = await chrome.storage.local.get(["installId"]);
-  if (v.installId) {
-    installId = v.installId;
+  const stored = await readStoredInstallId();
+  if (stored === STORAGE_UNAVAILABLE) {
+    // Do NOT mint an id here: there may be a persisted one we could not read.
+    // The caller announces itself without an identity (the wire protocol
+    // allows it) and re-announces once storage comes back.
+    return null;
+  }
+  if (stored) {
+    installId = stored;
     return installId;
   }
   installId =
@@ -82,39 +132,72 @@ async function getInstallId() {
     Array.from(crypto.getRandomValues(new Uint8Array(8)))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
-  await chrome.storage.local.set({ installId });
+  // Fire-and-forget: `hello` must not wait on the same API that just hung.
+  // Losing the write costs a new id on the next cold start, which is a far
+  // cheaper failure than never connecting at all.
+  Promise.resolve(chrome.storage.local.set({ installId })).catch((e) =>
+    console.warn("[bd-relay] storage.set failed:", e),
+  );
   return installId;
 }
 
 // ---- ws lifecycle ---------------------------------------------------------
 
+// GH#79: every handler below is bound to `sock`, the socket THIS call
+// created, and does nothing once `ws` has moved on. A socket can be
+// superseded while its events are still in flight — `forceReconnect()`
+// swaps `ws` immediately, but the old socket's `onclose` lands afterwards,
+// and a socket that was still CONNECTING when it lost the race still opens.
+// When those late handlers wrote the module globals unconditionally they
+// broke the live connection two ways: a stale `onclose` nulled the `ws`
+// that now pointed at the NEW socket (so `maintainLoop` dialled a duplicate
+// one tick later — the two `extension hello` lines ~1s apart with the same
+// install_id in the daemon log), and an orphan's `onmessage` kept
+// refreshing `lastInboundFrameTs` so `wsLooksHealthy()` vouched for the
+// live socket on the strength of frames nobody was reading.
 function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
+  let sock;
   try {
-    ws = new WebSocket(RELAY_URL);
+    sock = new WebSocket(RELAY_URL);
   } catch (e) {
     console.warn("[bd-relay] WebSocket construct failed:", e);
     // maintainLoop sees ws === null on next tick and retries.
     return;
   }
+  ws = sock;
 
-  ws.onopen = async () => {
+  // True while `sock` is the connection the rest of the extension drives.
+  const isCurrent = () => ws === sock;
+
+  const discard = (why) => {
+    try { sock.close(1000, why); } catch (_e) {}
+  };
+
+  sock.onopen = async () => {
+    if (!isCurrent()) {
+      // Lost the race while dialling: announce nothing, just hang up. A
+      // `hello` from here would give the daemon a second live connection
+      // for this install_id.
+      discard("superseded before open");
+      return;
+    }
     try {
       reconnectIdx = 0;
       lastPongTs = Date.now();
       lastInboundFrameTs = lastPongTs;
       const id = await getInstallId();
-      const manifest = chrome.runtime.getManifest();
-      safeSend({
-        type: "hello",
-        installId: id,
-        browser: "chrome",
-        version: manifest.version,
-        browserwrightVersion: manifest.version,
-        extensionProtocolVersion: BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION,
-      });
+      sendHello(sock, id);
+      if (!id) {
+        // GH#79: storage never answered, so we announced without an identity
+        // (the relay accepts that — it keys the connection by the socket
+        // instead). Keep trying in the background and re-announce the moment
+        // we can read the persisted id, so reconnect matching is restored
+        // without ever minting a second identity for this profile.
+        reannounceInstallIdWhenReadable(sock);
+      }
       // Re-announce currently-attached tabs so the daemon's ghost table
       // recovers after a reconnect.
       for (const tabId of attachedTabs) {
@@ -128,11 +211,15 @@ function connect() {
       // hits its timeout. Force-close so `onclose` fires and the
       // `maintainLoop` retries cleanly.
       console.warn("[bd-relay] onopen failed:", e);
-      try { ws?.close(1011, "hello failed"); } catch {}
+      try { sock.close(1011, "hello failed"); } catch {}
     }
   };
 
-  ws.onmessage = (ev) => {
+  sock.onmessage = (ev) => {
+    if (!isCurrent()) {
+      discard("superseded");
+      return;
+    }
     lastInboundFrameTs = Date.now();
     let msg;
     try {
@@ -152,16 +239,51 @@ function connect() {
     });
   };
 
-  ws.onclose = () => {
+  sock.onclose = () => {
+    if (!isCurrent()) {
+      // A superseded socket finishing its teardown. Clearing the globals
+      // here would strand the live socket.
+      return;
+    }
     ws = null;
     lastPongTs = 0;
     lastInboundFrameTs = 0;
     // maintainLoop will retry; no setTimeout here (would die when SW idles).
   };
 
-  ws.onerror = (ev) => {
+  sock.onerror = (ev) => {
     console.debug("[bd-relay] ws error:", ev);
   };
+}
+
+function sendHello(sock, id) {
+  const manifest = chrome.runtime.getManifest();
+  if (ws !== sock) return false;
+  return safeSend({
+    type: "hello",
+    installId: id || "",
+    browser: "chrome",
+    version: manifest.version,
+    browserwrightVersion: manifest.version,
+    extensionProtocolVersion: BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION,
+  });
+}
+
+async function reannounceInstallIdWhenReadable(sock) {
+  // Bounded: give up rather than leave a loop running for the SW's lifetime.
+  // Losing the identity costs reconnect matching, not the connection itself.
+  for (let attempt = 0;
+       attempt < INSTALL_ID_REANNOUNCE_ATTEMPTS && ws === sock;
+       attempt += 1) {
+    await sleep(INSTALL_ID_REANNOUNCE_DELAY_MS);
+    if (ws !== sock) return;
+    const id = await getInstallId();
+    if (id) {
+      console.warn("[bd-relay] re-announcing late install id");
+      sendHello(sock, id);
+      return;
+    }
+  }
 }
 
 function wsLooksHealthy() {

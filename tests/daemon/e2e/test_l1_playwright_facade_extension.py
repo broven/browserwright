@@ -49,6 +49,7 @@ from .conftest import (  # noqa: F401
     TEST_EXT_PORT,
     TEST_FACADE_L1_EXT_PORT as TEST_EXT_FACADE_PORT,
     _isolated_runtime_dir,
+    ext_ready_timeout,
 )
 
 # NOTE: TEST_EXT_FACADE_PORT here is the L1 extension-facade daemon's port
@@ -80,7 +81,9 @@ def ext_facade_ready(e2e_ext_facade_daemon, e2e_chrome):
     serves. Returns (ext_port, facade_port, runtime_dir).
     """
     ext_port, facade_port, runtime_dir = e2e_ext_facade_daemon
-    deadline = time.monotonic() + 25.0
+    # GH#79: same budget (and the same reasoning) as conftest's `ext_ready`.
+    budget = ext_ready_timeout()
+    deadline = time.monotonic() + budget
     last = None
     while time.monotonic() < deadline:
         try:
@@ -94,7 +97,8 @@ def ext_facade_ready(e2e_ext_facade_daemon, e2e_chrome):
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             pass
         time.sleep(0.2)
-    pytest.fail(f"extension never connected within 25s; last status={last}")
+    pytest.fail(
+        f"extension never connected within {budget:.0f}s; last status={last}")
 
 
 def test_connect_over_cdp_handshake_against_extension(ext_facade_ready):
