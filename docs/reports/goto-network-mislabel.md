@@ -205,6 +205,8 @@ not the departure page.
    `TargetClosedError` until a human notices and recycles the session.
    `resolve_current_target` already knows how to open and bind a tab; the
    resident-executor path needs to re-enter it when the bound page is closed.
+   — *Filed as #86 and DONE; it took three defects, not the one predicted here.
+   See `docs/reports/issue86-dead-tab-rebind.md`.*
 2. **`DEBUGGER_COMMAND_TIMEOUT_MS = 9000` is tight for `Page.navigate`.** It is
    a hard wall-clock cap, with no retry, on the one command a page load depends
    on, against sites whose full `goto` measures 10–18 s here. Either give

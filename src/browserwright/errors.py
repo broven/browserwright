@@ -86,6 +86,39 @@ class PageBindTimeout(BrowserwrightError):
         )
 
 
+class TabRebindFailed(BrowserwrightError):
+    """The session's bound tab died AND re-binding a replacement failed.
+
+    Issue #86: a session whose tab dies used to answer every later call in
+    1-4ms with ``TargetClosedError``, forever, because the bind was performed
+    once and never revisited. The bind is now re-entered when the bound page
+    is dead — but that recovery has to be *bounded*: exactly one attempt, and
+    a failure that is TELLABLE APART from the dead-tab condition it was trying
+    to repair. Without a distinct error a genuinely unusable browser would
+    look like a tab that is merely closed, and the caller would keep asking
+    for a rebind that cannot ever succeed.
+
+    So: ``TargetClosedError`` (or ``PageLoadFailed(reason="target-closed")``)
+    means "the tab is gone, recovery is being attempted"; THIS error means
+    "the tab is gone and recovery itself failed" — a different next action.
+    """
+
+    exit_code = 3
+    default_fix = (
+        "the session's tab is gone and re-opening one failed; the browser or "
+        "the extension relay is likely unusable. Check `browserwright doctor` "
+        "and the daemon log, then `browserwright session reset <id>` (or start "
+        "a new session) — retrying the same call will NOT help"
+    )
+
+    def __init__(self, reason: str = "", fix: str = ""):
+        self.reason = reason
+        message = "the session's tab is gone and re-binding a new one failed"
+        if reason:
+            message = f"{message}: {reason}"
+        super().__init__(message, fix=fix)
+
+
 class ElementNotFound(BrowserwrightError):
     exit_code = 3
     default_fix = (

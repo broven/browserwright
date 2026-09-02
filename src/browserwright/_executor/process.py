@@ -41,7 +41,7 @@ from contextlib import contextmanager, redirect_stdout
 from typing import Any
 
 from .._text import spill_text, truncate_hard
-from ..errors import BrowserwrightError, serialize
+from ..errors import BrowserwrightError, TabRebindFailed, serialize
 from .protocol import (
     MAX_TEXT_CHARS,
     TERMINAL_DEADLINE_EXCEEDED,
@@ -77,6 +77,16 @@ def _is_target_closed_family(exc: BaseException) -> bool:
     page in place -- it must exit so the next command cold-starts and
     re-attaches the session (B, target-closed self-heal)."""
     if type(exc).__name__ == "TargetClosedError":
+        return True
+    # Issue #86: `page.goto` is wrapped by `repl._smart_goto`, which TRANSLATES
+    # the underlying TargetClosedError into `PageLoadFailed(reason=
+    # "target-closed")` — a BrowserwrightError. `_execute` catches
+    # BrowserwrightError in an EARLIER branch than the raw-exception one this
+    # predicate used to guard, so the whole self-heal was unreachable for the
+    # single most common way a session meets a dead tab: navigating. Read the
+    # classifier's own bucket rather than hoping its rendered message still
+    # carries the original marker text (it is bounded to 300 chars).
+    if getattr(exc, "reason", None) == "target-closed":
         return True
     msg = str(exc).lower()
     return any(marker in msg for marker in _TARGET_CLOSED_MARKERS)
@@ -244,6 +254,16 @@ class _Worker:
         self._page_target_id: str | None = None
         # Re-entrancy guard for target-changed rebinds (issue #21).
         self._rebinding_page = False
+        # Issue #86: how many dead-tab rebinds this call has already spent.
+        # The bound is ONE. A second dead tab inside a single call is not a
+        # tab that needs rebinding, it is a browser that cannot hold one, and
+        # answering it with another rebind is how a bug turns into a loop.
+        self._rebinds_this_call = 0
+        # Issue #86: set when a call failed with a target-closed-family error,
+        # so the next call re-enters the bind discipline even if Playwright has
+        # not yet processed the target's destruction (its `pages` cache is fed
+        # by channel events that only drain while a sync call is in flight).
+        self._page_maybe_dead = False
         # The globals dict of the CURRENTLY executing heredoc, so a mid-call
         # rebind can swap its ``page`` name (issue #21 same-call visibility).
         self._active_globals: dict[str, Any] | None = None
@@ -506,7 +526,7 @@ class _Worker:
         finally:
             self._rebinding_page = False
 
-    def _rebind_page(self, sess=None) -> None:
+    def _rebind_page(self, sess=None, *, strict: bool = False) -> None:
         """Rebind ``self._page`` (and the running heredoc's ``page`` name) to
         the session's current target, re-resolving through the same
         reuse/recover/adopt/open discipline the cold-start bind uses.
@@ -514,19 +534,29 @@ class _Worker:
         ``sess`` is the session whose binding changed (the hook passes the
         one ``bind_target`` / ``open_session_tab`` / ``close_session_tab``
         received); falls back to ``current_session()`` for the pre-execute
-        reconcile path."""
+        reconcile path.
+
+        ``strict=True`` is the issue #86 dead-tab path: RAISE
+        ``TabRebindFailed`` instead of warning and keeping the old page. The
+        lenient behaviour is right when the old page is still usable (a
+        ``switch_tab`` whose destination could not be resolved); it is exactly
+        wrong when the old page IS the corpse being replaced, because "keep the
+        old page and warn" is how this failure became permanent."""
         from ..repl import playwright_handle as ph
         from ..repl.snapshot import make_snapshot
 
         if sess is None:
             from ..session import current_session
             sess = current_session()
-        try:
-            page = ph.bind_current_page(self._context, sess)
-        except Exception as e:  # noqa: BLE001 - keep the old page + warn
-            self._call_warnings.append(
-                f"page rebind to the session's current tab failed: {e}")
-            return
+        if strict:
+            page = ph.rebind_dead_page(self._context, sess)
+        else:
+            try:
+                page = ph.bind_current_page(self._context, sess)
+            except Exception as e:  # noqa: BLE001 - keep the old page + warn
+                self._call_warnings.append(
+                    f"page rebind to the session's current tab failed: {e}")
+                return
         self._page = page
         self._page_target_id = sess.current_target_id
         self._live_page_holder.page = page
@@ -542,14 +572,81 @@ class _Worker:
         if self._active_globals is not None:
             self._active_globals["page"] = page
 
+    # ---- issue #86: a session whose tab died must rebind, not fail forever --
+
+    def _live_page_is_dead(self) -> bool:
+        """Is the held ``page`` a handle to a tab that no longer exists?
+
+        Drains queued channel events first: the executor sits in ``queue.get``
+        between calls, so a tab that died while it was idle has not been
+        reported to ``page.is_closed()`` yet. Without the drain the probe is
+        blind to exactly the case issue #86 is about.
+        """
+        from ..repl.playwright_handle import drain_page_events, page_is_dead
+
+        if self._context is not None:
+            drain_page_events(self._context)
+        return page_is_dead(self._page)
+
+    def _rebind_dead_page(self) -> bool:
+        """Issue #86: re-enter the bind discipline for a dead tab. ONE attempt.
+
+        The executor holds ``self._page`` for its whole life, so a tab that
+        dies under it used to make EVERY later call in that session fail in
+        1-4ms with ``TargetClosedError`` — for good. Nothing was wrong with the
+        session, the browser, or the URL; the binding was simply never
+        revisited.
+
+        Recovery goes through ``bind_current_page`` →
+        ``resolve_current_target``, never ``context.new_page()``: only the
+        agent path opens the replacement tab INSIDE this session's tab group,
+        which is what keeps the ledger and the Playwright view on one tab (see
+        ``bind_current_page``'s docstring — an un-grouped tab is ledger drift
+        and tab explosion).
+
+        Returns True when a live page is bound, False when this call has
+        already spent its one attempt (or a rebind is already in flight).
+        Raises ``TabRebindFailed`` (a DIFFERENT error from the dead-tab
+        condition, on purpose) when the rebind itself fails — the caller turns
+        either outcome into a terminal response, so a browser that genuinely
+        cannot hold a tab open never turns into a rebind loop.
+        """
+        from ..session import current_session
+
+        # Armed BEFORE the attempt and cleared only on success, so a rebind
+        # that could not even run (re-entrancy, budget spent) still leaves the
+        # next call knowing the binding is suspect.
+        self._page_maybe_dead = True
+        if self._rebinding_page or self._rebinds_this_call >= 1:
+            return False
+        self._rebinds_this_call += 1
+        self._rebinding_page = True
+        try:
+            self._rebind_page(current_session(), strict=True)
+        finally:
+            self._rebinding_page = False
+        self._page_maybe_dead = False
+        return True
+
     def _reconcile_page_binding(self) -> None:
         """Before each execute, rebind the live page if the session's DURABLE
         current target (ledger) moved — e.g. an in-process CLI heredoc called
         ``bind_target`` / ``close_session_tab`` without touching the page
-        surface, or a previous call left the ledger ahead of this executor."""
+        surface, or a previous call left the ledger ahead of this executor.
+
+        Issue #86 rides on the same pre-call hook: a page whose tab is GONE is
+        rebound here too. The ledger comparison below cannot see that case —
+        when a tab dies without anyone telling browserwright, the ledger still
+        names the dead target, so it matches ``_page_target_id`` and the
+        reconcile returned early. Checking liveness is what makes the dead
+        binding recoverable instead of permanent, and it is cheap: both probes
+        in ``page_is_dead`` are local, with no CDP round-trip."""
         if not self._connected or self._context is None or self._page is None:
             return
         if self._rebinding_page:
+            return
+        if self._page_maybe_dead or self._live_page_is_dead():
+            self._rebind_dead_page()
             return
         try:
             from .. import session_registry as reg
@@ -629,6 +726,7 @@ class _Worker:
         the facade is up); `_connected` stays False so the next execute retries."""
         self._call_warnings = []
         self._call_screenshots = []
+        self._rebinds_this_call = 0
         try:
             self._ensure_cold_started()
         except BrowserwrightError as e:
@@ -651,8 +749,19 @@ class _Worker:
         # running heredoc's `page` name too, not just the next call's.
         # Also reconcile the live page against the session's DURABLE current
         # target before running this call (a separate process may have moved
-        # the ledger binding without this executor noticing).
-        self._reconcile_page_binding()
+        # the ledger binding without this executor noticing) — and, issue #86,
+        # rebind if the tab the live page points at is gone.
+        try:
+            self._reconcile_page_binding()
+        except TabRebindFailed as e:
+            # The tab is gone AND opening a replacement failed. This is the
+            # bound on issue #86's recovery: escalate to the pre-existing
+            # cold-restart (terminal recycle) instead of attempting another
+            # rebind, and answer with the DISTINCT error so the caller can tell
+            # "the tab died" from "the browser cannot give me a tab at all".
+            return self._finish(
+                io.StringIO(), error=serialize(e), exit_code=e.exit_code,
+                terminal_reason=TERMINAL_TARGET_CLOSED)
         self._active_globals = globals_ = self._build_globals()
         buf = io.StringIO()
         return_value: str | None = None
@@ -689,6 +798,16 @@ class _Worker:
                         terminal_reason=TERMINAL_RESET_REQUESTED,
                     )
                 except BrowserwrightError as e:
+                    # Issue #86: `page.goto` failures arrive here, not in the
+                    # raw-exception branch below — `repl._smart_goto` has
+                    # already translated the underlying TargetClosedError into
+                    # `PageLoadFailed(reason="target-closed")`. That is why the
+                    # target-closed recovery under this branch's sibling was
+                    # unreachable for the most common way a session meets a
+                    # dead tab, and why a dead tab stayed dead forever.
+                    if _is_target_closed_family(e):
+                        return self._target_closed_response(
+                            buf, serialize(e), e.exit_code)
                     return self._finish(
                         buf, error=serialize(e), exit_code=e.exit_code)
                 except SystemExit as e:
@@ -708,35 +827,9 @@ class _Worker:
                     fix = playwright_error_fix(e)
                     if fix:
                         error["fix"] = fix
-                    terminal_reason = None
                     if _is_target_closed_family(e):
-                        # B (target-closed self-heal): the session's tab
-                        # binding died under us (extension SW reload/update,
-                        # daemon restart, user closed the tab). The page is a
-                        # zombie and the facade connection still holds the
-                        # daemon's single-attacher slot, which deadlocks every
-                        # recovery path until this executor is reaped. So flush
-                        # this (hint-carrying) response and exit: the next
-                        # command cold-starts, re-attaches the session's tab
-                        # group (title-keyed recoverSession) and releases the
-                        # slot. The hint must NOT teach `session new` -- the
-                        # session itself is fine; only the executor is not.
-                        sid = self._session_id or "<id>"
-                        error["fix"] = (
-                            "the session's tab binding is gone (extension "
-                            "reloaded/updated, daemon restarted, or the tab was "
-                            "closed). The executor recycled itself; the NEXT "
-                            "command re-attaches the session automatically. If "
-                            "the tab is gone for good, run `browserwright "
-                            f"session reset -s {sid}` first, or `browserwright "
-                            f"session attach-active -s {sid}` to adopt the tab "
-                            "you are looking at, then retry."
-                        )
-                        terminal_reason = TERMINAL_TARGET_CLOSED
-                    return self._finish(
-                        buf, error=error, exit_code=3,
-                        terminal_reason=terminal_reason,
-                    )
+                        return self._target_closed_response(buf, error, 3)
+                    return self._finish(buf, error=error, exit_code=3)
         finally:
             self._active_globals = None
         return self._finish(
@@ -745,6 +838,57 @@ class _Worker:
             task_result_json=task_result_json,
             exit_code=0,
         )
+
+    def _target_closed_response(
+        self, buf: io.StringIO, error: dict[str, Any], exit_code: int,
+    ) -> ExecuteResponse:
+        """Answer a call that died because the session's tab is gone.
+
+        Issue #86 changed what "answer" means here. The old behaviour was
+        terminal-only: flush the error and exit the executor so the NEXT
+        command cold-starts and re-attaches. That was correct but never
+        reached for `page.goto` (see the BrowserwrightError branch), and even
+        where it was reached it threw away the executor's `state`.
+
+        Now: try ONE in-place rebind first. It goes through
+        ``resolve_current_target``, so the replacement tab lands in this
+        session's tab group and the ledger stays in step. If it works, the
+        session is usable again on the very next statement and the error says
+        so — retry, do NOT create a new session. If it does not, fall back to
+        exactly the old terminal recycle. One attempt, two clearly different
+        outcomes, no loop.
+        """
+        sid = self._session_id or "<id>"
+        failure: str | None = None
+        try:
+            if not self._rebind_dead_page():
+                failure = (
+                    "the tab died again after this call already rebound once")
+        except BaseException as rebind_exc:  # noqa: BLE001 - fall back, never raise
+            failure = str(rebind_exc)
+        if failure is not None:
+            error["fix"] = (
+                "the session's tab binding is gone (extension "
+                "reloaded/updated, daemon restarted, or the tab was closed) "
+                f"and re-binding a fresh tab failed ({failure}). The "
+                "executor recycled itself; the NEXT command re-attaches the "
+                "session automatically. If the tab is gone for good, run "
+                f"`browserwright session reset -s {sid}` first, or "
+                f"`browserwright session attach-active -s {sid}` to adopt the "
+                "tab you are looking at, then retry."
+            )
+            return self._finish(
+                buf, error=error, exit_code=exit_code,
+                terminal_reason=TERMINAL_TARGET_CLOSED,
+            )
+        error["fix"] = (
+            "the tab this session was bound to is gone (closed by the page, "
+            "by the user, or by a renderer crash). A fresh tab has been opened "
+            "in THIS session's tab group and `page` is bound to it — RETRY the "
+            "call. The session does not need to be recreated; if this keeps "
+            "happening on the same URL, that page is closing its own tab."
+        )
+        return self._finish(buf, error=error, exit_code=exit_code)
 
     @staticmethod
     def _exec_with_return(code: str, globals_: dict[str, Any]) -> str | None:
