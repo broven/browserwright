@@ -157,6 +157,17 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
                        held, pid)
 
 
+def _local_probe_host(facade_host: str) -> str:
+    """The address a client ON THIS MACHINE uses for a daemon bound to
+    ``facade_host``: loopback whenever the facade co-binds it (specific
+    non-loopback host, or a wildcard), else the host itself."""
+    from ..config import (LOOPBACK_HOST, _LOOPBACK_COVERING_HOSTS,
+                          needs_loopback_cobind)
+    if needs_loopback_cobind(facade_host) or facade_host in _LOOPBACK_COVERING_HOSTS:
+        return LOOPBACK_HOST
+    return facade_host
+
+
 async def run_serve(cfg: Config) -> int:
     """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code.
 
@@ -168,7 +179,16 @@ async def run_serve(cfg: Config) -> int:
     # file onto TCP: `/__ping__` on the configured port is the liveness probe,
     # and the port bind below is the mutual-exclusion primitive — a socket file
     # could go stale behind our back, an EADDRINUSE cannot.
-    existing = await _ipc.ping_status_async(timeout=1.0)
+    # ADR-0012 rule 6: probe the port THIS daemon is about to bind, on the
+    # address local clients use for it — not whatever endpoint this shell
+    # resolves (which, in an isolated dev/test environment without
+    # `BW_DAEMON_URL`, is the machine-global daemon).
+    own_port = cfg.resolved_facade_port()
+    if own_port:
+        existing = await _ipc.ping_status_async(
+            timeout=1.0, host=_local_probe_host(cfg.facade_host), port=own_port)
+    else:
+        existing = _ipc.NO_PONG  # port 0: nobody can be holding "our" port
     existing_pid, existing_version = existing.pid, existing.version
     if existing_pid is not None:
         # ADR-0012 rule 5: launchd KeepAlive respawns us into this branch
@@ -320,8 +340,19 @@ async def run_serve(cfg: Config) -> int:
     # a daemon told to bind port 0 (the per-test isolation scheme), and it is
     # ranked below every configured source in `daemon_url` precedence, so a
     # stale file can cost at most one failed ping.
-    _ipc.write_endpoint_state(endpoint_url)
-    logger.info("endpoint started at %s (control/cdp/exec)", endpoint_url)
+    #
+    # ADR-0012 rule 3: when the bind host is a specific non-loopback address
+    # (the tailnet remote-use setup) the facade co-binds loopback, and what we
+    # publish for LOCAL clients is the loopback address — otherwise every
+    # local client resolves the tailnet IP and dies with the VPN. Remote
+    # clients configure `BW_DAEMON_URL` explicitly and never read this file.
+    published_url = f"http://{_local_probe_host(cfg.facade_host)}:{bound}"
+    _ipc.write_endpoint_state(published_url)
+    if published_url != endpoint_url:
+        logger.info("endpoint started at %s (control/cdp/exec); published %s "
+                    "for local clients", endpoint_url, published_url)
+    else:
+        logger.info("endpoint started at %s (control/cdp/exec)", endpoint_url)
 
     # v0.4: for the extension shared context, start the relay ws server eagerly
     # so `browserwright-daemon doctor` can probe `__status__` even before any

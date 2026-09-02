@@ -167,6 +167,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # status (v0.2)
     p_status = sub.add_parser("status", help="report the daemon's IPC endpoint + liveness")
     p_status.add_argument("--json", action="store_true")
+    p_act = sub.add_parser(
+        "activity",
+        help=("is anyone using this daemon right now? exit 0 = idle, 4 = busy "
+              "(same gate `restart` uses; for scripts that must not disturb "
+              "live sessions, e.g. the e2e runner and upgrade-global)"))
+    p_act.add_argument("--json", action="store_true")
+    p_act.add_argument("--active-within", type=float, default=None, metavar="S",
+                       help="treat a session touched within S seconds as active")
 
     # ps — in-flight introspection. Sibling of `status`, NOT a flag on it:
     # `status` answers "is a daemon there" (liveness, used by the skill layer as
@@ -482,6 +490,24 @@ def _cmd_stop(args, cfg: Config) -> int:
         print(f"error: {not_ours_to_signal_message(endpoint, 'stop')}",
               file=sys.stderr)
         return 3
+    # ADR-0012 rule 6: an implicit endpoint (default / state file) whose port
+    # is not the port THIS configuration serves means the shell is pointed at
+    # a different daemon than the one its ports describe — the isolated-dev
+    # shape that stopped the machine-global daemon on 2026-09-02. Refuse
+    # unless the URL was configured explicitly.
+    # Only when the port was overridden (`--facade-port` / BD_FACADE_PORT /
+    # toml): a default config legitimately stops a daemon published on any
+    # port (the port-0 isolation scheme), an overridden one names a daemon.
+    own_port = cfg.facade_port
+    if not endpoint.explicit and own_port and endpoint.port != own_port:
+        print(
+            f"error: refusing to stop: this shell resolves the daemon endpoint "
+            f"to {endpoint.url} (from {endpoint.source}), but its own facade "
+            f"port is {own_port}. That is a different daemon. Set "
+            f"BW_DAEMON_URL=http://127.0.0.1:{own_port} to stop the daemon "
+            "these ports describe, or unset the port overrides to manage the "
+            "default one.", file=sys.stderr)
+        return 3
 
     pid = _ipc.ping_sync(timeout=1.0)
     if pid is None:
@@ -565,6 +591,28 @@ async def _run_backend_info(args, cfg: Config) -> int:
     }
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def _cmd_activity(args, cfg: Config) -> int:
+    """ADR-0012 rule 4: the one gate every "don't disturb live sessions"
+    script consults. Exit 0 when nobody would be interrupted, 4 when someone
+    would (reasons on stdout / in the JSON), 0 with ``determinate: false``
+    when the daemon could not be asked (nothing to interrupt)."""
+    from . import restart_guard
+
+    activity = restart_guard.probe(cfg, active_within=args.active_within)
+    if args.json:
+        print(json.dumps({"busy": activity.blocked,
+                          "determinate": activity.determinate,
+                          "reasons": list(activity.reasons)}, sort_keys=True))
+    elif activity.blocked:
+        print("busy:")
+        for r in activity.reasons:
+            print(f"  - {r}")
+    else:
+        print("idle" + ("" if activity.determinate else
+                        " (daemon did not answer; nothing to interrupt)"))
+    return 4 if activity.blocked else 0
 
 
 def _cmd_status(args, cfg: Config, *, probe=None) -> int:
@@ -1220,6 +1268,7 @@ _DISPATCH = {
     "stop": _cmd_stop,
     "restart": _cmd_restart,
     "status": _cmd_status,
+    "activity": _cmd_activity,
     "ps": _cmd_ps,
     "logs": _cmd_logs,
     # v0.5

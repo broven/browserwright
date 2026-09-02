@@ -1,6 +1,6 @@
 # Development never touches the global daemon, the global binary, or the daily Chrome
 
-Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 not yet implemented (#91). Supersedes the partial
+Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 and 6 implemented (#91). Amended the same day: remote use over the tailnet is a real requirement (a VPS drives this Mac's Chrome), so rule 3 keeps the non-loopback bind and makes it durable instead of removing it; rule 4 became an activity gate rather than a concurrency cap; rule 6 was added after the maintainer's own verification run stopped the global daemon. Supersedes the partial
 isolation in `tests/conftest.py` (kept) by extending the same rule to every
 developer-facing verb.
 
@@ -69,27 +69,51 @@ global install owns.** Concretely, "the global install" is:
 
 Rules, one per leak found:
 
-1. **`dev-link` installs under a different name.** It links
-   `~/.local/bin/browserwright-dev` and `browserwright-daemon-dev` (and a
-   `browserwright-dev` skill dir), never the unsuffixed names. The dev daemon
-   runs with its own `XDG_RUNTIME_DIR`, its own ports (a fixed dev block,
-   distinct from both production and the e2e block), its own ledger root,
-   and drives Chrome for Testing with the unpacked `chrome-extension/`,
-   never the daily Chrome. A dev checkout is exercised the way e2e already
-   exercises it, just interactively.
+1. **`dev-link` installs under a different name.** It writes wrapper
+   scripts `~/.local/bin/browserwright-dev` and `browserwright-daemon-dev`,
+   never the unsuffixed names, and removes any unsuffixed link that points
+   into a checkout. The wrappers pin the dev runtime: own `XDG_RUNTIME_DIR`,
+   `TMPDIR`, ledger root (`BS_HOME`), a fixed dev port block
+   (21989/21990/21991, clear of production, playwriter, OpenCLI and the e2e
+   block) and, decisively, `BW_DAEMON_URL` pointing at the dev port — the
+   port variables alone are not isolation (rule 6). The extension backend is
+   exercised with Chrome for Testing and the unpacked `chrome-extension/`
+   patched to the dev relay port, the way e2e already does it; never the
+   daily Chrome. No skill dir is linked: the skill text names the
+   `browserwright` binary, so a dev-named skill would route agents to the
+   global install anyway.
 2. **`upgrade-global` refuses while sessions are active.** It drops
-   `--force` and inherits the daemon's own refusal. A human who really wants
-   to interrupt live sessions runs `browserwright-daemon restart --force`
-   themselves, in a terminal, after reading the refusal that names the
-   sessions. No task, script, or skill document may pass `--force`.
-3. **The LaunchAgent is generated, never hand-edited.** `browserwright-daemon
-   install` owns the plist; it binds loopback only. Remote use (ADR-0011's
-   motivation) is configured through the daemon's own config file, not by
-   editing `ProgramArguments`. The current `--facade-host` is removed.
-4. **e2e caps its concurrency.** The harness limits simultaneous executors
-   and Chrome for Testing instances so an e2e run cannot starve the
-   production daemon of CPU. The exact cap is an implementation detail; the
-   rule is that an e2e run must not measurably slow a production session.
+   `--force` and inherits the daemon's own refusal (exit 4, sessions named);
+   the package and extension artifacts are already installed at that point,
+   so re-running it once the sessions are idle completes the upgrade. A
+   human who really wants to interrupt live sessions runs
+   `browserwright-daemon restart --force` themselves, in a terminal. No task,
+   script, or skill document may pass `--force`.
+3. **The LaunchAgent is generated, never hand-edited, and remote use is
+   durable.** `browserwright-daemon install` owns the plist. Remote use over
+   the tailnet is a real requirement, so `--facade-host <tailnet-ip>` stays
+   — but as an `install` argument that `install --force` without flags
+   carries forward from the installed plist (`plist_serve_args`), never as a
+   hand edit that the next regeneration silently drops. Two consequences
+   for local clients: the facade co-binds loopback (PR #78), and the daemon
+   **publishes the loopback address** in its endpoint state file, so a local
+   client never resolves the tailnet IP and a VPN outage only affects the
+   remote side. Remote clients set `BW_DAEMON_URL` explicitly and never read
+   that file.
+4. **e2e does not start while production is busy.** The ports are
+   isolated, the CPU is not. Rather than a concurrency cap (which would not
+   have stopped 20 leaked executors from competing), the e2e runner asks the
+   machine-global daemon `browserwright-daemon activity` — the same gate
+   `restart` uses — and refuses with exit 4 while any session is mid-task.
+   `E2E_FORCE=1` overrides for a human. The rule is still the outcome: an
+   e2e run must not measurably slow a production session.
+6. **`serve` and `stop` are keyed on their own port, not on whatever this
+   shell resolves.** `serve` stale-detects against the port it is about to
+   bind, on the address local clients use for it; `stop` refuses when the
+   config overrides the facade port but the implicitly resolved endpoint
+   names a different one. Found the hard way: an "isolated" shell with the
+   port variables set but no `BW_DAEMON_URL` made `serve` defer to the
+   global daemon and `stop` kill it.
 5. **Every daemon start, stop, and restart is attributed.** The daemon log
    gains timestamps and, for each lifecycle event, the initiator (launchd
    spawn, CLI verb with its cwd and parent process, self-exit watchdog). This
@@ -116,7 +140,9 @@ Rules, one per leak found:
 - `upgrade-global` can fail with "sessions active". That is the intended
   behavior; the fix is to wait or to end your own sessions, not to add
   `--force` back.
-- Remote use needs a config-file path for the bind host before rule 3 can be
-  completed; until then rule 3 means "loopback only".
+- `browserwright-daemon status --json` now reports the loopback URL as the
+  endpoint on a tailnet-bound daemon; the tailnet address is still visible
+  in `cdp_surface.ws`. Remote clients were never meant to read the state
+  file.
 - Once implemented, the daemon log's `already running` flood should stop. If
   it does not, the remaining initiator is visible by name (rule 5).
