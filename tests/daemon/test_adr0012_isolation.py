@@ -161,10 +161,14 @@ def test_activity_verb_exits_4_when_busy_and_0_when_idle(monkeypatch, capsys):
 def test_upgrade_global_no_longer_forces_a_restart():
     import tomllib
     tasks = tomllib.loads((REPO / "mise.toml").read_text())["tasks"]
-    code = "\n".join(ln for ln in tasks["upgrade-global"]["run"].splitlines()
+    run = tasks["upgrade-global"]["run"]
+    code = "\n".join(ln for ln in run.splitlines()
                      if not ln.lstrip().startswith("#") and "echo" not in ln)
     assert "restart --force" not in code
-    assert "browserwright-daemon restart" in code
+    assert 'global_cmd "$global_daemon" restart' in code
+    assert code.index("activity 2>&1") < code.index("uv tool install browserwright")
+    assert code.index("uv tool install browserwright") < code.index(
+        'global_cmd "$global_daemon" restart')
 
 
 def test_dev_link_never_writes_the_global_binary_names():

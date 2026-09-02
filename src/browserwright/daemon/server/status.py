@@ -82,6 +82,36 @@ def snapshot(daemon: object | None, *, state: object | None = None) -> dict:
     }
 
 
+def public_recovery_snapshot(daemon: object | None) -> dict:
+    """Minimal HTTP status safe for the unauthenticated facade endpoint.
+
+    The operator-only ``BrowserwrightDaemon.status`` RPC carries clients,
+    pending calls, executor identities and local socket paths.  None of those
+    belong on an HTTP route.  Recovery observers need only the running daemon
+    version and each session's public diagnosis.
+    """
+    recovery_machine = getattr(daemon, "recovery", None)
+    try:
+        states = recovery_machine.all() if recovery_machine is not None else {}
+    except Exception:  # noqa: BLE001 - public status must remain total
+        states = {}
+    sessions = []
+    for session_id, recovery in sorted(states.items()):
+        sessions.append({
+            "session_id": session_id,
+            "recovery": ({
+                "state": recovery.get("state"),
+                "since": recovery.get("since"),
+                "reason": recovery.get("reason"),
+            } if isinstance(recovery, dict) else None),
+        })
+    return {
+        "schema_version": 1,
+        "daemon_version": __version__,
+        "sessions": sessions,
+    }
+
+
 def _session_rows(daemon: object | None) -> list[dict]:
     """Per-session lifecycle rows from the daemon's termination bookkeeping.
     Absent daemon (bare-Router unit tests) yields an honest empty list."""

@@ -735,7 +735,8 @@ def _cmd_recover(args: list[str], *, session_id: Optional[str] = None) -> int:
     self-check (three criteria, two agreeing probes) runs here. "Gone" or
     "stale version" is repaired through the default endpoint's on-demand
     start (the sanctioned restart path); "something else answers on the
-    port" and "the probes disagree" are `needs-human`. Then the daemon runs
+    port" and "the probes disagree" are `needs-human` because recovery never
+    signals or replaces an unidentified process. Then the daemon runs
     the per-session ladder and reports the state reached. Exit 0 = healthy,
     4 = needs-human, 2 = usage."""
     kw = _parse_kv_args(args)
@@ -753,7 +754,7 @@ def _cmd_recover(args: list[str], *, session_id: Optional[str] = None) -> int:
     verdict = daemon_self_check(None)
     if not verdict["healthy"]:
         crit = verdict["criterion"]
-        if crit in ("gone", "foreign", "version") and not ep.explicit:
+        if crit in ("gone", "version") and not ep.explicit:
             steps.append(f"daemon: {verdict['detail']}; starting the installed one")
             from .daemon import _ipc
             _ipc.log_lifecycle(
@@ -787,15 +788,21 @@ def _cmd_recover(args: list[str], *, session_id: Optional[str] = None) -> int:
     except (OSError, subprocess.SubprocessError) as e:
         return _recover_report(sid, "needs-human", steps,
                                f"could not ask the daemon to recover: {e}")
-    if proc.returncode != 0:
-        return _recover_report(sid, "needs-human", steps,
-                               (proc.stderr or proc.stdout).strip()[:400]
-                               or f"daemon recover exited {proc.returncode}")
     try:
         result = _json.loads(proc.stdout.strip().splitlines()[-1])
+        if not isinstance(result, dict):
+            raise ValueError("recover result is not an object")
     except (ValueError, IndexError):
+        detail = ((proc.stderr or proc.stdout).strip()[:400]
+                  if proc.returncode != 0 else
+                  f"unreadable recover result: {proc.stdout[:200]!r}")
+        return _recover_report(
+            sid, "needs-human", steps,
+            detail or f"daemon recover exited {proc.returncode}")
+    if proc.returncode not in (0, 4):
         return _recover_report(sid, "needs-human", steps,
-                               f"unreadable recover result: {proc.stdout[:200]!r}")
+                               (proc.stderr or f"daemon recover exited "
+                                f"{proc.returncode}").strip()[:400])
     for st in result.get("steps") or []:
         steps.append(f"{st.get('rung')}: {st.get('detail')}")
     return _recover_report(sid, result.get("state") or "needs-human", steps,

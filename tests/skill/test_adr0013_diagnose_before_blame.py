@@ -326,6 +326,42 @@ def test_session_new_reuse_matches_backend_and_name_only(ledger_home):
     assert session_create.new(backend="cdp", name="hn", create=True, reuse=True) == cdp
 
 
+def test_session_new_reuse_skips_a_session_that_needs_human(ledger_home):
+    from browserwright import session_create
+    from browserwright import session_registry as reg
+
+    blocked = session_create.new(backend="extension", name="hn")
+    reg.update(blocked, recovery={
+        "state": "needs-human",
+        "since": 1,
+        "reason": "the tab group cannot be recovered",
+    })
+
+    replacement = session_create.new(
+        backend="extension", name="hn", reuse=True)
+
+    assert replacement != blocked
+    assert session_create.last_new_reused is None
+
+
+@pytest.mark.parametrize("state", [
+    "healthy",
+    "extension-disconnected",
+    "tab-gone",
+    "executor-unbound",
+    "executor-dead",
+])
+def test_session_new_reuse_accepts_recoverable_states(ledger_home, state):
+    from browserwright import session_create
+    from browserwright import session_registry as reg
+
+    existing = session_create.new(backend="extension", name="hn")
+    reg.update(existing, recovery={"state": state, "since": 1, "reason": ""})
+
+    assert session_create.new(
+        backend="extension", name="hn", reuse=True) == existing
+
+
 def test_daemon_log_lines_share_the_iso_timestamp_shape(monkeypatch, tmp_path, capsys):
     """Spec #92: ISO-8601 timestamps on every line — logger output included."""
     import logging

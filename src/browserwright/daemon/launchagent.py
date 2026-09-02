@@ -582,12 +582,14 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
 
 
 def daemon_self_check(cfg, *, expected_version: str | None = None) -> dict:
-    """The three automatic-restart criteria of ADR-0013 rule 2, each confirmed
-    by TWO consecutive probes so a transient glitch never triggers a restart.
+    """The three daemon diagnoses of ADR-0013 rule 2, each confirmed by TWO
+    consecutive probes so a transient glitch never triggers replacement.
 
     Returns ``{"healthy": bool, "criterion": None|"gone"|"foreign"|
     "version", "detail": str, "probes": [kind, kind]}``. ``healthy`` is True
-    only when both probes found our daemon on the expected version.
+    only when both probes found our daemon on the expected version. ``gone``
+    and ``version`` permit automatic replacement; ``foreign`` is reported for
+    human resolution because an unidentified process is never signalled.
     """
     from . import _ipc
     from .. import __version__

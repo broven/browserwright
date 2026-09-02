@@ -1,9 +1,9 @@
 # The daemon owns one recovery state machine per session; agents get one recovery verb
 
-Status: proposed (2026-09-02); rules 3 and 4 implemented (#92). Decided in a
-grilling session; the state machine (rules 1, 2, 5) is to be implemented after
-ADR-0012 removes the development-induced daemon churn, so that the remaining
-failures are the ones this ADR is for.
+Status: accepted and implemented (2026-09-02) by #92 and #94. ADR-0012 first
+removed development-induced daemon churn; the recovery state machine, executor
+adoption, recovery verb, and diagnosis-gated restart then implemented rules 1,
+2, and 5.
 
 ## Context
 
@@ -89,15 +89,15 @@ wait for the extension to reconnect (bounded by the relay's reconnect
 window) → rebind the session's tab → cold-start the session's executor →
 self-check the daemon. It affects one session only.
 
-The last rung may restart the daemon **automatically** when, and only when,
-the daemon's self-check finds one of: the daemon process is gone; the
-production port is held by something that does not answer the daemon's own
-ping; the running version differs from the installed version. Because a
-mistaken "port held by a stranger" verdict would recreate the restart loop
-this ADR is trying to end, that probe must agree on two consecutive attempts
-before it counts. Every automatic restart is logged with its reason (ADR-0012
-rule 5). If the ladder ends in `needs-human`, `recover` says so with the
-diagnosis and stops; it never loops.
+The last rung may replace the daemon **automatically** when, and only when, the
+daemon's self-check finds that its process is gone or that its running version
+differs from the installed version. Both verdicts require two consecutive
+agreeing probes. A production port held by a responder that cannot be proven to
+be browserwright is diagnosed as `needs-human`: recovery never signals an
+unknown process or starts a daemon that cannot bind. Every automatic replacement
+is logged with its reason and both probe results (ADR-0012 rule 5). If the ladder
+ends in `needs-human`, `recover` says so with the diagnosis and stops; it never
+loops.
 
 ### 3. Agent-visible error text follows a banned-word list
 
@@ -152,14 +152,27 @@ not documented for agents (ADR-0012 rule 2).
 - `status` and `doctor` gain a per-session state column that says which layer
   is broken. This is the observability that was missing in every incident
   reviewed.
-- The eight heartbeat/timeout budgets stop being independent policies and
-  become tunables of one machine; they should be documented in one table.
+- The heartbeat/timeout budgets are inputs to one recovery machine. Their
+  current values and ownership are centralized here; #94 intentionally did not
+  retune them:
+
+  | Hop / operation | Budget | Recovery meaning |
+  | --- | ---: | --- |
+  | Extension application ping | 20 s | Keeps the MV3 socket active. |
+  | Extension server-pong stale threshold | 25 s | Reconnect after a once-live daemon stops answering. |
+  | Extension legacy stale threshold | 45 s | Reconnect when no server ping has ever arrived. |
+  | Relay websocket ping / pong timeout | 20 s / 20 s | Transport-level dead-peer detection. |
+  | Relay application-frame stale threshold | 30 s | Demote a socket that is open but not useful. |
+  | Relay reconnect window | 35 s | Bound recovery rung 1. |
+  | Extension reload verification | 15 s | Bound replacement-service-worker proof. |
+  | Executor discovery readiness | 15 s | Bound executor cold-start in recovery rung 3. |
+  | Chrome debugger command / attach / detach | 9 s / 3 s / 3 s | Bound extension-side CDP operations. |
 - The extension relay's `recoverSession` sweep and the executor's
   `TERMINAL_TARGET_CLOSED` self-heal are folded into the state machine rather
   than deleted; the mechanisms are sound, their coordination was not.
-- Risk: the automatic-restart rung can still misjudge. The two-probe rule and
-  attributed logging are the mitigations; if a restart loop appears in the
-  log, the first suspect is that verdict.
+- Risk: the automatic-replacement rung can still misjudge gone/version. The
+  two-probe rule and attributed logging are the mitigations; an unidentified
+  port holder is never an automatic kill or replacement target.
 
 ## Sequencing
 

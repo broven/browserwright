@@ -83,10 +83,30 @@ Rules, one per leak found:
    `browserwright` binary, so a dev-named skill would route agents to the
    global install anyway.
 2. **`upgrade-global` refuses while sessions are active.** It drops
-   `--force` and inherits the daemon's own refusal (exit 4, sessions named);
-   the package and extension artifacts are already installed at that point,
-   so re-running it once the sessions are idle completes the upgrade. A
-   human who really wants to interrupt live sessions runs
+   `--force` and checks `browserwright-daemon activity` before changing the
+   global package or extension. A busy result exits 4 with the session names;
+   neither installation nor restart begins. The final unforced `restart`
+   repeats the same guard so a session that becomes busy during installation
+   is protected from the check/install race. After installation, the task
+   compares the installed CLI version with `status --json`; an already-running
+   healthy copy of that exact version makes restart an idempotent no-op, while
+   a missing or different daemon takes the ordinary unforced restart path.
+   Reload and verification continue either way. Immediately after the package
+   install, an explicit second activity gate runs unconditionally — including
+   on the same-version path — before status, extension work, reload, or
+   verification. If extension bytes changed, a third explicit gate runs
+   immediately before reload, covering activity that began during download;
+   `restart` retains its own internal guard for the remaining race.
+   Every post-install browserwright/browserwright-daemon command uses the
+   absolute `~/.local/bin` production entrypoint instead of PATH, and every
+   activity, status, restart, reload, and version command clears inherited dev
+   endpoint/config/runtime/port variables before addressing production, while
+   setting `TMPDIR` to macOS's canonical per-user temporary directory so
+   lifecycle state and logs do not fall back to shared `/tmp`. This deliberately
+   tightens the
+   original "install first, then let restart refuse" implementation: refusal
+   now leaves the entire global install untouched. A human who really wants
+   to interrupt live sessions runs
    `browserwright-daemon restart --force` themselves, in a terminal. No task,
    script, or skill document may pass `--force`.
 3. **The LaunchAgent is generated, never hand-edited, and remote use is
@@ -140,9 +160,9 @@ Rules, one per leak found:
   the global install. Verifying a change against the daily Chrome now means
   releasing it (`upgrade-global`, which will refuse while an agent is mid-task)
   or driving Chrome for Testing with the dev daemon.
-- `upgrade-global` can fail with "sessions active". That is the intended
-  behavior; the fix is to wait or to end your own sessions, not to add
-  `--force` back.
+- `upgrade-global` can fail with "sessions active" before installing anything.
+  That is the intended behavior; wait for the sessions to become idle and run
+  the whole task again, rather than adding `--force` back.
 - `browserwright-daemon status --json` now reports the loopback URL as the
   endpoint on a tailnet-bound daemon; the tailnet address is still visible
   in `cdp_surface.ws`. Remote clients were never meant to read the state

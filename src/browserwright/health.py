@@ -24,7 +24,7 @@ from pathlib import Path
 # Doctor blobs this browserwright build knows how to read. The daemon's current
 # contract is v3 (liveness fields added for issue #28, daemon v0.5.x); v1/v2 are
 # still parseable for the fields we use. Anything else = real version skew.
-_SUPPORTED_DOCTOR_SCHEMAS = (1, 2, 3)
+_SUPPORTED_DOCTOR_SCHEMAS = (1, 2, 3, 4)
 
 #: LaunchAgent plist path (macOS autostart). When it exists, a down daemon is
 #: a *restart*, not a first start — `serve` would fight launchd over the socket.

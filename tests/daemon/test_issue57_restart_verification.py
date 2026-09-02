@@ -189,10 +189,22 @@ def test_restart_refuses_a_healthy_daemon_before_activity_or_launchd(
         "healthy": True, "criterion": None,
         "detail": "the daemon answered twice", "probes": ["ours", "ours"],
     })
+    monkeypatch.setattr(
+        "browserwright.daemon.restart_guard._fetch_snapshot",
+        lambda cfg, timeout: {"sessions": [{
+            "session_id": "7",
+            "recovery": {
+                "state": "tab-gone", "since": 123.0,
+                "reason": "the tab was closed",
+            },
+        }]},
+    )
     with pytest.raises(LaunchAgentError) as exc:
         launchagent.restart(_Cfg(), timeout=1.0)
     assert exc.value.exit_code == 4
-    assert "browserwright recover --session <id>" in str(exc.value)
+    message = str(exc.value)
+    assert "session 7: tab-gone (the tab was closed)" in message
+    assert "browserwright recover --session <id>" in message
     assert harness["calls"] == []
 
 

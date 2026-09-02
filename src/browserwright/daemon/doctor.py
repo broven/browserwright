@@ -31,7 +31,10 @@ from .probe import daemon_status_async
 # top-level `alive` / `probe_state` / `pid` (DaemonStatus wire fields). The
 # liveness probe is local (endpoint ping + pid-file/port observations), zero
 # ws side effects, so it keeps the §9.4 contract.
-SCHEMA_VERSION = 3
+# schema_version bumped to 4 for ADR-0013: top-level `sessions` carries the
+# daemon-owned per-session recovery state from the side-effect-free HTTP
+# snapshot. Older readers can still ignore this additive field.
+SCHEMA_VERSION = 4
 
 # Backends in this preference order are eligible to be `recommended`.
 # Driven by spec §5.2's `recommended` field: choose the lowest ux_cost available.
@@ -90,6 +93,7 @@ async def doctor(cfg: Config, *, backend: str | None = None, probe_ws: bool = Fa
         "endpoint": st.endpoint,
         "cdp_surface": st.cdp_surface,
         "facade": st.cdp_surface,
+        "sessions": st.sessions,
         "recommended": _pick_recommended([_asdict(r) for r in results]),
         "backends": [_asdict(r) for r in results],
     }

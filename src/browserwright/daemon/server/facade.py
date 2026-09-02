@@ -16,9 +16,10 @@ three sub-surfaces:
   - **`/exec` — the exec-relay surface.** The executor data plane
     (`exec_relay.py`). Clients no longer dial an executor's socket.
 
-Plus the HTTP routes: `/json/version`, `/json`, `/json/list` (CDP bootstrap) and
-`/__ping__` (liveness + version, the stale-detect probe that used to be spoken
-over the unix socket). Any other path is a 4xx.
+Plus the HTTP routes: `/json/version`, `/json`, `/json/list` (CDP bootstrap),
+`/__ping__` (liveness + version), and the deliberately minimal `/__status__`
+(daemon version plus public per-session recovery diagnoses). The operator-only
+full snapshot remains on the control RPC. Any other path is a 4xx.
 
 Security (ADR-0011, deliberate): no application-layer auth. The boundary is the
 network layer — loopback by default, a tunnel/tailnet for remote — plus Origin
@@ -296,6 +297,10 @@ class PlaywrightFacade:
             resp = conn.respond(http.HTTPStatus.OK, body)
             resp.headers["Content-Type"] = "application/json"
             return resp
+        if path == "/__status__":
+            from .status import public_recovery_snapshot
+
+            return self._http_json(conn, public_recovery_snapshot(self._daemon))
         session_id = self._session_for_request(request)
         authority = self._authority_from_request(request)
         if path == "/json/version":
@@ -311,7 +316,7 @@ class PlaywrightFacade:
             http.HTTPStatus.NOT_FOUND,
             f"unknown browserwright endpoint path {path!r}; "
             f"expected one of {', '.join(_WS_PATHS)}, {PING_PATH}, "
-            "/json/version, /json, /json/list\n")
+            "/__status__, /json/version, /json, /json/list\n")
 
     def _origin_denial(self, conn: ServerConnection, request):
         """Anti-CSRF: refuse any ws upgrade that carries an `Origin` header.

@@ -14,6 +14,7 @@ from browserwright.daemon.config import Config, load
 from browserwright.daemon.errors import (
     Unavailable,
 )
+from browserwright.daemon.probe import DaemonStatus
 
 
 @pytest.mark.parametrize(
@@ -62,6 +63,35 @@ def test_cmd_status_json_includes_dead_endpoint(monkeypatch, tmp_path, capsys):
     assert payload["endpoint"]["explicit"] is True
     assert payload["cdp_surface"] is None
     assert payload["probe_state"] == "not_running"
+
+
+def test_cmd_status_json_carries_per_session_recovery(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "browserwright.daemon.probe.daemon_status",
+        lambda cfg, *, probe=None: DaemonStatus(
+            alive=True, probe_state="ok", pid=42, port_holder_pid=None,
+            version="1.2.3",
+            endpoint={"url": "http://127.0.0.1:19990"},
+            cdp_surface={"ws": "ws://127.0.0.1:19990/cdp", "port": 19990},
+            sessions=[{
+                "session_id": "7",
+                "recovery": {
+                    "state": "tab-gone", "since": 123.0,
+                    "reason": "the tab was closed",
+                },
+            }],
+        ),
+    )
+
+    assert cli_mod._cmd_status(SimpleNamespace(json=True), Config()) == 0
+    session = json.loads(capsys.readouterr().out)["sessions"][0]
+    assert session == {
+        "session_id": "7",
+        "recovery": {
+            "state": "tab-gone", "since": 123.0,
+            "reason": "the tab was closed",
+        },
+    }
 
 
 def test_cmd_status_json_marks_transient_probe_failure(tmp_path, capsys):

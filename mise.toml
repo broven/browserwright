@@ -317,7 +317,77 @@ set -euo pipefail
 # `--refresh` busts uv's index cache: right after a release uv otherwise
 # resolves to the cached previous version and silently installs the OLD wheel
 # (e.g. re-installing 0.6.13 minutes after 0.6.14 went live). See RELEASING.md.
+#
+# ADR-0012 rule 2, tightened after the original implementation: gate BEFORE
+# any install mutates the global tool or extension.  The checkout CLI knows the
+# current `activity` contract even when the globally installed CLI predates it;
+# the final `restart` below repeats the guard to close the check/install race.
+# Every command aimed at the global install crosses this boundary. A caller may
+# itself be running inside `browserwright-dev`, so inherited dev endpoint,
+# config, runtime and port variables must never redirect a global operation.
+production_tmpdir="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+if [[ -z "$production_tmpdir" ]]; then
+  production_tmpdir="/tmp"
+fi
+global_cmd() {
+  env -u BW_DAEMON_URL -u BD_CONFIG \
+    -u XDG_RUNTIME_DIR -u TMPDIR -u BS_HOME \
+    -u BD_EXTENSION_PORT -u BD_FACADE_PORT -u BD_CDP_PORT \
+    -u BD_FACADE_HOST -u BROWSERWRIGHT_DEV -u BROWSERWRIGHT_DEV_ROOT \
+    -u BROWSERWRIGHT_DEV_EXT_PORT -u BROWSERWRIGHT_DEV_FACADE_PORT \
+    -u BROWSERWRIGHT_DEV_CDP_PORT \
+    TMPDIR="$production_tmpdir" \
+    "$@"
+}
+global_cli="$HOME/.local/bin/browserwright"
+global_daemon="$HOME/.local/bin/browserwright-daemon"
+
+require_global_idle() {
+  local cli="$1"
+  local stage="$2"
+  local activity_report=""
+  local rc=0
+  if activity_report="$(global_cmd "$cli" activity 2>&1)"; then
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ $rc -eq 4 ]]; then
+    echo "upgrade-global: refusing $stage because the global daemon is busy:" >&2
+    echo "$activity_report" | sed 's/^/    /' >&2
+    exit 4
+  fi
+  echo "upgrade-global: could not check global daemon activity $stage:" >&2
+  echo "$activity_report" | sed 's/^/    /' >&2
+  exit $rc
+}
+
+activity_cli="{{config_root}}/.venv/bin/browserwright-daemon"
+if [[ ! -x "$activity_cli" ]]; then
+  activity_cli="$(command -v browserwright-daemon || true)"
+fi
+if [[ -z "$activity_cli" ]]; then
+  echo "upgrade-global: cannot check daemon activity; run mise run install first." >&2
+  exit 3
+fi
+require_global_idle "$activity_cli" "before installation"
+
 uv tool install browserwright --force --refresh
+if [[ ! -x "$global_cli" || ! -x "$global_daemon" ]]; then
+  echo "upgrade-global: uv did not install the expected global entrypoints under $HOME/.local/bin." >&2
+  exit 1
+fi
+installed_cli_version="$(global_cmd "$global_cli" version)"
+if [[ -z "$installed_cli_version" ]]; then
+  echo "Could not determine installed browserwright version." >&2
+  exit 1
+fi
+
+# Explicit post-install gate. This is intentionally separate from restart's
+# own guard: it runs even when the same-version fast path will skip restart,
+# and it prevents status, extension replacement/reload, and verification from
+# starting after a production session became busy during the package install.
+require_global_idle "$global_daemon" "after package installation"
 
 # --- Install the release-built Chrome extension artifact. -------------------
 # The extension is not distributed through PyPI. release.yml publishes a
@@ -379,11 +449,7 @@ download_extension_asset() {
 if [[ -z "${BROWSERWRIGHT_CHROME_EXTENSION_TARGET:-}" && "$(uname)" != "Darwin" ]]; then
   echo "Skipping chrome-extension install: set BROWSERWRIGHT_CHROME_EXTENSION_TARGET to enable on non-macOS."
 else
-  cli_version="$(browserwright version)"
-  if [[ -z "$cli_version" ]]; then
-    echo "Could not determine installed browserwright version." >&2
-    exit 1
-  fi
+  cli_version="$installed_cli_version"
 
   prev_hash="$(hash_ext_dir "$EXT_TARGET")"
   tmp_dir="$(mktemp -d)"
@@ -432,24 +498,49 @@ else
   fi
 fi
 
-# ADR-0012 rule 2: no `--force`. The daemon's own activity gate decides; if
-# someone (usually an agent) is mid-task, the upgrade stops here with their
-# session names and exit 4 — a human who really wants to interrupt them runs
-# `browserwright-daemon restart --force` themselves, in a terminal. The
-# package and extension artifacts above are already in place, so re-running
-# this task once the sessions are idle finishes the job.
+# ADR-0012 rule 2: no `--force`. If status proves the installed version is
+# already the healthy running version, restart is an idempotent no-op. Otherwise
+# call ordinary restart, whose own activity guard closes the check/install race.
+# A human who really wants to interrupt it runs the forced command themselves.
+status_rc=0
+daemon_status="$(global_cmd "$global_daemon" status --json 2>/dev/null)" \
+  || status_rc=$?
+running_version=""
+if [[ $status_rc -eq 0 ]]; then
+  running_version="$(global_cmd python3 - "$daemon_status" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except (IndexError, TypeError, ValueError):
+    payload = {}
+if payload.get("alive") is True and isinstance(payload.get("version"), str):
+    print(payload["version"])
+PY
+)"
+fi
 restart_stderr="$(mktemp)"
-restart_report="$(browserwright-daemon restart 2>"$restart_stderr")" || {
-  rc=$?
-  echo "upgrade-global: the new package is installed but the daemon was NOT restarted:" >&2
-  cat "$restart_stderr" >&2
-  rm -f "$restart_stderr"
-  echo "upgrade-global: re-run when the sessions above are idle (browserwright-daemon activity), or restart by hand with --force if you accept interrupting them." >&2
-  exit $rc
-}
+restart_rc=0
+restart_report=""
+if [[ "$running_version" == "$installed_cli_version" ]]; then
+  echo "upgrade-global: daemon already healthy on the installed version; no restart needed."
+else
+  restart_report="$(global_cmd "$global_daemon" restart 2>"$restart_stderr")" \
+    || restart_rc=$?
+  if [[ $restart_rc -ne 0 ]]; then
+    echo "upgrade-global: the new package is installed but the daemon was NOT restarted:" >&2
+    cat "$restart_stderr" >&2
+    rm -f "$restart_stderr"
+    echo "upgrade-global: re-run when the sessions above are idle (browserwright-daemon activity)." >&2
+    exit $restart_rc
+  fi
+fi
 rm -f "$restart_stderr"
-echo "$restart_report"
-python3 - "$restart_report" <<'PY'
+if [[ -n "$restart_report" ]]; then
+  echo "$restart_report"
+fi
+global_cmd python3 - "$restart_report" <<'PY'
 import json
 import sys
 
@@ -466,10 +557,11 @@ if interrupted:
 PY
 
 if [[ "$ext_changed" == "1" ]]; then
+  require_global_idle "$global_daemon" "before extension reload"
   echo "Requesting Chrome extension reload..."
-  if browserwright-daemon extension reload; then
+  if global_cmd "$global_daemon" extension reload; then
     echo "Waiting for extension to reconnect on version $ext_version..."
-    python3 - "$ext_version" <<'PY'
+    global_cmd python3 - "$ext_version" <<'PY'
 import json
 import os
 import sys
@@ -525,8 +617,8 @@ fi
 # manifest, which on a `uv tool` install (no manifest beside the venv) reduces
 # to "is the version string semver" — it reported "versions ok" while a 0.8.2
 # daemon was still serving (issue #57).
-browserwright version check --strict-daemon
-browserwright-daemon version check --strict-daemon
+global_cmd "$global_cli" version check --strict-daemon
+global_cmd "$global_daemon" version check --strict-daemon
 
 # --- Update the pi extension (@browserwright/pi). ---------------------------
 # Third release target from the same git tag (ADR-0008): the pi agent's
@@ -558,7 +650,7 @@ else
 fi
 
 echo ""
-echo "Done. Global browserwright is on $(browserwright version), the matching extension artifact and pi extension are installed, and the daemon is restarted."
+echo "Done. Global browserwright is on $(global_cmd "$global_cli" version), the matching extension artifact and pi extension are installed, and the daemon is healthy."
 """
 
 [tasks.version-check]

@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from browserwright import cli as user_cli
+from browserwright.daemon import cli as daemon_cli
 from browserwright.daemon import launchagent
 from browserwright.daemon._ipc import EndpointProbe
+from browserwright.daemon.config import Config
 from browserwright.daemon.server.proxy import Router
 from browserwright.daemon.server.session_state import (
     HEALTHY,
@@ -83,9 +85,12 @@ class _Registry:
 
 async def _invoke_recover(monkeypatch, *, backend="extension", ready=True,
                           tab_error=None, executor_alive=True, spawn_error=None,
-                          probe_error=None):
+                          probe_error=None, initial_state=None):
     machine = RecoveryStateMachine()
-    machine.load([{"id": "7", "backend": backend}],
+    row = {"id": "7", "backend": backend}
+    if initial_state is not None:
+        row["recovery"] = {"state": initial_state, "since": 1.0}
+    machine.load([row],
                  extension_connected=ready,
                  executor_alive=lambda _sid: executor_alive)
     relay = _Relay(ready)
@@ -189,12 +194,16 @@ async def test_recover_executor_failure_is_needs_human(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_no_existing_tab_is_recoverable_not_a_false_success(monkeypatch):
-    """Exit 0 means healthy, so recover may not return tab-gone as success."""
-    result, _, _, _, _ = await _invoke_recover(
+    """A missing tab becomes a fresh blank tab before recover says healthy."""
+    result, _, extension, _, _ = await _invoke_recover(
         monkeypatch, tab_error=RuntimeError("no recoverable tabs"),
-        executor_alive=True)
+        executor_alive=True, initial_state="tab-gone")
 
     assert result["state"] == HEALTHY
+    assert result["steps"] == [{
+        "rung": "tab", "ok": True, "detail": "session has a live tab"}]
+    assert extension.calls == [
+        "7", ("open", "about:blank", "7", True)]
 
 
 @pytest.mark.parametrize("state", [
@@ -220,6 +229,117 @@ def test_user_cli_healthy_result_exits_zero(monkeypatch, capsys):
                             "steps": [], "reason": ""}), ""))
 
     assert user_cli._cmd_recover(["--session", "7"]) == 0
+    assert "healthy" in capsys.readouterr().out
+
+
+def test_user_recover_parses_needs_human_json_despite_semantic_exit_four(
+        monkeypatch, capsys):
+    monkeypatch.setattr(launchagent, "daemon_self_check", lambda _cfg: {
+        "healthy": True, "criterion": None, "detail": "two good probes",
+        "probes": ["ours", "ours"],
+    })
+    monkeypatch.setattr(
+        "browserwright.daemon_url.daemon_endpoint",
+        lambda **_kw: DaemonEndpoint("http://127.0.0.1:19990", False, "default"),
+    )
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: CompletedProcess(
+        a[0], 4, json.dumps({
+            "sessionId": "7",
+            "state": NEEDS_HUMAN,
+            "steps": [{"rung": "tab", "ok": False,
+                       "detail": "no recoverable tab"}],
+            "reason": "the tab cannot be recovered",
+        }), "semantic exit 4"))
+
+    assert user_cli._cmd_recover(["--session", "7"]) == 4
+    captured = capsys.readouterr()
+    assert "session 7: needs-human — the tab cannot be recovered" in captured.out
+    assert "tab: no recoverable tab" in captured.err
+    assert "semantic exit 4" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(("state", "expected_exit"), [
+    (HEALTHY, 0),
+    (NEEDS_HUMAN, 4),
+])
+def test_daemon_recover_exit_code_matches_final_state(
+        monkeypatch, capsys, state, expected_exit):
+    async def recover_result(*_args, **_kwargs):
+        return {"sessionId": "7", "state": state, "steps": [], "reason": ""}
+
+    monkeypatch.setattr(daemon_cli, "_rpc_via_ws", recover_result)
+    args = SimpleNamespace(session="7")
+
+    assert daemon_cli._DISPATCH["recover"](args, Config()) == expected_exit
+    assert json.loads(capsys.readouterr().out)["state"] == state
+
+
+def test_user_recover_does_not_replace_an_unknown_port_holder(
+        monkeypatch, capsys):
+    monkeypatch.setattr(launchagent, "daemon_self_check", lambda _cfg: {
+        "healthy": False, "criterion": "foreign",
+        "detail": "HTTP 503 answered on the daemon port",
+        "probes": ["foreign", "foreign"],
+    })
+    monkeypatch.setattr(
+        "browserwright.daemon_url.daemon_endpoint",
+        lambda **_kw: DaemonEndpoint("http://127.0.0.1:19990", False, "default"),
+    )
+    monkeypatch.setattr(
+        "browserwright.session_create._ensure_daemon_running",
+        lambda: pytest.fail("recover must not disturb an unknown process"),
+    )
+    monkeypatch.setattr(
+        "browserwright.daemon._ipc.log_lifecycle",
+        lambda *_args, **_kwargs: pytest.fail("no replacement was attempted"),
+    )
+
+    assert user_cli._cmd_recover(["--session", "7"]) == 4
+    output = capsys.readouterr().out
+    assert "needs-human" in output
+    assert "HTTP 503" in output
+
+
+@pytest.mark.parametrize("criterion", ["gone", "version"])
+def test_user_recover_repairs_a_proven_daemon_problem_and_logs_evidence(
+        monkeypatch, capsys, criterion):
+    from browserwright.daemon import _ipc
+
+    monkeypatch.setattr(launchagent, "daemon_self_check", lambda _cfg: {
+        "healthy": False, "criterion": criterion,
+        "detail": f"confirmed {criterion}",
+        "probes": [criterion, criterion],
+    })
+    monkeypatch.setattr(
+        "browserwright.daemon_url.daemon_endpoint",
+        lambda **_kw: DaemonEndpoint("http://127.0.0.1:19990", False, "default"),
+    )
+    starts = []
+    monkeypatch.setattr(
+        "browserwright.session_create._ensure_daemon_running",
+        lambda: starts.append(criterion),
+    )
+    monkeypatch.setattr(
+        "browserwright.mode_b_client.ModeBClient.wait_until_alive",
+        lambda self, timeout: True,
+    )
+    lifecycle = []
+    monkeypatch.setattr(
+        _ipc, "log_lifecycle",
+        lambda event, **fields: lifecycle.append((event, fields)),
+    )
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: CompletedProcess(
+        a[0], 0, json.dumps({"sessionId": "7", "state": HEALTHY,
+                            "steps": [], "reason": ""}), ""))
+
+    assert user_cli._cmd_recover(["--session", "7"]) == 0
+    assert starts == [criterion]
+    assert lifecycle == [("automatic-recovery", {
+        "criterion": criterion,
+        "probes": f"{criterion},{criterion}",
+        "reason": f"confirmed {criterion}",
+        "session": "7",
+    })]
     assert "healthy" in capsys.readouterr().out
 
 

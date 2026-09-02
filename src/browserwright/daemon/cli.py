@@ -866,7 +866,7 @@ async def _rpc_via_ws(cfg: Config, method: str, params: dict,
 def _rpc_cmd(cfg: Config, method: str, params: dict, *,
              client_label: str, timeout: float = 10.0,
              browser_session: str | None = None,
-             emit=None, validate_result=None) -> int:
+             emit=None, validate_result=None, success_exit=None) -> int:
     """Shared runner for one-shot RPC subcommands: call `_rpc_via_ws`, map
     Unavailable→2 / DaemonError→3 — the same mapping main()'s top-level
     handler applies, duplicated here because tests (and any embedder) invoke
@@ -890,7 +890,7 @@ def _rpc_cmd(cfg: Config, method: str, params: dict, *,
         emit(result)
     else:
         print(json.dumps(result, sort_keys=True))
-    return 0
+    return success_exit(result) if success_exit is not None else 0
 
 
 async def _userscript_call_ws(cfg: Config, method: str, params: dict,
@@ -1022,6 +1022,8 @@ class _Forward:
     #: Reject a technically-successful response that doesn't mean what the
     #: caller needs. Raises DaemonError (→ exit 3).
     validate: Callable[[dict], None] | None = None
+    #: Map a successful response to the command's semantic exit code.
+    success_exit: Callable[[dict], int] | None = None
 
 
 def _need_session(a) -> str | None:
@@ -1167,7 +1169,8 @@ _FORWARDS: dict[str, _Forward] = {
         validate=_require_reaped),
     "recover": _Forward(
         "BrowserwrightDaemon.recover", "cli-recover", 90.0,
-        lambda a: {"session": a.session}),
+        lambda a: {"session": a.session},
+        success_exit=lambda result: 0 if result.get("state") == "healthy" else 4),
 }
 
 
@@ -1179,7 +1182,8 @@ def _forwarding_handler(spec: _Forward):
         return _rpc_cmd(cfg, spec.method, spec.params(args),
                         client_label=spec.label, timeout=spec.timeout,
                         browser_session=args.session,
-                        validate_result=spec.validate)
+                        validate_result=spec.validate,
+                        success_exit=spec.success_exit)
     handler.__name__ = f"_cmd_{spec.label.removeprefix('cli-').replace('-', '_')}"
     return handler
 

@@ -217,22 +217,43 @@ The global install is two independent pieces:
 mise run upgrade-global
 ```
 
-This: `uv tool install browserwright --force --refresh` (CLI+daemon from PyPI) →
-downloads the matching `browserwright-extension-<version>.zip` from the GitHub
-Release and unpacks it into the extension dir → `browserwright-daemon restart
---force` → `browserwright-daemon extension reload` → `browserwright-daemon
-version check --strict-daemon` → `pi update npm:@browserwright/pi` (pi
-extension, only when it is installed in pi's user settings).
+This first runs `browserwright-daemon activity`. If any production session is
+busy it exits 4 before changing the global package, extension, or daemon. Once
+idle, it runs `uv tool install browserwright --force --refresh` (CLI+daemon from
+PyPI) → unconditionally checks production activity a second time → downloads
+the matching `browserwright-extension-<version>.zip` from the
+GitHub Release and unpacks it into the extension dir → runs the ordinary,
+unforced `browserwright-daemon restart` → `browserwright-daemon extension
+reload` (after another activity check when extension bytes changed) →
+`browserwright-daemon version check --strict-daemon` → `pi update
+npm:@browserwright/pi` (pi extension, only when it is installed in pi's user
+settings). An already-healthy same-version daemon is an idempotent no-op: the
+task detects the version match through `status --json` and skips restart
+entirely; reload, strict version verification, and pi
+update still run. All commands aimed at the global daemon clear inherited dev
+endpoint, config, runtime, home, and port variables first, so running this task
+from a dev wrapper cannot redirect them to the isolated daemon. `TMPDIR` is set
+to macOS's canonical per-user temporary directory rather than merely unset, so
+global lifecycle state and logs stay in their normal production location. Once
+installation starts, every browserwright/browserwright-daemon invocation is
+the absolute `~/.local/bin` production entrypoint; an activated checkout or
+dev wrapper earlier on PATH cannot intercept status, restart, reload, or
+verification.
 
-> **Why `--force` and `--strict-daemon` (issue #57).** A restart kills every
-> session's live executor state, so `restart` refuses by default while anyone is
-> driving a session; an upgrade is explicit human intent, so it passes `--force`
-> and prints what it interrupted rather than killing silently. `--strict-daemon`
-> makes the post-check require that the daemon answering `/__status__` is running
-> the version just installed. Without it, the check compared the package to the
-> extension manifest — which on a `uv tool` install (no manifest beside the venv)
-> reduces to "is this string semver", and reported `versions ok` for a whole
-> release while a daemon one version behind kept serving.
+> **Why up to four activity checks and `--strict-daemon` (issues #91 and #57).** The
+> preflight keeps an initially busy refusal completely non-mutating. The
+> unconditional post-install check catches a session that became busy during
+> package installation even when a same-version daemon would skip restart. The
+> unforced restart checks once more internally. When extension bytes changed,
+> a final explicit check immediately before reload also covers a same-version
+> daemon and activity that began during the download. If any guard reports
+> busy, wait and rerun the whole task. `--strict-daemon` makes the post-check
+> require that the daemon
+> answering `/__status__` is running the version just installed. Without it,
+> the check compared the package to the extension manifest — which is absent
+> beside a `uv tool` venv — so it reduces to "is this string semver",
+> and reported `versions ok` for a whole release while a daemon one version
+> behind kept serving.
 
 > **If the upgrade reports a restart failure**, read the message: it distinguishes
 > "pid unchanged", "new process died on startup", and "new process is running the

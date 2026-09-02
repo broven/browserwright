@@ -317,27 +317,48 @@ def reap(*, idle_seconds: float) -> list[dict]:
     return pruned
 
 
+_REUSABLE_RECOVERY_STATES = frozenset({
+    "healthy",
+    "extension-disconnected",
+    "tab-gone",
+    "executor-unbound",
+    "executor-dead",
+})
+
+
+def _recovery_is_reusable(row: dict) -> bool:
+    """Whether a ledger row can converge without human intervention.
+
+    Rows written before recovery state existed remain reusable.  Once a daemon
+    has persisted a diagnosis, only the known healthy/recoverable states are
+    eligible; ``needs-human`` and malformed/unknown diagnoses must not hand the
+    agent straight back to a session it cannot repair.
+    """
+    if "recovery" not in row:
+        return True
+    recovery = row.get("recovery")
+    return (
+        isinstance(recovery, dict)
+        and recovery.get("state") in _REUSABLE_RECOVERY_STATES
+    )
+
+
 def find_reusable(*, backend: str, name: str,
                   owner: Optional[str] = None) -> Optional[dict]:
     """The most recent ledger session with this ``backend`` and ``name``
     (and, when given, ``owner`` — so a cdp ``--attach`` request never gets
     back a ``--create`` session of the same name, or vice versa).
 
-    ``session new --reuse`` (ADR-0013 rule 4) hands an agent back the session
-    it already has instead of a second one. A ledger row is the only
-    liveness we can check without the daemon; a session whose executor or
-    tab is gone is still *recoverable* (the next call rebinds), so every row
-    counts. ``session end`` removes the row, so an ended session is never
-    matched.
+    ``session new --reuse`` (ADR-0013 rule 4) hands an agent back a healthy or
+    daemon-recoverable session instead of a second one.  Legacy rows without a
+    recovery record remain eligible. ``session end`` removes the row, so an
+    ended session is never matched.
     """
-    # "Usable" here means "in the ledger": the ledger is the only truth a
-    # client holds without the daemon, and daemon-side liveness (executor,
-    # tab, browser) is what the next call rebinds or what ADR-0013's state
-    # machine will adjudicate. `new()` rejects an empty name before this runs.
     matches = [
         r for r in reg.list_all()
         if r.get("backend") == backend and r.get("name") == name
         and (owner is None or r.get("owner") == owner)
+        and _recovery_is_reusable(r)
     ]
     return matches[-1] if matches else None
 

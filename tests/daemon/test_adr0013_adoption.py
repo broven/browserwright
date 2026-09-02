@@ -10,18 +10,24 @@ import json
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import time
 from types import SimpleNamespace
 
 import pytest
+import websockets
 
+from browserwright._executor import protocol
 from browserwright.daemon import _ipc
 from browserwright.daemon import platforms
+from browserwright.daemon.config import Config
 from browserwright.daemon.server import executor_registry as er
 from browserwright.daemon.server import listener
 from browserwright.daemon.server.executor_registry import ExecutorRegistry
+from browserwright.daemon.server.facade import PlaywrightFacade
 
 
 @pytest.fixture
@@ -231,3 +237,85 @@ async def test_adopted_executor_is_reused_with_same_socket_and_identity_then_kil
     }
     assert registry.get("s-adopted") is None
     assert cleaned == ["s-adopted"]
+
+
+@pytest.mark.asyncio
+async def test_boot_adopts_a_live_executor_process_and_relays_real_exec_roundtrip(
+        isolated_runtime):
+    sid = "process-adopted"
+    executor_id = "00000000000000000000000000ad0bed"
+    sock = _ipc.executor_sock_path(sid)
+    server = r"""
+import json, os, socket, struct, sys
+length = struct.Struct(">I")
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.listen()
+print("ready", flush=True)
+while True:
+    conn, _ = listener.accept()
+    with conn:
+        header = conn.recv(4)
+        if len(header) != 4:
+            continue
+        size = length.unpack(header)[0]
+        body = b""
+        while len(body) < size:
+            chunk = conn.recv(size - len(body))
+            if not chunk:
+                break
+            body += chunk
+        request = json.loads(body)
+        response = {
+            "console": "adopted process: " + request["code"] + "\n",
+            "return_value": None,
+            "error": None,
+            "exit_code": 0,
+            "warnings": [],
+            "screenshots": [],
+            "truncated": False,
+            "terminal_reason": None,
+            "task_result_json": None,
+        }
+        payload = json.dumps(response).encode()
+        conn.sendall(length.pack(len(payload)) + payload)
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", server, str(sock)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    facade = None
+    registry = ExecutorRegistry()
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        _ipc.write_executor_file(sid, str(sock), proc.pid, executor_id)
+
+        records = er.cleanup_orphan_executors()
+        assert registry.adopt(records) == [sid]
+        adopted = registry.get(sid)
+        assert adopted is not None
+        assert (adopted.pid, adopted.executor_id, adopted.sock_path) == (
+            proc.pid, executor_id, str(sock))
+
+        daemon = SimpleNamespace(executors=registry)
+        facade = PlaywrightFacade(
+            cfg=Config(), port=0, host="127.0.0.1", daemon=daemon)
+        port = await facade.start()
+        async with websockets.connect(
+                f"ws://127.0.0.1:{port}/exec?session={sid}") as ws:
+            request = protocol.ExecuteRequest(
+                "print('still here')", 5000, executor_id=executor_id)
+            await ws.send(json.dumps(request.to_dict()))
+            response = protocol.ExecuteResponse.from_dict(
+                json.loads(await ws.recv()))
+
+        assert response.console == "adopted process: print('still here')\n"
+        assert proc.poll() is None
+    finally:
+        if facade is not None:
+            await facade.stop()
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=5)
