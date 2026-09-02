@@ -4,12 +4,14 @@ Two tools for [pi](https://github.com/badlogic/pi-mono), backed by **declarative
 providers** that drive [browserwright](https://github.com/broven/browserwright):
 
 ```
-bw_web_fetch(url, provider?)   → the page as Markdown
+bw_web_fetch(url, provider?)   → the page as Markdown, or raw text for text endpoints
 bw_web_search(query, provider?) → ranked links + the SERP features Google showed
 ```
 
-Both run through the user's **own Chrome**, so they see what the user sees —
-including pages behind a login. Zero npm dependencies; `typebox` and the pi
+The browserwright paths run through the user's **own Chrome**, so they see what
+the user sees — including pages behind a login. Fetch also has a raw-text
+fallback for endpoints such as GitHub Raw; that fallback makes a direct request
+and returns the text body verbatim. Zero npm dependencies; `typebox` and the pi
 packages come from pi's own install.
 
 ## Install
@@ -106,17 +108,20 @@ truncated: 382 of 480 lines (49.7KB of 71.5KB) · full: /tmp/browserwright-pi-xx
 
 ## What ships, and what does not
 
-This package ships **only the browserwright rungs**. There is one per tool:
+This package ships the browserwright-backed rungs plus a text fallback for fetch.
+There is one browserwright rung per tool:
 
 | tool | provider | kind |
 |------|----------|------|
-| `bw_web_fetch` | `browserwright` | `command` — `browserwright markdown <url>` |
+| `bw_web_fetch` | `browserwright` → `raw` | `command` — browser-rendered HTML, then `module` — text body verbatim |
 | `bw_web_search` | `browserwright-search` | `module` — a session lifecycle in TS |
 
-That is a real trade-off, and it points the wrong way for casual fetches: every
-`bw_web_fetch` opens a tab in the daily browser and takes ~4-7s, where a hosted
-reader API answers in ~1s without touching Chrome. What you get for it is login
-state and full JS rendering, which no anonymous rung has.
+That is a real trade-off, and it points the wrong way for casual HTML fetches: a
+browserwright `bw_web_fetch` opens a tab in the daily browser and takes ~4-7s,
+where a hosted reader API answers in ~1s without touching Chrome. What you get
+for the browser rung is login state and full JS rendering. Text endpoints such
+as GitHub Raw skip the browser conversion failure and are returned verbatim by
+the `raw` fallback.
 
 **The chain engine is still here.** Drop your own JSON into `providers/` to add a
 cheaper or anonymous rung ahead of the browser one — nothing needs to be
@@ -204,7 +209,8 @@ extraction has to run against the live DOM rather than the document response.
 ### `returns`
 
 `markdown` | `html` | `text` | `results`. **The core never converts between
-them**; it only labels the output so the model knows what it is reading.
+them**; it only labels the output so the model knows what it is reading. The
+built-in `raw` fetch provider returns accepted text response bodies unchanged.
 
 ## failWhen: the reason the chain exists
 

@@ -1,6 +1,6 @@
 {
   "order": {
-    "fetch": ["browserwright"],
+    "fetch": ["browserwright", "raw"],
     "search": ["browserwright-search"]
   },
   "defaultFailWhen": {
