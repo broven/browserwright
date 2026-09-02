@@ -58,14 +58,14 @@ export default function (pi: ExtensionAPI) {
 		name: "bw_web_fetch",
 		label: "Fetch Web Page",
 		description:
-			"Fetch a URL and return its content as Markdown. " +
+			"Fetch a URL and return its content as Markdown or text. " +
 			`Tries providers in order until one returns usable content: ${config.order.fetch.join(" → ")}. ` +
 			"The response header states which provider answered and what format the body is in. " +
 			"Output over 50KB is truncated and the full text written to a temp file whose path is given.",
-		promptSnippet: "Fetch a URL as markdown, through the user's real browser",
+		promptSnippet: "Fetch a URL as Markdown or text, through the user's real browser",
 		promptGuidelines: [
 			"Prefer `bw_web_fetch` over curl or a shell HTTP client for reading web pages — it renders JavaScript " +
-				"and carries the user's login state, so it can read pages an anonymous request cannot.",
+				"and carries the user's login state, while its text fallback also reads raw source endpoints.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "HTTP(S) URL to fetch" }),

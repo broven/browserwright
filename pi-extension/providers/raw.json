@@ -1,0 +1,16 @@
+{
+  "name": "raw",
+  "role": "fetch",
+  "kind": "module",
+  "module": "./providers/raw-text.ts",
+  "returns": "text",
+  "timeoutMs": 30000,
+  "failWhen": {
+    "matches": []
+  },
+  "_note": [
+    "Returns text responses verbatim for endpoints such as raw.githubusercontent.com.",
+    "The browserwright provider remains first, so HTML gets browser rendering and the user's login state when available.",
+    "Binary responses are rejected rather than decoded as corrupt text."
+  ]
+}

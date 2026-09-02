@@ -24,13 +24,14 @@ const LOG_PREFIX = "[browserwright-pi]";
 
 const DEFAULT_CONFIG: PiConfig = {
 	order: {
-		fetch: ["browserwright"],
+		fetch: ["browserwright", "raw"],
 		search: ["browserwright-search"],
 	},
 	// The default line of defence. minChars stays 0 on purpose: a false positive
 	// escalates to a rung that opens a tab in the user's real Chrome, so
 	// over-eager rejection interrupts them. Per-provider thresholds are meant to
-	// come from `/bw probe` evidence, not from guesses.
+	// come from `/bw probe` evidence, not from guesses. The raw text rung opts out
+	// of the phrase list because source files may legitimately contain those words.
 	defaultFailWhen: {
 		minChars: 0,
 		minResults: 0,
