@@ -40,9 +40,8 @@ def _rpc_error_fix(method: str, err: object) -> str:
         # breaks the deadlock; the generic -32601 hint does not apply.
         return (
             "an executor orphaned by a daemon crash may still hold this "
-            "target: run `browserwright session reset <session-id>` (or "
-            "`browserwright session end --session=<session-id>`) to reap it, "
-            "then retry"
+            "target: run `browserwright session reset <session-id>` to reap "
+            "it (the session, its tabs and its ledger row stay), then retry"
         )
     return ""
 

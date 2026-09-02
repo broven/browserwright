@@ -684,18 +684,24 @@ def test_doctor_checks_no_daemon_is_single_root_cause_failure(monkeypatch):
     checks = health.doctor_checks()["checks"]
     fails = [c for c in checks if c["status"] == "fail"]
     assert [c["name"] for c in fails] == ["daemon_running"]
-    assert "browserwright-daemon serve" in fails[0]["fix"]
+    # ADR-0013 rule 3: the fix names who is responsible for the process and
+    # the sanctioned start path (on-demand spawn / `install`), never `serve`.
+    assert "browserwright-daemon serve" not in fails[0]["fix"]
+    assert "on demand" in fails[0]["fix"]
     backend = next(c for c in checks if c["name"] == "backend")
     assert backend["status"] == "warn"
     assert "deferred" in backend["message"]
 
 
-def test_doctor_checks_daemon_down_with_launchagent_fix_says_restart(monkeypatch):
-    """A LaunchAgent-managed install restarts rather than serves: a bare
-    `serve` would fight launchd over the socket (issue #28)."""
+def test_doctor_checks_daemon_down_with_launchagent_reports_launchd_state(monkeypatch):
+    """A LaunchAgent-managed install: doctor reports what launchd knows
+    (state, pid, last exit) and where the daemon's last words are, instead
+    of telling the agent to restart (issue #28 → ADR-0013 rule 3)."""
     from browserwright import health
 
     monkeypatch.setattr(health, "_launchagent_installed", lambda: True)
+    monkeypatch.setattr(health, "_launchd_state", lambda: {
+        "state": "waiting", "pid": None, "last_exit": "1"})
     monkeypatch.setattr(health, "daemon_doctor", lambda: {
         "schema_version": 3, "alive": False,
         "probe_state": "not_running", "pid": None, "backends": [],
@@ -704,13 +710,19 @@ def test_doctor_checks_daemon_down_with_launchagent_fix_says_restart(monkeypatch
     checks = health.doctor_checks()["checks"]
     running = next(c for c in checks if c["name"] == "daemon_running")
     assert running["status"] == "fail"
-    assert "restart" in running["fix"]
+    assert "launchd" in running["fix"]
+    assert "state=waiting" in running["fix"]
+    assert "last exit=1" in running["fix"]
+    assert "browserwright-daemon logs" in running["fix"]
+    assert "restart" not in running["fix"]
+    assert "serve" not in running["fix"]
 
 
-def test_doctor_checks_half_alive_daemon_fix_reclaims_ports(monkeypatch):
-    """A half-alive daemon (port_held_by_unresponsive_process) always needs
-    `restart` to reclaim its ports — never a plain `serve`, which would crash
-    on EADDRINUSE (issue #28 / #15)."""
+def test_doctor_checks_half_alive_daemon_fix_names_the_reclaim(monkeypatch):
+    """A half-alive daemon (port_held_by_unresponsive_process): the next
+    on-demand start reclaims a stale daemon's ports itself (issue #15), so
+    the fix says that and how to name the holder — never `serve` (would
+    crash on EADDRINUSE) and, since ADR-0013, never `restart` either."""
     from browserwright import health
 
     monkeypatch.setattr(health, "_launchagent_installed", lambda: False)
@@ -723,7 +735,9 @@ def test_doctor_checks_half_alive_daemon_fix_reclaims_ports(monkeypatch):
     checks = health.doctor_checks()["checks"]
     running = next(c for c in checks if c["name"] == "daemon_running")
     assert running["status"] == "fail"
-    assert "restart" in running["fix"]
+    assert "reclaims" in running["fix"]
+    assert "lsof" in running["fix"]
+    assert "restart" not in running["fix"]
     assert "serve" not in running["fix"]
 
 
@@ -757,7 +771,8 @@ def test_cmd_doctor_no_daemon_reports_daemon_running_as_headline(monkeypatch, ca
     assert cli._cmd_doctor([]) == 1
     out = capsys.readouterr().out
     assert "✗ daemon_running" in out
-    assert "browserwright-daemon serve" in out
+    assert "browserwright-daemon serve" not in out
+    assert "on demand" in out
     assert "✗ backend" not in out
     assert "doctor: FAIL" in out
 
@@ -780,9 +795,11 @@ def test_session_create_reset_fix_no_longer_loops_through_doctor(monkeypatch):
 
     with pytest.raises(DaemonUnavailable) as excinfo:
         session_create.reset_executor({"id": sid})
-    assert "browserwright doctor" not in excinfo.value.fix
+    # The #28 loop is closed on doctor's side now (`daemon_running` fails on
+    # a down daemon), so doctor is a fine pointer again; `serve` is not
+    # (ADR-0013 rule 3: the default endpoint starts the daemon on demand).
     assert "browserwright-daemon status" in excinfo.value.fix
-    assert "browserwright-daemon serve" in excinfo.value.fix
+    assert "browserwright-daemon serve" not in excinfo.value.fix
     assert sid in excinfo.value.fix
 
 

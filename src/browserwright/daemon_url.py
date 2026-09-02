@@ -230,10 +230,9 @@ def unreachable_message(ep: DaemonEndpoint) -> str:
         f"no browserwright daemon answered at {ep.url} "
         f"(from {_SOURCE_LABEL.get(ep.source, ep.source)}). Because the "
         "endpoint was configured explicitly, browserwright will not start or "
-        "restart a daemon for you: start it on that machine with "
-        "`browserwright-daemon serve` (bind it with `--facade-host` so it is "
-        "reachable), or unset the setting to use the local default "
-        f"{DEFAULT_DAEMON_URL}."
+        "restart a daemon for you: the daemon must be running on that machine "
+        "and bound to a host this client can reach (`--facade-host`), or "
+        f"unset the setting to use the local default {DEFAULT_DAEMON_URL}."
     )
 
 
@@ -244,51 +243,95 @@ _SOURCE_LABEL = {
 }
 
 
+def probe(host: str, port: int, timeout: float = 1.5):
+    """Indirection over :func:`daemon._ipc.probe_endpoint_sync` so tests and
+    doctor can substitute observations without touching sockets."""
+    from .daemon._ipc import probe_endpoint_sync
+    return probe_endpoint_sync(host, port, timeout=timeout)
+
+
+def diagnose_endpoint(ep: DaemonEndpoint) -> list:
+    """Probe the resolved endpoint and, when they differ, the alternatives a
+    local client could have meant — the address the running daemon
+    published, and loopback. Returns the probes in the order taken.
+
+    ADR-0013 rule 3: an "unavailable" error must carry what the client
+    actually found, because "connection refused" and "something else
+    answered" are different diagnoses with different next steps.
+    """
+    probes = [probe(ep.host, ep.port)]
+    seen = {(ep.host, ep.port)}
+    published = _from_state_file()
+    candidates = []
+    if published:
+        parts = urlsplit(_normalize(published))
+        candidates.append((parts.hostname or "127.0.0.1", parts.port or 19990))
+    default = urlsplit(DEFAULT_DAEMON_URL)
+    candidates.append((default.hostname or "127.0.0.1", default.port or 19990))
+    for host, port in candidates:
+        if (host, port) in seen:
+            continue
+        seen.add((host, port))
+        probes.append(probe(host, port))
+    return probes
+
+
 def local_unreachable_fix(ep: DaemonEndpoint) -> str:
     """The `fix` for "nothing answered" on a NON-explicitly-configured endpoint.
 
-    The class default — "start the single global daemon: `browserwright-daemon
-    serve`" — is a dead end whenever the daemon is already running, which is
-    the common case here: the daemon bound a *specific* non-loopback host
-    (`--facade-host <tailnet-ip>`) and this client resolved something else. So
-    name the real divergence instead of guessing.
+    Built from what :func:`diagnose_endpoint` observed, never from a guess.
+    Four observed shapes, each with its own next step; none of them is
+    "restart the daemon" — a client that could not connect has no evidence
+    the daemon is at fault, and on 2026-09-01 that advice restarted a healthy
+    daemon out from under another agent (ADR-0012, ADR-0013 rule 3).
     """
-    published = _from_state_file()
-    normalized = _normalize(published) if published else None
+    from .version import package_version
 
-    if ep.source == "default" and normalized and normalized != ep.url:
+    probes = diagnose_endpoint(ep)
+    first, others = probes[0], probes[1:]
+    findings = "; ".join(pr.describe() for pr in probes)
+
+    # 1. A daemon answers somewhere this client did not look.
+    for pr in others:
+        if pr.answered:
+            alt = f"http://{pr.host}:{pr.port}"
+            return (
+                f"{findings}. This client resolved {ep.url} (from "
+                f"{ep.source}); the daemon is at {alt}. Point the client at it "
+                f"(`export {ENV_VAR}={alt}`); `browserwright doctor` names the "
+                "maintainer-side rebind that makes loopback answer too."
+            )
+    # 2. Something that is not browserwright holds the resolved port.
+    if first.kind == "foreign":
         return (
-            f"a daemon published {normalized} in its endpoint state file, but "
-            f"this client resolved the built-in default {ep.url} — they "
-            f"disagree. Point the client at it (`export {ENV_VAR}="
-            f"{normalized}`), or rebind the daemon so loopback is served too "
-            "(`browserwright-daemon install --facade-host 0.0.0.0` then "
-            "`browserwright-daemon restart`)."
+            f"{findings}. A proxy or another program is answering on the "
+            f"daemon's port, so nothing this client sends reaches browserwright. "
+            f"Find it with `lsof -nP -iTCP:{first.port} -sTCP:LISTEN` and stop "
+            "it, or move the daemon to another port. `browserwright-daemon "
+            "status` reports what browserwright itself believes is running."
         )
-    if ep.source == "state_file":
-        host_note = ""
-        if not ep.is_loopback:
-            host_note = (
-                f" That endpoint is bound to the non-loopback host "
-                f"{ep.host}, so it is only reachable over that interface — if "
-                "it is down (VPN/tailnet off), nothing local can reach the "
-                "daemon."
+    # 3. A daemon answers at the resolved address after all (a transient
+    #    failure between the caller's attempt and this probe), possibly on
+    #    the wrong version.
+    if first.answered:
+        installed = package_version()
+        if first.version and first.version != installed:
+            return (
+                f"{findings}, but the installed package is {installed}. The "
+                "running daemon is stale; the next command against the default "
+                "endpoint replaces it automatically. `browserwright version "
+                "check` shows both."
             )
         return (
-            f"the running daemon published {ep.url} but nothing answered "
-            f"there.{host_note} Check it with `browserwright-daemon status` "
-            "and `lsof -nP -iTCP:"
-            f"{ep.port} -sTCP:LISTEN`, then `browserwright-daemon restart`. "
-            "If the daemon is up, the state file is stale."
+            f"{findings} now — the failure was transient (the daemon was "
+            "still coming up). Retry the command."
         )
+    # 4. Nothing anywhere.
     return (
-        f"nothing is listening on the default endpoint {ep.url}. Check "
-        f"`browserwright-daemon status`; if a daemon IS running it is bound "
-        "elsewhere (see `--facade-host`) — point this client at it with "
-        f"${ENV_VAR}. Otherwise start one: `browserwright-daemon serve`. "
-        f"Note `lsof -nP -iTCP:{ep.port} -sTCP:LISTEN` shows a foreign holder "
-        "of the port (a proxy such as Surge can answer HTTP on it without a "
-        "daemon behind it)."
+        f"{findings}. The default endpoint starts a daemon on demand, and that "
+        "did not produce one. `browserwright doctor` reports whether launchd "
+        "manages the daemon and its last exit; `browserwright-daemon logs` "
+        "holds the startup error."
     )
 
 

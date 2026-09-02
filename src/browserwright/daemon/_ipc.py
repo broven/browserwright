@@ -542,6 +542,244 @@ def ping_sync(timeout: float = 1.0) -> int | None:
     return ping_status_sync(timeout=timeout).pid
 
 
+# ---- endpoint diagnosis (ADR-0013 rule 3: probe before blaming) -----------
+
+
+@dataclass(frozen=True)
+class EndpointProbe:
+    """What one ``GET /__ping__`` against ``host:port`` actually found.
+
+    ``kind`` is one of:
+
+    - ``ours``    — a browserwright daemon answered (``pid``/``version`` set)
+    - ``foreign`` — *something* spoke HTTP back, but not our pong. The
+                    ``status_line`` and ``server`` header say who (a proxy
+                    such as Surge answering 503 on our port is the observed
+                    case, issue #78 / ADR-0012).
+    - ``refused`` — nothing is listening (connection refused / unreachable)
+    - ``timeout`` — a socket opened but nothing came back in time
+    - ``garbage`` — bytes came back that were not HTTP at all
+
+    The point of the split: "connection refused" and "something else
+    answered" call for different next steps, and the old error text merged
+    them into one guess ("restart the daemon") that on 2026-09-01 took out a
+    healthy daemon.
+    """
+
+    kind: str
+    host: str
+    port: int
+    pid: int | None = None
+    version: str | None = None
+    status_line: str = ""
+    server: str = ""
+    detail: str = ""
+
+    @property
+    def answered(self) -> bool:
+        return self.kind == "ours"
+
+    def describe(self) -> str:
+        """One clause, suitable for inlining into an error message."""
+        where = f"{self.host}:{self.port}"
+        if self.kind == "ours":
+            v = f" (version {self.version})" if self.version else ""
+            return f"a browserwright daemon answers at {where}{v}"
+        if self.kind == "foreign":
+            who = f", Server: {self.server}" if self.server else ""
+            return (f"something other than browserwright answers at {where} "
+                    f"({self.status_line or 'HTTP response'}{who})")
+        if self.kind == "refused":
+            return f"nothing is listening at {where}"
+        if self.kind == "timeout":
+            return f"{where} accepted the connection but never answered"
+        return f"{where} answered with something that is not HTTP"
+
+
+def probe_endpoint_sync(host: str, port: int, timeout: float = 1.5) -> EndpointProbe:
+    """Classify whatever is on ``host:port``. Never raises.
+
+    Same request as :func:`ping_status_sync`, but keeps the response instead
+    of collapsing every non-pong into "no daemon".
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except (OSError, socket.timeout) as e:
+        detail = getattr(e, "strerror", None) or str(e)
+        return EndpointProbe(kind="refused", host=host, port=port, detail=detail)
+    data = b""
+    try:
+        sock.sendall(_ping_request(f"{host}:{port}"))
+        while b"\r\n\r\n" not in data and len(data) < 8192:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(1024)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            data += chunk
+        if b"\r\n\r\n" in data:
+            try:
+                sock.settimeout(min(0.2, max(0.0, deadline - time.monotonic())))
+                data += sock.recv(4096)
+            except (OSError, socket.timeout):
+                pass
+    except (OSError, socket.timeout) as e:
+        return EndpointProbe(kind="timeout", host=host, port=port, detail=str(e))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    if not data:
+        return EndpointProbe(kind="timeout", host=host, port=port)
+    if not data.startswith(b"HTTP/"):
+        return EndpointProbe(kind="garbage", host=host, port=port,
+                             detail=data[:40].decode("ascii", "replace"))
+    head, _, _ = data.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    status_line = lines[0].strip()
+    server = ""
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        if k.strip().lower() == "server":
+            server = v.strip()
+            break
+    pong = _pong_from_response(data)
+    if pong.pid is not None:
+        return EndpointProbe(kind="ours", host=host, port=port, pid=pong.pid,
+                             version=pong.version, status_line=status_line,
+                             server=server)
+    return EndpointProbe(kind="foreign", host=host, port=port,
+                         status_line=status_line, server=server)
+
+
+# ---- lifecycle attribution (ADR-0012 rule 5) --------------------------------
+
+#: Set by a CLI verb that spawns or signals the daemon, so the daemon (and the
+#: log line the verb writes) can say WHO asked. launchd never sets it, which is
+#: how a launchd respawn is told apart from a CLI-driven start.
+INITIATOR_ENV = "BW_DAEMON_INITIATOR"
+
+
+def describe_initiator(verb: str) -> str:
+    """``"cli:<verb> cwd=<dir> parent=<what launched this CLI>"`` — the
+    attribution string a CLI verb stamps on the lifecycle events it causes."""
+    import os as _os
+    cwd = _os.getcwd()
+    parent = _parent_command(_os.getppid())
+    return f"cli:{verb} cwd={cwd} parent={parent!r}"
+
+
+def _parent_command(pid: int) -> str:
+    """Best-effort command line of ``pid`` (``ps``); empty when unknown."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2.0)
+        return out.stdout.strip()[:200]
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def initiator_from_env() -> str:
+    """The daemon side: who started this process. ``launchd`` when the parent
+    is pid 1 and no CLI stamped the environment."""
+    import os as _os
+    stamped = _os.environ.get(INITIATOR_ENV, "").strip()
+    if stamped:
+        return stamped
+    if _os.getppid() == 1:
+        return "launchd"
+    return f"unknown parent={_parent_command(_os.getppid())!r}"
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def stderr_line(msg: str) -> None:
+    """A timestamped line on stderr — the daemon's launchd-captured channel.
+
+    Every ``print(..., file=sys.stderr)`` in the daemon's startup path goes
+    through here so the launchd log stops being undated (ADR-0012 rule 5).
+    """
+    import sys as _sys
+    print(f"{_iso_now()} {msg}", file=_sys.stderr)
+
+
+def log_lifecycle(event: str, **fields: object) -> None:
+    """Append one attributed lifecycle line to the daemon log file.
+
+    Written by the CLI verb that *causes* the event (``restart``, ``stop``,
+    an on-demand ``serve`` spawn), so the record exists even when the daemon
+    being replaced never gets to log its own exit. Best-effort: never raises.
+    """
+    parts = " ".join(f"{k}={v}" for k, v in fields.items())
+    line = f"{_iso_now()} LIFECYCLE {event}"
+    if parts:
+        line = f"{line} {parts}"
+    try:
+        p = log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+#: Collapse window for the "already running" line. launchd's KeepAlive
+#: respawns a daemon that exits 1 every few seconds forever, and each spawn is
+#: a fresh process, so the collapse state has to live on disk.
+ALREADY_RUNNING_SUMMARY_EVERY_S = 60.0
+
+
+def note_already_running(existing_pid: int, *, now: float | None = None) -> str | None:
+    """Record one "already running" refusal; return the line to log, or None.
+
+    First occurrence returns the plain line. Later ones within
+    :data:`ALREADY_RUNNING_SUMMARY_EVERY_S` return None (suppressed). The
+    first one past the window returns a summary carrying the suppressed
+    count, then the window restarts. Cross-process, via a small state file
+    in the runtime dir.
+    """
+    now = time.time() if now is None else now
+    p = runtime_dir() / f"{_PREFIX}.already-running.json"
+    state: dict = {}
+    try:
+        state = json.loads(p.read_text())
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    last_logged = float(state.get("last_logged") or 0.0)
+    suppressed = int(state.get("suppressed") or 0)
+    if last_logged and now - last_logged < ALREADY_RUNNING_SUMMARY_EVERY_S:
+        state["suppressed"] = suppressed + 1
+        _write_state(p, state)
+        return None
+    line = f"browserwright-daemon already running (pid {existing_pid})"
+    if suppressed:
+        line += (f"; {suppressed} further start attempt(s) refused in the "
+                 f"last {now - last_logged:.0f}s (launchd KeepAlive is "
+                 "respawning into an occupied endpoint)")
+    _write_state(p, {"last_logged": now, "suppressed": 0})
+    return line
+
+
+def _write_state(p: Path, state: dict) -> None:
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
 # ---- pid file helpers ------------------------------------------------------
 
 

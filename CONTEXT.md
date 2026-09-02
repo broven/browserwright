@@ -238,6 +238,23 @@ both ends of that relay now. Before ADR-0011 the client dialed the executor's
 socket directly and the plane survived a daemon restart; today it does not, and
 the client surfaces that as `ExecutorUnavailable`.
 
+### initiator
+Who caused a daemon lifecycle event: `launchd` (parent pid 1, nothing
+stamped), or `cli:<verb> cwd=… parent=…` for `restart` / `stop` / an
+on-demand `serve` spawn (`_ipc.describe_initiator`, carried to a child
+through `BW_DAEMON_INITIATOR`). ADR-0012 rule 5.
+
+**Trap:** launchd relaunches the daemon after a CLI `restart`, so the new
+daemon's own start line says `launchd`; the CLI's `LIFECYCLE restart` line
+just before it is the attribution.
+
+### lifecycle event
+A daemon start / stop / restart / spawn, written as one `LIFECYCLE <event>`
+line into the daemon log (`_ipc.log_lifecycle`) by whichever process caused
+it, so the record exists even when the daemon being replaced never logs its
+exit. Distinct from the extension's `hello` / relay reconnects, which are
+connection events, not process events.
+
 ### Router
 The frame-routing engine (`daemon/server/proxy.py`). Owns request-id rewriting,
 local↔upstream sessionId translation, the single-attacher rule, and the

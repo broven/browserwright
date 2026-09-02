@@ -106,9 +106,11 @@ class TabRebindFailed(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "the session's tab is gone and re-opening one failed; the browser or "
-        "the extension relay is likely unusable. Check `browserwright doctor` "
-        "and the daemon log, then `browserwright session reset <id>` (or start "
-        "a new session) — retrying the same call will NOT help"
+        "the extension relay is likely unusable. Run `browserwright doctor` — "
+        "it names the layer that is down (extension not connected, daemon "
+        "not answering). Once doctor is green, `browserwright session reset "
+        "<id>` recycles this session's executor. Retrying the same call will "
+        "NOT help, and a new session would fail the same way"
     )
 
     def __init__(self, reason: str = "", fix: str = ""):
@@ -189,8 +191,9 @@ class NetworkError(BrowserwrightError):
 class DaemonUnavailable(BrowserwrightError):
     exit_code = 2
     default_fix = (
-        "start the single global daemon: `browserwright-daemon serve` "
-        "(or run `browserwright doctor` to see what is missing)"
+        "run `browserwright doctor`: it probes the endpoint and reports whether "
+        "the daemon is down, bound elsewhere, or shadowed by another program "
+        "on its port"
     )
 
     def __init__(self, detail: str = "", fix: str = ""):
@@ -203,7 +206,8 @@ class NoSession(BrowserwrightError):
 
     exit_code = 2
     default_fix = (
-        "run `browserwright session new --backend=<extension|cdp|env> --name=SESSION_LABEL` "
+        "run `browserwright session new --reuse --backend=<extension|cdp> --name=SESSION_LABEL` "
+        "(--reuse returns the existing session of that name instead of a new one) "
         "then pass `-s <id>` to browserwright commands, for example "
         "`browserwright -s <id> -e 'print(snapshot())'` or "
         "`browserwright -s <id> task <site>/<name>`"
@@ -212,9 +216,11 @@ class NoSession(BrowserwrightError):
     def __init__(self, detail: str = "", fix: str = ""):
         self.detail = detail
         super().__init__(
-            "no session: run `browserwright session new --backend=<extension|cdp|env> "
-            "--name=SESSION_LABEL` first (use the `=` form; --name is a short "
-            "session label), then pass -s <id> on every execute call. "
+            "no session: run `browserwright session new --reuse "
+            "--backend=<extension|cdp> --name=SESSION_LABEL` first (use the `=` "
+            "form; --name is a short session label; --reuse hands back an "
+            "existing session of that name), then pass -s <id> on every "
+            "execute call. "
             + detail,
             fix=fix,
         )

@@ -492,6 +492,8 @@ def _cmd_stop(args, cfg: Config) -> int:
         return 0
 
     start0 = platforms.proc_start_time(pid)
+    _ipc.log_lifecycle("stop", pid=pid,
+                       initiator=_ipc.describe_initiator("stop"))
 
     def _same_process() -> bool:
         if start0 is None:
