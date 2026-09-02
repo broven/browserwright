@@ -363,7 +363,7 @@ def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():
     with pytest.raises(CDPError) as exc:
         CDPSession.send(cdp, "Target.attachToTarget", targetId="ext-tab-1")
     assert "orphaned" in exc.value.fix
-    assert "session reset" in exc.value.fix
+    assert "browserwright recover --session" in exc.value.fix
 
     cdp._closed = True
     cdp._closed_reason = "bye"

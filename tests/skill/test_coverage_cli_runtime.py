@@ -855,6 +855,36 @@ def test_doctor_checks_surfaces_available_backend_ux_warning(monkeypatch):
     assert warning["fix"] == "reload extension"
 
 
+def test_doctor_checks_show_per_session_recovery_state(monkeypatch):
+    from browserwright import health
+
+    monkeypatch.setattr(
+        health,
+        "daemon_doctor",
+        lambda: {
+            "schema_version": 4,
+            "alive": True,
+            "probe_state": "ok",
+            "pid": 42,
+            "backends": [],
+            "sessions": [{
+                "session_id": "7",
+                "recovery": {
+                    "state": "tab-gone", "since": 123.0,
+                    "reason": "the tab was closed",
+                },
+            }],
+        },
+    )
+
+    sessions = next(
+        check for check in health.doctor_checks()["checks"]
+        if check["name"] == "sessions")
+    assert sessions["status"] == "warn"
+    assert "7=tab-gone since=123.0 reason=the tab was closed" in sessions["message"]
+    assert "browserwright recover --session <id>" in sessions["fix"]
+
+
 def test_session_create_run_returns_three_for_timeout(monkeypatch):
     """A timed-out end-session subprocess is a failure (exit 3, matching the
     CLI's own TimeoutError mapping), never a crash — the ledger row is kept

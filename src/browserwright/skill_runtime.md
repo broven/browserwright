@@ -42,10 +42,10 @@ There is one recovery path, and it starts with reading, not restarting:
 
 1. **Read the error's `fix` line.** Every browserwright error carries one, and since ADR-0013 it is a diagnosis, not a guess: an unreachable endpoint tells you whether nothing is listening, another program answered on the port, or the daemon is on a different address.
 2. **`browserwright doctor`** when the fix line is not enough. It probes the daemon, the endpoint, and the extension, and names the layer that is down.
-3. **`browserwright session reset <id>`** when doctor is green but the session's tab or executor is gone. It recycles only that session's executor; tabs, the tab group, and the ledger row stay. `browserwright session attach-active` adopts the tab the user is looking at instead.
-4. **Report** if the same error survives one reset. Do not keep retrying.
+3. **`browserwright recover --session <id>`** — the one recovery verb. It checks the daemon twice (starting the installed one if it is gone or stale), waits for the extension, re-attaches the session's tab group, and keeps a live executor (your `state` survives) or cold-starts one. Exit 0 means `healthy`: retry your call. Exit 4 means `needs-human` and prints the layer that is still broken. It touches only this session.
+4. **Report** if `recover` says `needs-human`, or the same error survives one successful `recover`. Do not keep retrying. `browserwright session reset <id>` remains available for a wedged executor; `session attach-active` adopts the tab the user is looking at.
 
-Never do these as an agent: `browserwright-daemon restart` or `restart --force` (it severs every other agent's live session on this machine, and a client that could not connect has no evidence the daemon is at fault), `browserwright-daemon serve` (a launchd-managed daemon is already running; a second copy exits "already running"), or `session new` to escape an error (a new session opens a new tab against the same broken layer, and the ledger grew to 640 sessions that way once). Restarting the daemon is a human's call, made after reading `browserwright-daemon logs`.
+Never do these as an agent: invoke the daemon lifecycle commands directly (a client that failed to connect has no evidence that replacement is warranted), start a second daemon beside launchd, or use `session new` to escape an error (it opens against the same broken layer, and once grew the ledger to 640 rows). `browserwright recover` owns diagnosis and any warranted automatic replacement; manual lifecycle changes are a human's call after reading the daemon log.
 
 ### Adopting the page the user is looking at
 
@@ -155,9 +155,10 @@ These are NOT re-created per call. A long-lived per-session **executor** holds t
 - `page` and `context` are the **same live objects** across separate calls — they do not reconnect or re-bind each time. Navigate `page` in place; the NEXT call sees the same tab on the same URL, with no re-navigation.
 - The first browser call cold-starts the executor (connect + bind the session's
   current tab). Steady state is "same objects." A terminal `reset()`,
-  `browserwright session reset <id>`, outer request deadline, daemon restart,
-  or executor crash ends that executor; the next browser command cold-starts
-  and rebinds the ledger target.
+  `browserwright session reset <id>`, outer request deadline, or executor crash
+  ends that executor; the next browser command cold-starts and rebinds the
+  ledger target. A daemon replacement preserves the executor and `state`, then
+  reconnects its Playwright objects on the next call.
 
 This is the whole point: you are continuing one live session, not starting over each invocation.
 
@@ -180,14 +181,11 @@ Use `state` for cross-call working memory (a collected list, a cursor, a flag). 
 
 > **Executor recycle clears `state`** (so you are not surprised):
 > 1. You call `reset()` (below) — it clears `state` on purpose.
-> 2. The daemon restarts, the executor crashes, an outer executor request deadline expires, or you run `browserwright session reset <id>`: the next call cold-starts a fresh executor that re-binds the session's current tab via the ledger, but `state` starts empty. Persist anything you must keep across a restart with `remember(...)`, not `state`.
+> 2. The executor crashes, an outer executor request deadline expires, or you run `browserwright session reset <id>`: the next call cold-starts a fresh executor that re-binds the session's current tab via the ledger, but `state` starts empty. A normal daemon replacement adopts the executor, so `state` survives; persist important information with `remember(...)` regardless.
 
 ### `reset()` — terminal recycle / clean slate
 
-`reset()` requests a clean executor recycle and **ends the current code body**. Statements after `reset()` are not executed. The daemon confirms that the old executor is dead without closing browser tabs; the next command cold-starts, re-binds the session's current tab, and starts with empty `state`. Use it when:
-
-- the connection broke or the page closed (you see connection / "Frame detached" / facade errors), or
-- you want a deliberate clean slate (drop `state`, re-bind a fresh `page`).
+`reset()` requests a clean executor recycle and **ends the current code body**. Statements after `reset()` are not executed. The daemon confirms that the old executor is dead without closing browser tabs; the next command cold-starts, re-binds the session's current tab, and starts with empty `state`. Use it when you deliberately want a clean slate, or after `browserwright recover` specifically reports a wedged executor. Connection and closed-page errors go through `recover` first.
 
 ```bash
 browserwright -s "$sid" -e $'

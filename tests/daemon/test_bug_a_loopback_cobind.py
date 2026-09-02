@@ -116,6 +116,7 @@ async def test_cobind_failure_is_not_fatal(monkeypatch):
     port = await facade.start()
     try:
         assert facade._loopback_server is None
+        assert facade.local_client_host == host
         assert (await _ping(host, port))["pong"] is True
     finally:
         await facade.stop()

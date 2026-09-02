@@ -58,6 +58,50 @@ async def test_json_list_payload(facade):
             f"ws://127.0.0.1:{port}{FACADE_WS_PATH}")
 
 
+async def test_http_status_exposes_only_public_recovery_fields(facade, monkeypatch):
+    from browserwright.daemon.server import status
+
+    facade._daemon = SimpleNamespace(recovery=SimpleNamespace(
+        all=lambda: {
+            "7": {
+                "state": "tab-gone", "since": 123.0,
+                "reason": "the tab was closed", "generation": 8,
+            },
+        },
+    ))
+    monkeypatch.setattr(status, "__version__", "9.8.7")
+    monkeypatch.setattr(
+        status, "snapshot",
+        lambda daemon: pytest.fail("public status must not build the private snapshot"),
+    )
+
+    body = await _get_json(f"http://127.0.0.1:{facade.port}/__status__")
+
+    assert body == {
+        "schema_version": 1,
+        "daemon_version": "9.8.7",
+        "sessions": [{
+            "session_id": "7",
+            "recovery": {
+                "state": "tab-gone", "since": 123.0,
+                "reason": "the tab was closed",
+            },
+        }],
+    }
+    serialized = json.dumps(body)
+    for secret in ("clients", "executors", "pending", "sock", "private-id"):
+        assert secret not in serialized
+
+    from browserwright.daemon.probe import DaemonProbe
+
+    probe = DaemonProbe(Config())
+    monkeypatch.setattr(
+        probe, "endpoint",
+        lambda: {"url": f"http://127.0.0.1:{facade.port}"},
+    )
+    assert await probe.session_rows() == body["sessions"]
+
+
 async def test_json_version_uses_request_host_header(facade):
     # Feature 2: a client that reached us over Tailscale/LAN gets a ws URL that
     # points back at the authority IT used (the Host header), not the bound

@@ -95,6 +95,7 @@ tests/daemon/test_phase_c_foundation_unit.py  endpoint discovery + lazy heredoc 
 tests/daemon/test_facade_*.py              cdp-surface behavior (extension, proxy bypass, unit)
 tests/daemon/test_adr0011_*.py             the one TCP endpoint: surfaces, Origin, exec relay, addressing
 tests/daemon/test_adr0012_isolation.py     dev/prod isolation: own-port stale-detect, stop guard, plist carry-forward, activity gate
+tests/daemon/test_adr0013_*.py             recovery state, bounded recover, executor adoption/handoff
 tests/skill/test_adr0013_diagnose_before_blame.py  diagnose-before-blame errors, banned words, --reuse, attributed log
 tests/daemon/test_extension_*.py           extension upstream, title marker, version reload
 tests/daemon/test_launch_chrome.py         Chrome launch/discovery (fake binaries; no real Chrome)

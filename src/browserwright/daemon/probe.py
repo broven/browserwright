@@ -73,6 +73,9 @@ class DaemonStatus:
     #: `facade_error` explaining its absence. That state no longer exists — a
     #: daemon that cannot bind this port does not start at all.
     cdp_surface: dict | None = None
+    #: Per-session recovery rows from the daemon's side-effect-free HTTP
+    #: status snapshot. ``None`` means the daemon could not be asked.
+    sessions: list[dict] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +93,7 @@ class DaemonStatus:
             # Wire-compatible alias: `facade` was this field's name before the
             # term retired, and `status --json` is consumed by scripts.
             "facade": self.cdp_surface,
+            "sessions": self.sessions,
         }
 
 
@@ -182,6 +186,23 @@ class DaemonProbe:
         from . import _ipc
         return _ipc.endpoint_describe()
 
+    async def session_rows(self, timeout: float = 1.0) -> list[dict] | None:
+        """Read recovery rows without opening a websocket or mutating state."""
+        import httpx
+
+        url = str(self.endpoint().get("url") or "").rstrip("/") + "/__status__"
+        if not url.startswith(("http://", "https://")):
+            return None
+        try:
+            async with httpx.AsyncClient(
+                    timeout=timeout, trust_env=False, mounts={}) as client:
+                response = await client.get(url)
+            payload = response.json() if response.status_code == 200 else None
+            rows = payload.get("sessions") if isinstance(payload, dict) else None
+            return rows if isinstance(rows, list) else None
+        except Exception:  # noqa: BLE001 - status enrichment is best-effort
+            return None
+
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
 
@@ -220,10 +241,12 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
     # just used, so `status` can never name an address it did not probe.
     endpoint_info = p.endpoint()
     cdp_surface = None
+    sessions = None
     if pid is not None:
         from ..daemon_url import daemon_endpoint
         ep = daemon_endpoint()
         cdp_surface = {"ws": ep.ws("/cdp"), "port": ep.port}
+        sessions = await p.session_rows()
     return DaemonStatus(
         alive=pid is not None,
         probe_state=probe_state,
@@ -232,6 +255,7 @@ async def daemon_status_async(cfg, *, probe: DaemonProbe | None = None) -> Daemo
         version=version,
         endpoint=endpoint_info,
         cdp_surface=cdp_surface,
+        sessions=sessions,
     )
 
 

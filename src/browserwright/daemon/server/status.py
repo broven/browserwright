@@ -82,6 +82,36 @@ def snapshot(daemon: object | None, *, state: object | None = None) -> dict:
     }
 
 
+def public_recovery_snapshot(daemon: object | None) -> dict:
+    """Minimal HTTP status safe for the unauthenticated facade endpoint.
+
+    The operator-only ``BrowserwrightDaemon.status`` RPC carries clients,
+    pending calls, executor identities and local socket paths.  None of those
+    belong on an HTTP route.  Recovery observers need only the running daemon
+    version and each session's public diagnosis.
+    """
+    recovery_machine = getattr(daemon, "recovery", None)
+    try:
+        states = recovery_machine.all() if recovery_machine is not None else {}
+    except Exception:  # noqa: BLE001 - public status must remain total
+        states = {}
+    sessions = []
+    for session_id, recovery in sorted(states.items()):
+        sessions.append({
+            "session_id": session_id,
+            "recovery": ({
+                "state": recovery.get("state"),
+                "since": recovery.get("since"),
+                "reason": recovery.get("reason"),
+            } if isinstance(recovery, dict) else None),
+        })
+    return {
+        "schema_version": 1,
+        "daemon_version": __version__,
+        "sessions": sessions,
+    }
+
+
 def _session_rows(daemon: object | None) -> list[dict]:
     """Per-session lifecycle rows from the daemon's termination bookkeeping.
     Absent daemon (bare-Router unit tests) yields an honest empty list."""
@@ -89,13 +119,30 @@ def _session_rows(daemon: object | None) -> list[dict]:
     results = getattr(daemon, "_session_results", None)
     if not isinstance(phases, dict) or not isinstance(results, dict):
         return []
+    recovery = getattr(daemon, "recovery", None)
+    states: dict = {}
+    if recovery is not None:
+        try:
+            from ... import session_registry
+            holder = getattr(getattr(daemon, "shared_context", None), "holder", None)
+            relay = getattr(holder, "relay", None)
+            for row in session_registry.list_all():
+                recovery.ensure(
+                    row, extension_connected=bool(
+                        relay is not None and getattr(relay, "is_ready", False)),
+                    executor_alive=getattr(daemon, "executor_alive", lambda _sid: False))
+            states = recovery.all()
+        except Exception:  # noqa: BLE001
+            states = {}
     return [
         {
             "session_id": sid,
             "phase": phases.get(sid, "active"),
             "result": results.get(sid),
+            # ADR-0013: which layer is broken for this session, if any.
+            "recovery": states.get(sid),
         }
-        for sid in sorted(set(phases) | set(results))
+        for sid in sorted(set(phases) | set(results) | set(states))
     ]
 
 
@@ -215,7 +262,9 @@ def _executor_rows(daemon: object | None) -> list[dict]:
         rows.append({
             "session_id": session_id,
             "executor_id": getattr(h, "executor_id", None),
-            "pid": getattr(proc, "pid", None),
+            "pid": (h.current_pid() if hasattr(h, "current_pid")
+                    else getattr(proc, "pid", None)),
+            "adopted": bool(getattr(h, "adopted", False)),
             "alive": bool(h.is_alive()) if hasattr(h, "is_alive") else None,
             "sock": getattr(h, "sock_path", None),
             "age_s": (round(max(0.0, now_mono - spawned_at), 3)

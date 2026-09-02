@@ -57,6 +57,7 @@ DAEMON_VERBS: tuple[str, ...] = (
     "BrowserwrightDaemon.endSession",
     "BrowserwrightDaemon.ensureExecutor",
     "BrowserwrightDaemon.killExecutor",
+    "BrowserwrightDaemon.recover",
     "BrowserwrightDaemon.recoverSession",
     "BrowserwrightDaemon.extension.reload",
     "BrowserwrightDaemon.userscript.install",
@@ -86,6 +87,7 @@ VERBS_NEVER_METHOD_NOT_FOUND: frozenset[str] = frozenset({
     "BrowserwrightDaemon.endSession",
     "BrowserwrightDaemon.ensureExecutor",
     "BrowserwrightDaemon.killExecutor",
+    "BrowserwrightDaemon.recover",
     "BrowserwrightDaemon.recoverSession",
 })
 

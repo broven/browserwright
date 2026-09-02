@@ -31,6 +31,7 @@ Usage:
   browserwright -s <session-id> [--env NAME ...] --code-stdin < script.py
 
   browserwright session new --backend=<extension|cdp> --name=SESSION_LABEL [--reuse] [--create | --attach=PORT]
+  browserwright recover --session=<id>          (the one recovery verb: exit 0 healthy, 4 needs-human)
   browserwright session reset <id>
   browserwright session end --session=ID
   browserwright session attach-active [--session=ID | -s ID] [--json]
@@ -726,6 +727,101 @@ def _cmd_memory(args: list[str]) -> int:
     return 1
 
 
+def _cmd_recover(args: list[str], *, session_id: Optional[str] = None) -> int:
+    """`browserwright recover --session <id>` — ADR-0013 rule 2, the ONE
+    thing an agent does when a call failed.
+
+    Client side first: a dead daemon cannot answer an RPC, so the daemon
+    self-check (three criteria, two agreeing probes) runs here. "Gone" or
+    "stale version" is repaired through the default endpoint's on-demand
+    start (the sanctioned restart path); "something else answers on the
+    port" and "the probes disagree" are `needs-human` because recovery never
+    signals or replaces an unidentified process. Then the daemon runs
+    the per-session ladder and reports the state reached. Exit 0 = healthy,
+    4 = needs-human, 2 = usage."""
+    kw = _parse_kv_args(args)
+    sid = kw.get("session") or session_id
+    if not sid:
+        print("usage: browserwright recover --session=<id>", file=sys.stderr)
+        return 2
+    sid = str(sid)
+    from . import session_create
+    from .daemon.launchagent import daemon_self_check
+    from .daemon_url import daemon_endpoint
+
+    steps: list[str] = []
+    ep = daemon_endpoint()
+    verdict = daemon_self_check(None)
+    if not verdict["healthy"]:
+        crit = verdict["criterion"]
+        if crit in ("gone", "version") and not ep.explicit:
+            steps.append(f"daemon: {verdict['detail']}; starting the installed one")
+            from .daemon import _ipc
+            _ipc.log_lifecycle(
+                "automatic-recovery", criterion=crit,
+                probes=",".join(verdict.get("probes") or []),
+                reason=verdict["detail"], session=sid)
+            try:
+                session_create._ensure_daemon_running()
+            except Exception as e:  # noqa: BLE001
+                return _recover_report(sid, "needs-human", steps,
+                                       f"daemon could not be started: {e}")
+            from .mode_b_client import ModeBClient
+            if not ModeBClient().wait_until_alive(timeout=20.0):
+                return _recover_report(sid, "needs-human", steps,
+                                       "no daemon answered within 20s after the "
+                                       "start; `browserwright-daemon logs` has "
+                                       "its last words")
+            steps.append("daemon: up")
+        else:
+            return _recover_report(sid, "needs-human", steps, verdict["detail"])
+    else:
+        steps.append(f"daemon: {verdict['detail']}")
+
+    import json as _json
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["browserwright-daemon", "recover", "--session", sid],
+            capture_output=True, text=True, timeout=120.0,
+            env=session_create._daemon_child_env())
+    except (OSError, subprocess.SubprocessError) as e:
+        return _recover_report(sid, "needs-human", steps,
+                               f"could not ask the daemon to recover: {e}")
+    try:
+        result = _json.loads(proc.stdout.strip().splitlines()[-1])
+        if not isinstance(result, dict):
+            raise ValueError("recover result is not an object")
+    except (ValueError, IndexError):
+        detail = ((proc.stderr or proc.stdout).strip()[:400]
+                  if proc.returncode != 0 else
+                  f"unreadable recover result: {proc.stdout[:200]!r}")
+        return _recover_report(
+            sid, "needs-human", steps,
+            detail or f"daemon recover exited {proc.returncode}")
+    if proc.returncode not in (0, 4):
+        return _recover_report(sid, "needs-human", steps,
+                               (proc.stderr or f"daemon recover exited "
+                                f"{proc.returncode}").strip()[:400])
+    for st in result.get("steps") or []:
+        steps.append(f"{st.get('rung')}: {st.get('detail')}")
+    return _recover_report(sid, result.get("state") or "needs-human", steps,
+                           result.get("reason") or "")
+
+
+def _recover_report(sid: str, state: str, steps: list[str], reason: str) -> int:
+    for line in steps:
+        print(f"  - {line}", file=sys.stderr)
+    if state == "healthy":
+        print(f"session {sid}: healthy — retry your call")
+        return 0
+    print(f"session {sid}: {state}" + (f" — {reason}" if reason else ""))
+    if state == "needs-human":
+        print("  a retry will not change this; report it with the lines above "
+              "(`browserwright doctor` has the full picture)", file=sys.stderr)
+    return 4
+
+
 def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     """``browserwright session {new|attach-active|reset|end|list|prune} ...`` (P2)."""
     from . import session_create
@@ -1115,6 +1211,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_session(rest, session_id=global_session))
     if cmd == "whoami":
         sys.exit(_cmd_whoami(rest, session_id=global_session))
+    if cmd == "recover":
+        sys.exit(_cmd_recover(rest, session_id=global_session))
     if cmd == "userscript":
         sys.exit(_cmd_userscript(rest, session_id=global_session))
 

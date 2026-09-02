@@ -32,7 +32,7 @@ EXPECTED_TOP_KEYS = {
     # browser-driving call comes through. Their absence used to be invisible
     # here, so doctor reported all green while every such call failed.
     # `facade` is the pre-ADR-0011 name of `cdp_surface`, kept for wire compat.
-    "endpoint", "cdp_surface", "facade",
+    "endpoint", "cdp_surface", "facade", "sessions",
 }
 KNOWN_UX_COSTS = {"none", "banner", "extension-permission"}
 
@@ -46,7 +46,7 @@ def _no_live_daemon(monkeypatch):
 
 
 def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
-                   pid=None, cdp_surface=None):
+                   pid=None, cdp_surface=None, sessions=None):
     async def _fake(cfg, *, probe=None):
         return DaemonStatus(
             alive=alive,
@@ -58,6 +58,7 @@ def _stub_liveness(monkeypatch, *, alive=False, probe_state="not_running",
                       "url": "http://127.0.0.1:19990", "explicit": False,
                       "source": "default"},
             cdp_surface=cdp_surface,
+            sessions=sessions,
         )
 
     monkeypatch.setattr(doctor_mod, "daemon_status_async", _fake)
@@ -88,6 +89,26 @@ async def test_doctor_blob_carries_liveness_fields(monkeypatch):
     assert out["alive"] is True
     assert out["probe_state"] == "ok"
     assert out["pid"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_doctor_blob_carries_per_session_recovery(monkeypatch):
+    recovery = [{
+        "session_id": "7",
+        "recovery": {
+            "state": "executor-dead", "since": 456.0,
+            "reason": "executor exited",
+        },
+    }]
+    _stub_liveness(
+        monkeypatch, alive=True, probe_state="ok", pid=4242,
+        sessions=recovery,
+    )
+    _patch_all_unavailable(monkeypatch)
+
+    out = await doctor_mod.doctor(load(env={}))
+
+    assert out["sessions"] == recovery
 
 
 @pytest.mark.asyncio

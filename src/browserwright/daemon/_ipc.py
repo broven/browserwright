@@ -87,6 +87,79 @@ def pid_path() -> Path:
     return runtime_dir() / f"{_PREFIX}.pid"
 
 
+def executor_handoff_path() -> Path:
+    """One-shot intent marker for a daemon replacement.
+
+    SIGTERM is also used by a real ``stop``, so the daemon cannot infer from
+    the signal whether resident executors should be preserved.  The process
+    orchestrating a replacement writes this marker immediately before sending
+    SIGTERM; graceful shutdown consumes it only when both pid and process
+    start-time match the current daemon and the marker is fresh.
+    """
+    return runtime_dir() / f"{_PREFIX}.executor-handoff"
+
+
+def request_executor_handoff(pid: int, *, max_age_s: float = 30.0) -> bool:
+    """Ask daemon ``pid`` to leave its executors for the replacement.
+
+    The start-time fingerprint prevents a stale marker from applying to a
+    recycled pid.  ``max_age_s`` is stored for forward-compatible readers;
+    callers normally use the short default replacement window.
+    """
+    try:
+        from .platforms import proc_start_time
+        started = proc_start_time(pid)
+        if started is None:
+            return False
+        fp = executor_handoff_path()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{fp.name}.", dir=fp.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fd = -1
+                json.dump({"pid": pid, "start_time": started,
+                           "created_at": time.time(), "max_age_s": max_age_s}, fh)
+            os.replace(tmp, fp)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                Path(tmp).unlink()
+            except FileNotFoundError:
+                pass
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def consume_executor_handoff(pid: int) -> bool:
+    """Consume and validate the one-shot replacement marker for ``pid``."""
+    fp = executor_handoff_path()
+    try:
+        payload = json.loads(fp.read_text())
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return False
+    finally:
+        # One shot even when malformed: a damaged marker must never make a
+        # later, unrelated stop leak resident executors.
+        try:
+            fp.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+    try:
+        from .platforms import proc_start_time
+        age = time.time() - float(payload["created_at"])
+        max_age = float(payload.get("max_age_s", 30.0))
+        return (
+            int(payload["pid"]) == pid
+            and 0.0 <= age <= max_age
+            and proc_start_time(pid) == payload["start_time"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 # ---- Phase B: per-session executor discovery -------------------------------
 #
 # The persistent per-session executor (`browserwright._executor`) binds its OWN

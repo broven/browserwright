@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import struct
 
 import websockets
 from websockets.asyncio.server import ServerConnection
 
-from ..._executor.protocol import _MAX_FRAME
+from ..._executor.protocol import ExecuteRequest, ExecuteResponse, _MAX_FRAME
 from .state import UpstreamPhase
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,9 @@ async def _preflight(daemon, session_id: str) -> None:
         return
     await ctx.holder.prepare_executor(session_id)
     await ctx.holder.ensure_open()
+    converge = getattr(ctx.holder, "converge_session_tab", None)
+    if callable(converge):
+        await converge(session_id)
 
 
 async def resolve_executor_sock(daemon, session_id: str) -> str:
@@ -132,7 +136,8 @@ async def serve_exec_relay(conn: ServerConnection, *, daemon,
 
     logger.info("exec relay: session %s bridged to %s", session_id, sock_path)
     c2e = asyncio.create_task(_ws_to_executor(conn, writer))
-    e2c = asyncio.create_task(_executor_to_ws(reader, conn))
+    e2c = asyncio.create_task(_executor_to_ws(
+        reader, conn, daemon=daemon, session_id=session_id))
     try:
         await asyncio.wait({c2e, e2c}, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -164,7 +169,8 @@ async def _ws_to_executor(conn: ServerConnection, writer) -> None:
         return
 
 
-async def _executor_to_ws(reader, conn: ServerConnection) -> None:
+async def _executor_to_ws(reader, conn: ServerConnection, *, daemon=None,
+                          session_id: str | None = None) -> None:
     """One length-prefixed executor frame → one ws message."""
     try:
         while True:
@@ -174,6 +180,7 @@ async def _executor_to_ws(reader, conn: ServerConnection) -> None:
                 raise ExecRelayError(
                     f"executor frame too large: {length} > {_MAX_FRAME}")
             payload = await reader.readexactly(length)
+            _report_executor_result(daemon, session_id, payload)
             await conn.send(payload.decode("utf-8", errors="replace"))
     except (asyncio.IncompleteReadError, ConnectionResetError):
         return
@@ -182,3 +189,59 @@ async def _executor_to_ws(reader, conn: ServerConnection) -> None:
     except (ExecRelayError, OSError) as e:
         logger.debug("exec relay e->c ended: %r", e)
         return
+
+
+def _report_executor_result(daemon, session_id: str | None,
+                            payload: bytes) -> None:
+    """Feed the executor's observed tab outcome into daemon recovery state."""
+    machine = getattr(daemon, "recovery", None)
+    if machine is None or not session_id:
+        return
+    try:
+        response = json.loads(payload)
+        from ..._executor.protocol import TERMINAL_TARGET_CLOSED
+        from .session_state import TAB_RECOVER_FAILED, TAB_RECOVERED
+
+        if response.get("terminal_reason") == TERMINAL_TARGET_CLOSED:
+            error = response.get("error") or {}
+            machine.note(session_id, TAB_RECOVER_FAILED,
+                         reason=str(error.get("msg") or "executor lost its tab")[:200],
+                         executor_alive=True)
+        elif response.get("error") is None:
+            machine.note(session_id, TAB_RECOVERED,
+                         reason="executor completed a call on a live tab",
+                         executor_alive=True)
+    except Exception:  # noqa: BLE001 - observation never breaks the data plane
+        logger.debug("exec relay: could not classify executor result",
+                     exc_info=True)
+
+
+async def probe_executor_binding(daemon, session_id: str,
+                                 *, timeout: float = 30.0) -> None:
+    """Run a no-op on the resident executor to prove its tab binding."""
+    registry = getattr(daemon, "executors", None)
+    handle = registry.get(session_id) if registry is not None else None
+    if handle is None or not handle.is_alive():
+        raise ExecRelayError("no live executor available for binding probe")
+    reader, writer = await _dial_executor(handle.sock_path)
+    request = ExecuteRequest(
+        code="None", timeout_ms=max(1, int(timeout * 1000)),
+        executor_id=handle.executor_id)
+    payload = json.dumps(request.to_dict()).encode()
+    try:
+        writer.write(_LEN.pack(len(payload)) + payload)
+        await writer.drain()
+        header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+        (length,) = _LEN.unpack(header)
+        if length > _MAX_FRAME:
+            raise ExecRelayError(
+                f"executor probe frame too large: {length} > {_MAX_FRAME}")
+        raw = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+        _report_executor_result(daemon, session_id, raw)
+        response = ExecuteResponse.from_dict(json.loads(raw))
+        if response.error is not None:
+            raise ExecRelayError(str(response.error.get("msg") or response.error))
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()

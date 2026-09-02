@@ -56,11 +56,9 @@ class ExecutorUnavailable(BrowserwrightError):
     connected — actionable: the daemon must be running (it spawns the
     executor)."""
 
-    default_fix = ("ensure the daemon is running (`browserwright-daemon status "
-                   "--json` should show `alive`); if the executor is stale, "
-                   "call `reset()` as a standalone/final inline statement, "
-                   "then retry in a new command; or run `browserwright "
-                   "session reset <id>` before retrying.")
+    default_fix = ("run `browserwright recover --session <id>`; it diagnoses "
+                   "the daemon, tab, and executor in order and reports the "
+                   "one layer that still needs human attention")
 
 
 @dataclass(frozen=True)
@@ -105,8 +103,8 @@ def _ensure_executor_lease(sess) -> ExecutorLease:
         )
     if not isinstance(executor_id, str) or not executor_id:
         raise ExecutorUnavailable(
-            "ensureExecutor returned no executor instance identity; restart "
-            "the daemon so timeout cleanup cannot target a newer process"
+            "ensureExecutor returned no executor instance identity; run "
+            "`browserwright recover --session <id>` before retrying"
         )
     return ExecutorLease(session_id=sid, executor_id=executor_id)
 

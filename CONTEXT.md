@@ -81,15 +81,16 @@ workspace boundary"*, which is the property every caller actually depends on.
 ### ledger
 The durable session registry — one lock-serialized JSON file per `BS_HOME`
 (`$BS_HOME/sessions/ledger.json`, `BS_HOME` defaults to `~/.browserwright`).
-It is the **only** thing here that outlives every process: daemons restart,
-executors are fail-stopped, Chrome closes, and each agent command is a fresh
-shell — the session survives all of it because the ledger does.
+It is the durable source that outlives daemon replacement and fresh agent
+shells. Resident executors may also survive a daemon replacement, but their
+identity and health are re-proven from discovery records before adoption.
 
 A record has two tiers, and conflating them is the recurring bug:
 
 | tier | fields | authority |
 |---|---|---|
 | durable fact | `id` · `backend` · `owner` · `workspace` · `name` · `created_at` · `last_seen` | authoritative — the daemon obeys these |
+| recovery observation | `recovery.{state, since, reason}` | daemon-owned diagnosis, rebuilt from live relay/executor facts on boot |
 | runtime cache | `runtime.{current_target_id, updated_at}` | a *candidate* — written best-effort, re-proven against the live browser |
 
 Four jobs, all load-bearing:
@@ -198,6 +199,19 @@ endpoint's `/exec` relay, and `ensureExecutor` answers with readiness plus an
 `executor_id`, never a path. A socket path is meaningless from another machine,
 which is exactly what made remote use impossible before ADR-0011.
 
+**Trap:** a replacement daemon adopts a live executor only when its discovery
+record has a matching pid start-time fingerprint, socket, and executor id. A
+real daemon stop still reaps it; request deadlines and session reset/end remain
+fail-stop and deliberately lose executor `state`.
+
+### recovery state
+The daemon's persisted per-session answer to which layer is currently broken:
+`healthy`, `extension-disconnected`, `tab-gone`, `executor-unbound`,
+`executor-dead`, or `needs-human`. Relay, tab-recovery, and executor lifecycle
+events are inputs to this state; `status`, `doctor`, and `browserwright recover`
+read it. `since` is when the diagnosis last changed and `reason` is evidence,
+not a remediation guess. ADR-0013.
+
 ### endpoint
 The daemon's **single TCP front door** (default `http://127.0.0.1:19990`) — the
 only way any downstream reaches the daemon, local or remote (ADR-0011). One
@@ -233,10 +247,10 @@ means the client will never auto-start or restart that daemon: it is someone
 else's process, possibly on another machine. Only the unconfigured default
 keeps auto-start.
 
-**Trap — a daemon restart severs live `/exec` data planes.** The daemon owns
-both ends of that relay now. Before ADR-0011 the client dialed the executor's
-socket directly and the plane survived a daemon restart; today it does not, and
-the client surfaces that as `ExecutorUnavailable`.
+**Trap — an in-flight `/exec` call can still be severed by daemon replacement.**
+The caller retries once the replacement is up. Between calls, the replacement
+adopts fingerprint-verified executors, and the next call reconnects the
+executor's Playwright controller while preserving its Python `state`.
 
 ### initiator
 Who caused a daemon lifecycle event: `launchd` (parent pid 1, nothing

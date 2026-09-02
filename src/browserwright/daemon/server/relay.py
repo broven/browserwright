@@ -215,6 +215,11 @@ class _ExtensionConn:
     tabs: dict[int, GhostTarget] = field(default_factory=dict)
     last_frame_ts: float = field(default_factory=time.monotonic)
     app_ping_task: asyncio.Task | None = None
+    # Relay epoch assigned when this specific connection says hello. Events
+    # must carry their source connection's epoch: the relay-global counter may
+    # already belong to a newer connection when a superseded socket emits a
+    # late frame.
+    connection_generation: int = 0
 
 
 class RelayServer:
@@ -262,6 +267,11 @@ class RelayServer:
         # uses it to re-attach extension sessions whose ghost table was lost
         # with the previous connection. Set by the listener.
         self._on_extension_hello: (
+            Callable[..., Awaitable[None]] | None) = None
+        # ADR-0013: invoked when a connection that had said hello goes away
+        # and no other extension is ready — every extension session is now
+        # undrivable and the recovery state must say so. Set by the listener.
+        self._on_extension_closed: (
             Callable[..., Awaitable[None]] | None) = None
         # GH#79: install_ids that have said hello to THIS daemon before, so a
         # reconnect can be told apart from a first connect. background.js
@@ -1259,6 +1269,12 @@ class RelayServer:
             for fut in list(ext.pending.values()):
                 if not fut.done():
                     fut.set_exception(ConnectionError("extension disconnected"))
+            if (ext.hello_received.is_set() and not self.is_ready
+                    and self._on_extension_closed is not None):
+                try:
+                    await self._on_extension_closed(install_id=ext.install_id or "")
+                except Exception as e:  # noqa: BLE001 - a reporter must not break the relay
+                    logger.debug("extension-closed hook failed: %r", e)
 
     async def _dispatch_from_extension(self, ext: _ExtensionConn,
                                        temp_key: str, msg: dict) -> None:
@@ -1266,6 +1282,7 @@ class RelayServer:
 
         if kind == "hello":
             self._connection_generation += 1
+            ext.connection_generation = self._connection_generation
             ext.install_id = str(msg.get("installId") or "")
             ext.browser = str(msg.get("browser") or "")
             ext.version = str(msg.get("version") or "")
@@ -1405,7 +1422,8 @@ class RelayServer:
             # lifecycle so they can synthesize Target.targetCreated /
             # attachedToTarget for a live `connect_over_cdp` client. The agent
             # path ignores these (its `_on_event` only handles `event`).
-            self._schedule_fanout_listeners(msg)
+            self._schedule_fanout_listeners(
+                msg, generation=ext.connection_generation)
             return
 
         if kind == "detached":
@@ -1418,7 +1436,8 @@ class RelayServer:
                     await self._on_event(msg)
                 except Exception as e:
                     logger.warning("relay detached handler raised: %r", e)
-            self._schedule_fanout_listeners(msg)
+            self._schedule_fanout_listeners(
+                msg, generation=ext.connection_generation)
             return
 
         if kind == "response":
@@ -1443,7 +1462,8 @@ class RelayServer:
                     await self._on_event(msg)
                 except Exception as e:
                     logger.warning("relay event handler raised: %r", e)
-            await self._fanout_listeners(msg)
+            await self._fanout_listeners(
+                msg, generation=ext.connection_generation)
             return
 
         logger.debug("extension sent unknown type %r: %s", kind, str(msg)[:100])
@@ -1468,17 +1488,19 @@ class RelayServer:
         except asyncio.CancelledError:
             raise
 
-    async def _fanout_listeners(self, msg: dict) -> None:
+    async def _fanout_listeners(self, msg: dict, *, generation: int) -> None:
         """Call every additional fan-out observer with the raw extension
         message (PR2). Isolated from the primary `_on_event` so one observer
         raising can't drop the message for the others or the agent path."""
+        payload = dict(msg)
+        payload.setdefault("_relay_generation", generation)
         for listener in list(self._event_listeners):
             try:
-                await listener(msg)
+                await listener(payload)
             except Exception as e:  # noqa: BLE001
                 logger.warning("relay fan-out listener raised: %r", e)
 
-    def _schedule_fanout_listeners(self, msg: dict) -> None:
+    def _schedule_fanout_listeners(self, msg: dict, *, generation: int) -> None:
         """Notify secondary observers without blocking the relay reader.
 
         An extension ``attached`` frame is often followed immediately by the
@@ -1490,7 +1512,13 @@ class RelayServer:
         """
         if not self._event_listeners:
             return
-        task = asyncio.create_task(self._fanout_listeners(dict(msg)))
+        payload = dict(msg)
+        # Capture the source connection's epoch NOW. The task may not run until
+        # after a newer extension has connected; stamping it there would make
+        # a superseded event look current to recovery state.
+        payload["_relay_generation"] = generation
+        task = asyncio.create_task(
+            self._fanout_listeners(payload, generation=generation))
 
         def _done(t: asyncio.Task) -> None:
             try:

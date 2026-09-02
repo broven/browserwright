@@ -16,6 +16,8 @@ endpoint lives in `facade.py`; `run_serve` builds it and hands it
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import asyncio
 import contextlib
 import json
@@ -246,7 +248,10 @@ async def run_serve(cfg: Config) -> int:
     # subprocesses + their stale `bw-exec-*` sockets/discovery files left by a
     # prior daemon SIGKILL, same rationale as the cdp sweep above.
     from .executor_registry import cleanup_orphan_executors
-    cleanup_orphan_executors()
+    # ADR-0013 rule 1: live, fingerprint-verified executors are KEPT here and
+    # adopted into the registry once the Daemon exists (below), so a daemon
+    # swap no longer severs every session's executor.
+    adoptable_executors = cleanup_orphan_executors()
 
     # Log file is best-effort — we route Python logging to it but never crash
     # the daemon over a write failure.
@@ -279,6 +284,25 @@ async def run_serve(cfg: Config) -> int:
     shared_context = make_context(backend=shared_backend, cfg=shared_cfg)
     daemon = Daemon(cfg=cfg, shared_context=shared_context,
                     make_context=make_context)
+    # ADR-0013 rule 1: rebuild every session's recovery state from disk plus
+    # what this daemon can observe right now, instead of assuming an empty
+    # world. The shared holder reports relay events into the same machine.
+    try:
+        adoptable_sessions = {
+            str(rec.get("session") or "") for rec in adoptable_executors}
+        daemon.recovery.load(
+            session_registry.list_all(), extension_connected=False,
+            executor_alive=lambda sid: sid in adoptable_sessions)
+    except Exception as e:  # noqa: BLE001 - a damaged ledger must not stop serve
+        logger.warning("recovery: could not load session states: %r", e)
+    if adoptable_executors:
+        adopted = daemon.executors.adopt(adoptable_executors)
+        logger.info("adopted %d live executor(s) from the previous daemon: %s",
+                    len(adopted), ", ".join(adopted) or "-")
+    holder = getattr(shared_context, "holder", None)
+    if holder is not None:
+        holder.recovery = daemon.recovery
+        holder.executor_alive = daemon.executor_alive
 
     # SIGTERM / SIGINT → set the stop event. We don't tear down inline because
     # we still need to run the graceful shutdown sequence (close clients with
@@ -346,7 +370,9 @@ async def run_serve(cfg: Config) -> int:
     # publish for LOCAL clients is the loopback address — otherwise every
     # local client resolves the tailnet IP and dies with the VPN. Remote
     # clients configure `BW_DAEMON_URL` explicitly and never read this file.
-    published_url = f"http://{_local_probe_host(cfg.facade_host)}:{bound}"
+    local_client_host = getattr(
+        endpoint, "local_client_host", _local_probe_host(cfg.facade_host))
+    published_url = f"http://{local_client_host}:{bound}"
     _ipc.write_endpoint_state(published_url)
     if published_url != endpoint_url:
         logger.info("endpoint started at %s (control/cdp/exec); published %s "
@@ -364,8 +390,24 @@ async def run_serve(cfg: Config) -> int:
             # Precedence (CLI > env > toml port > toml relay_url > default)
             # is centralized in cfg.backends.extension.resolved_host_port().
             host, port = cfg.backends.extension.resolved_host_port()
-            shared_context.holder.relay = RelayServer(host=host, port=port)
-            port = await shared_context.holder.relay.start()
+            relay = RelayServer(host=host, port=port)
+            shared_context.holder.relay = relay
+            # A replacement daemon starts with no open ExtensionUpstream, but
+            # Chrome reconnects to this eager relay immediately.  Install the
+            # lifecycle callbacks after constructing the relay and BEFORE it
+            # starts accepting connections; wiring them above this block was
+            # a no-op because holder.relay was still None there, losing the
+            # first hello and leaving adopted executors unable to rebind.
+            relay._on_extension_hello = (  # noqa: SLF001
+                shared_context.holder._on_extension_hello  # noqa: SLF001
+            )
+            relay._on_extension_closed = (  # noqa: SLF001
+                shared_context.holder._on_extension_closed  # noqa: SLF001
+            )
+            add_listener = getattr(relay, "add_event_listener", None)
+            if callable(add_listener):
+                add_listener(shared_context.holder._on_target_event)  # noqa: SLF001
+            port = await relay.start()
             logger.info("extension relay started on port %d", port)
         except OSError as e:
             # issue #15 (2.2): if we still can't bind after the reclaim pass, the
@@ -654,6 +696,10 @@ class _UpstreamHolder:
         # across idle detach/reattach. The relay is transport only.
         self._extension_adapter: ExtensionUpstream | None = None
         self._last_auto_recover: float = 0.0
+        # ADR-0013: the daemon's recovery state machine and its executor
+        # liveness oracle, wired by `run_serve` once the Daemon exists.
+        self.recovery = None
+        self.executor_alive: Callable[[str], bool] = lambda sid: False
         self._open_lock = asyncio.Lock()
         self._cfg: Config = cfg
         # v0.4: only populated when backend=extension. Owned by the holder
@@ -708,6 +754,40 @@ class _UpstreamHolder:
         if not self.relay.is_ready:
             raise Unavailable(
                 _NO_EXTENSION_CONNECTED_MSG.format(sid=session_id))
+
+    async def converge_session_tab(self, session_id: str, *, force: bool = False) -> dict | None:
+        """Make an extension session own one live tab, once and bounded.
+
+        Called after ``prepare_executor`` and ``ensure_open`` on the ordinary
+        command path, and forced by the explicit recovery verb.  Existing
+        healthy sessions stay on the fast path.  If the prior group vanished,
+        opening one blank tab is the deterministic replacement; returning
+        ``healthy`` while merely promising that a later call might open it was
+        the ambiguity ADR-0013 removes.
+        """
+        if self.relay is None:
+            return None
+        machine = self.recovery
+        if (not force and machine is not None
+                and machine.state_of(session_id) == "healthy"):
+            return None
+        ext = self._extension_adapter
+        if ext is None:
+            raise RuntimeError("extension adapter is not open")
+        generation = getattr(self.relay, "connection_generation", None)
+        try:
+            result = await ext.recover_session(session_id)
+            detail = "tab group re-attached"
+        except Exception:
+            result = await ext.open_background_tab(
+                "about:blank", session_id=session_id, background=True)
+            detail = "fresh tab opened in the session group"
+        self._note(session_id, "tab_recovered", generation=generation,
+                   reason=detail)
+        logger.info("recovery: converged session %s (%s, target=%s)",
+                    session_id, detail,
+                    result.get("targetId") if isinstance(result, dict) else "-")
+        return result
 
     async def _broadcast_event(self, method: str, params: dict) -> None:
         """Fan a `{method, params}` envelope to every connected client.
@@ -935,6 +1015,10 @@ class _UpstreamHolder:
                 self.relay._on_extension_hello = (  # noqa: SLF001
                     self._on_extension_hello
                 )
+            if hasattr(self.relay, "_on_extension_closed"):
+                self.relay._on_extension_closed = (  # noqa: SLF001
+                    self._on_extension_closed
+                )
             # Use the daemon's open timeout (default 5s in tests) but allow
             # the user a generous window (60s) to load the extension. Spec
             # §8.4 'extension-permission' ux_cost — user has to click the
@@ -978,6 +1062,11 @@ class _UpstreamHolder:
         hammer the extension with attach round-trips.
         """
 
+        from .session_state import EXTENSION_HELLO
+        generation = getattr(self.relay, "connection_generation", None)
+        self._note_extension_sessions(EXTENSION_HELLO, generation=generation,
+                                      reason="extension connected; re-attaching tabs")
+
         async def _recover() -> None:
             try:
                 await asyncio.sleep(_AUTO_RECOVER_DELAY_S)
@@ -1002,6 +1091,8 @@ class _UpstreamHolder:
                     continue
                 try:
                     await ext.recover_session(sid)
+                    self._note(sid, "tab_recovered", generation=generation,
+                               reason="tab group re-attached after extension hello")
                     # GH#79: say which of the two it was. This line used to
                     # read "after extension reconnect" unconditionally — it
                     # fires on EVERY hello, including the very first one from
@@ -1015,11 +1106,96 @@ class _UpstreamHolder:
                         sid,
                         "first connect" if first_seen else "reconnect",
                         install_id or "(unknown)")
-                except Exception:  # noqa: BLE001 - no group / empty group /
+                except Exception as e:  # noqa: BLE001 - no group / empty group /
                     # still reconnecting -- the next hello retries.
-                    pass
+                    self._note(sid, "tab_recover_failed", generation=generation,
+                               reason=str(e)[:200])
 
         asyncio.create_task(_recover())
+
+    async def _on_extension_closed(self, *, install_id: str = "") -> None:
+        """The last ready extension connection went away (ADR-0013)."""
+        self._note_extension_sessions(
+            "extension_lost",
+            reason=f"extension disconnected (install_id={install_id or 'unknown'})")
+
+    async def _on_target_event(self, msg: dict) -> None:
+        """Validate Target lifecycle against the canonical tab group."""
+        kind = msg.get("type")
+        tab_id = msg.get("tabId")
+        if kind not in ("attached", "detached") or not isinstance(tab_id, int):
+            return
+        generation = msg.get("_relay_generation")
+        if not isinstance(generation, int):
+            generation = getattr(self.relay, "connection_generation", None)
+        ext = self._extension_adapter
+        if ext is None:
+            # Before the first upstream open there is no group-aware adapter;
+            # the hello recovery sweep will establish and report the facts.
+            return
+        target_id = f"ext-tab-{tab_id}"
+        try:
+            from ... import session_registry as reg
+            from .session_state import TAB_RECOVER_FAILED, TAB_RECOVERED
+
+            for row in reg.list_all():
+                if row.get("backend") != "extension":
+                    continue
+                runtime = row.get("runtime") or {}
+                if runtime.get("current_target_id") != target_id:
+                    continue
+                sid = str(row.get("id") or "")
+                current = self.recovery.get(sid) if self.recovery is not None else None
+                if (isinstance(generation, int) and current is not None
+                        and isinstance(current.get("generation"), int)
+                        and generation < current["generation"]):
+                    continue
+                if kind == "detached":
+                    # `chrome.debugger` detached can mean tab removal OR a
+                    # DevTools takeover. Re-resolve the named group and attempt
+                    # the normal bounded re-attach before deciding which.
+                    try:
+                        await ext.recover_session(sid)
+                    except Exception as e:  # noqa: BLE001
+                        self._note(sid, TAB_RECOVER_FAILED,
+                                   generation=generation,
+                                   reason=f"current target could not be re-attached: {e}")
+                    else:
+                        self._note(sid, TAB_RECOVERED, generation=generation,
+                                   reason="current target re-attached after Target detach")
+                else:
+                    # An attached debugger says nothing about workspace
+                    # ownership. Promote only after the live tab group proves
+                    # this target belongs to the session.
+                    if await ext.target_belongs_to_session(sid, target_id):
+                        self._note(sid, TAB_RECOVERED, generation=generation,
+                                   reason="current target attached in session group")
+        except Exception as e:  # noqa: BLE001 - observation cannot break relay
+            logger.debug("recovery: target event could not be recorded: %r", e)
+
+    def _note(self, sid: str, event: str, *, generation=None, reason: str = "") -> None:
+        machine = self.recovery
+        if machine is None:
+            return
+        try:
+            machine.note(sid, event, reason=reason, generation=generation,
+                         executor_alive=self.executor_alive(sid))
+        except Exception as e:  # noqa: BLE001 - never let bookkeeping break the relay path
+            logger.debug("recovery note %s for %s failed: %r", event, sid, e)
+
+    def _note_extension_sessions(self, event: str, *, generation=None,
+                                 reason: str = "") -> None:
+        if self.recovery is None:
+            return
+        try:
+            from ... import session_registry as reg
+            rows = reg.list_all()
+        except Exception:  # noqa: BLE001
+            return
+        for rec in rows:
+            if rec.get("backend") == "extension":
+                self._note(str(rec.get("id") or ""), event,
+                           generation=generation, reason=reason)
 
     async def _end_raw_session(
         self, session_id: str, *, deadline: float | None = None,
@@ -1361,6 +1537,11 @@ _SHUTDOWN_TEARDOWN_DRAIN_S = 65.0
 async def _graceful_shutdown(daemon: "Daemon") -> None:
     """Called on SIGTERM. Drain in-flight teardowns, run close etiquette on
     every context, then close the listener."""
+    # Consume replacement intent immediately. Draining a teardown may take
+    # longer than the marker's anti-staleness window; validation is about when
+    # SIGTERM arrived, not how long graceful shutdown etiquette takes.
+    from .. import _ipc as daemon_ipc
+    preserve_executors = daemon_ipc.consume_executor_handoff(os.getpid())
     # ADR-0009: teardown may be mid-flight for up to the full teardown budget,
     # and `trigger_close` below pulls the relay out from under it — which can
     # land between a tab close and its ledger checkpoint. Wait for those tasks
@@ -1384,8 +1565,13 @@ async def _graceful_shutdown(daemon: "Daemon") -> None:
             await ctx.holder.trigger_close("daemon_shutdown")
         except Exception as e:
             logger.warning("shutdown close failed for %s: %r", ctx.backend, e)
-    # Phase B (PR2): SIGTERM every registered executor — they are daemon
-    # children and must die with us (mirrors the per-context close above).
+    # A real stop still owns and reaps every executor.  A replacement writes a
+    # fingerprinted, one-shot handoff marker before SIGTERM; in that one case
+    # the new daemon adopts the still-live processes and their Python state.
+    if preserve_executors:
+        logger.info("shutdown: preserving %d executor(s) for replacement daemon",
+                    len(getattr(daemon.executors, "_handles", {})))
+        return
     try:
         await daemon.executors.kill_all()
     except Exception as e:  # noqa: BLE001
