@@ -447,14 +447,19 @@ def _cleanup_orphan_cdp_chrome() -> None:
 # ---- log wiring ------------------------------------------------------------
 
 
+#: One timestamp shape for every line in the daemon log — logger output,
+#: `LIFECYCLE` lines and startup stderr all agree (ADR-0012 rule 5).
+_LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
 def _wire_logging() -> None:
     """Route the daemon's logger to a file under TMPDIR. Best-effort."""
     try:
         log_p = _ipc.log_path()
         log_p.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(str(log_p), encoding="utf-8")
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
         root = logging.getLogger()
         root.setLevel(logging.INFO)
         # Also echo to stderr. Under launchd that is the captured
@@ -462,8 +467,7 @@ def _wire_logging() -> None:
         # through to logging's lastResort handler — undated, unlabelled,
         # which is what the launchd log looked like (ADR-0012 rule 5).
         echo = logging.StreamHandler(sys.stderr)
-        echo.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        echo.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
         root.addHandler(echo)
         root.addHandler(handler)
     except OSError:

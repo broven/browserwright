@@ -314,8 +314,11 @@ def reap(*, idle_seconds: float) -> list[dict]:
     return pruned
 
 
-def find_reusable(*, backend: str, name: str) -> Optional[dict]:
-    """The most recent ledger session with this ``backend`` and ``name``.
+def find_reusable(*, backend: str, name: str,
+                  owner: Optional[str] = None) -> Optional[dict]:
+    """The most recent ledger session with this ``backend`` and ``name``
+    (and, when given, ``owner`` — so a cdp ``--attach`` request never gets
+    back a ``--create`` session of the same name, or vice versa).
 
     ``session new --reuse`` (ADR-0013 rule 4) hands an agent back the session
     it already has instead of a second one. A ledger row is the only
@@ -331,6 +334,7 @@ def find_reusable(*, backend: str, name: str) -> Optional[dict]:
     matches = [
         r for r in reg.list_all()
         if r.get("backend") == backend and r.get("name") == name
+        and (owner is None or r.get("owner") == owner)
     ]
     return matches[-1] if matches else None
 
@@ -372,7 +376,10 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     global last_new_reused
     last_new_reused = None
     if reuse and backend in ("extension", "cdp"):
-        existing = find_reusable(backend=backend, name=name)
+        owner = None
+        if backend == "cdp":
+            owner = "create" if create else ("attach" if attach is not None else None)
+        existing = find_reusable(backend=backend, name=name, owner=owner)
         if existing is not None:
             last_new_reused = str(existing["id"])
             reg.touch(last_new_reused)

@@ -318,6 +318,34 @@ def test_session_new_reuse_matches_backend_and_name_only(ledger_home):
     assert other != ext
     cdp = session_create.new(backend="cdp", name="hn", create=True, reuse=True)
     assert cdp != ext
+    # cdp: create and attach are different sessions even under one name
+    attached = session_create.new(backend="cdp", name="hn", attach=9222, reuse=True)
+    assert attached != cdp
+    assert session_create.new(backend="cdp", name="hn", create=True, reuse=True) == cdp
+
+
+def test_daemon_log_lines_share_the_iso_timestamp_shape(monkeypatch, tmp_path, capsys):
+    """Spec #92: ISO-8601 timestamps on every line — logger output included."""
+    import logging
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    from browserwright.daemon.server import listener
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    try:
+        root.handlers.clear()
+        listener._wire_logging()
+        logging.getLogger("browserwright.test").info("probe line")
+        for h in root.handlers:
+            h.flush()
+    finally:
+        for h in root.handlers:
+            if h not in saved:
+                root.removeHandler(h)
+                h.close()
+        root.handlers[:] = saved
+    text = (tmp_path / "browserwright-daemon.log").read_text()
+    line = [ln for ln in text.splitlines() if "probe line" in ln][-1]
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} INFO ", line), line
 
 
 def test_cli_session_new_reuse_says_so(ledger_home, capsys):
