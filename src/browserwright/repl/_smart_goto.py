@@ -162,27 +162,134 @@ def _bounded_timeout(total_ms: int, cap_ms: int) -> int:
     return max(1, min(int(total_ms), cap_ms))
 
 
-def _page_load_failed(url: str, phase: str, exc: BaseException) -> PageLoadFailed:
-    msg = str(exc)
-    exc_type = type(exc).__name__
-    lower = msg.lower()
-    if "timeout" in lower or exc_type == "TimeoutError":
-        return PageLoadFailed(
-            url,
-            phase,
-            fix="site did not respond at commit; verify it with http_get(url) or retry",
+# Navigation failure buckets. These are the `reason` field of PageLoadFailed —
+# an agent reads it to decide what to do next, so every bucket must point at a
+# DIFFERENT next action. Two buckets that share a fix are a bug: this table
+# used to collapse everything non-timeout into "network", which told users to
+# check their connection while the real failure was in the CDP/relay layer.
+#
+# The concrete accident this replaces: the extension caps every
+# `chrome.debugger.sendCommand` at 9000ms (`DEBUGGER_COMMAND_TIMEOUT_MS` in
+# chrome-extension/background.js) and reports the breach as "... timed out
+# after 9000ms ...". That string contains "timed out" but NOT "timeout", so it
+# missed the timeout check and fell into the second, identical branch —
+# `network`. A whole crawl's worth of "the extension's navigate budget expired
+# on a slow page" was reported to the operator as "check your network".
+_REASON_TIMEOUT = "timeout"
+_REASON_NETWORK = "network"
+_REASON_EXT_BUDGET = "extension-budget"
+_REASON_NAV_INTERRUPTED = "navigation-interrupted"
+_REASON_TARGET_CLOSED = "target-closed"
+_REASON_FRAME_DETACHED = "frame-detached"
+_REASON_CDP = "cdp-transport"
+_REASON_UNKNOWN = "unknown"
+
+_DETAIL_MAX = 300
+
+# Ordered most-specific-first; the first entry whose needle appears in the
+# lowercased message wins. Transport buckets deliberately sit ABOVE the generic
+# timeout bucket: a relay/extension budget that expires is NOT the site failing
+# to respond, and saying so sends the operator to the wrong layer.
+_CLASSIFIERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        _REASON_EXT_BUDGET,
+        "NOT a network problem: the browserwright extension caps every "
+        "chrome.debugger command at 9s (DEBUGGER_COMMAND_TIMEOUT_MS in "
+        "chrome-extension/background.js — a constant, not an env var), and "
+        "this navigation took longer to commit. The navigation may still be "
+        "completing in Chrome. Heavy SPAs routinely exceed it; navigate from a "
+        "fresh tab (context.new_page()) instead of reusing one parked on a "
+        "heavy page, and retry",
+        ("chrome.debugger.sendcommand timed out", "-32001",
+         "chrome.debugger.attach timed out", "chrome.debugger.detach timed out"),
+    ),
+    (
+        # net::ERR_ABORTED is NOT a network condition: Chrome emits it when a
+        # navigation is cancelled — superseded by another goto, turned into a
+        # download, or killed by the page itself. Bucketing it as "network"
+        # sends the user to check their connection for a race they own.
+        _REASON_NAV_INTERRUPTED,
+        "navigation was cancelled or superseded (download, redirect, or a "
+        "competing goto on the same page); ensure only one navigation runs per "
+        "page at a time, then retry page.goto(url)",
+        ("net::err_aborted", "interrupted by another navigation",
+         "navigation was cancel"),
+    ),
+    (
+        _REASON_NETWORK,
+        "check the URL and network; use http_get(url) to verify the site is "
+        "reachable",
+        ("net::", "ssl", "name_not_resolved", "err_internet_disconnected"),
+    ),
+    (
+        _REASON_TARGET_CLOSED,
+        "the tab/context backing this session went away mid-navigation; "
+        "re-acquire the page (page() / `session reset <id>`) before retrying, "
+        "and check whether the tab was closed by hand or by another session",
+        ("target closed", "target page, context or browser has been closed",
+         "browser has been closed", "page has been closed", "page was closed",
+         "session closed", "has been closed"),
+    ),
+    (
+        _REASON_FRAME_DETACHED,
+        "the frame was detached mid-navigation (usually a same-page rewrite or "
+        "an iframe teardown); retry page.goto(url) on a freshly acquired frame",
+        ("frame was detached", "frame has been detached", "detached frame",
+         "execution context was destroyed"),
+    ),
+    (
+        _REASON_CDP,
+        "the CDP path between the daemon, the extension relay and Chrome "
+        "failed — a transport fault, NOT the site. Check `browserwright "
+        "doctor` and the daemon log; if it repeats, recycle the session",
+        ("relay send failed", "extension relay", "extension reconnected",
+         "protocol error", "websocket", "ws closed", "no close frame",
+         "connection closed", "chrome.debugger", "debugger is not attached"),
+    ),
+)
+
+
+def _detail_for(exc: BaseException) -> str:
+    """Original exception type + first message line, bounded.
+
+    Playwright appends a multi-line call log to most errors; the first line is
+    the part that identifies the failure. Everything below it is noise, but the
+    type name never is — a bare message loses the difference between a
+    TimeoutError and a transport error that happens to mention a timeout.
+    """
+    lines = str(exc).strip().splitlines()
+    head = lines[0].strip() if lines else ""
+    if len(head) > _DETAIL_MAX:
+        head = head[: _DETAIL_MAX - 1] + "\u2026"
+    return f"{type(exc).__name__}: {head}" if head else type(exc).__name__
+
+
+def _classify(exc: BaseException) -> tuple[str, str]:
+    """Map a navigation exception to (reason, fix)."""
+    lower = str(exc).lower()
+    for reason, fix, needles in _CLASSIFIERS:
+        if any(needle in lower for needle in needles):
+            return reason, fix
+    if "timeout" in lower or "timed out" in lower or type(exc).__name__ == "TimeoutError":
+        return (
+            _REASON_TIMEOUT,
+            "site did not respond at commit; verify it with http_get(url) or retry",
         )
-    if "net::" in msg or "ssl" in lower or "name_not_resolved" in lower:
-        return PageLoadFailed(
-            url,
-            "network",
-            fix="check the URL and network; use http_get(url) to verify the site is reachable",
-        )
-    return PageLoadFailed(
-        url,
-        "network",
-        fix="check the URL and network; use http_get(url) to verify the site is reachable",
+    return (
+        _REASON_UNKNOWN,
+        "unrecognised navigation failure — do NOT assume it is the network; "
+        "read the exception detail in this message, then retry page.goto(url) "
+        "once and check the daemon log if it repeats",
     )
+
+
+def _page_load_failed(url: str, phase: str, exc: BaseException) -> PageLoadFailed:
+    reason, fix = _classify(exc)
+    # `phase` ("commit") is only meaningful for the timeout bucket, where it
+    # says how far the navigation got. Every other bucket names its own cause.
+    if reason == _REASON_TIMEOUT:
+        reason = phase or _REASON_TIMEOUT
+    return PageLoadFailed(url, reason, fix=fix, detail=_detail_for(exc))
 
 
 class _NetworkMonitor:
