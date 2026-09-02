@@ -60,6 +60,18 @@ export interface KnowledgeGraph {
  */
 export interface SearchPayload {
 	results: SearchResult[];
+	/**
+	 * The engine stated, in so many words, that nothing matched.
+	 *
+	 * Only ever set alongside an empty `results`, and it is the one thing that
+	 * separates an honestly empty search from the failure mode that looks
+	 * identical from the outside: a captcha or consent wall parses perfectly and
+	 * also yields zero rows. Without this flag both have to be rejected, and a
+	 * query the engine answered correctly is reported to the model as a broken
+	 * tool — which is exactly what it then works around instead of rewriting the
+	 * query.
+	 */
+	noMatch?: boolean;
 	answerBox?: AnswerBox;
 	knowledgeGraph?: KnowledgeGraph;
 	peopleAlsoAsk?: string[];
@@ -236,6 +248,12 @@ export interface Inspected {
 	text: string;
 	/** Item count, for list payloads. Undefined for text payloads. */
 	count?: number;
+	/**
+	 * A zero count that the source asserted rather than one we inferred from a
+	 * payload we could not read. Lifts the blanket rejection of an empty list —
+	 * see `SearchPayload.noMatch`.
+	 */
+	authoritativeEmpty?: boolean;
 }
 
 export type Inspector<T> = (value: T) => Inspected;

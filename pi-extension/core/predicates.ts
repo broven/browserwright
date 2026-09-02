@@ -74,6 +74,7 @@ export const inspectText: Inspector<string> = (content) => ({ text: content });
 export const inspectSearch: Inspector<SearchPayload> = (payload) => ({
 	count: payload.results.length,
 	text: payload.results.map((r) => `${r.title} ${r.snippet ?? ""}`).join("\n"),
+	authoritativeEmpty: payload.noMatch === true,
 });
 
 /**
@@ -89,9 +90,13 @@ export function failureReason<T>(value: T, rule: FailWhen, inspect: Inspector<T>
 	const count = inspected.count;
 
 	if (count !== undefined) {
-		// A search that parsed cleanly but found nothing is a failure worth
-		// falling through on: an interstitial usually yields a valid, empty list
-		// rather than an error.
+		// An engine that said "no documents matched" has answered the question.
+		// Accepting that is what stops a correctly-answered query from reaching
+		// the model as a failed tool call; the needle scan below is skipped with
+		// it, which costs nothing because the haystack is empty either way.
+		if (count === 0 && inspected.authoritativeEmpty) return undefined;
+		// Any other empty list is a failure worth falling through on: an
+		// interstitial usually yields a valid, empty list rather than an error.
 		if (count === 0) return "no results";
 		const minResults = rule.minResults ?? 0;
 		if (minResults > 0 && count < minResults) {

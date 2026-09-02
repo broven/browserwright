@@ -20,6 +20,7 @@ const ANSWER_KEYS = ["answerBox", "answer_box", "answer", "featured_snippet"] as
 const KG_KEYS = ["knowledgeGraph", "knowledge_graph"] as const;
 const PAA_KEYS = ["peopleAlsoAsk", "people_also_ask", "relatedQuestions"] as const;
 const RELATED_KEYS = ["relatedSearches", "related_searches", "relatedQueries"] as const;
+const NO_MATCH_KEYS = ["noMatch", "no_match", "zeroResults"] as const;
 
 function firstValue(row: Record<string, unknown>, keys: readonly string[]): unknown {
 	for (const key of keys) {
@@ -136,6 +137,10 @@ export function normalizeSearchPayload(value: unknown): SearchPayload {
 
 	const relatedSearches = stringList(firstValue(body, RELATED_KEYS));
 	if (relatedSearches) payload.relatedSearches = relatedSearches;
+
+	// Only meaningful next to an empty list. A source claiming both rows and
+	// "nothing matched" is contradicting itself, and the rows are the evidence.
+	if (payload.results.length === 0 && firstValue(body, NO_MATCH_KEYS) === true) payload.noMatch = true;
 
 	return payload;
 }

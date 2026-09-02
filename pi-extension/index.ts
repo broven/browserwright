@@ -180,6 +180,9 @@ export default function (pi: ExtensionAPI) {
 					query,
 					provider: result.provider,
 					count: result.content?.results.length ?? 0,
+					// Zero rows is a success now, so the trace has to record which
+					// kind of zero it was.
+					noMatch: result.content?.noMatch === true,
 					features: {
 						answerBox: Boolean(result.content?.answerBox),
 						knowledgeGraph: Boolean(result.content?.knowledgeGraph),

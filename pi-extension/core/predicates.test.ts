@@ -142,6 +142,22 @@ describe("failureReason over result lists", () => {
 		assert.equal(failureReason(payload(), rule(), inspectSearch), "no results");
 	});
 
+	it("accepts an empty list the engine asserted was empty", () => {
+		// The whole point of noMatch: this and the interstitial case above are the
+		// same payload from the outside.
+		assert.equal(failureReason({ results: [], noMatch: true }, rule(), inspectSearch), undefined);
+	});
+
+	it("accepts an asserted empty even under a minResults floor", () => {
+		// minResults 1 is what the shipped browser rung declares. An assertion of
+		// emptiness has to clear it, or the flag buys nothing in production.
+		assert.equal(failureReason({ results: [], noMatch: true }, rule({ minResults: 1 }), inspectSearch), undefined);
+	});
+
+	it("still rejects an empty list when noMatch is false", () => {
+		assert.equal(failureReason({ results: [], noMatch: false }, rule(), inspectSearch), "no results");
+	});
+
 	it("applies minResults", () => {
 		assert.equal(failureReason(payload(row(1)), rule({ minResults: 3 }), inspectSearch), "too few results (1 < 3)");
 	});
@@ -242,6 +258,14 @@ describe("normalizeSearchPayload", () => {
 		assert.equal("answerBox" in out, false);
 		assert.equal("peopleAlsoAsk" in out, false);
 		assert.equal("relatedSearches" in out, false);
+	});
+
+	it("carries an asserted empty through, and only next to an empty list", () => {
+		assert.equal(normalizeSearchPayload({ organic: [], noMatch: true }).noMatch, true);
+		// A source claiming rows AND "nothing matched" contradicts itself; the
+		// rows are the evidence, so the flag is dropped rather than the rows.
+		assert.equal("noMatch" in normalizeSearchPayload({ organic: [{ url: "https://a" }], noMatch: true }), false);
+		assert.equal("noMatch" in normalizeSearchPayload({ organic: [] }), false);
 	});
 
 	it("survives junk without throwing", () => {
