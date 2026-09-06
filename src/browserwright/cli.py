@@ -33,7 +33,7 @@ Usage:
   browserwright session new --backend=<extension|cdp> --name=SESSION_LABEL [--reuse] [--create | --attach=PORT]
   browserwright recover --session=<id>          (the one recovery verb: exit 0 healthy, 4 needs-human)
   browserwright session reset <id>
-  browserwright session end --session=ID
+  browserwright session end <id>          (also `session end --session=<id>`)
   browserwright session attach-active [--session=ID | -s ID] [--json]
   browserwright session list [--json]
   browserwright session prune [--idle=SECONDS]
@@ -894,8 +894,12 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
     if sub == "end":
         from .errors import BrowserwrightError
         from .session_ctx import resolve_session_or_env
+        # Accept a positional id (`session end <id>`) like `reset` does (#100).
+        # Before this, a positional id fell through to the generic `no session`
+        # blob and the launched browser + ledger row silently survived.
+        raw_sid = args[1] if len(args) > 1 and not args[1].startswith("--") else session_id
         try:
-            rec = resolve_session_or_env(session_id)
+            rec = resolve_session_or_env(raw_sid)
             message = session_create.end(rec)
         except BrowserwrightError as e:
             print(str(e), file=sys.stderr)
