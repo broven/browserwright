@@ -641,6 +641,17 @@ if command -v pi >/dev/null 2>&1; then
   if grep -q '"npm:@browserwright/pi"' "$HOME/.pi/agent/settings.json" 2>/dev/null; then
     echo ""
     echo "Updating pi extension @browserwright/pi (npm)..."
+    # pnpm refuses `install -g` (which `pi update` triggers) when its global bin
+    # directory is missing from PATH. A non-interactive `mise run` env has the
+    # pnpm *home* (e.g. $HOME/Library/pnpm) but usually not the `bin` subdir, so
+    # this step used to fail just after the CLI/daemon/extension upgraded —
+    # leaving @browserwright/pi silently a release behind. Prepend the resolved
+    # global bin dir so the pi step can't drop out of the upgrade again.
+    PNPM_GLOBAL_BIN="$(pnpm bin -g 2>/dev/null || echo "${PNPM_HOME:-$HOME/Library/pnpm}/bin")"
+    case ":$PATH:" in
+      *":$PNPM_GLOBAL_BIN:"*) : ;;
+      *) export PATH="$PNPM_GLOBAL_BIN:$PATH" ;;
+    esac
     # pnpm 11 may hold a just-published version behind its supply-chain
     # minimum-release-age policy. Exclude only our own named package; keep the
     # age guard intact for every transitive dependency in this resolution.
