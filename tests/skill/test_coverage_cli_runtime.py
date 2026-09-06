@@ -1028,6 +1028,47 @@ def test_session_create_end_extension_passes_no_group_id(tmp_bs_home, monkeypatc
     assert reg.get(sid) is None
 
 
+def test_cmd_session_end_positional_id(tmp_bs_home, monkeypatch, capsys):
+    """#100: `session end <id>` must accept the positional id like `reset` does.
+
+    Before the fix the `end` handler only ever resolved the `-s/--session`
+    value, so a positional id fell through to the generic `no session` blob:
+    the launched Chrome kept running and the ledger row stayed (silent leak).
+    """
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="cdp", owner="create", name="attached")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "end",
+        lambda rec: calls.append(rec["id"]) or f"ended {rec['id']}",
+    )
+
+    assert cli._cmd_session(["end", sid]) == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"ended {sid}\n"
+
+
+def test_cmd_session_end_positional_id_via_main(tmp_bs_home, monkeypatch, capsys):
+    """#100: the positional form must also work through the real CLI entrypoint."""
+    from browserwright import cli, session_create, session_registry as reg
+
+    sid = reg.allocate(backend="cdp", owner="create", name="attached")
+    calls = []
+    monkeypatch.setattr(
+        session_create,
+        "end",
+        lambda rec: calls.append(rec["id"]) or f"ended {rec['id']}",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["session", "end", sid])
+    assert exc.value.code == 0
+    assert calls == [sid]
+    assert capsys.readouterr().out == f"ended {sid}\n"
+
+
 def test_cmd_session_end_reports_partial_extension_teardown(
     tmp_bs_home, monkeypatch, capsys,
 ):
