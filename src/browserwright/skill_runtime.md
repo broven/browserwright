@@ -82,12 +82,34 @@ browserwright -s "$sid" -f script.py
 browserwright -s "$sid" --code-stdin < script.py
 ```
 
-### Passing approved credentials to the resident executor
+### Passing caller environment to the resident executor
 
-A secret broker injects credentials into the short-lived CLI process, while
-browser code runs in the resident executor. Select each credential explicitly
-with repeatable `--env NAME`; Browserwright forwards only those values for that
-one request:
+Browserwright never forwards the invoking shell's environment implicitly. A
+pure `-e` body that does not reference an executor-bound name runs in the
+short-lived CLI process and naturally sees that process's `PATH`. Direct tasks
+always run in the resident executor, and referencing `run_task()` from `-e`
+moves that whole code request there too. Because the daemon launched the
+resident executor, its base environment and `PATH` can differ from the invoking
+shell's.
+
+Select each value explicitly with repeatable, name-only `--env NAME`. For a
+local task that starts an executable available only through the caller's
+`PATH`, forward `PATH` on either task entrypoint:
+
+```bash
+# Direct task command
+browserwright -s "$sid" task local.example/build --env PATH
+
+# The same task nested in executor-backed inline code
+browserwright -s "$sid" --env PATH -e 'run_task("local.example/build")'
+```
+
+`--env PATH` sends the caller's string value as-is for one request; it does not
+translate paths or make a client-machine executable available to a daemon on a
+different host. No variable, including `PATH`, is selected by default.
+
+The same mechanism forwards credentials injected into the short-lived CLI
+process by a secret broker:
 
 ```bash
 approved-secret exec \
@@ -102,15 +124,16 @@ page.get_by_label("Password").fill(os.environ["SITE_PASSWORD"])
 '
 ```
 
-Pass names only. `--env SITE_EMAIL=value` is rejected so credential values do
-not enter shell history or the process argument list. An unset selected variable
-is also rejected before execution, and its value is never printed in the error.
-Inside the executor, selected variables temporarily overlay standard
-`os.environ` after the browser connection is ready. Browserwright restores the
-executor's prior environment exactly when the call succeeds, raises, or exits;
-the next call cannot see the values unless it selects them again. Values travel
-directly over the local executor socket and are not written to persistent
-`state`, discovery files, or Browserwright logs.
+Pass names only. `--env SITE_EMAIL=value` is rejected so values do not enter
+shell history or the process argument list. An unset selected variable is also
+rejected before execution, and its value is never printed in the error. Inside
+the executor, selected variables temporarily overlay standard `os.environ`
+after the browser connection is ready. This applies equally to direct task
+requests and executor-backed inline code. Browserwright restores the executor's
+prior environment exactly when the call succeeds, raises, or exits; the next
+call cannot see the values unless it selects them again. Values travel directly
+over the local executor socket and are not written to persistent `state`,
+discovery files, or Browserwright logs.
 
 ## Driving The Browser: real Playwright
 

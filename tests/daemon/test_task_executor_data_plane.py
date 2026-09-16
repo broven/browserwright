@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import ClassVar
 
 import pytest
@@ -169,6 +170,31 @@ def test_worker_task_request_borrows_live_surface(monkeypatch):
     assert captured["surface"].snapshot is worker._snapshot
     assert captured["isolated"] is True
     assert captured["kwargs"] == {"count": 2}
+
+
+def test_worker_task_request_restores_selected_env_after_failure(monkeypatch):
+    from browserwright import task_runner
+
+    key = "BROWSERWRIGHT_TEST_TASK_FAILURE_ENV"
+    monkeypatch.delenv(key, raising=False)
+    worker = _connected_worker()
+
+    def failing_task(*_args, **_kwargs):
+        assert os.environ[key] == "request-only"
+        raise RuntimeError("task failed")
+
+    monkeypatch.setattr(task_runner, "_run_task_on_surface", failing_task)
+    response = worker._execute(
+        protocol.ExecuteRequest(
+            code="",
+            env={key: "request-only"},
+            task=protocol.TaskEnvelope(site="example.com", name="check"),
+        )
+    )
+
+    assert response.error is not None
+    assert response.error["type"] == "RuntimeError"
+    assert key not in os.environ
 
 
 def test_inline_run_task_routes_and_uses_executor_wrapper(monkeypatch):
