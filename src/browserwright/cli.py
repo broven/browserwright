@@ -45,7 +45,7 @@ Usage:
       One page as Markdown. Creates and tears down its own session, so it takes
       no -s. Absolute links, shadow DOM flattened in, HTML only.
 
-  browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
+  browserwright -s <session-id> task <site>/<name> [--env NAME ...] [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
 
   browserwright install
@@ -66,15 +66,25 @@ Global option (valid before or after any subcommand):
 """
 
 TASK_HELP = """Usage:
-  browserwright -s <session-id> task <site>/<name> [--key=value ...] [--isolated]
+  browserwright -s <session-id> task <site>/<name> [--env NAME ...] [--key=value ...] [--isolated]
 
 Runs a site-skill task in the bound Browserwright session. Session may also be
 provided as --session=<id> after `task`, or via BD_SESSION.
 
+Tasks run in the daemon-launched resident executor, whose PATH may differ from
+the invoking shell. Environment variables are not forwarded implicitly. Select
+only the names this request needs; for local executable lookup, use --env PATH.
+
 Flags:
+  --env NAME             forward one variable from this CLI process for this
+                         task request only; repeat for multiple variables
   --json-args JSON       merge a JSON object into task args
   --json-output          print task result as JSON
   --output json          alias for --json-output
+
+Executable lookup examples:
+  browserwright -s "$sid" task local.example/build --env PATH
+  browserwright -s "$sid" --env PATH -e 'run_task("local.example/build")'
 """
 
 USERSCRIPT_HELP = """Usage:
@@ -177,6 +187,27 @@ def _bind_cli_session(session_id: Optional[str]):
     return 0
 
 
+def _parse_env_option(
+    args: list[str], index: int,
+) -> tuple[str, int, Optional[str]]:
+    """Parse one name-only ``--env`` option at ``index`` if present."""
+    arg = args[index]
+    if arg == "--env":
+        if index + 1 >= len(args) or args[index + 1].startswith("-"):
+            return "", 0, "--env requires a variable name"
+        name = args[index + 1]
+        consumed = 2
+    elif arg.startswith("--env="):
+        name = arg.split("=", 1)[1]
+        consumed = 1
+    else:
+        return "", 0, None
+    error = _validate_request_env_name(name)
+    if error:
+        return "", 0, error
+    return name, consumed, None
+
+
 def _parse_execute_args(
     args: list[str],
 ) -> tuple[Optional[str], Optional[str], list[str], Optional[str]]:
@@ -204,23 +235,12 @@ def _parse_execute_args(
             session_id = a.split("=", 1)[1]
             i += 1
             continue
-        if a == "--env":
-            if i + 1 >= n or args[i + 1].startswith("-"):
-                return None, None, [], "--env requires a variable name"
-            name = args[i + 1]
-            error = _validate_execute_env_name(name)
-            if error:
-                return None, None, [], error
-            env_names.append(name)
-            i += 2
-            continue
-        if a.startswith("--env="):
-            name = a.split("=", 1)[1]
-            error = _validate_execute_env_name(name)
-            if error:
-                return None, None, [], error
-            env_names.append(name)
-            i += 1
+        env_name, consumed, env_error = _parse_env_option(args, i)
+        if env_error:
+            return None, None, [], env_error
+        if consumed:
+            env_names.append(env_name)
+            i += consumed
             continue
         if a in {"-e", "--execute"}:
             if i + 1 >= n:
@@ -300,7 +320,7 @@ def _parse_execute_args(
     return session_id, code, env_names, None
 
 
-def _validate_execute_env_name(name: str) -> Optional[str]:
+def _validate_request_env_name(name: str) -> Optional[str]:
     """Validate one name-only ``--env`` argument without echoing its value."""
     from ._executor.protocol import is_valid_env_name
 
@@ -319,7 +339,7 @@ def _validate_execute_env_name(name: str) -> Optional[str]:
     return None
 
 
-def _resolve_execute_env(
+def _resolve_request_env(
     env_names: list[str],
 ) -> tuple[dict[str, str], Optional[str]]:
     """Select explicit variables from this CLI process for one request."""
@@ -339,7 +359,7 @@ def _cmd_execute(args: list[str]) -> int:
               "(-e 'print(snapshot())' | -f script.py | --code-stdin)",
               file=sys.stderr)
         return 1
-    request_env, err = _resolve_execute_env(env_names)
+    request_env, err = _resolve_request_env(env_names)
     if err:
         print(f"usage error: {err}", file=sys.stderr)
         return 1
@@ -351,12 +371,37 @@ def _cmd_execute(args: list[str]) -> int:
     )
 
 
+def _extract_env_args(
+    args: list[str],
+) -> tuple[list[str], list[str], Optional[str]]:
+    """Remove repeatable name-only ``--env`` options from command arguments."""
+    env_names: list[str] = []
+    out: list[str] = []
+    i, n = 0, len(args)
+    while i < n:
+        arg = args[i]
+        env_name, consumed, env_error = _parse_env_option(args, i)
+        if env_error:
+            return [], [], env_error
+        if consumed:
+            env_names.append(env_name)
+            i += consumed
+            continue
+        out.append(arg)
+        i += 1
+    return env_names, out, None
+
+
 def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
     if args and args[0] in {"-h", "--help"}:
         sys.stdout.write(TASK_HELP)
         return 0
+    usage = (
+        "usage: browserwright -s <session-id> task <site>/<name> "
+        "[--env NAME ...] [--key=val ...]"
+    )
     if not args:
-        print("usage: browserwright -s <session-id> task <site>/<name> [--key=val ...]", file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 1
     inner_session, args, err = _extract_session_arg(args)
     if err:
@@ -364,8 +409,16 @@ def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
         return 1
     if inner_session:
         session_id = inner_session
+    env_names, args, err = _extract_env_args(args)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
+    request_env, err = _resolve_request_env(env_names)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
     if not args:
-        print("usage: browserwright -s <session-id> task <site>/<name> [--key=val ...]", file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 1
     spec = args[0]
     if "/" not in spec:
@@ -398,6 +451,7 @@ def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
             name,
             args=kwargs,
             isolated=isolated,
+            env=request_env,
         )
     except Exception as e:  # noqa: BLE001
         print(f"task crashed: {e!r}", file=sys.stderr)

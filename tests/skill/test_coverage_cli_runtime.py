@@ -178,6 +178,17 @@ def test_global_session_prefix_dispatches_execute_starting_with_env(monkeypatch)
     assert calls == [argv]
 
 
+def test_cmd_task_help_explains_explicit_executable_path(capsys):
+    from browserwright import cli
+
+    assert cli._cmd_task(["--help"]) == 0
+
+    help_text = capsys.readouterr().out
+    assert "not forwarded implicitly" in help_text
+    assert "--env PATH" in help_text
+    assert 'run_task("local.example/build")' in help_text
+
+
 def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys):
     from browserwright import cli
     from browserwright import session_registry as reg
@@ -211,6 +222,81 @@ def test_global_session_prefix_dispatches_task(monkeypatch, tmp_bs_home, capsys)
         "kwargs": {"count": 2},
     }
     assert calls[0][3]["isolated"] is False
+
+
+def test_cmd_task_dispatches_selected_env_separately_from_task_args(
+    monkeypatch, tmp_bs_home, capsys,
+):
+    from browserwright import cli
+    from browserwright import session_registry as reg
+    from browserwright._executor import client as executor_client
+    from browserwright._executor.protocol import ExecuteResponse
+
+    sid = reg.allocate(backend="cdp", owner="create", name="job")
+    captured = {}
+    monkeypatch.setenv("ISSUE103_FIRST", "first-value")
+    monkeypatch.setenv("ISSUE103_SECOND", "second-value")
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda _sess, _site, _name, **kwargs: (
+            captured.update(kwargs)
+            or ExecuteResponse(
+                return_value="{'count': 2}",
+                task_result_json='{"count": 2}',
+            )
+        ),
+    )
+
+    assert cli._cmd_task([
+        "--session", sid,
+        "example.com/check",
+        "--env", "ISSUE103_FIRST",
+        "--count=2",
+        "--env=ISSUE103_SECOND",
+    ]) == 0
+
+    assert captured["args"] == {"count": 2}
+    assert captured["env"] == {
+        "ISSUE103_FIRST": "first-value",
+        "ISSUE103_SECOND": "second-value",
+    }
+    assert capsys.readouterr().out == "{'count': 2}\n"
+
+
+@pytest.mark.parametrize(
+    ("env_arg", "expected_error"),
+    [
+        (["--env", "ISSUE103_MISSING"], "is not set"),
+        (["--env=ISSUE103_TOKEN=secret"], "must not include a value"),
+        (["--env", "not-valid-secret"], "invalid environment variable name"),
+    ],
+)
+def test_cmd_task_rejects_invalid_or_unset_env_before_execution(
+    monkeypatch, tmp_bs_home, capsys, env_arg, expected_error,
+):
+    from browserwright import cli
+    from browserwright import session_registry as reg
+    from browserwright._executor import client as executor_client
+
+    sid = reg.allocate(backend="cdp", owner="create", name="job")
+    monkeypatch.delenv("ISSUE103_MISSING", raising=False)
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+    monkeypatch.setattr(
+        executor_client,
+        "run_task_on_executor",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid environment selection reached task execution"
+        ),
+    )
+
+    assert cli._cmd_task([
+        "--session", sid, "example.com/check", *env_arg,
+    ]) == 1
+    error = capsys.readouterr().err
+    assert expected_error in error
+    assert "secret" not in error
+    assert "must-not-leak" not in error
 
 
 def test_cmd_version_check_json_reports_consistent_versions(monkeypatch, capsys):
