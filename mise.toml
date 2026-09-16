@@ -302,6 +302,7 @@ depends = ["dev-link"]
 
 [tasks.upgrade-global]
 description = "Upgrade global browserwright from PyPI, install the matching GitHub Release Chrome extension artifact and pi npm extension, restart the daemon, and verify"
+usage = 'flag "--force" help="Force the update even when active sessions are using the global daemon; in-flight calls may be interrupted"'
 dir = "{{config_root}}"
 run = """
 #!/usr/bin/env bash
@@ -341,12 +342,21 @@ global_cmd() {
 }
 global_cli="$HOME/.local/bin/browserwright"
 global_daemon="$HOME/.local/bin/browserwright-daemon"
+force="${usage_force:-false}"
+restart_force_arg=""
+if [[ "$force" == "true" ]]; then
+  restart_force_arg="--force"
+fi
 
 require_global_idle() {
   local cli="$1"
   local stage="$2"
   local activity_report=""
   local rc=0
+  if [[ "$force" == "true" ]]; then
+    echo "upgrade-global: --force enabled; bypassing activity gate for $stage." >&2
+    return 0
+  fi
   if activity_report="$(global_cmd "$cli" activity 2>&1)"; then
     return 0
   else
@@ -498,10 +508,11 @@ else
   fi
 fi
 
-# ADR-0012 rule 2: no `--force`. If status proves the installed version is
-# already the healthy running version, restart is an idempotent no-op. Otherwise
-# call ordinary restart, whose own activity guard closes the check/install race.
-# A human who really wants to interrupt it runs the forced command themselves.
+# ADR-0012 rule 2: a normal upgrade does not force a restart. If status proves
+# the daemon is already the healthy running version, restart is an idempotent
+# no-op. Otherwise call ordinary restart, whose own activity guard closes the
+# check/install race. `--force` is an explicit human override for every activity
+# gate and the restart, and may interrupt in-flight calls.
 status_rc=0
 daemon_status="$(global_cmd "$global_daemon" status --json 2>/dev/null)" \
   || status_rc=$?
@@ -526,7 +537,7 @@ restart_report=""
 if [[ "$running_version" == "$installed_cli_version" ]]; then
   echo "upgrade-global: daemon already healthy on the installed version; no restart needed."
 else
-  restart_report="$(global_cmd "$global_daemon" restart 2>"$restart_stderr")" \
+  restart_report="$(global_cmd "$global_daemon" restart ${restart_force_arg:+"$restart_force_arg"} 2>"$restart_stderr")" \
     || restart_rc=$?
   if [[ $restart_rc -ne 0 ]]; then
     echo "upgrade-global: the new package is installed but the daemon was NOT restarted:" >&2
@@ -702,8 +713,9 @@ run = "scripts/bump-version.sh minor"
 
 [tasks.chore]
 description = "Create a patch release, wait for PyPI, then upgrade the global installation"
+usage = 'flag "--force" help="Force the global update; in-flight daemon calls may be interrupted"'
 dir = "{{config_root}}"
-run = "scripts/release-chore.sh"
+run = "scripts/release-chore.sh ${usage_force:-false}"
 
 [tasks.restart-daemon]
 description = "Restart the installed browserwright LaunchAgent daemon after a local release"

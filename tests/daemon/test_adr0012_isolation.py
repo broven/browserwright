@@ -1,7 +1,8 @@
 """ADR-0012 (development never touches the global daemon), issue #91.
 
-Rule 2: `upgrade-global` no longer passes `--force` (mise.toml, checked here
-        by text so a re-introduction fails a test).
+Rule 2: `upgrade-global` does not force a restart by default (mise.toml, checked
+        by text so the default safety behavior cannot regress). An explicit
+        `--force` is available for a human operator.
 Rule 3: the plist is generated; `install --force` without flags carries the
         installed serve args forward; a non-loopback bind publishes loopback
         for local clients.
@@ -158,7 +159,7 @@ def test_activity_verb_exits_4_when_busy_and_0_when_idle(monkeypatch, capsys):
 # ---- rules 1, 2, 4 as text: the mise tasks and the e2e runner -------------
 
 
-def test_upgrade_global_no_longer_forces_a_restart():
+def test_upgrade_global_only_forces_when_explicit():
     import tomllib
     tasks = tomllib.loads((REPO / "mise.toml").read_text())["tasks"]
     run = tasks["upgrade-global"]["run"]
@@ -166,6 +167,9 @@ def test_upgrade_global_no_longer_forces_a_restart():
                      if not ln.lstrip().startswith("#") and "echo" not in ln)
     assert "restart --force" not in code
     assert 'global_cmd "$global_daemon" restart' in code
+    assert 'restart_force_arg="--force"' in code
+    assert 'usage_force' in code
+    assert '--force' in tasks["upgrade-global"]["usage"]
     assert code.index("activity 2>&1") < code.index("uv tool install browserwright")
     assert code.index("uv tool install browserwright") < code.index(
         'global_cmd "$global_daemon" restart')

@@ -18,18 +18,28 @@ git push origin vX.Y.Z
 # create tag -> push -> wait for PyPI -> upgrade the global install.
 mise run chore
 
+# Force the global update immediately (may interrupt in-flight daemon calls):
+# mise run chore --force
+
 # 2. update this machine to the just-released version
 mise run upgrade-global
+# Direct forced global update: mise run upgrade-global --force
 ```
 
 `mise run chore` performs the push and the global upgrade automatically. It waits up to
-30 minutes for the exact version to appear in PyPI; override
-`BROWSERWRIGHT_PYPI_WAIT_TIMEOUT`, `BROWSERWRIGHT_PYPI_POLL_INTERVAL`, or
-`BROWSERWRIGHT_PYPI_URL` when needed.
+30 minutes for the exact version to appear in PyPI, then waits up to another 30
+minutes for the global daemon to become idle; override
+`BROWSERWRIGHT_PYPI_WAIT_TIMEOUT`, `BROWSERWRIGHT_PYPI_POLL_INTERVAL`,
+`BROWSERWRIGHT_ACTIVITY_WAIT_TIMEOUT`, or the corresponding `*_POLL_INTERVAL`
+variables when needed. If a previous run already created the tag at `HEAD`,
+`chore` resumes that release instead of creating another patch tag.
 
 There is no background polling for new versions. The `chore` task polls only while it
 is running; the normal upgrade remains manual. The only automatic piece is the
 in-Chrome extension reload (see [Extension auto-reload](#extension-auto-reload)).
+
+`--force` is an explicit override for the global daemon activity gates and restart;
+it may interrupt in-flight calls and should only be used deliberately.
 
 ---
 
