@@ -685,6 +685,26 @@ uv run browserwright-daemon version check
 uv run browserwright --print-skill >/dev/null
 """
 
+[tasks."version:major"]
+description = "Create the next major release tag"
+dir = "{{config_root}}"
+run = "scripts/bump-version.sh major"
+
+[tasks."version:patch"]
+description = "Create the next patch release tag"
+dir = "{{config_root}}"
+run = "scripts/bump-version.sh patch"
+
+[tasks."version:minor"]
+description = "Create the next minor release tag"
+dir = "{{config_root}}"
+run = "scripts/bump-version.sh minor"
+
+[tasks.chore]
+description = "Create a patch release, wait for PyPI, then upgrade the global installation"
+dir = "{{config_root}}"
+run = "scripts/release-chore.sh"
+
 [tasks.restart-daemon]
 description = "Restart the installed browserwright LaunchAgent daemon after a local release"
 dir = "{{config_root}}"

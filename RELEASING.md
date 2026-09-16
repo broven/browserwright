@@ -8,16 +8,28 @@ machine (the global `uv tool` install + the Chrome extension). Read this with
 
 ```bash
 # 1. cut a release  (CI publishes to PyPI + GitHub Release on tag push)
-git tag -a vX.Y.Z -m "browserwright X.Y.Z — <summary>"
+mise run version:patch   # fixes: vX.Y.Z -> vX.Y.(Z+1)
+mise run version:minor   # features: vX.Y.Z -> vX.(Y+1).0
+mise run version:major   # breaking changes: vX.Y.Z -> v(X+1).0.0
+# The version tasks create a local annotated tag and print the push command.
 git push origin vX.Y.Z
+
+# Or run the complete patch-release flow:
+# create tag -> push -> wait for PyPI -> upgrade the global install.
+mise run chore
 
 # 2. update this machine to the just-released version
 mise run upgrade-global
 ```
 
-Nothing polls for new versions. Step 2 is **manual** — there is no background
-auto-upgrader. The only automatic piece is the in-Chrome extension reload (see
-[Extension auto-reload](#extension-auto-reload)).
+`mise run chore` performs the push and the global upgrade automatically. It waits up to
+30 minutes for the exact version to appear in PyPI; override
+`BROWSERWRIGHT_PYPI_WAIT_TIMEOUT`, `BROWSERWRIGHT_PYPI_POLL_INTERVAL`, or
+`BROWSERWRIGHT_PYPI_URL` when needed.
+
+There is no background polling for new versions. The `chore` task polls only while it
+is running; the normal upgrade remains manual. The only automatic piece is the
+in-Chrome extension reload (see [Extension auto-reload](#extension-auto-reload)).
 
 ---
 
