@@ -176,10 +176,11 @@ Members, grouped:
 - **lifecycle** — `start`/`stop` (daemon-lifetime resources: the relay's
   listening socket) · `open`/`close` (one connection) · `attach`/`detach`
   (atomic publication to `Router`) · `is_open` · `relay` (or `None`)
-- **readiness / recovery** — `bind_recovery` · `prepare_executor` (cold-start
-  preflight) · `converge(session, force)` (make the session own one live tab)
+- **readiness / recovery** — `bind_recovery` · `await_browser` and
+  `converge(session, force)` (steps 1 and 3 of the **drivable path**) ·
+  `reconnect` (rung 1 of `recover`)
 - **tabs** — `open_tab` · `close_session_tab` · `list_tabs` · `get_targets` ·
-  `target_belongs_to_session` · `current_page` · `attach_active` · `recover`
+  `target_belongs_to_session` · `current_page` · `attach_active`
 - **teardown** — `end_session(session, deadline=None)`: the adapter applies
   the owner rule to the browser
 - **wire / misc** — `send_cdp` · `wait_session_announce` ·
@@ -244,6 +245,35 @@ The daemon's persisted per-session answer to which layer is currently broken:
 events are inputs to this state; `status`, `doctor`, and `browserwright recover`
 read it. `since` is when the diagnosis last changed and `reason` is evidence,
 not a remediation guess. ADR-0013.
+
+The state machine (`session_state.RecoveryStateMachine`) is the only
+authority. Every other hop *reports*: the relay (hello, closed, Target
+detach), the executor registry (ready, exited, reaped), the drivable path's
+`converge`, and the executor itself, through `ExecuteResponse.recovery_event`
+— `bound` (a call completed on the held page), `rebound` (the tab died and
+`page` was re-bound in place, before or during the call), `target-gone` (the
+rebind failed; the executor recycles). The exec relay feeds that event to the
+machine (`bound`/`rebound` → tab recovered, `target-gone` → tab lost) and
+strips it from the agent's frame.
+
+**Trap:** never infer recovery from the agent-facing response. An in-place
+rebind answers the agent with an *error* ("RETRY the call") and is a
+*recovery*; reading `error` / `terminal_reason` misfiled it as neither.
+
+### drivable path
+The one sequence that makes a session's browser side usable:
+`Daemon.ensure_session_drivable(session, force=False)` = the adapter's
+`await_browser` (bounded grace for the browser to be reachable) → the holder's
+`ensure_open` → the adapter's `converge` (one live tab; `force` skips the
+healthy fast path). `Daemon.ensure_executor` runs it inside the executor
+registry's per-session lifecycle lock and then spawns the executor. Every
+entry uses it: `ensureExecutor`, the `/exec` relay, `recoverSession`
+(forced, no spawn — its caller is usually the executor binding), and
+`recover` (rungs 2 and 3).
+
+**Trap:** do not add a second copy "because this caller is usually warmed
+up". The `/exec` relay's copy skipped `converge` whenever the upstream was
+connected, and handed out executors for sessions whose tab was gone.
 
 ### endpoint
 The daemon's **single TCP front door** (default `http://127.0.0.1:19990`) — the
