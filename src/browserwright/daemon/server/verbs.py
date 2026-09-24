@@ -7,8 +7,6 @@ belongs to ``CdpUpstream``, not to this dispatcher.
 """
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 import secrets
@@ -28,19 +26,6 @@ logger = logging.getLogger(__name__)
 #: the original #32 symptom. Note this deadline is computed BEFORE the executor
 #: reap, which can spend ~4s of it.
 _END_SESSION_BUDGET_S = 60.0
-
-
-def _teardown_budget_result(backend: str) -> dict:
-    return {
-        "ok": False,
-        "partial": True,
-        "timedOut": True,
-        "closed": [],
-        "failed": [],
-        "unknown": ["workspace"],
-        "kept": [],
-        "backend": backend,
-    }
 
 
 class Handler(Protocol):
@@ -474,11 +459,11 @@ class SessionVerbsMixin:
         in-flight teardown and returns the FINAL result, so the caller can
         never time out mid-teardown and never mistakes slow for hung.
 
-        extension: close every tab in the session's adapter-owned tab group.
-
-        cdp: the per-session context owns a dedicated Chrome. Close that Chrome
-        (SIGTERM the launched pid), close the upstream, and drop the context —
-        the uniform, non-`-32601` success shape (docs §RPCs)."""
+        The workspace teardown itself is one call — ``Daemon.end_workspace``
+        — and the session's adapter applies the owner rule there: extension
+        closes the session's tab group, a create-owned cdp session's Chrome is
+        killed, an attach-owned browser is left running. Every backend answers
+        the same uniform, non-`-32601` result shape (docs §RPCs)."""
         session = params.get("session")
         if not isinstance(session, str) or not session:
             await self._send_to_client(client.client_id, _error_response(
@@ -491,7 +476,11 @@ class SessionVerbsMixin:
             return
 
         daemon = self.daemon
-        registry = getattr(daemon, "executors", None) if daemon is not None else None
+        if daemon is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                "endSession unavailable: router is not attached to a daemon"))
+            return
 
         # Adapters stop cooperatively at this deadline, after committing every
         # confirmed mutation. The registry deliberately never hard-cancels the
@@ -499,152 +488,47 @@ class SessionVerbsMixin:
         teardown_deadline = time.monotonic() + _END_SESSION_BUDGET_S - 0.5
 
         async def teardown_workspace() -> dict:
-            # This readiness + teardown runs under ExecutorRegistry's lifecycle
-            # gate in production. A queued ensure therefore cannot reopen the
-            # workspace between executor reap and terminal teardown.
-            record = session_registry.get(session)
-            record_backend = (
-                record.get("backend") if isinstance(record, dict) else None)
-            attach_owned_raw = (
-                isinstance(record, dict)
-                and record.get("owner") == "attach"
-                and record_backend == "cdp"
-            )
-            if attach_owned_raw and self.upstream is None:
-                # Every raw-CDP session has a per-session context now, so there
-                # is no longer a branch where teardown is skipped. `env` used to
-                # fall through here with `ended = None` — it routed to the
-                # shared context and had nothing of its own to drop — which also
-                # meant it could never report failure. It can now, and that is
-                # honest: a context that fails to close is a real partial.
-                ended: bool | None = False
-                teardown_cdp = getattr(daemon, "teardown_cdp_context", None)
-                if callable(teardown_cdp):
-                    ended = await teardown_cdp(
-                        session, deadline=teardown_deadline)
-                ok = ended is not False
-                return {
-                    "ok": ok,
-                    "partial": not ok,
-                    "timedOut": (
-                        not ok and time.monotonic() >= teardown_deadline),
-                    "closed": [],
-                    "failed": [] if ok else ["workspace"],
-                    "unknown": [] if ok else ["workspace"],
-                    "kept": [],
-                    "backend": record_backend,
-                }
-            if (self.upstream is None and self._ensure_upstream is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                remaining = max(0.0, teardown_deadline - time.monotonic())
-                if remaining <= 0:
-                    return _teardown_budget_result(self.state.backend_name)
-                try:
-                    await asyncio.wait_for(
-                        self._ensure_upstream(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    # ensure_open may have been cancelled *after* publishing an
-                    # adapter — assigned and attached — but before
-                    # set_connected. Keying the reset on `upstream is None`
-                    # left exactly that case in CONNECTING permanently, where
-                    # _gate_upstream_ready neither forwards frames nor starts
-                    # another open, so client traffic piles up unanswered in
-                    # the pre-open buffer. Reset whenever the open did not
-                    # finish, and take the half-published adapter down with it.
-                    # No workspace mutation follows this result.
-                    if self.state.upstream_phase != UpstreamPhase.CONNECTED:
-                        partial = self.upstream
-                        self.upstream = None
-                        if partial is not None:
-                            with contextlib.suppress(Exception):
-                                partial.detach(self)
-                            with contextlib.suppress(Exception):
-                                await partial.close(reason="open_timeout")
-                        await self.state.set_disconnected()
-                    return _teardown_budget_result(self.state.backend_name)
-            upstream = self.upstream
-            if upstream is None:
-                raise RuntimeError("upstream not attached")
-            # Declared on the protocol, so called directly — see the
-            # target_belongs_to_session note below on why probing is wrong.
-            return await upstream.end_session_before(
+            # Runs under ExecutorRegistry's lifecycle gate, so a queued ensure
+            # cannot reopen the workspace between executor reap and terminal
+            # teardown.
+            return await daemon.end_workspace(
                 session, deadline=teardown_deadline)
 
-        daemon_terminate = getattr(daemon, "terminate_session", None)
-        terminate = (
-            daemon_terminate if callable(daemon_terminate)
-            else getattr(registry, "terminate_session", None))
-        if callable(terminate):
-            try:
-                if callable(daemon_terminate):
-                    reap, result = await terminate(
-                        session, teardown_workspace,
-                        caller_token=client.connection_token,
-                        budget=_END_SESSION_BUDGET_S,
-                        # Issue #32: return at the initiate boundary. The
-                        # bounded fast phase (revoke + reap) completed; the
-                        # bounded workspace teardown continues daemon-side
-                        # and the caller polls/joins for the final result — a
-                        # slow teardown can no longer outlive this RPC.
-                        wait=False)
-                else:
-                    reap, result = await terminate(
-                        session, teardown_workspace,
-                        budget=_END_SESSION_BUDGET_S)
-                if reap.get("reaped") is not True:
-                    await self._send_to_client(
-                        client.client_id,
-                        _error_response(
-                            req_id, -32603,
-                            "endSession could not confirm executor death: "
-                            f"{reap!r}"),
-                    )
-                    return
-                if isinstance(result, dict):
-                    result.setdefault("backend", self.state.backend_name)
-            except Exception as e:  # noqa: BLE001 - executor kill is best-effort
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"endSession failed: {e!r}"))
-                return
-        else:
-            # Lightweight test doubles and old embedders retain the prior
-            # sequence; the real daemon registry always takes the atomic path.
-            if registry is not None:
-                try:
-                    reap = await registry.kill_current_and_wait(session)
-                    if reap.get("reaped") is not True:
-                        await self._send_to_client(
-                            client.client_id,
-                            _error_response(
-                                req_id, -32603,
-                                "endSession could not confirm executor death: "
-                                f"{reap!r}"),
-                        )
-                        return
-                except Exception as e:  # noqa: BLE001
-                    await self._send_to_client(client.client_id, _error_response(
+        try:
+            reap, result = await daemon.terminate_session(
+                session, teardown_workspace,
+                caller_token=client.connection_token,
+                budget=_END_SESSION_BUDGET_S,
+                # Issue #32: return at the initiate boundary. The bounded fast
+                # phase (revoke + reap) completed; the bounded workspace
+                # teardown continues daemon-side and the caller polls/joins for
+                # the final result — a slow teardown can no longer outlive
+                # this RPC.
+                wait=False)
+            if reap.get("reaped") is not True:
+                await self._send_to_client(
+                    client.client_id,
+                    _error_response(
                         req_id, -32603,
-                        f"endSession executor reap failed: {e!r}"))
-                    return
-            result = await self._invoke_upstream(
-                client, req_id, "endSession failed",
-                lambda upstream: upstream.end_session(session))
-            if result is None:
+                        "endSession could not confirm executor death: "
+                        f"{reap!r}"),
+                )
                 return
+            if isinstance(result, dict):
+                result.setdefault("backend", self.state.backend_name)
+        except Exception as e:  # noqa: BLE001 - executor kill is best-effort
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"endSession failed: {e!r}"))
+            return
         if (isinstance(result, dict) and result.get("ok") is True
-                and not result.get("initiated") and daemon is not None):
-            machine = getattr(daemon, "recovery", None)
-            if machine is not None:
-                from .session_state import SESSION_ENDED
-                machine.note(session, SESSION_ENDED)
+                and not result.get("initiated")):
+            from .session_state import SESSION_ENDED
+            daemon.recovery.note(session, SESSION_ENDED)
         await self._send_to_client(client.client_id, _result_response(req_id, result))
         if (isinstance(result, dict) and result.get("ok") is True
-                and client.connection_token is not None
-                and daemon is not None):
-            revoke = getattr(daemon, "revoke_session_lease", None)
-            if callable(revoke):
-                await revoke(client.connection_token)
+                and client.connection_token is not None):
+            await daemon.revoke_session_lease(client.connection_token)
 
     async def _handle_ensure_executor(
         self, client: ClientState, params: dict, req_id: int | None,
@@ -699,10 +583,7 @@ class SessionVerbsMixin:
                     raise RuntimeError(f"upstream open: {e!r}") from e
             context_for = getattr(daemon, "context_for_required", None)
             if callable(context_for):
-                holder = context_for(session).holder
-                converge = getattr(holder, "converge_session_tab", None)
-                if callable(converge):
-                    await converge(session)
+                await context_for(session).upstream.converge(session)
         try:
             ensure_with_preflight = getattr(
                 registry, "ensure_with_preflight", None)
@@ -750,7 +631,7 @@ class SessionVerbsMixin:
         from .session_state import (EXECUTOR_READY, EXTENSION_DISCONNECTED,
                                     EXTENSION_HELLO, HEALTHY, NEEDS_HUMAN,
                                     RECOVERY_FAILED, TAB_GONE,
-                                    TAB_RECOVER_FAILED, TAB_RECOVERED)
+                                    TAB_RECOVER_FAILED)
         daemon = self.daemon
         machine = getattr(daemon, "recovery", None)
         registry = getattr(daemon, "executors", None) if daemon is not None else None
@@ -769,8 +650,8 @@ class SessionVerbsMixin:
         context_for = getattr(daemon, "context_for_required", None)
         context = context_for(session) if callable(context_for) else getattr(
             daemon, "shared_context", None)
-        holder = getattr(context, "holder", None)
-        relay = getattr(holder, "relay", None)
+        upstream = getattr(context, "upstream", None)
+        relay = getattr(upstream, "relay", None)
 
         def current_state() -> str | None:
             return machine.state_of(session) if machine is not None else None
@@ -821,20 +702,7 @@ class SessionVerbsMixin:
             try:
                 if self._ensure_upstream is not None:
                     await self._ensure_upstream()
-                converge = getattr(holder, "converge_session_tab", None)
-                if callable(converge):
-                    await converge(session, force=True)
-                else:
-                    ext = getattr(holder, "_extension_adapter", None)
-                    try:
-                        await ext.recover_session(session)
-                    except Exception:
-                        await ext.open_background_tab(
-                            "about:blank", session_id=session, background=True)
-                    note(TAB_RECOVERED, reason="tab group re-attached by recover",
-                         executor_alive=(registry is not None and
-                                         registry.get(session) is not None and
-                                         registry.get(session).is_alive()))
+                await upstream.converge(session, force=True)
                 steps.append({"rung": "tab", "ok": True,
                               "detail": "session has a live tab"})
             except Exception as e:  # noqa: BLE001
@@ -909,10 +777,7 @@ class SessionVerbsMixin:
             daemon = self.daemon
             context_for = getattr(daemon, "context_for_required", None)
             if callable(context_for):
-                holder = context_for(session).holder
-                converge = getattr(holder, "converge_session_tab", None)
-                if callable(converge):
-                    await converge(session)
+                await context_for(session).upstream.converge(session)
         return preflight
 
     async def _handle_kill_executor(

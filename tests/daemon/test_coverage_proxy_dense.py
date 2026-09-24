@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -261,13 +260,12 @@ async def test_extension_detached_event_invalidates_router_binding():
     assert "ext-tab-7" not in state.attachers
 
 
-def attach_cdp(router: Router, cap: Capture, command, *, on_end_session=None):
+def attach_cdp(router: Router, cap: Capture, command):
     async def on_close(_reason: str) -> None:
         return None
 
     upstream = CdpUpstream(
-        router.forward_from_upstream, on_close, state=router.state,
-        on_end_session=on_end_session)
+        router.forward_from_upstream, on_close, state=router.state)
     upstream.send_command = command
     upstream.send_cdp = cap.upstream_send
     router.upstream = None
@@ -743,18 +741,41 @@ async def test_open_recover_close_and_end_error_translation_branches():
 
     # ADR-0009: endSession takes only the session; the daemon derives the
     # group's title from the ledger, so a caller cannot hand it a group id.
-    async def end_session_only(session: str):
-        return {"session": session, "ok": True}
-
-    router.upstream.end_session = end_session_only
+    router.daemon = _TeardownDaemon(
+        lambda session, deadline: {"session": session, "ok": True})
     await router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": client.session_id},
     }))
     assert cap.per_client[client.client_id][-1]["result"] == {
-        "session": client.session_id, "ok": True,
+        "session": client.session_id, "ok": True, "backend": "extension",
     }
+
+
+class _TeardownDaemon:
+    """The daemon surface `endSession` uses: one terminate, one teardown.
+
+    ``end_workspace`` answers with ``outcome(session, deadline)``, or raises
+    whatever that returns if it is an exception."""
+
+    def __init__(self, outcome) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[str, float | None]] = []
+        self.recovery = SimpleNamespace(note=lambda *_a, **_kw: None)
+
+    async def terminate_session(self, session, teardown, **_kw):
+        return {"reaped": True}, await teardown()
+
+    async def end_workspace(self, session, *, deadline=None):
+        self.calls.append((session, deadline))
+        result = self.outcome(session, deadline)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def revoke_session_lease(self, _token) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -762,35 +783,25 @@ async def test_end_session_daemon_edge_cases():
     state, router, cap, (client,) = setup_router()
     client.session_id = "sess"
 
-    class TeardownDaemon:
-        def __init__(self, fail: bool = False) -> None:
-            self.contexts = {"sess": object()}
-            self.fail = fail
-            self.calls: list[str] = []
-
-        async def teardown_cdp_context(self, session: str) -> None:
-            self.calls.append(session)
-            if self.fail:
-                raise RuntimeError("teardown failed")
-
-    good = TeardownDaemon()
-    router.daemon = good
     async def unused_command(*args, **kwargs):
         raise AssertionError("endSession must not send CDP")
-    attach_cdp(
-        router, cap, unused_command,
-        on_end_session=good.teardown_cdp_context)
+    attach_cdp(router, cap, unused_command)
+
+    good = _TeardownDaemon(lambda _s, _d: {"ok": True, "closed": []})
+    router.daemon = good
     await router.route_from_client(client, json.dumps({
         "id": 2,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "sess"},
     }))
-    assert good.calls == ["sess"]
+    assert [sid for sid, _ in good.calls] == ["sess"]
+    # The teardown is bounded: the verb always hands the daemon a deadline.
+    assert good.calls[0][1] is not None
+    # A result without a backend gets the context's, never a missing field.
     assert cap.per_client[client.client_id][-1]["result"]["backend"] == "cdp"
 
-    bad = TeardownDaemon(fail=True)
-    router.daemon = bad
-    router.upstream._on_end_session = bad.teardown_cdp_context
+    router.daemon = _TeardownDaemon(
+        lambda _s, _d: RuntimeError("teardown failed"))
     await router.route_from_client(client, json.dumps({
         "id": 3,
         "method": "BrowserwrightDaemon.endSession",
@@ -798,92 +809,13 @@ async def test_end_session_daemon_edge_cases():
     }))
     assert last_error(cap, client)["code"] == -32603
 
-
-@pytest.mark.asyncio
-async def test_cdp_end_session_does_not_turn_false_teardown_into_success():
-    state, router, cap, (client,) = setup_router()
-    client.session_id = "sess"
-
-    async def refused(_session: str) -> bool:
-        return False
-
-    attach_cdp(router, cap, lambda *_args, **_kwargs: None,
-               on_end_session=refused)
+    router.daemon = None
     await router.route_from_client(client, json.dumps({
         "id": 4,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "sess"},
     }))
-
-    result = cap.per_client[client.client_id][-1]["result"]
-    assert result["ok"] is False
-    assert result["failed"] == ["workspace"]
-
-
-@pytest.mark.asyncio
-async def test_raw_external_workspace_noop_end_remains_successful():
-    state, router, cap, (client,) = setup_router()
-    client.session_id = "sess"
-
-    async def not_owned(_session: str) -> None:
-        return None
-
-    attach_cdp(router, cap, lambda *_args, **_kwargs: None,
-               on_end_session=not_owned)
-    await router.route_from_client(client, json.dumps({
-        "id": 5,
-        "method": "BrowserwrightDaemon.endSession",
-        "params": {"session": "sess"},
-    }))
-
-    assert cap.per_client[client.client_id][-1]["result"]["ok"] is True
-
-
-@pytest.mark.asyncio
-async def test_end_session_cold_open_respects_budget_and_restores_phase(
-    monkeypatch,
-):
-    from browserwright.daemon.server import verbs as verbs_mod
-
-    state, router, cap, (client,) = setup_router()
-    client.session_id = "sess"
-    router.upstream = None
-    state.upstream_phase = UpstreamPhase.DISCONNECTED
-    ensure_cancelled = False
-
-    async def slow_ensure():
-        nonlocal ensure_cancelled
-        await state.begin_connecting("extension")
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            ensure_cancelled = True
-            raise
-
-    class Registry:
-        async def terminate_session(self, session, teardown, *, budget=None):
-            return ({"reaped": True}, await teardown())
-
-    async def disconnect(_reason):
-        return None
-
-    router.daemon = SimpleNamespace(executors=Registry())
-    router.bind_lifecycle(
-        ensure_upstream=slow_ensure, trigger_disconnect=disconnect)
-    monkeypatch.setattr(verbs_mod, "_END_SESSION_BUDGET_S", 0.55)
-
-    await router.route_from_client(client, json.dumps({
-        "id": 6,
-        "method": "BrowserwrightDaemon.endSession",
-        "params": {"session": "sess"},
-    }))
-
-    result = cap.per_client[client.client_id][-1]["result"]
-    assert result["ok"] is False
-    assert result["partial"] is True
-    assert result["timedOut"] is True
-    assert ensure_cancelled is True
-    assert state.upstream_phase is UpstreamPhase.DISCONNECTED
+    assert last_error(cap, client)["code"] == -32603
 
 
 @pytest.mark.asyncio
@@ -892,55 +824,49 @@ async def test_end_offline_attach_owned_raw_session_skips_upstream_startup(
 ):
     """Ending an attach-owned raw-CDP session must not start an upstream first.
 
-    The teardown assertion below **inverted** with #38. This used to be
-    parametrized over `["cdp", "env"]` and expect `0` teardown calls for `env`,
-    because an env session routed to the shared context and had no per-session
-    context of its own to drop. Every raw-CDP session has one now, so teardown
-    always runs — and it is still safe for attach, because the holder only
-    SIGTERMs a pid it launched itself and an attach-owned holder has none.
+    Driven through the real daemon: the verb's teardown reaches the session's
+    own context, whose adapter owns no browser, so nothing is resolved,
+    launched, or signalled — and it still reports success.
     """
-    backend = "cdp"
+    import os
+
     from browserwright import session_registry
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server.daemon import Daemon
+    from browserwright.daemon.server.upstream_context import build_context
 
-    state, router, cap, (client,) = setup_router(
-        backend=backend, phase=UpstreamPhase.DISCONNECTED,
-        wire_upstream=False)
-    client.session_id = "sess"
     monkeypatch.setattr(
-        session_registry,
-        "get",
-        lambda sid: {
-            "id": sid, "backend": backend, "owner": "attach",
-        },
-    )
+        session_registry, "get",
+        lambda sid: {"id": sid, "backend": "cdp", "owner": "attach",
+                     "workspace": {"port": 9222}})
+    monkeypatch.setattr(session_registry, "update", lambda *_a, **_kw: None)
 
-    class Registry:
-        async def terminate_session(self, session, teardown, *, budget=None):
-            return {"reaped": True}, await teardown()
+    async def no_resolve(_cfg):
+        pytest.fail("ending an attach-owned session opened its upstream")
 
-    class Daemon:
-        executors = Registry()
+    monkeypatch.setattr("browserwright.daemon.resolver.resolve", no_resolve)
+    monkeypatch.setattr(
+        os, "kill", lambda *_a: pytest.fail("attach-owned teardown signalled"))
 
-        def __init__(self):
-            self.teardown_calls = []
+    shared = build_context(backend="extension", cfg=Config(backend="extension"))
+    daemon = Daemon(cfg=Config(backend="extension"), shared_context=shared)
+    ctx = daemon.context_for_required("sess")
+    cap = Capture()
+    client = ctx.state.allocate_client("c", session_id="sess")
+    ctx.router.register_client(
+        client.client_id, cap.client_send_for(client.client_id))
 
-        async def teardown_cdp_context(self, session, *, deadline=None):
-            self.teardown_calls.append((session, deadline))
-            return True
-
-    daemon = Daemon()
-    router.daemon = daemon
-    await router.route_from_client(client, json.dumps({
+    await ctx.router.route_from_client(client, json.dumps({
         "id": 7,
         "method": "BrowserwrightDaemon.endSession",
         "params": {"session": "sess"},
     }))
-
-    assert cap.ensure_calls == 0
-    result = cap.per_client[client.client_id][-1]["result"]
-    assert result["ok"] is True
-    assert result["backend"] == backend
-    assert len(daemon.teardown_calls) == 1
+    # Issue #32: the verb answers at the initiate boundary; join for the end.
+    await daemon.executors.await_termination("sess")
+    first = cap.per_client[client.client_id][-1]
+    assert "error" not in first, first
+    assert ctx.state.upstream_phase is UpstreamPhase.DISCONNECTED
+    assert "sess" not in daemon.contexts
 
 
 @pytest.mark.asyncio

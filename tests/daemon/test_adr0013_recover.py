@@ -13,6 +13,7 @@ from browserwright.daemon import cli as daemon_cli
 from browserwright.daemon import launchagent
 from browserwright.daemon._ipc import EndpointProbe
 from browserwright.daemon.config import Config
+from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.proxy import Router
 from browserwright.daemon.server.session_state import (
     HEALTHY,
@@ -95,12 +96,21 @@ async def _invoke_recover(monkeypatch, *, backend="extension", ready=True,
                  executor_alive=lambda _sid: executor_alive)
     relay = _Relay(ready)
     extension = _Extension(tab_error)
-    holder = SimpleNamespace(relay=relay, _extension_adapter=extension)
+
+    async def _noop(_value):
+        return None
+
+    # The real adapter owns tab convergence; only its browser round-trips are
+    # stood in for.
+    upstream = ExtensionUpstream(relay, _noop, _noop)
+    upstream.bind_recovery(machine, lambda _sid: executor_alive)
+    upstream.recover_session = extension.recover_session
+    upstream.open_background_tab = extension.open_background_tab
     registry = _Registry(machine, alive=executor_alive, spawn_error=spawn_error)
     daemon = SimpleNamespace(
         recovery=machine,
         executors=registry,
-        shared_context=SimpleNamespace(holder=holder),
+        shared_context=SimpleNamespace(upstream=upstream),
     )
     state = DaemonState(backend_name=backend)
     state.upstream_phase = UpstreamPhase.CONNECTED

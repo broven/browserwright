@@ -12,8 +12,11 @@ from browserwright.daemon.errors import Unavailable
 from browserwright.daemon.server import listener as listener_mod
 from browserwright.daemon.server import relay as relay_mod
 from browserwright.daemon.server import upstream as upstream_mod
+from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.relay import GhostTarget, RelayServer, _ExtensionConn
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+from browserwright.daemon.server.upstream import CdpUpstream
+from browserwright.daemon.server.upstream_context import UpstreamHolder
 
 
 class _FakeResponse:
@@ -53,11 +56,21 @@ class _FakeRouter:
 
 
 @pytest.mark.asyncio
-async def test_upstream_holder_extension_missing_relay_emits_connecting_then_fails():
+async def test_upstream_holder_extension_no_extension_emits_connecting_then_fails():
     state = DaemonState(backend_name="extension")
     client = state.allocate_client("listener-dense")
     router = _FakeRouter()
-    holder = listener_mod._UpstreamHolder(state, router, Config(backend="extension", timeout=0.01))
+
+    class NoExtensionRelay:
+        async def wait_ready(self, timeout):
+            raise asyncio.TimeoutError
+
+        def set_event_handler(self, handler):
+            raise AssertionError("an unopened adapter must not take events")
+
+    holder = UpstreamHolder(state, router, lambda h: ExtensionUpstream(
+        NoExtensionRelay(), router.forward_from_upstream,
+        h.on_upstream_closed, open_timeout=0.01))
 
     with pytest.raises(Unavailable):
         await holder.ensure_open()
@@ -73,70 +86,72 @@ async def test_upstream_holder_extension_missing_relay_emits_connecting_then_fai
             },
         )
     ]
-    assert holder.upstream is None
+    assert router.upstream is None
+    assert holder.is_open is False
 
 
 @pytest.mark.asyncio
 async def test_upstream_holder_open_chrome_success_wires_router_and_internal_command(monkeypatch):
     state = DaemonState(backend_name="env")
     router = _FakeRouter()
-    holder = listener_mod._UpstreamHolder(state, router, Config(backend="env", timeout=0.01))
-    commands: list[tuple[str, dict | None]] = []
     opened: dict[str, object] = {}
 
-    class FakeConn:
-        is_open = True
+    class FakeWS:
+        def __init__(self):
+            self.inbox: asyncio.Queue = asyncio.Queue()
+            self.sent: list[dict] = []
 
-        def __init__(self, *, on_frame, on_close, state=None,
-                     on_end_session=None):
-            opened["callbacks"] = (on_frame, on_close)
+        async def send(self, text):
+            msg = json.loads(text)
+            self.sent.append(msg)
+            await self.inbox.put(json.dumps({"id": msg["id"], "result": {}}))
 
-        async def open(self, ws_url, **kwargs):
-            opened["ws_url"] = ws_url
-            opened["kwargs"] = kwargs
+        def __aiter__(self):
+            return self
 
-        async def send_text(self, frame):
+        async def __anext__(self):
+            return await self.inbox.get()
+
+        async def close(self, **_kw):
             return None
 
-        async def send_cdp(self, frame):
-            return None
+    ws = FakeWS()
 
-        def attach(self, router):
-            router.upstream = self
-
-        def detach(self, router):
-            if router.upstream is self:
-                router.upstream = None
-
-        async def send_command(self, method, params=None, **kwargs):  # type: ignore[no-redef]
-            commands.append((method, params))
-            return {"ok": True}
+    async def fake_connect(url, **kwargs):
+        opened["ws_url"] = url
+        return ws
 
     async def fake_resolve(cfg):
         assert cfg.backend == "env"
         return SimpleNamespace(ws_url="ws://127.0.0.1/devtools/browser/fake")
 
-    monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
-    monkeypatch.setattr(listener_mod, "CdpUpstream", FakeConn)
+    monkeypatch.setattr("browserwright.daemon.resolver.resolve", fake_resolve)
+    monkeypatch.setattr(upstream_mod.websockets, "connect", fake_connect)
+    holder = UpstreamHolder(state, router, lambda h: CdpUpstream(
+        on_frame=router.forward_from_upstream, on_close=h.on_upstream_closed,
+        state=state, cfg=Config(backend="env", timeout=0.01)))
 
-    await holder._open_chrome_upstream(holder._cfg)
+    try:
+        await holder.ensure_open()
 
-    assert opened["ws_url"] == "ws://127.0.0.1/devtools/browser/fake"
-    assert opened["kwargs"]["timeout"] == 0.01
-    assert commands == [("Target.setDiscoverTargets", {"discover": True})]
-    assert state.upstream_phase == UpstreamPhase.CONNECTED
-    assert state.upstream_ws_url == "ws://127.0.0.1/devtools/browser/fake"
-    assert router.upstream is holder.upstream
+        assert opened["ws_url"] == "ws://127.0.0.1/devtools/browser/fake"
+        assert [(m["method"], m.get("params")) for m in ws.sent] == [
+            ("Target.setDiscoverTargets", {"discover": True})]
+        assert state.upstream_phase == UpstreamPhase.CONNECTED
+        assert state.upstream_ws_url == "ws://127.0.0.1/devtools/browser/fake"
+        assert router.upstream is holder.upstream
+        assert router.drained == 1
+    finally:
+        await holder.trigger_close("daemon_shutdown")
 
 
 @pytest.mark.asyncio
-async def test_trigger_close_sends_detach_and_closed_events_then_clears_callbacks(monkeypatch):
+async def test_trigger_close_sends_detach_and_closed_events_then_clears_callbacks():
     state = DaemonState(backend_name="cdp")
     client = state.allocate_client("c1")
     state.bind_session(client.client_id, "local-1", "up-1", "target-1")
     await state.set_connected("ws://chrome")
     router = _FakeRouter()
-    holder = listener_mod._UpstreamHolder(state, router, Config(backend="cdp"), session_id="s1")
     closed: list[tuple[int, str]] = []
     detached_phases: list[UpstreamPhase] = []
 
@@ -151,11 +166,8 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
             if router.upstream is self:
                 router.upstream = None
 
-    holder.upstream = FakeUpstream()
+    holder = UpstreamHolder(state, router, lambda _h: FakeUpstream())
     router.upstream = holder.upstream
-    holder.cdp_pid = 999
-    killed: list[int | None] = []
-    monkeypatch.setattr(holder, "_kill_cdp_chrome", lambda: killed.append(holder.cdp_pid))
 
     await holder.trigger_close("skill_disconnect")
 
@@ -165,11 +177,11 @@ async def test_trigger_close_sends_detach_and_closed_events_then_clears_callback
     ]
     assert router.sent[0][1]["params"] == {"sessionId": "local-1", "targetId": "target-1"}
     assert router.sent[1][1]["params"] == {"reason": "skill_disconnect"}
-    assert holder.upstream is None
     assert router.upstream is None
+    # The adapter is closed exactly once; whatever it owns (a create-owned
+    # Chrome) ends inside its own close.
     assert closed == [(1000, "skill_disconnect")]
     assert detached_phases == [UpstreamPhase.DISCONNECTED]
-    assert killed == [999]
     assert state.upstream_phase == UpstreamPhase.DISCONNECTED
 
 
@@ -193,7 +205,7 @@ async def test_idle_watchdog_closes_idle_cdp_context_and_drops_it(monkeypatch):
     daemon = SimpleNamespace(
         all_contexts=lambda: [ctx],
         dropped=[],
-        drop_cdp_context=lambda sid: daemon.dropped.append(sid),
+        drop_context=lambda sid: daemon.dropped.append(sid),
     )
     sleeps = 0
 

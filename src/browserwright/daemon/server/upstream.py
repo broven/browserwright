@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
 import os
@@ -43,27 +42,69 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class Upstream(Protocol):
-    """Session-shaped browser upstream used by :class:`proxy.Router`.
+    """Session-shaped browser upstream: one adapter per backend.
+
+    An adapter owns its backend's whole lifecycle, not just its frames:
+    ``CdpUpstream`` launches and kills the Chrome a ``--create`` session owns
+    and applies the owner rule at teardown; ``ExtensionUpstream`` owns the
+    relay, the extension's hello/closed/target events and tab-group
+    convergence. Everything outside the adapters (``UpstreamHolder``, the
+    verbs, the daemon) calls these members and never asks which backend it is
+    talking to.
 
     ``attach`` / ``detach`` make publication to the router atomic.  An adapter
     is attached before the state becomes CONNECTED and detached only after the
     state becomes DISCONNECTED, so a verb can never observe a connected router
     with a partially-wired implementation.
+
+    The adapter object is long-lived: it exists from context creation to
+    daemon exit and is opened/closed any number of times in between (lazy
+    open, idle close, reconnect). ``start``/``stop`` bracket the daemon-lifetime
+    resources (the extension relay's listening socket); ``open``/``close``
+    bracket one connection.
     """
 
     @property
     def is_open(self) -> bool: ...
 
+    #: The extension relay this adapter speaks through, or ``None`` when it
+    #: speaks raw CDP. Read by status/doctor and the cdp surface only.
+    @property
+    def relay(self) -> Any: ...
+
     def attach(self, router: "Router") -> None: ...
 
     def detach(self, router: "Router") -> None: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def open(self, ws_url: str | None = None, *,
+                   timeout: float | None = None) -> None: ...
+
+    async def close(self, *, code: int = 1000, reason: str = "") -> None: ...
+
+    #: Wire the daemon's ADR-0013 recovery state machine. Called for every
+    #: context the daemon builds, shared or per-session.
+    def bind_recovery(self, machine: Any,
+                      executor_alive: Callable[[str], bool]) -> None: ...
+
+    #: Cold-start readiness before an executor may be spawned for
+    #: ``session_id``. Raises an actionable ``Unavailable`` when the browser
+    #: side cannot become ready inside the control-plane budget.
+    async def prepare_executor(self, session_id: str) -> None: ...
+
+    #: Make ``session_id`` own one live tab, once and bounded (ADR-0013).
+    #: ``force`` skips the healthy fast path (the explicit recovery verb).
+    #: Returns the representative tab, or ``None`` when nothing needed doing.
+    async def converge(self, session_id: str, *,
+                       force: bool = False) -> dict | None: ...
 
     async def open_tab(self, url: str, *, background: bool = True,
                        session_id: str | None = None,
                        group_name: str | None = None,
                        skip_post_attach_commands: bool = False) -> dict: ...
-
-    async def close_tab(self, target: str) -> dict: ...
 
     #: Close one tab *on behalf of a session* and leave that session's durable
     #: recovery anchor consistent. Declared here rather than probed for with
@@ -87,22 +128,19 @@ class Upstream(Protocol):
     async def attach_active(self, *, session_id: str | None = None,
                             group_name: str | None = None) -> dict: ...
 
-    async def end_session(self, session_id: str) -> dict: ...
-
-    #: Deadline-aware end_session. Declared here so the caller does not have to
-    #: probe for it — a `hasattr` fallback to the unbounded variant would make
-    #: the teardown budget silently optional.
-    async def end_session_before(self, session_id: str, *,
-                                 deadline: float) -> dict: ...
+    #: Tear down ``session_id``'s workspace, applying the owner rule to the
+    #: *browser* (docs/session-workspaces.md "Teardown"). Returns the honest
+    #: ``{ok, closed, failed, unknown, kept, backend}`` result; ``partial`` /
+    #: ``timedOut`` mark a retryable budget miss. With a ``deadline`` the
+    #: adapter stops cooperatively there and may wait that long for its browser
+    #: to become reachable; ``deadline=None`` is the unattended sweep
+    #: (auto-prune): unbounded, but it never waits for a disconnected browser.
+    async def end_session(self, session_id: str, *,
+                          deadline: float | None = None) -> dict: ...
 
     async def recover(self, session_id: str | None = None) -> dict: ...
 
     async def send_cdp(self, frame: str) -> None: ...
-
-    async def open(self, ws_url: str | None = None, *,
-                   timeout: float = 30.0) -> None: ...
-
-    async def close(self, *, code: int = 1000, reason: str = "") -> None: ...
 
     async def wait_session_announce(self, session_id: str,
                                     timeout: float = 2.0) -> bool: ...
@@ -112,6 +150,11 @@ class Upstream(Protocol):
 
     async def reload_extensions(self, *, reason: str = "manual",
                                 expected_version: str | None = None) -> dict: ...
+
+#: Profile-dir prefix of every Chrome a create-owned adapter launches
+#: (``bs-s<session id>``). The startup orphan sweep keys on it, so the two can
+#: never disagree about which profiles are ours.
+OWNED_PROFILE_PREFIX = "bs-s"
 
 # 30s upstream heartbeat — spec §10 open question "Browser.getVersion 心跳频率"
 # resolved to 30s.
@@ -123,15 +166,28 @@ _DAEMON_ID_BASE = -2_000_000_000
 
 
 class CdpUpstream:
-    """Wraps a single ws to Chrome's browser-level CDP endpoint.
+    """The raw-CDP adapter: one ws to a browser-level CDP endpoint, plus the
+    lifecycle of the browser behind it.
 
     Lifecycle:
-      open(ws_url) → forward() pumps frames → close() ends it cleanly.
+      open() → forward() pumps frames → close() ends it cleanly. The object
+      outlives any one connection: idle close and reopen reuse it.
+
+    Browser ownership (docs/session-workspaces.md, CONTEXT.md "owner") lives
+    here and nowhere else. ``owns_browser`` is the ledger's ``owner ==
+    "create"``: only then does ``open`` launch a dedicated Chrome (profile
+    ``bs-s<sid>``), and only a pid this adapter launched is ever signalled.
+    An attach-owned adapter has no pid, so every kill path is a no-op for it —
+    ending the session closes our websocket and leaves the external browser
+    running, through that one data dependency rather than a teardown branch.
 
     `on_frame(text)` is called for every frame *from* upstream. It is the
     caller's job to forward it downstream (modulo BrowserwrightDaemon.* answers
-    which never enter here).
+    which never enter here). `on_close(reason)` fires when the connection ends.
     """
+
+    #: A raw-CDP adapter never speaks through the extension relay.
+    relay = None
 
     def __init__(
         self,
@@ -139,7 +195,9 @@ class CdpUpstream:
         on_close: Callable[[str], Awaitable[None]],
         *,
         state: Any | None = None,
-        on_end_session: Callable[..., Awaitable[bool | None]] | None = None,
+        cfg: Any | None = None,
+        session_id: str | None = None,
+        owns_browser: bool = False,
     ):
         self._on_frame = on_frame
         self._on_close = on_close
@@ -154,7 +212,15 @@ class CdpUpstream:
         self._target_info: dict[str, dict] = {}
         self._userscripts: dict[str, dict] = {}
         self._state = state
-        self._on_end_session = on_end_session
+        # The endpoint this adapter resolves on open. For a per-session
+        # context it is pinned from the ledger `workspace` by the context
+        # factory; a lazily allocated `--create` port is pinned back here.
+        self._cfg = cfg
+        self.session_id = session_id
+        self.owns_browser = owns_browser
+        self._browser_pid: int | None = None
+        self._browser_profile_dir: str | None = None
+        self._recovery: Any | None = None
 
     @property
     def backend_name(self) -> str:
@@ -166,6 +232,21 @@ class CdpUpstream:
     @property
     def ws_url(self) -> str | None:
         return self._ws_url
+
+    @property
+    def cfg(self) -> Any | None:
+        """The Config whose cdp endpoint this adapter resolves.
+
+        The cdp surface resolves its own byte-for-byte passthrough from the
+        same Config, so a per-session endpoint reaches it through exactly one
+        channel."""
+        return self._cfg
+
+    @property
+    def browser_pid(self) -> int | None:
+        """Pid of the Chrome this adapter launched, or None (attach-owned, or
+        not launched yet)."""
+        return self._browser_pid
 
     @property
     def is_open(self) -> bool:
@@ -181,12 +262,57 @@ class CdpUpstream:
         if router.upstream is self:
             router.upstream = None
 
-    async def open(self, ws_url: str | None = None, *, timeout: float = 30.0) -> None:
-        """Connect to upstream. Raises on failure; caller transitions state."""
-        if not ws_url:
-            raise ValueError("raw-CDP upstream requires a websocket URL")
+    async def start(self) -> None:
+        """Nothing lives longer than a connection on raw CDP."""
+
+    async def stop(self) -> None:
+        """Nothing lives longer than a connection on raw CDP."""
+
+    def bind_recovery(self, machine: Any,
+                      executor_alive: Callable[[str], bool]) -> None:
+        """Accepted for uniformity. A raw-CDP adapter reports no recovery
+        events of its own today: its browser/tab is re-proven by the
+        executor's bind (``session_state.load`` marks it ``tab-gone``)."""
+        self._recovery = machine
+
+    async def prepare_executor(self, session_id: str) -> None:
+        """Nothing to wait for: ``open`` launches/resolves the browser."""
+
+    async def converge(self, session_id: str, *,
+                       force: bool = False) -> dict | None:
+        """No durable tab binding to converge: the executor's bind resolves
+        the current page lazily (``current_page``)."""
+        return None
+
+    async def open(self, ws_url: str | None = None, *,
+                   timeout: float | None = None) -> None:
+        """Connect to upstream. Raises on failure; caller transitions state.
+
+        With no ``ws_url`` this is the lifecycle open: launch the owned Chrome
+        (create-owned, once), resolve the Config's endpoint, connect, and ask
+        Chrome to gossip about targets. An explicit ``ws_url`` connects to
+        exactly that endpoint and nothing else.
+        """
         if self._ws is not None:
             raise RuntimeError("upstream already open")
+        lifecycle = ws_url is None
+        if lifecycle:
+            if self._cfg is None:
+                raise ValueError("raw-CDP upstream requires a websocket URL")
+            from ..resolver import resolve
+
+            if self.owns_browser and self.session_id is not None:
+                await self._launch_browser()
+            try:
+                ws_url = (await resolve(self._cfg)).ws_url
+            except Exception as e:
+                logger.warning("upstream resolve failed: %s", e)
+                raise
+            if timeout is None:
+                timeout = self._cfg.timeout
+        if timeout is None:
+            timeout = 30.0
+        assert ws_url is not None
         with _localhost_bypass_proxy(ws_url):
             connect_kwargs: dict[str, Any] = {
                 # Big max_size: CDP `Page.captureScreenshot` returns base64
@@ -209,13 +335,99 @@ class CdpUpstream:
                 "ping_interval": 20,
                 "ping_timeout": 20,
             }
-            self._ws = await asyncio.wait_for(
-                websockets.connect(ws_url, **connect_kwargs),
-                timeout=timeout,
-            )
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(ws_url, **connect_kwargs),
+                    timeout=timeout,
+                )
+            except Exception as e:
+                if lifecycle:
+                    logger.warning("upstream open failed: %r", e)
+                raise
         self._ws_url = ws_url
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if lifecycle:
+            # Tell Chrome to gossip about all targets so the router can keep
+            # its target table without the client having to enable it.
+            try:
+                await self.send_command(
+                    "Target.setDiscoverTargets", {"discover": True})
+            except Exception as e:
+                logger.warning("setDiscoverTargets failed: %r", e)
+
+    async def _launch_browser(self) -> None:
+        """Launch the Chrome a ``--create`` session owns: a dedicated process
+        on its own port with profile ``bs-s{id}``.
+
+        Idempotent: once launched (pid set) this no-ops, so a reconnect never
+        spawns a second Chrome while the first is still ours.
+
+        Port selection: reuse the port the ledger pinned into the Config, else
+        allocate a free one and pin it back onto ``self._cfg`` so the resolve
+        that follows (and the cdp surface) probe the right port.
+
+        ``launch_chrome`` runs in-process (not the CLI) so the spawned pid is
+        visible here for teardown. It raises ``Unavailable`` on failure, which
+        surfaces to the client as an ordinary upstream-open failure.
+        """
+        if self._browser_pid is not None:
+            return  # already launched (warm reconnect)
+        from ..launch_chrome import launch_chrome as _launch_chrome
+
+        cfg = self._cfg
+        port = cfg.backends.cdp.port
+        if not port:
+            import socket as _socket
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            try:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            finally:
+                s.close()
+            import dataclasses as _dc
+            cfg = self._cfg = _dc.replace(
+                cfg,
+                backends=_dc.replace(
+                    cfg.backends,
+                    cdp=_dc.replace(cfg.backends.cdp, port=port),
+                ),
+            )
+
+        profile = f"{OWNED_PROFILE_PREFIX}{self.session_id}"
+        logger.info("launching cdp Chrome for session %s on port %d (profile %s)",
+                    self.session_id, port, profile)
+        out = await _launch_chrome(cfg, profile=profile, persistent=True,
+                                   port=port, timeout=max(cfg.timeout, 30.0))
+        extras = out.get("extras") or {}
+        self._browser_pid = extras.get("pid")
+        self._browser_profile_dir = extras.get("profile_path")
+
+    def _kill_browser(self) -> bool:
+        """SIGTERM the Chrome this adapter launched (best-effort; it may
+        already be gone). Clears the pid so a later open relaunches fresh.
+        Leaves the profile dir on disk — a persistent ``bs-s{id}`` dir that
+        the startup orphan sweep removes; removing it inline races Chrome's
+        shutdown writeback. Returns False only when the signal could not be
+        delivered. A no-op returning True when no pid is owned — which is
+        always the case for an attach-owned adapter."""
+        pid = self._browser_pid
+        if pid is None:
+            return True
+        import signal as _signal
+        try:
+            os.kill(pid, _signal.SIGTERM)
+            self._browser_pid = None
+            logger.info("killed cdp Chrome pid %d for session %s",
+                        pid, self.session_id)
+            return True
+        except ProcessLookupError as e:
+            self._browser_pid = None
+            logger.debug("cdp Chrome pid %s already gone: %r", pid, e)
+            return True
+        except (PermissionError, OSError) as e:
+            logger.warning("could not terminate cdp Chrome pid %s: %r", pid, e)
+            return False
 
     async def send_text(self, frame: str) -> None:
         """Forward a downstream frame to upstream verbatim."""
@@ -464,44 +676,28 @@ class CdpUpstream:
                 session_id, e)
         return result
 
-    async def end_session(self, session_id: str) -> dict:
-        """End an cdp workspace; env/attach ownership remains external."""
-        ended: bool | None = None
-        if self._on_end_session is not None:
-            ended = await self._on_end_session(session_id)
-        return {"ok": ended is not False, "closed": [],
-                "failed": [] if ended is not False else ["workspace"],
-                "kept": [],
-                "backend": self.backend_name}
+    async def end_session(self, session_id: str, *,
+                          deadline: float | None = None) -> dict:
+        """Apply the owner rule to the browser: kill it only if we launched it.
 
-    async def end_session_before(
-        self, session_id: str, *, deadline: float,
-    ) -> dict:
-        """Bounded raw-workspace teardown with an honest retryable result."""
-        ended: bool | None = None
-        if self._on_end_session is not None:
-            parameters = inspect.signature(
-                self._on_end_session).parameters.values()
-            accepts_deadline = any(
-                parameter.name == "deadline"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters)
-            if accepts_deadline:
-                ended = await self._on_end_session(
-                    session_id, deadline=deadline)
-            else:
-                # Compatibility for embedders/test doubles predating the
-                # cooperative-deadline callback. Production's daemon callback
-                # accepts the keyword.
-                ended = await self._on_end_session(session_id)
-        ok = ended is not False
+        The workspace of a raw-CDP session is the browser instance, so there
+        are no tabs to close one by one. A create-owned adapter terminates its
+        Chrome here — before any cancellable await, so a budget miss further
+        up can lose notifications but never leak the process. An attach-owned
+        adapter owns no pid and this is a no-op: the external browser keeps
+        running. Closing the connection itself is the owning context's job
+        (``UpstreamContext.end_session``).
+        """
+        if not self._kill_browser():
+            raise RuntimeError(
+                f"could not terminate cdp Chrome for session {session_id!r}")
         return {
-            "ok": ok,
-            "partial": not ok,
-            "timedOut": not ok and time.monotonic() >= deadline,
+            "ok": True,
+            "partial": False,
+            "timedOut": False,
             "closed": [],
-            "failed": [] if ok else ["workspace"],
-            "unknown": [] if ok else ["workspace"],
+            "failed": [],
+            "unknown": [],
             "kept": [],
             "backend": self.backend_name,
         }
@@ -754,7 +950,14 @@ class CdpUpstream:
                            f"{self.backend_name}")}
 
     async def close(self, *, code: int = 1000, reason: str = "") -> None:
-        """Close the upstream cleanly. Idempotent."""
+        """Close the upstream cleanly. Idempotent.
+
+        An owned Chrome is a daemon child and dies with its connection on
+        every close path (session end, idle close, daemon shutdown, Chrome
+        exit). Killed first, synchronously, so no await in the websocket close
+        below can leak it.
+        """
+        self._kill_browser()
         if self._reader_task is not None:
             self._reader_task.cancel()
         if self._heartbeat_task is not None:
@@ -774,6 +977,10 @@ class CdpUpstream:
         self._target_sessions.clear()
         self._target_info.clear()
         self._current_target_id = None
+        # New-document scripts are registered per page session, and every
+        # session died with this connection. A reopen starts with none, as a
+        # freshly connected browser would.
+        self._userscripts.clear()
 
     # ---- internal ---------------------------------------------------------
 

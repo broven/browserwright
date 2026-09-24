@@ -244,93 +244,98 @@ def test_cleanup_orphan_executors_no_runtime_dir(tmp_path, monkeypatch):
 # ---- endSession kills the executor (both backends) -------------------------
 
 
-def _router_with_client(backend: str):
-    """Minimal Router + one registered client through the real dispatch path."""
-    from browserwright.daemon.server.proxy import Router
-    from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+class _RecordingAdapter:
+    """Stands in for the shared extension adapter's browser work only."""
 
-    captured: dict[int, list] = {}
-    state = DaemonState(backend_name=backend)
-    state.upstream_phase = UpstreamPhase.CONNECTED
-    router = Router(state)
+    def __init__(self, check=None):
+        self.ended: list[tuple[str, float | None]] = []
+        self._check = check
 
-    async def _ensure():
+    def bind_recovery(self, machine, executor_alive) -> None:
         return None
 
-    async def _disc(_reason):
-        return None
+    def detach(self, router) -> None:
+        if router.upstream is self:
+            router.upstream = None
 
-    router.bind_lifecycle(_ensure, _disc)
-    async def _upstream_send(_text):
-        return None
-    router.update_upstream_send(_upstream_send)
-    client = state.allocate_client("c")
-    client.session_id = "sess"
-    captured[client.client_id] = []
+    async def end_session(self, session_id, *, deadline=None):
+        if self._check is not None:
+            self._check(session_id)
+        self.ended.append((session_id, deadline))
+        return {"ok": True, "closed": [], "failed": [], "kept": [],
+                "backend": "extension"}
+
+
+def _real_daemon(**cfg_kw):
+    """A real Daemon over a real shared extension context (relay not started)."""
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server.daemon import Daemon
+    from browserwright.daemon.server.upstream_context import build_context
+
+    cfg = Config(backend="extension", **cfg_kw)
+    shared = build_context(backend="extension", cfg=cfg)
+    return Daemon(cfg=cfg, shared_context=shared)
+
+
+async def _end_session_over(ctx, session: str) -> dict:
+    """Drive the real endSession verb on ``ctx``'s router; return the reply."""
+    from browserwright.daemon.server.state import UpstreamPhase
+
+    ctx.state.upstream_phase = UpstreamPhase.CONNECTED
+    client = ctx.state.allocate_client("c", session_id=session)
+    replies: list[dict] = []
 
     async def _send(text):
-        captured[client.client_id].append(json.loads(text))
+        replies.append(json.loads(text))
 
-    router.register_client(client.client_id, _send)
-    return router, client, captured
-
-
-class _RecordingRegistry:
-    def __init__(self):
-        self.killed: list[str] = []
-
-    async def kill_current_and_wait(self, session_id):
-        self.killed.append(session_id)
-        return {"killed": True, "reaped": True, "matched": True}
+    ctx.router.register_client(client.client_id, _send)
+    await ctx.router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "BrowserwrightDaemon.endSession",
+        "params": {"session": session},
+    }))
+    return replies[-1]
 
 
 @pytest.mark.asyncio
-async def test_end_session_kills_executor_extension():
-    router, client, captured = _router_with_client("extension")
-    reg = _RecordingRegistry()
+async def test_end_session_kills_executor_extension(
+        stub_terminate, tmp_path, monkeypatch):
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda sid: {"id": sid, "backend": "extension", "name": "e"})
+    daemon = _real_daemon()
+    adapter = _RecordingAdapter()
+    daemon.shared_context.holder.upstream = adapter
+    daemon.executors._handles["sess"] = _handle("sess")
 
-    class _Daemon:
-        executors = reg
-        contexts: dict = {}
+    reply = await _end_session_over(daemon.shared_context, "sess")
 
-    async def _end_session(session, *a):
-        return {"ok": True, "closed": [], "kept": []}
-
-    router.daemon = _Daemon()
-    router.upstream.end_session = _end_session
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.endSession",
-        "params": {"session": "sess"},
-    }))
-    assert reg.killed == ["sess"], "extension endSession did not kill executor"
-    assert captured[client.client_id][-1]["result"]["ok"] is True
+    assert stub_terminate == ["sess"], "extension endSession did not kill executor"
+    assert reply["result"]["ok"] is True
+    await daemon.executors.await_termination("sess")
+    assert [sid for sid, _ in adapter.ended] == ["sess"]
 
 
 @pytest.mark.asyncio
-async def test_end_session_kills_executor_cdp():
-    router, client, captured = _router_with_client("cdp")
-    reg = _RecordingRegistry()
+async def test_end_session_kills_executor_cdp(
+        stub_terminate, tmp_path, monkeypatch):
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "browserwright.session_registry.get",
+        lambda sid: {"id": sid, "backend": "cdp", "owner": "attach",
+                     "workspace": {"port": 9222}})
+    daemon = _real_daemon()
+    ctx = daemon.context_for_required("sess")
+    daemon.executors._handles["sess"] = _handle("sess")
 
-    class _Daemon:
-        executors = reg
-        contexts = {"sess": object()}
+    reply = await _end_session_over(ctx, "sess")
 
-        async def teardown_cdp_context(self, session):
-            return True
-
-    router.daemon = _Daemon()
-    async def _end_session(session, *args):
-        await router.daemon.teardown_cdp_context(session)
-        return {"ok": True, "closed": [], "kept": [], "backend": "cdp"}
-    router.upstream.end_session = _end_session
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.endSession",
-        "params": {"session": "sess"},
-    }))
-    assert reg.killed == ["sess"], "cdp endSession did not kill executor"
-    assert captured[client.client_id][-1]["result"]["backend"] == "cdp"
+    assert stub_terminate == ["sess"], "cdp endSession did not kill executor"
+    assert reply["result"]["backend"] == "cdp"
+    final = await daemon.executors.await_termination("sess")
+    assert final["ok"] is True
+    assert "sess" not in daemon.contexts
 
 
 # ---- idle-watchdog drives executor supervision -----------------------------
@@ -415,7 +420,8 @@ async def test_idle_watchdog_idle_reaps_when_configured(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypatch):
+async def test_auto_prune_sessions_uses_configured_threshold(
+        stub_terminate, tmp_path, monkeypatch):
     from browserwright import session_registry as reg
     from browserwright.daemon.config import Config
     from browserwright.daemon.server import listener
@@ -424,36 +430,17 @@ async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypat
     sid = reg.allocate(backend="cdp", owner="create", name="old")
     reg._with_entry(sid, lambda e: e.update(last_seen=0.0))
 
-    class _Executors:
-        def __init__(self):
-            self.killed: list[str] = []
-
-        async def kill_current_and_wait(self, session_id):
-            self.killed.append(session_id)
-            return {"killed": True, "reaped": True, "matched": True}
-
-    class _Daemon:
-        cfg = Config(session_idle_prune=12.5)
-        executors = _Executors()
-        shared_context = None
-
-        def __init__(self):
-            self.torn_down: list[str] = []
-
-        async def teardown_cdp_context(self, session_id):
-            assert reg.get(session_id) is not None
-            self.torn_down.append(session_id)
-            return True
-
-    daemon = _Daemon()
+    daemon = _real_daemon(session_idle_prune=12.5)
+    daemon.executors._handles[sid] = _handle(sid)
 
     pruned = await listener._auto_prune_sessions(daemon, reason="test")
     assert len(pruned) == 1
     assert pruned[0]["id"] == sid
     assert pruned[0]["backend"] == "cdp"
     assert pruned[0]["owner"] == "create"
-    assert daemon.executors.killed == [sid]
-    assert daemon.torn_down == [sid]
+    assert stub_terminate == [sid]
+    # The per-session context the scope check created was torn down with it.
+    assert sid not in daemon.contexts
     assert reg.get(sid) is None
 
     daemon.cfg = Config(session_idle_prune=None)
@@ -461,11 +448,9 @@ async def test_auto_prune_sessions_uses_configured_threshold(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
+async def test_auto_prune_sessions_closes_open_extension_workspace(
+        stub_terminate, tmp_path, monkeypatch):
     from browserwright import session_registry as reg
-    from browserwright.daemon.config import Config
     from browserwright.daemon.server import listener
 
     monkeypatch.setenv("BS_HOME", str(tmp_path))
@@ -478,37 +463,20 @@ async def test_auto_prune_sessions_closes_open_extension_workspace(tmp_path, mon
         ),
     )
 
-    class _Executors:
-        def __init__(self):
-            self.killed: list[str] = []
+    def _row_still_there(session_id):
+        assert reg.get(session_id) is not None
 
-        async def kill_current_and_wait(self, session_id):
-            self.killed.append(session_id)
-            return {"killed": True, "reaped": True, "matched": True}
-
-    class _Upstream:
-        def __init__(self):
-            self.ended: list[str] = []
-
-        async def end_session(self, session_id):
-            assert reg.get(session_id) is not None
-            self.ended.append(session_id)
-            return {"ok": True, "closed": [], "failed": [], "kept": []}
-
-    upstream = _Upstream()
-    daemon = SimpleNamespace(
-        cfg=Config(session_idle_prune=1.0),
-        executors=_Executors(),
-        shared_context=SimpleNamespace(
-            holder=SimpleNamespace(upstream=upstream),
-        ),
-    )
+    daemon = _real_daemon(session_idle_prune=1.0)
+    adapter = _RecordingAdapter(check=_row_still_there)
+    daemon.shared_context.holder.upstream = adapter
+    daemon.executors._handles[sid] = _handle(sid)
 
     pruned = await listener._auto_prune_sessions(daemon, reason="test")
 
     assert [rec["id"] for rec in pruned] == [sid]
-    assert daemon.executors.killed == [sid]
-    assert upstream.ended == [sid]  # ADR-0009: no group id threaded through
+    assert stub_terminate == [sid]
+    # ADR-0009: no group id threaded through; the sweep passes no deadline.
+    assert adapter.ended == [(sid, None)]
     assert reg.get(sid) is None
 
 

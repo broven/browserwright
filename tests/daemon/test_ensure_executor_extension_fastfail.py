@@ -16,9 +16,9 @@ from typing import Any
 
 import pytest
 
-from browserwright.daemon.config import Config
 from browserwright.daemon.errors import Unavailable
-from browserwright.daemon.server import listener as listener_mod
+from browserwright.daemon.server import extension_upstream as ext_mod
+from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.proxy import Router
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
 
@@ -124,19 +124,21 @@ async def _ensure_executor(router: Router, client) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_extension_holder_owns_executor_readiness_fastfail(monkeypatch):
-    monkeypatch.setattr(listener_mod, "_EXECUTOR_READY_BUDGET_S", 0.05)
+async def test_extension_adapter_owns_executor_readiness_fastfail(monkeypatch):
+    monkeypatch.setattr(ext_mod, "_EXECUTOR_READY_BUDGET_S", 0.05)
     relay = _FakeRelay(ready=False)
-    state = DaemonState(backend_name="renamed-extension-wrapper")
-    holder = listener_mod._UpstreamHolder(
-        state, Router(state), Config(backend="renamed-extension-wrapper"))
-    holder.relay = relay
+
+    async def _noop(_value: str) -> None:
+        return None
+
+    adapter = ExtensionUpstream(relay, _noop, _noop)
 
     with pytest.raises(Unavailable, match="chrome://extensions"):
-        await holder.prepare_executor("246")
+        await adapter.prepare_executor("246")
 
     assert relay.wait_calls == 1
-    assert state.upstream_phase == UpstreamPhase.DISCONNECTED
+    # The probe never opens the adapter: a later reconnect stays recoverable.
+    assert adapter.is_open is False
 
 
 @pytest.mark.asyncio

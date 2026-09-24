@@ -70,7 +70,7 @@ async def _preflight(daemon, session_id: str) -> None:
 
     The same cold-start ordering `verbs._handle_ensure_executor` documents: an
     executor's first act is to connect the cdp surface and resolve its Chrome,
-    which only has a port once the holder has launched it. Spawning first makes
+    which only has a port once the adapter has launched it. Spawning first makes
     the executor probe a stale port, 404, and die during cold-start.
 
     A client normally calls `ensureExecutor` over `/control` first, so this is
@@ -84,11 +84,9 @@ async def _preflight(daemon, session_id: str) -> None:
     ctx = context_for(session_id)
     if ctx.state.upstream_phase == UpstreamPhase.CONNECTED:
         return
-    await ctx.holder.prepare_executor(session_id)
+    await ctx.upstream.prepare_executor(session_id)
     await ctx.holder.ensure_open()
-    converge = getattr(ctx.holder, "converge_session_tab", None)
-    if callable(converge):
-        await converge(session_id)
+    await ctx.upstream.converge(session_id)
 
 
 async def resolve_executor_sock(daemon, session_id: str) -> str:

@@ -58,6 +58,7 @@ class _SendOnlyUpstream:
 
     ws_url = None
     is_open = True
+    relay = None
 
     def attach(self, router: "Router") -> None:
         router.upstream = self  # type: ignore[assignment]
@@ -69,10 +70,25 @@ class _SendOnlyUpstream:
     async def send_cdp(self, frame: str) -> None:
         await self._send(frame)
 
-    async def open(self, ws_url=None, *, timeout: float = 30.0) -> None:
+    async def open(self, ws_url=None, *, timeout: float | None = None) -> None:
         return None
 
     async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        return None
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    def bind_recovery(self, machine, executor_alive) -> None:
+        return None
+
+    async def prepare_executor(self, session_id: str) -> None:
+        return None
+
+    async def converge(self, session_id: str, *, force: bool = False) -> None:
         return None
 
     async def _unavailable(self, *args, **kwargs):
@@ -94,12 +110,6 @@ class _SendOnlyUpstream:
         # rely on their browser-instance workspace boundary; shared extension
         # callers must fail closed when this answer is unavailable.
         return None
-
-    async def end_session_before(
-        self, session_id: str, group_id: int | None = None, *, deadline: float,
-    ) -> dict:
-        raise RuntimeError(
-            "forwarding-only upstream cannot end a session")
 
     async def recover(self, *args, **kwargs) -> dict:
         return {"recovered": [], "groupId": -1, "tabs": []}

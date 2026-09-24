@@ -1,106 +1,42 @@
 """Single global daemon: multi-upstream, session-keyed routing.
 
-`docs/refactor-single-daemon.md` §"Key insight: the engine already exists":
-`Router` + `DaemonState` + `_UpstreamHolder` are already a complete
-single-upstream / multi-client engine — they only touch `self.state.*` and one
-one attached ``Upstream``. So this module does NOT rewrite routing/translation
-logic. It:
-
-  - bundles one `(state, router, holder)` triple per upstream into an
-    `UpstreamContext` (the per-upstream unit of `docs §Decomposition`), and
-  - adds the thin global `Daemon` that owns the shared (extension/real-browser)
-    context plus one lazily-created context per cdp session, and dispatches a
-    connecting client to the right context by reading the session's *immutable*
-    backend from the ledger.
+The daemon holds one shared `UpstreamContext` (the real-browser upstream every
+extension session multiplexes onto) plus one lazily-created context per `cdp`
+session, and dispatches a connecting client to the right one by reading the
+session's *immutable* backend from the ledger. Which record gets which context
+— and which adapter — is decided in exactly one place,
+`upstream_context.context_for_record`.
 
 Cross-talk is structurally impossible: a client is bound to exactly one context
 for its whole connection, so each context's `Router._broadcast` only ever
 reaches that context's own clients (browser-level events stay scoped to the
 upstream that produced them).
-
-Phase boundaries (this file is Phase 2):
-  - The actual per-session cdp Chrome *launch* is Phase 3. Here we only create
-    the context object + its `(state, router, holder)` triple, wiring the
-    holder with a cfg whose cdp port comes from the session's workspace; the
-    holder's existing resolve/connect path is left untouched.
 """
 from __future__ import annotations
 
-import dataclasses
 import asyncio
 import itertools
 import logging
-import time
 from collections.abc import Awaitable, Callable
 
 from ... import session_registry
-from .._net import redact_url
 from ..config import Config
-from .state import DaemonState
-from .proxy import Router
+from .upstream_context import (
+    UnroutableRecord,
+    UpstreamContext,
+    context_for_record,
+)
+
+__all__ = ["Daemon", "UnknownSessionError", "UpstreamContext"]
 
 logger = logging.getLogger(__name__)
+
+#: `(session_id, ledger record, daemon cfg) -> UpstreamContext | None`.
+ContextFactory = Callable[[str, dict, Config], "UpstreamContext | None"]
 
 
 class UnknownSessionError(KeyError):
     """Raised when an explicit session-bound client names no ledger session."""
-
-
-# ---- per-upstream context --------------------------------------------------
-
-
-def _endpoint_from_workspace(workspace: object) -> tuple[int | None, str | None]:
-    """The ONE reader of a session's `workspace` endpoint. Returns `(port, url)`.
-
-    | workspace | result | meaning |
-    |---|---|---|
-    | `{"port": 9222}` | `(9222, None)` | a browser on this machine |
-    | `{"url": "ws://…"}` | `(None, "ws://…")` | an endpoint handed to us |
-    | anything else | `(None, None)` | fall back to the daemon's default port |
-
-    Total on purpose. The ledger is a JSON file a user can hand-edit, and a
-    malformed record must fail *safe* rather than open: falling back to the
-    operator-configured default port can never reach a browser they did not
-    configure, whereas trusting a half-parsed value could.
-
-    `{"port": ...}` and `{"url": ...}` are mutually exclusive by construction —
-    there is deliberately no `kind` discriminator, because a discriminator can
-    disagree with the value it describes. `int` vs `str` already carries it,
-    and the URL's own scheme already separates verbatim-ws from HTTP discovery.
-    """
-    if not isinstance(workspace, dict):
-        return None, None
-    url = workspace.get("url")
-    if isinstance(url, str) and url:
-        return None, url
-    port = workspace.get("port")
-    # `bool` is an `int` subclass and must not be read as a port number.
-    if isinstance(port, int) and not isinstance(port, bool):
-        return port, None
-    return None, None
-
-
-class UpstreamContext:
-    """One live upstream: its `(state, router, holder)` triple.
-
-    Mirrors exactly what `run_serve` used to build for the single upstream —
-    just bundled so the `Daemon` can hold N of them. The holder is created by
-    `make_context` (it lives in listener.py to avoid an import cycle), so this
-    class is a passive bundle: it owns no construction logic, only the handle
-    each dispatch path needs (`router` to register a client, `state` to release
-    it, `holder` for lifecycle).
-    """
-
-    def __init__(self, *, backend: str, state: DaemonState, router: Router,
-                 holder: object, session_id: str | None = None):
-        self.backend = backend
-        self.state = state
-        self.router = router
-        # Typed as object to keep this module free of a listener import cycle
-        # (_UpstreamHolder lives in listener.py and imports nothing from here).
-        self.holder = holder
-        # None for the shared context; the cdp session id otherwise.
-        self.session_id = session_id
 
 
 # ---- the thin global daemon ------------------------------------------------
@@ -115,12 +51,12 @@ class Daemon:
     extension/env session routes here.
 
     `contexts` holds one `UpstreamContext` per cdp session, created lazily on
-    first reference (Phase 3 makes the holder actually launch the per-session
-    Chrome — here it is only wired with a port-pinned cfg).
+    first reference by the context factory (default
+    `upstream_context.context_for_record`, injectable for tests).
     """
 
     def __init__(self, *, cfg: Config, shared_context: UpstreamContext,
-                 make_context):
+                 context_factory: ContextFactory | None = None):
         self.cfg = cfg
         self.shared_context = shared_context
         # Exactly one context per cdp session, no exceptions. `daemon_scope`
@@ -141,10 +77,8 @@ class Daemon:
         # into it; `status`, `doctor` and `recover` read it.
         self.recovery = RecoveryStateMachine(persist=ledger_persist)
         self.executors.on_event = self.recovery.note
-        # Injected factory `(backend, cfg, session_id) -> UpstreamContext`.
-        # Lives in listener.py (it builds the _UpstreamHolder); injected to
-        # avoid an import cycle.
-        self._make_context = make_context
+        self._context_factory: ContextFactory = (
+            context_factory or context_for_record)
         # Global, unique-across-contexts client id source — purely for
         # log-friendliness so two contexts never print the same client #.
         self._next_client_id: "itertools.count[int]" = itertools.count(1)
@@ -158,10 +92,14 @@ class Daemon:
         self._session_phases: dict[str, str] = {}
         self._session_results: dict[str, dict] = {}
         self._termination_locks: dict[str, asyncio.Lock] = {}
-        # Back-reference set on each context's router so RPC handlers
-        # (endSession etc.) can reach the daemon to create/drop
-        # an cdp context.
-        shared_context.router.daemon = self  # type: ignore[attr-defined]
+        self._register(shared_context)
+
+    def _register(self, ctx: UpstreamContext) -> None:
+        """Wire one context into the daemon: the router's back-reference (verbs
+        reach the executor registry through it) and the ADR-0013 recovery
+        machine — the same for every context, shared or per-session."""
+        ctx.router.daemon = self  # type: ignore[attr-defined]
+        ctx.bind_recovery(self.recovery, self.executor_alive)
 
     def executor_alive(self, session_id: str) -> bool:
         handle = self.executors.get(str(session_id))
@@ -198,17 +136,28 @@ class Daemon:
             if require_known:
                 raise UnknownSessionError(session_id)
             return self.shared_context
-        backend = record.get("backend")
-        if backend == "cdp":
-            return self._ensure_cdp_context(session_id, record)
-        if backend == "extension":
-            if self.shared_context.backend == "extension":
+        ctx = self.contexts.get(session_id)
+        if ctx is not None:
+            return ctx
+        try:
+            ctx = self._context_factory(session_id, record, self.cfg)
+        except UnroutableRecord:
+            raise UnknownSessionError(session_id) from None
+        if ctx is None:
+            # The record rides the shared context — only if that context
+            # actually serves its backend.
+            if record.get("backend") == self.shared_context.backend:
                 return self.shared_context
             raise UnknownSessionError(session_id)
-        # A malformed/forward-version/legacy record must never inherit the
-        # shared browser merely because it is not named "cdp". Retired `env`
-        # records land here too, until `migrate_legacy_backends` clears them.
-        raise UnknownSessionError(session_id)
+        self._register(ctx)
+        # Dies with its browser: an upstream that closes on its own takes the
+        # per-session context with it, and a later connect rebuilds it.
+        ctx.holder.on_upstream_lost = (
+            lambda: self.drop_context(session_id))
+        self.contexts[session_id] = ctx
+        logger.info("created %s upstream context for session %s",
+                    ctx.backend, session_id)
+        return ctx
 
     def context_for_required(self, session_id: str) -> UpstreamContext:
         """Resolve an explicitly session-bound context, failing closed."""
@@ -387,129 +336,28 @@ class Daemon:
 
         self.recovery.note(session_id, SESSION_ENDED)
 
-    def _ensure_cdp_context(self, session_id: str, record: dict) -> UpstreamContext:
-        """Get or create the per-session cdp context.
+    def drop_context(self, session_id: str) -> UpstreamContext | None:
+        """Forget a per-session context. Returns it, or None if absent.
 
-        Phase 2 scope: build the context object (its own state/router/holder)
-        and wire the holder with a cfg whose cdp port comes from the session's
-        `workspace["port"]` when present (else the existing resolve path is
-        left intact). The actual Chrome *launch* is Phase 3 — the holder's
-        lazy-open will then resolve+connect to that port.
-        """
-        ctx = self.contexts.get(session_id)
-        if ctx is not None:
-            return ctx
-        cfg = self._cdp_cfg_for(record)
-        ctx = self._make_context(backend="cdp", cfg=cfg, session_id=session_id)
-        # Preserve ownership semantics past the ledger→context boundary:
-        # create-owned sessions launch/kill daemon-owned Chrome; attach
-        # sessions only connect to the caller-provided port.
-        try:
-            ctx.holder.cdp_owns_browser = record.get("owner") == "create"  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        # Same daemon back-reference the shared context got, so the cdp
-        # context's RPC handlers can drop themselves on endSession.
-        ctx.router.daemon = self  # type: ignore[attr-defined]
-        self.contexts[session_id] = ctx
-        # Redacted: a per-session endpoint can carry a bearer token, and daemon
-        # logs get pasted into bug reports.
-        logger.info("created cdp upstream context for session %s (port=%s endpoint=%s)",
-                    session_id, cfg.backends.cdp.port,
-                    redact_url(cfg.backends.cdp.endpoint))
-        return ctx
-
-    def _cdp_cfg_for(self, record: dict) -> Config:
-        """Derive a per-session cdp Config from the ledger record.
-
-        Pins `backend="cdp"` plus whichever endpoint the session's workspace
-        carries, so the holder's resolve path targets the right browser. This
-        is the ONLY place a per-session endpoint enters the system — and it
-        enters through the Config rather than as an attribute on the holder,
-        because that is the channel the Playwright facade already reads
-        (`facade._resolve_cdp_ws` takes `ctx.holder._cfg`). A second channel
-        would mean teaching the facade about it too.
-        """
-        port, endpoint = _endpoint_from_workspace(record.get("workspace"))
-        cfg = dataclasses.replace(self.cfg, backend="cdp")
-        if port is not None or endpoint is not None:
-            # `replace` shares the nested BackendsConfig instance; copy the cdp
-            # sub-config so per-session pinning never mutates the shared cfg
-            # (or another session's context).
-            fields: dict = {"endpoint": endpoint}
-            if port is not None:
-                fields["port"] = port
-            cfg.backends = dataclasses.replace(
-                cfg.backends,
-                cdp=dataclasses.replace(cfg.backends.cdp, **fields),
-            )
-        return cfg
-
-    def drop_cdp_context(self, session_id: str) -> UpstreamContext | None:
-        """Remove an cdp context from the registry. Returns the dropped
-        context, or None if absent.
-
-        This only de-registers the context (sync, callable from `_on_upstream_
-        closed` after teardown already ran). To also close the upstream + kill
-        the owned Chrome, use the async `teardown_cdp_context` instead — it runs
-        the holder's `trigger_close` (which SIGTERMs the Chrome) before
-        dropping."""
+        Only de-registers (sync): the connection is already closed when this
+        runs from `on_upstream_lost` / the idle watchdog. Ending a session's
+        workspace goes through `end_workspace`, which closes first."""
         return self.contexts.pop(session_id, None)
 
-    async def teardown_cdp_context(
-        self, session_id: str, *, deadline: float | None = None,
-    ) -> bool:
-        """Phase 3 endSession teardown: close the per-session upstream, kill the
-        daemon-owned Chrome (the holder's `trigger_close` SIGTERMs `cdp_pid`),
-        and drop the context. Returns True if a context was found + torn down.
+    async def end_workspace(self, session_id: str, *,
+                            deadline: float | None = None) -> dict:
+        """Tear down one session's workspace through its context.
 
-        Idempotent-ish: a missing context returns False so the caller can still
-        answer the wire RPC with a uniform success shape."""
-        ctx = self.contexts.get(session_id)
-        if ctx is None:
-            return False
-        holder = ctx.holder
-        # Terminate the owned process before the first cancellable close-
-        # etiquette await. A timeout can lose notifications, but cannot leak
-        # the Chrome or leave the context stuck in CLOSING.
-        kill = getattr(holder, "_kill_cdp_chrome", None)
-        if callable(kill):
-            if kill() is False:
-                raise RuntimeError(
-                    f"could not terminate cdp Chrome for session {session_id!r}")
-        try:
-            # "skill_disconnect" is the closest honest CloseReason — the client
-            # explicitly asked to end this session (vs chrome_exit / idle).
-            close = holder.trigger_close("skill_disconnect")  # type: ignore[attr-defined]
-            if deadline is None:
-                await close
-            else:
-                remaining = max(0.0, deadline - time.monotonic())
-                if remaining <= 0:
-                    close.close()
-                    abort = getattr(holder, "abort_cdp_teardown", None)
-                    if callable(abort):
-                        await abort()
-                    return False
-                await asyncio.wait_for(close, timeout=remaining)
-        except asyncio.TimeoutError:
-            abort = getattr(holder, "abort_cdp_teardown", None)
-            if callable(abort):
-                await abort()
-            logger.warning("teardown cdp context %s exceeded its budget", session_id)
-            return False
-        except asyncio.CancelledError:
-            abort = getattr(holder, "abort_cdp_teardown", None)
-            if callable(abort):
-                await asyncio.shield(abort())
-            raise
-        except Exception as e:
-            abort = getattr(holder, "abort_cdp_teardown", None)
-            if callable(abort):
-                await abort()
-            logger.warning("teardown cdp context %s close failed: %r",
-                           session_id, e)
-            raise
-        self.contexts.pop(session_id, None)
-        logger.info("tore down cdp context for session %s", session_id)
-        return True
+        The one teardown entry point for `endSession` and auto-prune alike:
+        the context's adapter applies the owner rule, a per-session context
+        closes its own connection, and on success that context is dropped so
+        the registry never keeps a dead session's entry.
+        """
+        ctx = self.context_for_required(session_id)
+        result = await ctx.end_session(session_id, deadline=deadline)
+        if (ctx is not self.shared_context and isinstance(result, dict)
+                and result.get("ok") is True):
+            self.contexts.pop(session_id, None)
+            logger.info("tore down %s context for session %s",
+                        ctx.backend, session_id)
+        return result
