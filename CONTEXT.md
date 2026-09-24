@@ -256,11 +256,32 @@ executor's Playwright controller while preserving its Python `state`.
 Who caused a daemon lifecycle event: `launchd` (parent pid 1, nothing
 stamped), or `cli:<verb> cwd=… parent=…` for `restart` / `stop` / an
 on-demand `serve` spawn (`_ipc.describe_initiator`, carried to a child
-through `BW_DAEMON_INITIATOR`). ADR-0012 rule 5.
+through `BW_DAEMON_INITIATOR` by `daemon_lifecycle.ensure`). ADR-0012 rule 5.
 
 **Trap:** launchd relaunches the daemon after a CLI `restart`, so the new
 daemon's own start line says `launchd`; the CLI's `LIFECYCLE restart` line
 just before it is the attribution.
+
+### daemon lifecycle
+The client side's one owner of "is the daemon up, and make it so"
+(`src/browserwright/daemon_lifecycle.py`). Three calls: `diagnose()` returns
+one `DaemonVerdict` (`up` · `stale` · `down` · `foreign` · `unreachable` ·
+`undecided`), `ensure(reason)` is the **only** Layer 2 code that starts or
+replaces the daemon (executor handoff, initiator, `LIFECYCLE` line, child env),
+and `unreachable_fix()` builds the agent-facing diagnosis text. Every
+`browserwright-daemon <verb>` a Layer 2 module runs goes through its
+`run_verb` adapter, which carries the resolved endpoint into the child.
+
+**Trap:** constructing a `Session` (or its `ModeBClient`) has no lifecycle side
+effect — no probe, no version check, no restart. Version coherence is enforced
+by `ensure()` at `session new` / `recover` (and the session verbs that already
+talk to the daemon CLI), never by opening a connection. An explicitly
+configured endpoint (see `endpoint`) is diagnosed, never started or replaced.
+
+**Trap:** `diagnose(confirm=True)` takes two probes and concludes nothing when
+they disagree (`undecided`); only `down` and `stale` on the default endpoint
+are `replaceable`. `foreign` (something that is not browserwright holds the
+port) is never replaced by `recover` — ADR-0013 rule 2.
 
 ### activity gate
 The daemon's own answer to "would interrupting me hurt someone right now":
