@@ -68,6 +68,17 @@ let lastInboundFrameTs = 0;
 let seenServerPing = false;
 let daemonVersion = null;
 
+// Web Store updates (GH#106). Chrome installs a downloaded update only once
+// the extension goes idle, and this one never does -- `pingLoop` and the
+// keepalive alarm exist precisely to stop that. Without this the update waits
+// for a browser restart, so users sat on old builds for weeks.
+// `onUpdateAvailable` records it; `applyPendingUpdateIfIdle` reloads into it
+// once no session holds a tab, or after UPDATE_MAX_DEFER_MS regardless (a
+// leaked session must not pin the old build forever) -- but never mid-command.
+const UPDATE_MAX_DEFER_MS = 60 * 60 * 1000;
+let pendingUpdate = null;  // { version, since }
+let inflightCommands = 0;
+
 // ---- install id (stable across reloads) -----------------------------------
 
 // GH#79 (cold start): a `chrome.storage.local` call issued while the service
@@ -227,7 +238,10 @@ function connect() {
     } catch {
       return;
     }
-    handleDaemonMessage(msg).catch((e) => {
+    inflightCommands += 1;
+    handleDaemonMessage(msg).finally(() => {
+      inflightCommands -= 1;
+    }).catch((e) => {
       console.warn("[bd-relay] handler failed:", e);
       if (typeof msg?.id === "number") {
         safeSend({
@@ -316,6 +330,7 @@ async function maintainLoop() {
   // ws onmessage/send events, not on setTimeout callbacks or on the
   // protocol-level PING the daemon's `websockets` lib emits.
   while (true) {
+    await applyPendingUpdateIfIdle();
     const state = ws ? ws.readyState : WebSocket.CLOSED;
     if (state === WebSocket.OPEN) {
       if (!wsLooksHealthy()) {
@@ -343,6 +358,17 @@ async function maintainLoop() {
     reconnectIdx += 1;
     await sleep(delay);
   }
+}
+
+async function applyPendingUpdateIfIdle() {
+  if (!pendingUpdate || inflightCommands > 0) return;
+  const overdue = Date.now() - pendingUpdate.since > UPDATE_MAX_DEFER_MS;
+  if (attachedTabs.size > 0 && !overdue) return;
+  const { version } = pendingUpdate;
+  pendingUpdate = null;
+  console.info("[bd-relay] reloading into store update", version);
+  await cleanupMarkersBeforeReload();
+  chrome.runtime.reload();
 }
 
 // MV3 SW lifetime keepalive. Send an app-level ping on the open ws every
@@ -1914,6 +1940,10 @@ chrome.runtime.onStartup.addListener(() => {
 });
 chrome.runtime.onInstalled.addListener(() => {
   if (!ws) connect();
+});
+// maintainLoop applies it on its next tick once nothing is using the extension.
+chrome.runtime.onUpdateAvailable.addListener((details) => {
+  pendingUpdate = { version: details?.version || "", since: Date.now() };
 });
 
 // Belt-and-suspenders: chrome.alarms wakes the SW every 30s even after
