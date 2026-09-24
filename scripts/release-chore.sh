@@ -139,4 +139,6 @@ if [[ "$force" == "true" ]]; then
 fi
 
 echo "PyPI is ready; updating the global installation..."
-mise run upgrade-global "${upgrade_args[@]}"
+# `${arr[@]+...}`: macOS bash 3.2 treats an empty array as unset under `set -u`,
+# so the plain expansion aborted every non-forced chore right here.
+mise run upgrade-global ${upgrade_args[@]+"${upgrade_args[@]}"}

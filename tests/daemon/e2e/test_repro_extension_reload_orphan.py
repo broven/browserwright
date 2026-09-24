@@ -288,7 +288,9 @@ def test_extension_sw_loss_orphans_resident_executor(
     # `[fix]` line after the traceback (inline.py).
     assert "[fix]" in result_b.stderr, result_b.stderr
     fix = result_b.stderr.split("[fix]", 1)[1].strip()
-    assert "session reset" in fix and "attach-active" in fix, fix
+    # ADR-0013: one instruction, `recover`, in place of the old
+    # `session reset` / `attach-active` pair.
+    assert "recover --session orphan-repro" in fix, fix
     assert "session new" not in fix, fix
     # B: the executor recycled itself (terminal target_closed) -- the NEXT
     # command cold-starts and re-attaches the session automatically. The cold

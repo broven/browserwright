@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -103,6 +104,11 @@ def _end_daemon_session(record: dict) -> bool:
                               timeout=_END_SESSION_CLI_TIMEOUT).returncode == 0
 
 
+#: How long `session reset` keeps retrying `kill-executor` against a daemon
+#: that answers but has not finished starting (issue #40 after a SIGKILL).
+_RESET_DAEMON_STARTUP_S = 10.0
+
+
 def reset_executor(record: dict) -> str:
     """Recycle only this session's resident executor.
 
@@ -112,7 +118,17 @@ def reset_executor(record: dict) -> str:
     """
     lifecycle.ensure("session reset")
     sid = record["id"]
-    rc = lifecycle.run_verb(["kill-executor", "--session", str(sid)]).returncode
+    args = ["kill-executor", "--session", str(sid)]
+    rc = lifecycle.run_verb(args).returncode
+    # `lifecycle.ensure` returns once a spawned daemon answers, which can be
+    # while it is still starting (and still sweeping the old one's orphans).
+    # Retry while it answers; a daemon that does not answer falls through to
+    # the local reap below at once.
+    deadline = time.monotonic() + _RESET_DAEMON_STARTUP_S
+    while (rc != 0 and time.monotonic() < deadline
+           and lifecycle.diagnose().up):
+        time.sleep(0.5)
+        rc = lifecycle.run_verb(args).returncode
     if rc != 0:
         # Issue #40: when the daemon is unreachable, the executor cannot be
         # reaped through it and the session is stuck — the orphan blocks the

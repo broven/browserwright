@@ -97,6 +97,11 @@ APP_PING_INTERVAL = 5.0
 STALE_FRAME_AFTER = 30.0
 RECONNECT_WAIT_TIMEOUT = 35.0
 
+# GH#106: first extension build whose ws handlers are bound to their own
+# socket (GH#79 / #81). Older builds null the live `ws` from *any* socket's
+# `onclose`, so closing a superseded socket makes them dial again.
+SOCKET_BOUND_HANDLERS_VERSION = "0.17.2"
+
 # D (reload verification): after sending reloadExtension we wait this long for
 # the SW to come back before declaring it dead. Chrome does not reliably
 # restart a reloaded MV3 SW (the alarm net is cleared by the reload), so this
@@ -220,6 +225,19 @@ class _ExtensionConn:
     # already belong to a newer connection when a superseded socket emits a
     # late frame.
     connection_generation: int = 0
+
+
+def _has_legacy_ws_handlers(ext: _ExtensionConn) -> bool:
+    """True for a released build older than SOCKET_BOUND_HANDLERS_VERSION.
+
+    Unparseable versions and the unpacked dev build (`0.0.0`) run the handlers
+    in this checkout, so they count as current.
+    """
+    version = ext.browserwright_version or ext.version
+    if version == "0.0.0":
+        return False
+    order = compare_versions(version, SOCKET_BOUND_HANDLERS_VERSION).order
+    return order is not None and order < 0
 
 
 class RelayServer:
@@ -1057,6 +1075,15 @@ class RelayServer:
                 "caller must revalidate ownership")
         return fresh
 
+    def _evict_without_closing(self, ext: _ExtensionConn) -> None:
+        if ext.app_ping_task is not None:
+            ext.app_ping_task.cancel()
+        # A legacy build answers on its newest socket, never on this one.
+        for fut in list(ext.pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError(
+                    "extension relay superseded by a newer connection"))
+
     async def _force_close_extension(self, ext: _ExtensionConn, *, reason: str) -> None:
         logger.warning(
             "force-closing stale extension relay connection: install_id=%s reason=%s",
@@ -1316,15 +1343,27 @@ class RelayServer:
             self._extensions.pop(temp_key, None)
             self._extensions[ext.install_id or temp_key] = ext
             ext.hello_received.set()
+            # GH#106: never close the superseded socket of a pre-0.17.2 build.
+            # Its `onclose` strands the extension's live socket, the next
+            # dial supersedes that one, and the pair livelock about twice a
+            # second. Evicting it is enough: it is off the routing table, and
+            # with no ping loop nothing on this side ever closes it.
+            closes_safely = not _has_legacy_ws_handlers(ext)
             for other in superseded:
                 logger.info(
                     "superseding older relay connection for install_id=%s "
-                    "(the extension dialled twice)",
+                    "(the extension dialled twice)%s",
                     ext.install_id,
+                    "" if closes_safely else
+                    "; leaving it open: extension %s predates socket-bound "
+                    "handlers" % (ext.browserwright_version or ext.version),
                 )
-                asyncio.create_task(self._force_close_extension(
-                    other, reason="superseded by a newer connection from the "
-                                  "same install_id"))
+                if closes_safely:
+                    asyncio.create_task(self._force_close_extension(
+                        other, reason="superseded by a newer connection from "
+                                      "the same install_id"))
+                else:
+                    self._evict_without_closing(other)
             if ext.app_ping_task is None or ext.app_ping_task.done():
                 ext.app_ping_task = asyncio.create_task(self._app_ping_loop(ext))
             self._first_ready.set()

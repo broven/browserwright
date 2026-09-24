@@ -242,6 +242,9 @@ class ExtensionUpstream:
         self._recovery: Any | None = None
         self._executor_alive: Callable[[str], bool] = lambda _sid: False
         self._last_auto_recover: float = 0.0
+        # A sweep is queued and has not started yet; later hellos ride on it.
+        self._auto_recover_queued: bool = False
+        self._auto_recover_hello: tuple[str, bool] = ("", False)
         # Map: upstream sessionId → tabId (for the rare path where commands
         # specify sessionId without our naming convention).
         self._sessions: dict[str, int] = {}
@@ -1430,15 +1433,31 @@ class ExtensionUpstream:
         self._note_extension_sessions(EXTENSION_HELLO, generation=generation,
                                       reason="extension connected; re-attaching tabs")
 
+        # GH#106: the throttle defers, it never drops. It used to `return` for
+        # a hello inside the window, so a service worker that restarted within
+        # 10s of the previous sweep (e.g. a drift reload right after the first
+        # hello) lost its tabs for good: nothing else re-attaches them.
+        self._auto_recover_hello = (install_id, first_seen)
+        if self._auto_recover_queued:
+            return
+        self._auto_recover_queued = True
+
         async def _recover() -> None:
             try:
                 await asyncio.sleep(_AUTO_RECOVER_DELAY_S)
+                wait = (self._last_auto_recover + _AUTO_RECOVER_THROTTLE_S
+                        - time.monotonic())
+                if wait > 0:
+                    await asyncio.sleep(wait)
             except asyncio.CancelledError:
+                self._auto_recover_queued = False
                 return
-            now = time.monotonic()
-            if (now - self._last_auto_recover) < _AUTO_RECOVER_THROTTLE_S:
-                return
-            self._last_auto_recover = now
+            # Unqueue before sweeping: a hello that lands mid-sweep may come
+            # from a SW that lost the tabs this sweep is re-attaching.
+            self._auto_recover_queued = False
+            self._last_auto_recover = time.monotonic()
+            install_id, first_seen = self._auto_recover_hello
+            generation = getattr(self._relay, "connection_generation", None)
             if not self._opened_once:
                 return
             try:
