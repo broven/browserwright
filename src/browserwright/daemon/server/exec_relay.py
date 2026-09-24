@@ -147,7 +147,7 @@ async def _executor_to_ws(reader, conn: ServerConnection, *, daemon=None,
                 raise ExecRelayError(
                     f"executor frame too large: {length} > {_MAX_FRAME}")
             payload = await reader.readexactly(length)
-            _report_executor_result(daemon, session_id, payload)
+            payload = report_recovery_event(daemon, session_id, payload)
             await conn.send(payload.decode("utf-8", errors="replace"))
     except (asyncio.IncompleteReadError, ConnectionResetError):
         return
@@ -158,29 +158,40 @@ async def _executor_to_ws(reader, conn: ServerConnection, *, daemon=None,
         return
 
 
-def _report_executor_result(daemon, session_id: str | None,
-                            payload: bytes) -> None:
-    """Feed the executor's observed tab outcome into daemon recovery state."""
-    machine = getattr(daemon, "recovery", None)
-    if machine is None or not session_id:
-        return
+def report_recovery_event(daemon, session_id: str | None,
+                          payload: bytes) -> bytes:
+    """Hand the executor's ``recovery_event`` to the daemon's recovery state
+    machine and return the agent-facing frame without it.
+
+    The executor reports what it observed about the tab binding; the machine
+    decides what that means for the session (ADR-0013 rule 1). Nothing here
+    reads the agent-facing ``error`` or ``terminal_reason``: a recovery that
+    had to be guessed from error text is one the machine could not see.
+    """
     try:
         response = json.loads(payload)
-        from ..._executor.protocol import TERMINAL_TARGET_CLOSED
-        from .session_state import TAB_RECOVER_FAILED, TAB_RECOVERED
+    except ValueError:
+        return payload  # not ours to judge; the client reports it malformed
+    if not isinstance(response, dict) or "recovery_event" not in response:
+        return payload
+    event = response.pop("recovery_event")
+    machine = getattr(daemon, "recovery", None)
+    if machine is not None and session_id and isinstance(event, dict):
+        from .session_state import EXECUTOR_RECOVERY_INPUTS
 
-        if response.get("terminal_reason") == TERMINAL_TARGET_CLOSED:
-            error = response.get("error") or {}
-            machine.note(session_id, TAB_RECOVER_FAILED,
-                         reason=str(error.get("msg") or "executor lost its tab")[:200],
-                         executor_alive=True)
-        elif response.get("error") is None:
-            machine.note(session_id, TAB_RECOVERED,
-                         reason="executor completed a call on a live tab",
-                         executor_alive=True)
-    except Exception:  # noqa: BLE001 - observation never breaks the data plane
-        logger.debug("exec relay: could not classify executor result",
-                     exc_info=True)
+        kind = event.get("kind")
+        machine_input = EXECUTOR_RECOVERY_INPUTS.get(kind)
+        if machine_input is None:
+            logger.debug("exec relay: ignoring recovery event %r", kind)
+        else:
+            try:
+                machine.note(session_id, machine_input,
+                             reason=str(event.get("detail") or kind)[:200],
+                             executor_alive=True)
+            except Exception:  # noqa: BLE001 - observation never breaks the data plane
+                logger.debug("exec relay: could not record %r", kind,
+                             exc_info=True)
+    return json.dumps(response).encode("utf-8")
 
 
 async def probe_executor_binding(daemon, session_id: str,
@@ -204,7 +215,7 @@ async def probe_executor_binding(daemon, session_id: str,
             raise ExecRelayError(
                 f"executor probe frame too large: {length} > {_MAX_FRAME}")
         raw = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
-        _report_executor_result(daemon, session_id, raw)
+        raw = report_recovery_event(daemon, session_id, raw)
         response = ExecuteResponse.from_dict(json.loads(raw))
         if response.error is not None:
             raise ExecRelayError(str(response.error.get("msg") or response.error))

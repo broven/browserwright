@@ -5,7 +5,8 @@ Before this module eight components each judged "is the other side dead" on
 their own budget, and nothing could tell an agent whether to wait for the
 extension, rebind a tab, or cold-start an executor. The machine here is fed by
 those components (relay hello / close, the executor registry, the recovery
-sweep) and read by `status`, `doctor` and the `recover` verb.
+sweep, the executor's per-call ``recovery_event``) and read by `status`,
+`doctor` and the `recover` verb.
 
 States (agent-visible strings, see CONTEXT.md "recovery state"):
 
@@ -54,6 +55,15 @@ EXECUTOR_EXITED = "executor_exited"
 EXECUTOR_REAPED = "executor_reaped"
 RECOVERY_FAILED = "recovery_failed"
 SESSION_ENDED = "session_ended"
+
+#: The executor's ``ExecuteResponse.recovery_event`` kinds, as inputs. The
+#: executor reports what it saw; this table is where that becomes a recovery
+#: input — an in-place rebind is a recovered tab, a failed one a lost tab.
+EXECUTOR_RECOVERY_INPUTS = {
+    "bound": TAB_RECOVERED,
+    "rebound": TAB_RECOVERED,
+    "target-gone": TAB_RECOVER_FAILED,
+}
 
 
 class RecoveryStateMachine:

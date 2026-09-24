@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
 
 from browserwright.daemon.server.daemon import Daemon
-from browserwright.daemon.server.exec_relay import _report_executor_result
 from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.relay import RelayServer
 from browserwright.daemon.server.session_state import (
@@ -104,23 +102,6 @@ def test_tab_failure_dominates_executor_reap_and_respawn():
     assert machine.note("7", TAB_RECOVER_FAILED) == TAB_GONE
     assert machine.note("7", EXECUTOR_EXITED) == TAB_GONE
     assert machine.note("7", EXECUTOR_READY) == TAB_GONE
-
-
-def test_exec_relay_reports_live_and_lost_tab_outcomes():
-    machine, _ = _machine(HEALTHY)
-    daemon = SimpleNamespace(recovery=machine)
-
-    _report_executor_result(daemon, "7", json.dumps({
-        "error": {"msg": "page disappeared"},
-        "terminal_reason": "target_closed",
-    }).encode())
-    assert machine.state_of("7") == TAB_GONE
-
-    _report_executor_result(daemon, "7", json.dumps({
-        "error": None,
-        "terminal_reason": None,
-    }).encode())
-    assert machine.state_of("7") == HEALTHY
 
 
 def test_terminal_session_removes_recovery_state():
