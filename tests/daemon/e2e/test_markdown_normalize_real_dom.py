@@ -74,14 +74,17 @@ def serve():
 
 
 @pytest.fixture
-def render(serve):
+def render(serve, cft_binary):
     """(markdown, raw, base_url) for a freshly loaded page."""
     from playwright.sync_api import sync_playwright
 
     def _render(*, csp: bool = False, extract: bool = False):
         base = serve(csp=csp)
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            # The harness's Chrome for Testing, not Playwright's own download:
+            # that one goes missing on every Playwright bump.
+            browser = p.chromium.launch(
+                executable_path=str(cft_binary), headless=True)
             try:
                 # bypass_csp stays OFF on purpose: turning it on would let the
                 # page's blocked scripts run and stop Trusted Types being

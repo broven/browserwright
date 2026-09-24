@@ -524,3 +524,20 @@ def test_e2e_force_bypasses_activity_and_reaches_pytest(tmp_path):
     assert len(invocations) == 2
     assert "_e2e_ports.py" in invocations[0]
     assert invocations[1] == "run python -m pytest chosen_test.py -q"
+
+
+def test_e2e_flags_only_still_selects_the_e2e_suite(tmp_path):
+    # `run.sh -v` (what `mise run test:e2e` runs) must select tests/daemon/e2e:
+    # the e2e conftest skips every real_chrome test unless a path under it is
+    # given, so passing flags straight through ran the unit suite green with
+    # all of e2e skipped.
+    env, uv_log, _ = _e2e_fake_environment(tmp_path, daemon_rc=0)
+
+    proc = subprocess.run(
+        ["bash", str(REPO / "tests/daemon/e2e/run.sh"), "-q", "-k", "relay"],
+        text=True, capture_output=True, env=env, cwd=REPO, timeout=20,
+    )
+
+    assert proc.returncode == 23
+    assert uv_log.read_text().splitlines()[1] == (
+        "run python -m pytest -q -k relay tests/daemon/e2e")

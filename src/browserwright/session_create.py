@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
+import time
 from typing import Optional
 
 from . import session_registry as reg
@@ -200,6 +201,11 @@ def _end_daemon_session(record: dict) -> bool:
     return _run(cmd, timeout=_END_SESSION_CLI_TIMEOUT) == 0
 
 
+#: How long `session reset` keeps retrying `kill-executor` against a daemon
+#: that answers but has not finished starting (issue #40 after a SIGKILL).
+_RESET_DAEMON_STARTUP_S = 10.0
+
+
 def reset_executor(record: dict) -> str:
     """Recycle only this session's resident executor.
 
@@ -209,12 +215,16 @@ def reset_executor(record: dict) -> str:
     """
     _ensure_daemon_running()
     sid = record["id"]
-    rc = _run([
-        "browserwright-daemon",
-        "kill-executor",
-        "--session",
-        str(sid),
-    ])
+    cmd = ["browserwright-daemon", "kill-executor", "--session", str(sid)]
+    rc = _run(cmd)
+    # `_ensure_daemon_running` returns as soon as it has spawned a daemon, so
+    # the first call can land while that daemon is still starting (and still
+    # sweeping the old one's orphans). Retry while it answers; a daemon that
+    # does not answer falls through to the local reap below at once.
+    deadline = time.monotonic() + _RESET_DAEMON_STARTUP_S
+    while rc != 0 and time.monotonic() < deadline and _daemon_is_running():
+        time.sleep(0.5)
+        rc = _run(cmd)
     if rc != 0:
         # Issue #40: when the daemon is unreachable, the executor cannot be
         # reaped through it and the session is stuck — the orphan blocks the

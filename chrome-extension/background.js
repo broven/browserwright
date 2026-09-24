@@ -1354,6 +1354,43 @@ const MARKER_RAW_TITLE_SRC = `
   }
 `;
 
+// Playwright reads titles -- `page.title()`, `expect(page).to_have_title()` --
+// in its own isolated "utility" world, which has its own Document.prototype, so
+// the main-world accessor in MARKER_INSTALL_SCRIPT never reaches it and agents
+// read "👀 <title>". Give every utility world a read-side strip too. Only the
+// getter changes: the main-world observer re-marks whatever gets written.
+const PLAYWRIGHT_UTILITY_WORLD_PREFIX = "__playwright_utility_world_";
+const UTILITY_WORLD_TITLE_SCRIPT = `
+(function() {
+` + MARKER_STRIP_PREFIX_SRC + `
+  const native = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+  if (!native || !native.get || !native.set) return;
+  Object.defineProperty(Document.prototype, 'title', {
+    configurable: true,
+    enumerable: true,
+    get: function() { return stripPrefix(native.get.call(this)); },
+    set: function(value) { native.set.call(this, value); },
+  });
+})();
+`;
+
+function stripMarkerInUtilityWorld(source, params) {
+  const ctx = params?.context;
+  const name = ctx?.name || ctx?.auxData?.name || "";
+  if (typeof ctx?.id !== "number"
+      || !name.startsWith(PLAYWRIGHT_UTILITY_WORLD_PREFIX)) {
+    return;
+  }
+  // Issued before the event is forwarded: Chrome runs one debuggee's commands
+  // in order, and Playwright cannot address this context until it has seen
+  // the event, so no title read in it can overtake the install.
+  debuggerCommand(source, "Runtime.evaluate", {
+    expression: UTILITY_WORLD_TITLE_SCRIPT,
+    contextId: ctx.id,
+  }).catch((e) =>
+    console.warn("[bd-relay] utility-world title strip failed:", e));
+}
+
 const MARKER_INSTALL_SCRIPT = `
 (function() {
 ` + MARKER_STRIP_PREFIX_SRC + `
@@ -1763,6 +1800,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
   if (typeof source.sessionId === "string" && source.sessionId) {
     return;
+  }
+  if (method === "Runtime.executionContextCreated") {
+    stripMarkerInUtilityWorld(source, params);
   }
   safeSend({
     type: "event",

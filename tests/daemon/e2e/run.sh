@@ -113,4 +113,15 @@ fi
 
 # Test deps live in the `dev` dependency-group (PEP 735), which uv installs by
 # default — no `--extra test` (that extra doesn't exist).
-exec uv run python -m pytest "$@"
+# The e2e conftest skips every real_chrome test unless a positional arg points
+# under tests/daemon/e2e (or `-m real_chrome` is given), so flags alone -- the
+# "whole e2e suite" usage above, and `mise run test:e2e` -- used to run the
+# unit suite with all of e2e skipped, and report green.
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *.py|*.py::*|tests/*) exec uv run python -m pytest "$@" ;;
+    *) [ -e "$arg" ] && exec uv run python -m pytest "$@" ;;
+  esac
+done
+exec uv run python -m pytest "$@" tests/daemon/e2e
