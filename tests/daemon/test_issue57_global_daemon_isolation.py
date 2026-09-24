@@ -56,25 +56,24 @@ def test_the_endpoint_the_suite_resolves_is_not_the_real_one():
     assert ep.source == "state_file"
 
 
-def test_cold_start_entry_points_are_neutralised():
-    """Vector A, layer 1: wandering into them must not start a daemon."""
-    from browserwright import mode_b_client, session_create
+def test_cold_start_entry_point_is_neutralised():
+    """Vector A, layer 1: wandering into it must not start a daemon."""
+    from browserwright import daemon_lifecycle
 
-    assert session_create._ensure_daemon_running() is None
-    assert mode_b_client.ModeBClient._spawn_daemon(object()) is None
+    assert daemon_lifecycle.ensure("test").healthy
 
 
 def test_a_real_detached_spawn_is_a_loud_failure():
     """Vector A, layer 2: a *new* path to a real spawn fails by name.
 
-    The two entry points above are no-ops so ordinary tests need not know they
-    exist; this backstop is what turns "someone found a third way to Popen a
+    The entry point above is a no-op so ordinary tests need not know it
+    exists; this backstop is what turns "someone found another way to Popen a
     daemon" into a red test instead of a leaked process.
     """
-    from browserwright import session_create
+    from browserwright import daemon_lifecycle
 
     with pytest.raises(AssertionError) as e:
-        session_create._spawn_detached(["browserwright-daemon", "serve"])
+        daemon_lifecycle._spawn_detached(["serve"], initiator="test")
     assert "spawn a real browserwright-daemon" in str(e.value)
 
 

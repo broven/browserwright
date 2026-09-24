@@ -17,11 +17,6 @@ from browserwright import cli, session_create
 from browserwright import session_registry as reg
 
 
-@pytest.fixture(autouse=True)
-def _no_daemon(monkeypatch):
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-
-
 def _new(*args) -> int:
     return cli._cmd_session(["new", "--backend=cdp", "--name=t", *args])
 

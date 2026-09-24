@@ -185,22 +185,24 @@ async def test_gh32_slow_teardown_never_outlives_the_caller(
 
 @pytest.mark.asyncio
 async def test_gh32_failed_end_call_keeps_ledger_row_although_daemon_went_terminal(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, make_verdict,
 ):
     """Layer-2 consequence (unchanged by the fix, locked as a reminder): a
     `session end` that cannot confirm completion keeps the ledger row — while
     the daemon underneath may already be terminal, so ordinary operations on
     that row are refused. The fix makes the confirm path reliable (initiate +
     join), so this only remains reachable via a genuinely unreachable daemon."""
-    from browserwright import session_create, session_registry as reg
+    from browserwright import daemon_lifecycle, session_create
+    from browserwright import session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
     monkeypatch.setenv("BS_HOME", str(tmp_path))
     # Avoid the auto-start path: the daemon "is running" but its CLI exits 3
     # (main() maps the client-side TimeoutError to exit code 3 — see
     # `daemon/cli.py` main(): `except Exception` → 3).
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: True)
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: 3)
+    monkeypatch.setattr(daemon_lifecycle, "diagnose", lambda **kw: make_verdict())
+    monkeypatch.setattr(daemon_lifecycle, "run_verb",
+                        lambda args, **kwargs: daemon_lifecycle.VerbResult(3))
 
     sid = reg.allocate(backend="extension", owner="attach", name="repro")
     record = reg.get(sid)

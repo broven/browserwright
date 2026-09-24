@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -593,7 +592,7 @@ def _cmd_markdown(args: list[str]) -> int:
             create=(backend == "cdp"),
             attach=None,
             name=str(kw.get("name", "markdown")),
-        )
+        ).id
     except (ValueError, BrowserwrightError) as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -785,12 +784,13 @@ def _cmd_recover(args: list[str], *, session_id: Optional[str] = None) -> int:
     """`browserwright recover --session <id>` — ADR-0013 rule 2, the ONE
     thing an agent does when a call failed.
 
-    Client side first: a dead daemon cannot answer an RPC, so the daemon
-    self-check (three criteria, two agreeing probes) runs here. "Gone" or
-    "stale version" is repaired through the default endpoint's on-demand
-    start (the sanctioned restart path); "something else answers on the
-    port" and "the probes disagree" are `needs-human` because recovery never
-    signals or replaces an unidentified process. Then the daemon runs
+    Client side first: a dead daemon cannot answer an RPC, so
+    `daemon_lifecycle.diagnose(confirm=True)` (two agreeing probes) runs
+    here. "Down" or "stale" on the default endpoint is repaired by
+    `daemon_lifecycle.ensure` (the sanctioned start/replace path);
+    "something else answers on the port", "the probes disagree" and an
+    explicitly configured endpoint are `needs-human` because recovery never
+    signals or replaces a process it cannot prove is ours. Then the daemon runs
     the per-session ladder and reports the state reached. Exit 0 = healthy,
     4 = needs-human, 2 = usage."""
     kw = _parse_kv_args(args)
@@ -799,54 +799,35 @@ def _cmd_recover(args: list[str], *, session_id: Optional[str] = None) -> int:
         print("usage: browserwright recover --session=<id>", file=sys.stderr)
         return 2
     sid = str(sid)
-    from . import session_create
-    from .daemon.launchagent import daemon_self_check
-    from .daemon_url import daemon_endpoint
+    from . import daemon_lifecycle as lifecycle
 
     steps: list[str] = []
-    ep = daemon_endpoint()
-    verdict = daemon_self_check(None)
-    if not verdict["healthy"]:
-        crit = verdict["criterion"]
-        if crit in ("gone", "version") and not ep.explicit:
-            steps.append(f"daemon: {verdict['detail']}; starting the installed one")
-            from .daemon import _ipc
-            _ipc.log_lifecycle(
-                "automatic-recovery", criterion=crit,
-                probes=",".join(verdict.get("probes") or []),
-                reason=verdict["detail"], session=sid)
-            try:
-                session_create._ensure_daemon_running()
-            except Exception as e:  # noqa: BLE001
-                return _recover_report(sid, "needs-human", steps,
-                                       f"daemon could not be started: {e}")
-            from .mode_b_client import ModeBClient
-            if not ModeBClient().wait_until_alive(timeout=20.0):
-                return _recover_report(sid, "needs-human", steps,
-                                       "no daemon answered within 20s after the "
-                                       "start; `browserwright-daemon logs` has "
-                                       "its last words")
-            steps.append("daemon: up")
-        else:
-            return _recover_report(sid, "needs-human", steps, verdict["detail"])
+    verdict = lifecycle.diagnose(confirm=True)
+    if verdict.healthy:
+        steps.append(f"daemon: {verdict.detail}")
+    elif verdict.replaceable:
+        steps.append(f"daemon: {verdict.detail}; starting the installed one")
+        try:
+            after = lifecycle.ensure(f"recover session={sid}", wait=20.0)
+        except Exception as e:  # noqa: BLE001
+            return _recover_report(sid, "needs-human", steps,
+                                   f"daemon could not be started: {e}")
+        if not after.up:
+            return _recover_report(sid, "needs-human", steps,
+                                   "no daemon answered within 20s after the "
+                                   "start; `browserwright-daemon logs` has "
+                                   "its last words")
+        steps.append("daemon: up")
     else:
-        steps.append(f"daemon: {verdict['detail']}")
+        return _recover_report(sid, "needs-human", steps, verdict.detail)
 
-    import json as _json
-    import subprocess
-    try:
-        proc = subprocess.run(
-            ["browserwright-daemon", "recover", "--session", sid],
-            capture_output=True, text=True, timeout=120.0,
-            env=session_create._daemon_child_env())
-    except (OSError, subprocess.SubprocessError) as e:
+    proc = lifecycle.run_verb(["recover", "--session", sid], timeout=120.0)
+    if proc.missing or proc.timed_out:
         return _recover_report(sid, "needs-human", steps,
-                               f"could not ask the daemon to recover: {e}")
-    try:
-        result = _json.loads(proc.stdout.strip().splitlines()[-1])
-        if not isinstance(result, dict):
-            raise ValueError("recover result is not an object")
-    except (ValueError, IndexError):
+                               f"could not ask the daemon to recover: "
+                               f"{proc.stderr}")
+    result = proc.json()
+    if result is None:
         detail = ((proc.stderr or proc.stdout).strip()[:400]
                   if proc.returncode != 0 else
                   f"unreadable recover result: {proc.stdout[:200]!r}")
@@ -916,7 +897,7 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
                   file=sys.stderr)
             return 1
         try:
-            sid = session_create.new(
+            made = session_create.new(
                 backend=backend, create=bool(kw.get("create")),
                 attach=kw.get("attach"), name=kw.get("name"),
                 reuse=bool(kw.get("reuse")),
@@ -924,11 +905,16 @@ def _cmd_session(args: list[str], *, session_id: Optional[str] = None) -> int:
         except ValueError as e:
             print(str(e), file=sys.stderr)
             return 1
-        if session_create.last_new_reused == sid:
+        sid = made.id
+        if made.reused:
             print(f"OK: reusing session {sid} (--reuse matched an existing "
                   f"{backend} session named {kw.get('name')!r})", file=sys.stderr)
         else:
             print(f"OK: session {sid} created", file=sys.stderr)
+        if not made.daemon.up:
+            print(f"warning: the daemon is not answering yet — "
+                  f"{made.daemon.detail}; `browserwright doctor` says why",
+                  file=sys.stderr)
         print(sid)  # token-frugal: bare id
         return 0
 
@@ -1027,14 +1013,14 @@ def _cmd_userscript(args: list[str], *, session_id: Optional[str] = None) -> int
     verify = "--verify" in args
     fwd = [a for a in args if a != "--verify"]
 
-    daemon_cmd = ["browserwright-daemon", "userscript"]
+    verb = ["userscript"]
     if session_id:
-        daemon_cmd += ["--session", session_id]
-    # ADR-0011: forward this process's resolved endpoint, or the child CLI
-    # would push/remove userscripts on whichever daemon its own default
-    # resolves to.
-    from .daemon_url import child_env
-    result = subprocess.run([*daemon_cmd, *fwd], env=child_env())
+        verb += ["--session", session_id]
+    # The adapter forwards this process's resolved endpoint (ADR-0011), or the
+    # child CLI would push/remove userscripts on whichever daemon its own
+    # default resolves to. Output goes straight to this terminal.
+    from . import daemon_lifecycle as lifecycle
+    result = lifecycle.run_verb([*verb, *fwd], timeout=None, capture=False)
     if result.returncode != 0:
         # Push failed — don't reload/screenshot a stale state. Surface the
         # push failure so the agent fixes the script first.
@@ -1167,19 +1153,38 @@ def _cmd_version(args: list[str]) -> int:
 
 
 def _extension_relay_status() -> dict | None:
-    import os
-    import urllib.request
+    """``{daemon_version, extension_details}`` for `version check`.
 
-    port = os.environ.get("BD_EXTENSION_PORT") or "19989"
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/__status__",
-            timeout=1.0,
-        ) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        return payload if isinstance(payload, dict) else None
-    except Exception:
+    The daemon's version comes from the one source every lifecycle decision
+    uses — the resolved endpoint's ``/__ping__`` (``daemon_lifecycle``), so
+    `--daemon-url` / ``$BW_DAEMON_URL`` are honoured. The connected
+    extensions come from the relay's ``/__status__``, located through
+    ``Config`` (``BD_EXTENSION_PORT`` / toml / ``--config``) — and only when
+    the endpoint is on this machine: the relay is machine-local (ADR-0011),
+    so a remote daemon's extensions are not ours to read, and the local
+    relay would describe a different daemon.
+    """
+    from . import daemon_lifecycle as lifecycle
+
+    verdict = lifecycle.diagnose()
+    if not verdict.up:
         return None
+    out: dict = {"daemon_version": verdict.version, "extension_details": []}
+    if not verdict.endpoint.is_locally_signalable:
+        return out
+    try:
+        from .daemon.config import load
+        from .daemon.relay_status import fetch_json
+        from .daemon_url import cli_config_path
+
+        cfg = load(cli_config_path=cli_config_path())
+        host, port = cfg.backends.extension.resolved_host_port()
+        relay = fetch_json(host, port)
+    except Exception:  # noqa: BLE001 - version check must never fail on this
+        relay = None
+    if relay:
+        out["extension_details"] = relay.get("extension_details") or []
+    return out
 
 
 def _split_daemon_url(argv: list[str]) -> list[str]:

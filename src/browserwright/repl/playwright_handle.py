@@ -114,19 +114,19 @@ def _facade_ws_url(*, session_id: str | None = None) -> str:
     one produces a usable connection — reporting the difference here is what
     keeps the failure legible instead of surfacing as a Playwright timeout.
     """
-    from ..daemon import _ipc
-    from ..daemon_url import daemon_endpoint, unreachable_message
+    from .. import daemon_lifecycle as lifecycle
+    from ..daemon_url import unreachable_message
 
     if session_id is None:
         session_id = _current_browserwright_session_id()
-    ep = daemon_endpoint()
-    pong = _ipc.ping_status_sync()
-    if pong.pid is None:
+    verdict = lifecycle.diagnose()
+    ep = verdict.endpoint
+    if not verdict.up:
         if ep.explicit:
             raise FacadeUnavailable(unreachable_message(ep))
         raise FacadeUnavailable(
             f"no daemon is answering at {ep.url}, so there is no browser to "
-            "connect to (start it with `browserwright-daemon start`)")
+            "connect to", fix=lifecycle.unreachable_fix(ep))
     return _with_session_query(ep.ws("/cdp"), session_id)
 
 

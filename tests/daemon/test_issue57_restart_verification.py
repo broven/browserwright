@@ -25,6 +25,13 @@ STALE = f"{INSTALLED}-stale"
 class _Cfg:
     """Only the sliver of Config that `restart()` touches."""
 
+    facade_host = "127.0.0.1"
+
+    def resolved_facade_port(self) -> int:
+        # The diagnosis probe is the conftest wall's "refused" stub, so the
+        # number is never dialled.
+        return 19990
+
 
 @pytest.fixture
 def harness(monkeypatch, tmp_path):
@@ -184,11 +191,11 @@ def test_restart_refuses_when_someone_is_working(harness):
 
 
 def test_restart_refuses_a_healthy_daemon_before_activity_or_launchd(
-        harness, monkeypatch):
-    monkeypatch.setattr(launchagent, "daemon_self_check", lambda cfg, **kw: {
-        "healthy": True, "criterion": None,
-        "detail": "the daemon answered twice", "probes": ["ours", "ours"],
-    })
+        harness, monkeypatch, make_verdict):
+    from browserwright import daemon_lifecycle
+
+    monkeypatch.setattr(daemon_lifecycle, "diagnose", lambda **kw: make_verdict(
+        detail="the daemon answered twice"))
     monkeypatch.setattr(
         "browserwright.daemon.restart_guard._fetch_snapshot",
         lambda cfg, timeout: {"sessions": [{

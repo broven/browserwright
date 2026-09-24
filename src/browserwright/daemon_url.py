@@ -17,8 +17,8 @@ The first three sources are **explicit**: the operator named an endpoint, so a
 failed connection is an error and the client must never auto-start or restart a
 daemon — a remote daemon is not ours to spawn, and even a hand-written localhost
 URL says "I am pointing you at a daemon I manage". The state file and the
-default are *not* explicit; those keep today's auto-start / version-skew restart
-behavior.
+default are *not* explicit; those keep auto-start and version-skew replacement,
+both owned by :mod:`browserwright.daemon_lifecycle`.
 
 The state file is written by the daemon at bind time and removed at shutdown. It
 exists for one reason: a daemon told to bind port 0 (the test-isolation scheme)
@@ -241,98 +241,6 @@ _SOURCE_LABEL = {
     "env": f"${ENV_VAR}",
     "toml": "the `daemon_url` config key",
 }
-
-
-def probe(host: str, port: int, timeout: float = 1.5):
-    """Indirection over :func:`daemon._ipc.probe_endpoint_sync` so tests and
-    doctor can substitute observations without touching sockets."""
-    from .daemon._ipc import probe_endpoint_sync
-    return probe_endpoint_sync(host, port, timeout=timeout)
-
-
-def diagnose_endpoint(ep: DaemonEndpoint) -> list:
-    """Probe the resolved endpoint and, when they differ, the alternatives a
-    local client could have meant — the address the running daemon
-    published, and loopback. Returns the probes in the order taken.
-
-    ADR-0013 rule 3: an "unavailable" error must carry what the client
-    actually found, because "connection refused" and "something else
-    answered" are different diagnoses with different next steps.
-    """
-    probes = [probe(ep.host, ep.port)]
-    seen = {(ep.host, ep.port)}
-    published = _from_state_file()
-    candidates = []
-    if published:
-        parts = urlsplit(_normalize(published))
-        candidates.append((parts.hostname or "127.0.0.1", parts.port or 19990))
-    default = urlsplit(DEFAULT_DAEMON_URL)
-    candidates.append((default.hostname or "127.0.0.1", default.port or 19990))
-    for host, port in candidates:
-        if (host, port) in seen:
-            continue
-        seen.add((host, port))
-        probes.append(probe(host, port))
-    return probes
-
-
-def local_unreachable_fix(ep: DaemonEndpoint) -> str:
-    """The `fix` for "nothing answered" on a NON-explicitly-configured endpoint.
-
-    Built from what :func:`diagnose_endpoint` observed, never from a guess.
-    Four observed shapes, each with its own next step; none of them is
-    "restart the daemon" — a client that could not connect has no evidence
-    the daemon is at fault, and on 2026-09-01 that advice restarted a healthy
-    daemon out from under another agent (ADR-0012, ADR-0013 rule 3).
-    """
-    from .version import package_version
-
-    probes = diagnose_endpoint(ep)
-    first, others = probes[0], probes[1:]
-    findings = "; ".join(pr.describe() for pr in probes)
-
-    # 1. A daemon answers somewhere this client did not look.
-    for pr in others:
-        if pr.answered:
-            alt = f"http://{pr.host}:{pr.port}"
-            return (
-                f"{findings}. This client resolved {ep.url} (from "
-                f"{ep.source}); the daemon is at {alt}. Point the client at it "
-                f"(`export {ENV_VAR}={alt}`); `browserwright doctor` names the "
-                "maintainer-side rebind that makes loopback answer too."
-            )
-    # 2. Something that is not browserwright holds the resolved port.
-    if first.kind == "foreign":
-        return (
-            f"{findings}. A proxy or another program is answering on the "
-            f"daemon's port, so nothing this client sends reaches browserwright. "
-            f"Find it with `lsof -nP -iTCP:{first.port} -sTCP:LISTEN` and stop "
-            "it, or move the daemon to another port. `browserwright-daemon "
-            "status` reports what browserwright itself believes is running."
-        )
-    # 3. A daemon answers at the resolved address after all (a transient
-    #    failure between the caller's attempt and this probe), possibly on
-    #    the wrong version.
-    if first.answered:
-        installed = package_version()
-        if first.version and first.version != installed:
-            return (
-                f"{findings}, but the installed package is {installed}. The "
-                "running daemon is stale; the next command against the default "
-                "endpoint replaces it automatically. `browserwright version "
-                "check` shows both."
-            )
-        return (
-            f"{findings} now — the failure was transient (the daemon was "
-            "still coming up). Retry the command."
-        )
-    # 4. Nothing anywhere.
-    return (
-        f"{findings}. The default endpoint starts a daemon on demand, and that "
-        "did not produce one. `browserwright doctor` reports whether launchd "
-        "manages the daemon and its last exit; `browserwright-daemon logs` "
-        "holds the startup error."
-    )
 
 
 def not_ours_to_signal_message(ep: DaemonEndpoint, action: str) -> str:

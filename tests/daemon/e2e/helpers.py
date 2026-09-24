@@ -86,7 +86,7 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
         # The cdp daemon resolves its upstream against this port.
         env["BD_CDP_PORT"] = str(TEST_CDP_PORT)
         # Isolation wall for ANY daemon this skill process might spawn
-        # (session_create._ensure_daemon_running / coherence respawn): without
+        # (daemon_lifecycle.ensure at `session new` / `recover`): without
         # BD_EXTENSION_PORT the spawned `serve` binds the PRODUCTION relay port
         # 19989 — the user's real Chrome extension dials that, and sibling
         # test daemons' startup reclaim then fight/kill it. Pin the test relay

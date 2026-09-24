@@ -18,7 +18,6 @@ CLI worked, which it does with no daemon running, so ``doctor`` reported
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 # Doctor blobs this browserwright build knows how to read. The daemon's current
@@ -35,18 +34,16 @@ _LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" \
 def daemon_doctor() -> dict:
     """Forward ``browserwright-daemon doctor --json``. Always returns a dict; on
     failure returns a synthetic ``schema_version:1`` blob explaining why."""
-    cmd = ["browserwright-daemon", "doctor", "--json"]
-    try:
-        # ADR-0011: report on the daemon THIS process is addressed at, not the
-        # one the child CLI would default to.
-        from .daemon_url import child_env
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
-                              env=child_env())
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+    from . import daemon_lifecycle as lifecycle
+
+    # The adapter carries this process's resolved endpoint into the child, so
+    # the report is on the daemon THIS process is addressed at (ADR-0011).
+    proc = lifecycle.run_verb(["doctor", "--json"], timeout=10)
+    if proc.missing or proc.timed_out:
         return {
             "schema_version": 1,
             "backends": [],
-            "error": str(e),
+            "error": proc.stderr,
             "skill_synthetic": True,
         }
     if proc.returncode != 0:
@@ -123,8 +120,9 @@ def _daemon_fix(info: dict) -> str:
     if info.get("probe_state") == PORT_HELD:
         return (
             "the daemon's ports are held by a process that does not answer; "
-            "the next on-demand start reclaims ports from a stale browserwright "
-            "daemon by itself (issue #15). Re-run `browserwright doctor` in a "
+            "the next `browserwright session new` reclaims ports from a stale "
+            "browserwright daemon by itself (issue #15). Re-run "
+            "`browserwright doctor` in a "
             "few seconds; if it is still held, `lsof -nP -iTCP:19990 "
             "-sTCP:LISTEN` names the holder"
         )
@@ -143,8 +141,8 @@ def _daemon_fix(info: dict) -> str:
         )
     return (
         "no LaunchAgent is installed, so nothing keeps the daemon up; "
-        "`browserwright install` sets one up, and the default endpoint "
-        "starts a daemon on demand for the next command"
+        "`browserwright install` sets one up, and `browserwright session "
+        "new` starts one on demand on the default endpoint"
     )
 
 
@@ -228,8 +226,8 @@ def doctor_checks() -> dict:
                 "fail",
                 "the daemon reports no cdp surface",
                 "the running daemon is older than the installed package "
-                "(`browserwright version check`); the next command against "
-                "the default endpoint replaces it",
+                "(`browserwright version check`); `browserwright recover "
+                "--session <id>` replaces it on the default endpoint",
             )
         else:
             # A doctor blob too old to carry it. Can't observe it, so don't
@@ -394,42 +392,34 @@ def doctor_checks() -> dict:
     }
 
 
-def _probe_tcp(host: str, port: int, *, timeout: float = 1.5) -> str | None:
-    """``None`` when a TCP connect succeeds, else a short reason."""
-    import socket
-
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return None
-    except OSError as e:
-        return e.strerror or str(e)
-
-
 def _endpoint_reachability_checks() -> list[dict]:
     """Dial the resolved endpoint AND loopback; report the divergence.
 
     Two distinct failures hide behind "the daemon is running":
-      - the endpoint the client resolves answers nothing at all;
+      - the endpoint the client resolves answers nothing of ours at all;
       - it answers, but loopback (what every client falls back to when the
         endpoint state file is not visible) does not.
     The second is BUG A, and it is invisible unless you actually connect.
+    Both dials are :func:`daemon_lifecycle.diagnose` — a listener that is not
+    browserwright (a proxy answering 503) is not a daemon, so it fails.
     """
-    from .daemon_url import daemon_endpoint
+    from . import daemon_lifecycle as lifecycle
+    from .daemon_url import DaemonEndpoint
 
     try:
-        ep = daemon_endpoint()
+        verdict = lifecycle.diagnose()
     except Exception:  # noqa: BLE001 - doctor must never raise
         return []
+    ep = verdict.endpoint
 
-    resolved_err = _probe_tcp(ep.host, ep.port)
-    if resolved_err is not None:
-        from .daemon_url import local_unreachable_fix
+    if not verdict.up:
         return [{
             "name": "endpoint_reachable",
             "status": "fail",
-            "message": (f"nothing answered at {ep.host}:{ep.port} "
-                        f"(the endpoint resolved from {ep.source})"),
-            "fix": local_unreachable_fix(ep),
+            "message": (f"no browserwright daemon answered at "
+                        f"{ep.host}:{ep.port} (the endpoint resolved from "
+                        f"{ep.source}): {verdict.detail}"),
+            "fix": lifecycle.unreachable_fix(ep),
         }]
 
     if ep.is_loopback:
@@ -440,8 +430,10 @@ def _endpoint_reachability_checks() -> list[dict]:
             "fix": "",
         }]
 
-    loopback_err = _probe_tcp("127.0.0.1", ep.port)
-    if loopback_err is None:
+    loopback = lifecycle.diagnose(endpoint=DaemonEndpoint(
+        url=f"http://127.0.0.1:{ep.port}", explicit=ep.explicit,
+        source=ep.source))
+    if loopback.up:
         return [{
             "name": "endpoint_reachable",
             "status": "pass",
@@ -453,9 +445,9 @@ def _endpoint_reachability_checks() -> list[dict]:
         "name": "endpoint_reachable",
         "status": "fail",
         "message": (f"the daemon answers at {ep.host}:{ep.port} but NOT on "
-                    f"127.0.0.1:{ep.port} ({loopback_err}) — any local client "
-                    "that cannot read the endpoint state file will fail to "
-                    "connect"),
+                    f"127.0.0.1:{ep.port} ({loopback.detail}) — any local "
+                    "client that cannot read the endpoint state file will "
+                    "fail to connect"),
         "fix": ("point local clients at it with "
                 f"`export BW_DAEMON_URL=http://{ep.host}:{ep.port}`; the "
                 "durable fix is a LaunchAgent that serves loopback too "
