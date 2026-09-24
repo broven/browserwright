@@ -68,6 +68,17 @@ let lastInboundFrameTs = 0;
 let seenServerPing = false;
 let daemonVersion = null;
 
+// Web Store updates (GH#106). Chrome installs a downloaded update only once
+// the extension goes idle, and this one never does -- `pingLoop` and the
+// keepalive alarm exist precisely to stop that. Without this the update waits
+// for a browser restart, so users sat on old builds for weeks.
+// `onUpdateAvailable` records it; `applyPendingUpdateIfIdle` reloads into it
+// once no session holds a tab, or after UPDATE_MAX_DEFER_MS regardless (a
+// leaked session must not pin the old build forever) -- but never mid-command.
+const UPDATE_MAX_DEFER_MS = 60 * 60 * 1000;
+let pendingUpdate = null;  // { version, since }
+let inflightCommands = 0;
+
 // ---- install id (stable across reloads) -----------------------------------
 
 // GH#79 (cold start): a `chrome.storage.local` call issued while the service
@@ -227,7 +238,10 @@ function connect() {
     } catch {
       return;
     }
-    handleDaemonMessage(msg).catch((e) => {
+    inflightCommands += 1;
+    handleDaemonMessage(msg).finally(() => {
+      inflightCommands -= 1;
+    }).catch((e) => {
       console.warn("[bd-relay] handler failed:", e);
       if (typeof msg?.id === "number") {
         safeSend({
@@ -316,6 +330,7 @@ async function maintainLoop() {
   // ws onmessage/send events, not on setTimeout callbacks or on the
   // protocol-level PING the daemon's `websockets` lib emits.
   while (true) {
+    await applyPendingUpdateIfIdle();
     const state = ws ? ws.readyState : WebSocket.CLOSED;
     if (state === WebSocket.OPEN) {
       if (!wsLooksHealthy()) {
@@ -343,6 +358,17 @@ async function maintainLoop() {
     reconnectIdx += 1;
     await sleep(delay);
   }
+}
+
+async function applyPendingUpdateIfIdle() {
+  if (!pendingUpdate || inflightCommands > 0) return;
+  const overdue = Date.now() - pendingUpdate.since > UPDATE_MAX_DEFER_MS;
+  if (attachedTabs.size > 0 && !overdue) return;
+  const { version } = pendingUpdate;
+  pendingUpdate = null;
+  console.info("[bd-relay] reloading into store update", version);
+  await cleanupMarkersBeforeReload();
+  chrome.runtime.reload();
 }
 
 // MV3 SW lifetime keepalive. Send an app-level ping on the open ws every
@@ -1328,6 +1354,43 @@ const MARKER_RAW_TITLE_SRC = `
   }
 `;
 
+// Playwright reads titles -- `page.title()`, `expect(page).to_have_title()` --
+// in its own isolated "utility" world, which has its own Document.prototype, so
+// the main-world accessor in MARKER_INSTALL_SCRIPT never reaches it and agents
+// read "👀 <title>". Give every utility world a read-side strip too. Only the
+// getter changes: the main-world observer re-marks whatever gets written.
+const PLAYWRIGHT_UTILITY_WORLD_PREFIX = "__playwright_utility_world_";
+const UTILITY_WORLD_TITLE_SCRIPT = `
+(function() {
+` + MARKER_STRIP_PREFIX_SRC + `
+  const native = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+  if (!native || !native.get || !native.set) return;
+  Object.defineProperty(Document.prototype, 'title', {
+    configurable: true,
+    enumerable: true,
+    get: function() { return stripPrefix(native.get.call(this)); },
+    set: function(value) { native.set.call(this, value); },
+  });
+})();
+`;
+
+function stripMarkerInUtilityWorld(source, params) {
+  const ctx = params?.context;
+  const name = ctx?.name || ctx?.auxData?.name || "";
+  if (typeof ctx?.id !== "number"
+      || !name.startsWith(PLAYWRIGHT_UTILITY_WORLD_PREFIX)) {
+    return;
+  }
+  // Issued before the event is forwarded: Chrome runs one debuggee's commands
+  // in order, and Playwright cannot address this context until it has seen
+  // the event, so no title read in it can overtake the install.
+  debuggerCommand(source, "Runtime.evaluate", {
+    expression: UTILITY_WORLD_TITLE_SCRIPT,
+    contextId: ctx.id,
+  }).catch((e) =>
+    console.warn("[bd-relay] utility-world title strip failed:", e));
+}
+
 const MARKER_INSTALL_SCRIPT = `
 (function() {
 ` + MARKER_STRIP_PREFIX_SRC + `
@@ -1738,6 +1801,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (typeof source.sessionId === "string" && source.sessionId) {
     return;
   }
+  if (method === "Runtime.executionContextCreated") {
+    stripMarkerInUtilityWorld(source, params);
+  }
   safeSend({
     type: "event",
     tabId: source.tabId,
@@ -1914,6 +1980,10 @@ chrome.runtime.onStartup.addListener(() => {
 });
 chrome.runtime.onInstalled.addListener(() => {
   if (!ws) connect();
+});
+// maintainLoop applies it on its next tick once nothing is using the extension.
+chrome.runtime.onUpdateAvailable.addListener((details) => {
+  pendingUpdate = { version: details?.version || "", since: Date.now() };
 });
 
 // Belt-and-suspenders: chrome.alarms wakes the SW every 30s even after
