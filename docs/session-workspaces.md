@@ -166,9 +166,10 @@ Hard invariants:
   relay-callback synthesis. The discriminator is `Router._raw_cdp_backend`
   ("backend is not `extension`"), never a name check.
 - Ending an attach-owned session must not close the external browser. This
-  holds through one data dependency, not a teardown branch: `_launch_cdp_chrome`
-  is the only writer of `cdp_pid`, it runs only when `cdp_owns_browser` is true,
-  and every kill path is gated on `cdp_pid is not None`.
+  holds through one data dependency inside `CdpUpstream`, not a teardown
+  branch: `_launch_browser` is the only writer of `browser_pid`, it runs only
+  when `owns_browser` (the ledger's `owner == "create"`) is true, and every kill
+  path is gated on `browser_pid is not None`.
 
 ### Driving N external profiles
 
@@ -232,6 +233,12 @@ Ending a session follows ownership:
 
 Executor cleanup is separate from browser ownership and may run for any session.
 
+There is one teardown entry point, `Daemon.end_workspace`, used by `endSession`
+and auto-prune alike. It calls the session's adapter (`Upstream.end_session`),
+which applies the rules above; a per-session (`cdp`) context then closes its
+own connection within the same deadline and is dropped. No caller outside the
+adapters branches on backend or owner to decide what teardown does.
+
 `endSession` is an **initiate-then-join** verb (issue #32), not a synchronous
 request/response verb: its worst case (serial tab closes over a cold extension
 reconnect window) outlives any caller's timeout, so the daemon returns at the
@@ -292,10 +299,17 @@ fingerprint-verified executor record rather than reaping it; later
 - `src/browserwright/session_runtime.py` persists current target and extension
   `group_id` runtime data.
 - `src/browserwright/daemon/server/daemon.py` routes sessions to the shared
-  context or per-session `cdp` contexts.
+  context or per-session `cdp` contexts, and owns the one teardown entry point.
+- `src/browserwright/daemon/server/upstream_context.py` builds a context from a
+  ledger record (the only backend → adapter map) and holds the backend-agnostic
+  lazy-open / close etiquette.
+- `src/browserwright/daemon/server/upstream.py` declares the `Upstream`
+  protocol and implements `CdpUpstream`, including the create-owned Chrome
+  launch/kill.
 - `src/browserwright/daemon/server/facade.py` is the endpoint server: it routes
   `/cdp`, `/control` and `/exec` clients.
 - `src/browserwright/daemon/server/facade_extension.py` implements the
   extension-only Playwright synthesis layer.
 - `src/browserwright/daemon/server/extension_upstream.py` and
-  `src/browserwright/daemon/server/relay.py` own extension tab/group state.
+  `src/browserwright/daemon/server/relay.py` own extension tab/group state,
+  and the adapter owns the relay's hello/closed/Target lifecycle events.

@@ -377,7 +377,7 @@ src/browserwright/
 │   ├── _stale.py         ← detect + reclaim a half-alive daemon's relay/endpoint ports
 │   ├── launchagent.py    ← macOS service registration (install / uninstall / restart)
 │   ├── relay_status.py   ← the relay's /__status__ endpoint, fetched from one place
-│   └── server/           ← endpoint server, listener/Router, relay, exec relay, executor registry
+│   └── server/           ← endpoint server, listener/Router, Upstream adapters + contexts, relay, exec relay, executor registry
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
 tests/
