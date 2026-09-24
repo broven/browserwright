@@ -848,8 +848,8 @@ class ExtensionUpstream:
         self._recovery = machine
         self._executor_alive = executor_alive
 
-    async def prepare_executor(self, session_id: str) -> None:
-        """Cold-start preflight for ``ensureExecutor``.
+    async def await_browser(self, session_id: str) -> None:
+        """Step 1 of the drivable path.
 
         Give the extension's service worker a short reconnect grace, then fail
         with the useful diagnosis before the normal 60-second interactive open
@@ -870,8 +870,8 @@ class ExtensionUpstream:
                        force: bool = False) -> dict | None:
         """Make an extension session own one live tab, once and bounded.
 
-        Called after ``prepare_executor`` and the open on the ordinary command
-        path, and forced by the explicit recovery verb. Existing healthy
+        Step 3 of the drivable path, after ``await_browser`` and the open;
+        forced by the explicit recovery verbs. Existing healthy
         sessions stay on the fast path. If the prior group vanished, opening
         one blank tab is the deterministic replacement; returning ``healthy``
         while merely promising that a later call might open it was the
@@ -895,6 +895,38 @@ class ExtensionUpstream:
                     session_id, detail,
                     result.get("targetId") if isinstance(result, dict) else "-")
         return result
+
+    async def reconnect(self, session_id: str) -> str | None:
+        """Recovery rung 1: wait for the extension within the relay's
+        reconnect window.
+
+        Also corrects a stale ``extension-disconnected`` diagnosis when the
+        relay is in fact ready: the hello that would have said so may have
+        predated this session's record.
+        """
+        from .relay import RECONNECT_WAIT_TIMEOUT
+        from .session_state import EXTENSION_DISCONNECTED, EXTENSION_HELLO
+
+        machine = self._recovery
+        stale = (machine is not None and machine.state_of(session_id)
+                 == EXTENSION_DISCONNECTED)
+        if self._relay.is_ready and not stale:
+            return None
+        if not self._relay.is_ready:
+            try:
+                await self._relay.wait_ready(timeout=RECONNECT_WAIT_TIMEOUT)
+            except Exception:  # noqa: BLE001 - timeout + reconnect hiccups
+                pass
+        if not self._relay.is_ready:
+            raise Unavailable(
+                "the Chrome extension is not connected: is Chrome running "
+                "with the browserwright extension enabled? "
+                "`browserwright doctor` shows the relay state")
+        self._note(session_id, EXTENSION_HELLO,
+                   generation=getattr(self._relay, "connection_generation",
+                                      None),
+                   reason="extension connected during recover")
+        return "extension connected"
 
     async def open(self, ws_url: str | None = None, *,
                    timeout: float | None = None) -> None:
@@ -1315,12 +1347,6 @@ class ExtensionUpstream:
             "groupId": group_id,
             "recovered": recovered,
         }
-
-    async def recover(self, session_id: str | None = None) -> dict:
-        # ADR-0009: the verbs layer calls recover with only the session id and
-        # the group is found by its TITLE; the numeric groupId param is gone
-        # (a leftover signature would have made title recovery unreachable).
-        return await self.recover_session(session_id)
 
     async def close_tab(self, target: str) -> dict:
         """Close a tab addressed by upstream sessionId or targetId.

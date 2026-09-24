@@ -85,10 +85,13 @@ class _SendOnlyUpstream:
     def bind_recovery(self, machine, executor_alive) -> None:
         return None
 
-    async def prepare_executor(self, session_id: str) -> None:
+    async def await_browser(self, session_id: str) -> None:
         return None
 
     async def converge(self, session_id: str, *, force: bool = False) -> None:
+        return None
+
+    async def reconnect(self, session_id: str) -> None:
         return None
 
     async def _unavailable(self, *args, **kwargs):
@@ -110,9 +113,6 @@ class _SendOnlyUpstream:
         # rely on their browser-instance workspace boundary; shared extension
         # callers must fail closed when this answer is unavailable.
         return None
-
-    async def recover(self, *args, **kwargs) -> dict:
-        return {"recovered": [], "groupId": -1, "tabs": []}
 
     async def wait_session_announce(self, session_id: str,
                                     timeout: float = 2.0) -> bool:
@@ -167,7 +167,6 @@ class Router(SessionVerbsMixin):
         self._client_sends: dict[int, Callable[[str], Awaitable[None]]] = {}
         self._ensure_upstream: Callable[[], Awaitable[None]] | None = None
         self._trigger_disconnect: Callable[[str], Awaitable[None]] | None = None
-        self._prepare_executor: Callable[[str], Awaitable[None]] | None = None
         # Background tasks fired off when a client frame triggers lazy
         # upstream open. We keep references so they don't get GC'd mid-await
         # (asyncio warning), and so we can cancel them on shutdown.
@@ -243,11 +242,9 @@ class Router(SessionVerbsMixin):
         self,
         ensure_upstream: Callable[[], Awaitable[None]],
         trigger_disconnect: Callable[[str], Awaitable[None]],
-        prepare_executor: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._ensure_upstream = ensure_upstream
         self._trigger_disconnect = trigger_disconnect
-        self._prepare_executor = prepare_executor
 
     # ---- downstream → upstream ------------------------------------------
 

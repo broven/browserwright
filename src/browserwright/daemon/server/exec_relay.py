@@ -34,7 +34,6 @@ import websockets
 from websockets.asyncio.server import ServerConnection
 
 from ..._executor.protocol import ExecuteRequest, ExecuteResponse, _MAX_FRAME
-from .state import UpstreamPhase
 
 logger = logging.getLogger(__name__)
 
@@ -65,52 +64,22 @@ async def _dial_executor(sock_path: str) -> tuple:
             await asyncio.sleep(0.05)
 
 
-async def _preflight(daemon, session_id: str) -> None:
-    """Open the session's upstream browser before an executor may be spawned.
-
-    The same cold-start ordering `verbs._handle_ensure_executor` documents: an
-    executor's first act is to connect the cdp surface and resolve its Chrome,
-    which only has a port once the adapter has launched it. Spawning first makes
-    the executor probe a stale port, 404, and die during cold-start.
-
-    A client normally calls `ensureExecutor` over `/control` first, so this is
-    already satisfied and both steps short-circuit. It is done here too because
-    `/exec` can spawn an executor on its own, and "usually someone else warmed
-    it up" is not an ordering guarantee.
-    """
-    context_for = getattr(daemon, "context_for_required", None)
-    if not callable(context_for):
-        return  # a daemon without per-session contexts has nothing to open
-    ctx = context_for(session_id)
-    if ctx.state.upstream_phase == UpstreamPhase.CONNECTED:
-        return
-    await ctx.upstream.prepare_executor(session_id)
-    await ctx.holder.ensure_open()
-    await ctx.upstream.converge(session_id)
-
-
 async def resolve_executor_sock(daemon, session_id: str) -> str:
     """The session's executor socket path, spawning the executor if absent.
 
-    Goes through the registry's `ensure_with_preflight`, exactly as the
-    `ensureExecutor` verb does: the preflight has to run **inside** the
-    per-session lifecycle lock, or a concurrent teardown can reopen the browser
-    between the two steps.
+    `/exec` can spawn an executor on its own (a direct or remote client, or an
+    executor that died after `ensureExecutor`), so it goes through the same
+    drivable path as the `ensureExecutor` verb — `Daemon.ensure_executor` —
+    never a copy of it: "usually someone else warmed it up" is not an ordering
+    guarantee, and a copy that skipped tab convergence is exactly how the two
+    drifted.
     """
-    registry = getattr(daemon, "executors", None) if daemon is not None else None
-    if registry is None:
+    ensure_executor = getattr(daemon, "ensure_executor", None)
+    if not callable(ensure_executor):
         raise ExecRelayError(
             "exec relay unavailable: daemon has no executor registry")
-
-    async def preflight() -> None:
-        await _preflight(daemon, session_id)
-
     try:
-        ensure_with_preflight = getattr(registry, "ensure_with_preflight", None)
-        if callable(ensure_with_preflight):
-            return await ensure_with_preflight(session_id, preflight)
-        await preflight()
-        return await registry.ensure(session_id)
+        return await ensure_executor(session_id)
     except Exception as e:  # noqa: BLE001 - surfaced to the client as a close
         raise ExecRelayError(f"could not ensure executor: {e}") from e
 

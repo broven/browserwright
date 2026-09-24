@@ -37,7 +37,7 @@ class _Router:
         self.unregistered: list[int] = []
         self.released: list[int] = []
         self.upstream_senders: list[object] = []
-        self.lifecycle: tuple[object, object, object] | None = None
+        self.lifecycle: tuple[object, object] | None = None
         self.drained = 0
         self.daemon = None
         self.upstream = None
@@ -55,9 +55,9 @@ class _Router:
         self.unregistered.append(cid)
 
     def bind_lifecycle(
-        self, ensure_upstream, trigger_disconnect, prepare_executor=None,
+        self, ensure_upstream, trigger_disconnect,
     ) -> None:
-        self.lifecycle = (ensure_upstream, trigger_disconnect, prepare_executor)
+        self.lifecycle = (ensure_upstream, trigger_disconnect)
 
     async def route_from_client(self, client, text: str) -> None:
         self.routes.append((client.client_id, text))
@@ -260,9 +260,6 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
             return None
 
         async def trigger_close(self, reason: str) -> None:
-            return None
-
-        async def prepare_executor(self, session_id: str) -> None:
             return None
 
     class Conn:

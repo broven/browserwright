@@ -728,16 +728,20 @@ async def test_open_recover_close_and_end_error_translation_branches():
     assert close_attempts[-1] == ("s-client", "ghost")
     assert "ghost" in state.targets
 
-    async def malformed_recover(*args, **kwargs):
-        return {"sessionId": "UP"}
+    # The drivable path answered with a tab that has no targetId: the verb
+    # must refuse to register a binding for it.
+    class _MalformedDrivable:
+        async def ensure_session_drivable(self, session_id, *, force=False):
+            return {"sessionId": "UP"}
 
-    router.upstream.recover = malformed_recover
+    router.daemon = _MalformedDrivable()
     await router.route_from_client(client, json.dumps({
         "id": 6,
         "method": "BrowserwrightDaemon.recoverSession",
         "params": {},
     }))
     assert last_error(cap, client)["code"] == -32603
+    assert "malformed" in last_error(cap, client)["message"]
 
     # ADR-0009: endSession takes only the session; the daemon derives the
     # group's title from the ledger, so a caller cannot hand it a group id.
@@ -1030,18 +1034,44 @@ async def test_cdp_attach_active_reuses_local_page_then_surfaces_enumeration_err
 
 
 @pytest.mark.asyncio
-async def test_cdp_recover_reuses_existing_local_binding():
-    state, router, cap, (client,) = setup_router(backend="cdp")
+async def test_cdp_recover_reuses_existing_local_binding(monkeypatch, tmp_path):
+    """`recoverSession` runs the daemon's forced drivable path; on raw CDP
+    that resolves the current page, and an existing client binding for it is
+    reused rather than duplicated."""
+    from browserwright import session_registry
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server.daemon import Daemon
+    from browserwright.daemon.server.upstream_context import build_context
+
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    sid = session_registry.allocate(backend="cdp", owner="attach", name="t")
+
+    async def already_connected(self, ws_url=None, *, timeout=None):
+        return None
+
+    async def should_not_call(self, method: str, params=None, session_id=None,
+                              timeout=10.0):
+        raise AssertionError(method)
+
+    # The browser is the stand-in; the daemon, its per-session context and
+    # the adapter's drivable path are real.
+    monkeypatch.setattr(CdpUpstream, "open", already_connected)
+    monkeypatch.setattr(CdpUpstream, "send_command", should_not_call)
+    cfg = Config()
+    daemon = Daemon(cfg=cfg, shared_context=build_context(
+        backend="extension", cfg=cfg))
+    ctx = daemon.context_for_required(sid)
+    state, router = ctx.state, ctx.router
+    cap = Capture()
+    client = state.allocate_client("client")
+    client.session_id = sid
+    router.register_client(client.client_id, cap.client_send_for(client.client_id))
     state.bind_session(client.client_id, "local", "UP", "T")
     state.claim_attacher("T", client.client_id, "local", "UP")
     state.note_target_info({
         "targetId": "T", "type": "page", "url": "https://front/", "title": "Front",
     })
 
-    async def should_not_call(method: str, params=None, session_id=None):
-        raise AssertionError(method)
-
-    attach_cdp(router, cap, should_not_call)
     await router.route_from_client(client, json.dumps({
         "id": 1, "method": "BrowserwrightDaemon.recoverSession",
     }))

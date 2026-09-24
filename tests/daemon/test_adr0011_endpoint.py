@@ -80,6 +80,19 @@ class _FakeRegistry:
         return self._sock
 
 
+class _FakeDaemon:
+    """The daemon's side of the relay: its one drivable path (here, just the
+    registry's ensure) and its recovery state machine."""
+
+    executors: _FakeRegistry | None = None
+    recovery = None
+
+    async def ensure_executor(self, session_id: str) -> str:
+        if self.executors is None:
+            raise RuntimeError("daemon has no executor registry")
+        return await self.executors.ensure(session_id)
+
+
 @pytest.fixture
 def short_tmp(tmp_path_factory):
     """A short-path dir for AF_UNIX sockets (see `_FakeExecutorServer.start`)."""
@@ -102,7 +115,7 @@ async def endpoint():
         async for raw in conn:
             await conn.send(json.dumps({"echo": json.loads(raw)}))
 
-    daemon = type("_D", (), {"executors": None})()
+    daemon = _FakeDaemon()
     server = PlaywrightFacade(cfg=Config(), port=0, host="127.0.0.1",
                               daemon=daemon, control_handler=control_handler)
     port = await server.start()

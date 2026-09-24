@@ -90,16 +90,26 @@ class Upstream(Protocol):
     def bind_recovery(self, machine: Any,
                       executor_alive: Callable[[str], bool]) -> None: ...
 
-    #: Cold-start readiness before an executor may be spawned for
-    #: ``session_id``. Raises an actionable ``Unavailable`` when the browser
-    #: side cannot become ready inside the control-plane budget.
-    async def prepare_executor(self, session_id: str) -> None: ...
+    #: Step 1 of the drivable path (``Daemon.ensure_session_drivable``): a
+    #: short, bounded grace for the browser side to become reachable for
+    #: ``session_id``. Raises an actionable ``Unavailable`` when it cannot
+    #: inside the control-plane budget. Never mutates the upstream state.
+    async def await_browser(self, session_id: str) -> None: ...
 
-    #: Make ``session_id`` own one live tab, once and bounded (ADR-0013).
-    #: ``force`` skips the healthy fast path (the explicit recovery verb).
-    #: Returns the representative tab, or ``None`` when nothing needed doing.
+    #: Step 3 of the drivable path: make ``session_id`` own one live tab, once
+    #: and bounded (ADR-0013). ``force`` skips the healthy fast path (the
+    #: explicit recovery verbs). Returns the representative tab —
+    #: ``{sessionId, targetId, groupId, recovered, ...}`` — or ``None`` when
+    #: nothing needed doing; a forced converge always returns one.
     async def converge(self, session_id: str, *,
                        force: bool = False) -> dict | None: ...
+
+    #: Recovery rung 1 (``recover`` verb): wait, bounded by the backend's own
+    #: reconnect window, for the connection between daemon and browser to
+    #: come back. Returns a step detail when it had something to wait for,
+    #: ``None`` when there was nothing to do; raises ``Unavailable`` with the
+    #: human diagnosis when the window runs out.
+    async def reconnect(self, session_id: str) -> str | None: ...
 
     async def open_tab(self, url: str, *, background: bool = True,
                        session_id: str | None = None,
@@ -137,8 +147,6 @@ class Upstream(Protocol):
     #: (auto-prune): unbounded, but it never waits for a disconnected browser.
     async def end_session(self, session_id: str, *,
                           deadline: float | None = None) -> dict: ...
-
-    async def recover(self, session_id: str | None = None) -> dict: ...
 
     async def send_cdp(self, frame: str) -> None: ...
 
@@ -275,13 +283,26 @@ class CdpUpstream:
         executor's bind (``session_state.load`` marks it ``tab-gone``)."""
         self._recovery = machine
 
-    async def prepare_executor(self, session_id: str) -> None:
+    async def await_browser(self, session_id: str) -> None:
         """Nothing to wait for: ``open`` launches/resolves the browser."""
 
     async def converge(self, session_id: str, *,
                        force: bool = False) -> dict | None:
-        """No durable tab binding to converge: the executor's bind resolves
-        the current page lazily (``current_page``)."""
+        """No durable tab binding to reconstruct: the executor's bind resolves
+        the current page lazily, so the unforced path has nothing to do.
+
+        Forced (the recovery verbs) it returns the nearest honest equivalent
+        of the extension's group recovery: the current live page, or the
+        documented blank fallback when the workspace is empty, in the same
+        representative-tab shape."""
+        if not force:
+            return None
+        result = await self.current_page(session_id)
+        return {**result, "groupId": -1, "recovered": []}
+
+    async def reconnect(self, session_id: str) -> str | None:
+        """Nothing outlives a raw-CDP connection to wait for: the drivable
+        path's open launches or re-resolves the browser."""
         return None
 
     async def open(self, ws_url: str | None = None, *,
@@ -701,17 +722,6 @@ class CdpUpstream:
             "kept": [],
             "backend": self.backend_name,
         }
-
-    async def recover(self, session_id: str | None = None) -> dict:
-        """Return the nearest honest raw-CDP recovery equivalent.
-
-        Raw workspaces have no durable group binding, so there are no group
-        members to reconstruct. Rebind the current live page (or create the
-        documented blank fallback when the workspace is empty) and return the
-        same representative-tab shape as the extension adapter.
-        """
-        result = await self.current_page(session_id)
-        return {**result, "groupId": -1, "recovered": []}
 
     async def wait_session_announce(self, session_id: str,
                                     timeout: float = 2.0) -> bool:

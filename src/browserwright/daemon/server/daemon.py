@@ -163,6 +163,45 @@ class Daemon:
         """Resolve an explicitly session-bound context, failing closed."""
         return self.context_for(session_id, require_known=True)
 
+    # ---- the drivable path (ADR-0013 rule 1) ------------------------------
+
+    async def ensure_session_drivable(self, session_id: str, *,
+                                      force: bool = False) -> dict | None:
+        """Make ``session_id``'s browser side drivable: the one path.
+
+        Three steps, each owned by the session's adapter, none branching on
+        backend here: wait (bounded) for the browser side to be reachable,
+        open the upstream, converge the session to one live tab. ``force``
+        skips the adapter's healthy fast path — the explicit recovery verbs
+        use it. Returns the adapter's representative tab when it converged,
+        ``None`` when nothing needed doing.
+
+        Callers that go on to spawn an executor use `ensure_executor`, which
+        runs this inside the executor registry's per-session lifecycle lock.
+        """
+        ctx = self.context_for_required(session_id)
+        try:
+            await ctx.upstream.await_browser(session_id)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"upstream readiness: {e}") from e
+        try:
+            await ctx.holder.ensure_open()
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"upstream open: {e!r}") from e
+        return await ctx.upstream.converge(session_id, force=force)
+
+    async def ensure_executor(self, session_id: str) -> str:
+        """Make the session drivable and return its executor socket path,
+        spawning the executor if absent.
+
+        The drivable path runs **inside** the registry's per-session lifecycle
+        lock: outside it a concurrent `endSession` could close the browser
+        between readiness and spawn. Used by the `ensureExecutor` verb, the
+        `recover` verb and the `/exec` relay alike.
+        """
+        return await self.executors.ensure_with_preflight(
+            session_id, lambda: self.ensure_session_drivable(session_id))
+
     def acquire_session_lease(
         self,
         session_id: str,

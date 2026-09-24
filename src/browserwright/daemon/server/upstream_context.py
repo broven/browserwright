@@ -325,7 +325,6 @@ def build_context(*, backend: str, cfg: Config, session_id: str | None = None,
     router.bind_lifecycle(
         ensure_upstream=holder.ensure_open,
         trigger_disconnect=holder.trigger_close,
-        prepare_executor=holder.upstream.prepare_executor,
     )
     return UpstreamContext(backend=backend, state=state, router=router,
                            holder=holder, session_id=session_id)

@@ -3,217 +3,220 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from subprocess import CompletedProcess
 from types import SimpleNamespace
 
 import pytest
 
 from browserwright import cli as user_cli
+from browserwright import session_registry
 from browserwright.daemon import cli as daemon_cli
 from browserwright.daemon import launchagent
 from browserwright.daemon._ipc import EndpointProbe
 from browserwright.daemon.config import Config
-from browserwright.daemon.server.extension_upstream import ExtensionUpstream
-from browserwright.daemon.server.proxy import Router
+from browserwright.daemon.server import executor_registry as registry_mod
+from browserwright.daemon.server.daemon import Daemon
+from browserwright.daemon.server.relay import RelayServer
 from browserwright.daemon.server.session_state import (
     HEALTHY,
     NEEDS_HUMAN,
     TAB_RECOVERED,
-    RecoveryStateMachine,
 )
-from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+from browserwright.daemon.server.upstream import CdpUpstream
+from browserwright.daemon.server.upstream_context import build_context
 from browserwright.daemon_url import DaemonEndpoint
 
 
-class _Relay:
-    def __init__(self, ready: bool):
-        self.ready = ready
-        self.wait_calls = 0
+class _Browser:
+    """The browser side of the daemon: the only thing stood in for.
 
-    @property
-    def is_ready(self):
-        return self.ready
+    Everything between the verb and these round-trips — the Router, the
+    ``Daemon`` and its drivable path, the context factory, the adapters, the
+    executor registry and the recovery state machine — is the real one.
+    """
+
+    def __init__(self, *, ready: bool, tab_error: Exception | None):
+        self.ready = ready
+        self.tab_error = tab_error
+        self.wait_calls = 0
+        self.calls: list = []
 
     async def wait_ready(self, timeout):
         self.wait_calls += 1
         if not self.ready:
             raise asyncio.TimeoutError
 
-
-class _Extension:
-    def __init__(self, error: Exception | None = None):
-        self.error = error
-        self.calls = []
-
     async def recover_session(self, sid):
         self.calls.append(sid)
-        if self.error:
-            raise self.error
-        return {"recovered": [1]}
+        if self.tab_error:
+            raise self.tab_error
+        return {"sessionId": "u1", "targetId": "ext-tab-1", "recovered": [1]}
 
     async def open_background_tab(self, url, *, session_id, background):
         self.calls.append(("open", url, session_id, background))
-        return {"tabId": 2}
+        return {"sessionId": "u2", "targetId": "ext-tab-2", "tabId": 2}
 
 
-class _Handle:
-    def __init__(self, alive=True):
-        self.alive = alive
+async def _invoke_recover(monkeypatch, tmp_path, *, backend="extension",
+                          ready=True, tab_error=None, executor_alive=True,
+                          spawn_error=None, probe_error=None,
+                          initial_state=None):
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    sid = session_registry.allocate(backend=backend, owner="attach", name="t")
 
-    def is_alive(self):
-        return self.alive
+    browser = _Browser(ready=ready, tab_error=tab_error)
+    monkeypatch.setattr(RelayServer, "is_ready",
+                        property(lambda _self: browser.ready))
+    monkeypatch.setattr(RelayServer, "wait_ready",
+                        lambda _relay, timeout: browser.wait_ready(timeout))
 
-
-class _Registry:
-    def __init__(self, machine, *, alive=True, spawn_error=None):
-        self.machine = machine
-        self.handle = _Handle(alive) if alive else None
-        self.spawn_error = spawn_error
-        self.ensure_calls = []
-
-    def get(self, _sid):
-        return self.handle
-
-    async def ensure_with_preflight(self, sid, preflight):
-        self.ensure_calls.append(sid)
-        await preflight()
-        if self.spawn_error:
-            raise self.spawn_error
-        self.handle = _Handle(True)
-        self.machine.note(sid, "executor_ready", executor_alive=True)
-        return f"/tmp/{sid}.sock"
-
-
-async def _invoke_recover(monkeypatch, *, backend="extension", ready=True,
-                          tab_error=None, executor_alive=True, spawn_error=None,
-                          probe_error=None, initial_state=None):
-    machine = RecoveryStateMachine()
-    row = {"id": "7", "backend": backend}
-    if initial_state is not None:
-        row["recovery"] = {"state": initial_state, "since": 1.0}
-    machine.load([row],
-                 extension_connected=ready,
-                 executor_alive=lambda _sid: executor_alive)
-    relay = _Relay(ready)
-    extension = _Extension(tab_error)
-
-    async def _noop(_value):
+    async def _no_browser(self, ws_url=None, *, timeout=None):
         return None
 
-    # The real adapter owns tab convergence; only its browser round-trips are
-    # stood in for.
-    upstream = ExtensionUpstream(relay, _noop, _noop)
-    upstream.bind_recovery(machine, lambda _sid: executor_alive)
-    upstream.recover_session = extension.recover_session
-    upstream.open_background_tab = extension.open_background_tab
-    registry = _Registry(machine, alive=executor_alive, spawn_error=spawn_error)
-    daemon = SimpleNamespace(
-        recovery=machine,
-        executors=registry,
-        shared_context=SimpleNamespace(upstream=upstream),
-    )
-    state = DaemonState(backend_name=backend)
-    state.upstream_phase = UpstreamPhase.CONNECTED
-    router = Router(state)
-    router.daemon = daemon
-    client = state.allocate_client("test")
-    client.session_id = "7"
+    async def _current_page(self, session_id=None):
+        return {"sessionId": "u3", "targetId": "T1", "tabId": None}
+
+    monkeypatch.setattr(CdpUpstream, "open", _no_browser)
+    monkeypatch.setattr(CdpUpstream, "current_page", _current_page)
+
+    cfg = Config()
+    daemon = Daemon(cfg=cfg, shared_context=build_context(
+        backend="extension", cfg=cfg))
+    ext = daemon.shared_context.upstream
+    ext.recover_session = browser.recover_session
+    ext.open_background_tab = browser.open_background_tab
+
+    spawned: list[str] = []
+
+    async def _spawn(session_id):
+        # The executor subprocess is the other stand-in: a handle whose
+        # liveness is this test process.
+        spawned.append(session_id)
+        if spawn_error:
+            raise spawn_error
+        return registry_mod.ExecutorHandle(
+            session_id=session_id, proc=None, sock_path=f"/tmp/{session_id}.s",
+            pid=os.getpid())
+
+    monkeypatch.setattr(daemon.executors, "_spawn", _spawn)
+    if executor_alive:
+        await daemon.executors.ensure(sid)
+        spawned.clear()
+    if initial_state is not None:
+        session_registry.update(
+            sid, recovery={"state": initial_state, "since": 1.0})
+    # Boot: the state machine is rebuilt from the ledger (ADR-0013 rule 1).
+    daemon.recovery.load(session_registry.list_all(), extension_connected=ready,
+                         executor_alive=daemon.executor_alive)
+
+    async def probe(_daemon, session_id):
+        if probe_error:
+            raise probe_error
+        daemon.recovery.note(session_id, TAB_RECOVERED, executor_alive=True)
+
+    monkeypatch.setattr(
+        "browserwright.daemon.server.exec_relay.probe_executor_binding", probe)
+
+    ctx = daemon.context_for_required(sid)
+    client = ctx.state.allocate_client("test")
+    client.session_id = sid
     replies = []
 
     async def send(text):
         replies.append(json.loads(text))
 
-    router.register_client(client.client_id, send)
-    monkeypatch.setattr(
-        "browserwright.daemon.server.verbs.session_registry.get",
-        lambda sid: {"id": sid, "backend": backend},
-    )
-
-    async def probe(_daemon, sid):
-        if probe_error:
-            raise probe_error
-        machine.note(sid, TAB_RECOVERED, executor_alive=True)
-
-    monkeypatch.setattr(
-        "browserwright.daemon.server.exec_relay.probe_executor_binding", probe)
-    await router._handle_recover(client, {"session": "7"}, 41)
-    return replies[-1]["result"], relay, extension, registry, machine
+    ctx.router.register_client(client.client_id, send)
+    await ctx.router.route_from_client(client, json.dumps({
+        "id": 41, "method": "BrowserwrightDaemon.recover",
+        "params": {"session": sid}}))
+    result = replies[-1]["result"]
+    return result, browser, spawned, daemon.recovery.state_of(sid)
 
 
 @pytest.mark.asyncio
-async def test_recover_keeps_a_live_executor_and_reports_healthy(monkeypatch):
-    result, relay, extension, registry, machine = await _invoke_recover(monkeypatch)
+async def test_recover_keeps_a_live_executor_and_reports_healthy(
+        monkeypatch, tmp_path):
+    result, browser, spawned, state = await _invoke_recover(
+        monkeypatch, tmp_path, initial_state=HEALTHY)
 
     assert result["state"] == HEALTHY
     assert result["steps"] == []
-    assert extension.calls == []
-    assert registry.ensure_calls == []
-    assert machine.state_of("7") == HEALTHY
-    assert relay.wait_calls == 0
+    assert browser.calls == []
+    assert spawned == []
+    assert state == HEALTHY
+    assert browser.wait_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_recover_extension_timeout_is_bounded_needs_human(monkeypatch):
-    result, relay, extension, registry, _ = await _invoke_recover(
-        monkeypatch, ready=False, executor_alive=False)
+async def test_recover_extension_timeout_is_bounded_needs_human(
+        monkeypatch, tmp_path):
+    result, browser, spawned, _ = await _invoke_recover(
+        monkeypatch, tmp_path, ready=False, executor_alive=False)
 
     assert result["state"] == NEEDS_HUMAN
     assert len(result["steps"]) == 1
-    assert result["steps"][0]["rung"] == "extension"
+    assert result["steps"][0]["rung"] == "browser"
     assert result["steps"][0]["ok"] is False
-    assert relay.wait_calls == 1
-    assert extension.calls == []
-    assert registry.ensure_calls == []
+    assert "extension is not connected" in result["reason"]
+    assert browser.wait_calls == 1
+    assert browser.calls == []
+    assert spawned == []
 
 
 @pytest.mark.asyncio
-async def test_recover_cold_starts_only_the_requested_executor(monkeypatch):
-    result, _, _, registry, machine = await _invoke_recover(
-        monkeypatch, backend="cdp", executor_alive=False)
+async def test_recover_cold_starts_only_the_requested_executor(
+        monkeypatch, tmp_path):
+    result, _, spawned, state = await _invoke_recover(
+        monkeypatch, tmp_path, backend="cdp", executor_alive=False)
 
-    assert registry.ensure_calls == ["7"]
+    assert len(spawned) == 1
     assert result["state"] == HEALTHY
-    assert machine.state_of("7") == HEALTHY
-    assert [s["rung"] for s in result["steps"]] == ["executor", "tab"]
+    assert state == HEALTHY
+    assert [s["rung"] for s in result["steps"]] == ["executor"]
 
 
 @pytest.mark.asyncio
-async def test_recover_cdp_binding_failure_is_needs_human(monkeypatch):
-    result, _, _, _, machine = await _invoke_recover(
-        monkeypatch, backend="cdp", executor_alive=True,
+async def test_recover_cdp_binding_failure_is_needs_human(
+        monkeypatch, tmp_path):
+    """A resident executor under a replacement daemon: the cdp tab is not
+    re-proven until the executor's own binding answers."""
+    result, _, _, state = await _invoke_recover(
+        monkeypatch, tmp_path, backend="cdp", executor_alive=True,
         probe_error=RuntimeError("cannot bind tab"))
 
     assert result["state"] == NEEDS_HUMAN
-    assert result["steps"][-1]["rung"] == "tab"
+    assert [s["rung"] for s in result["steps"]] == [
+        "tab", "executor", "binding"]
     assert result["steps"][-1]["ok"] is False
-    assert machine.state_of("7") == NEEDS_HUMAN
+    assert state == NEEDS_HUMAN
 
 
 @pytest.mark.asyncio
-async def test_recover_executor_failure_is_needs_human(monkeypatch):
-    result, _, _, registry, machine = await _invoke_recover(
-        monkeypatch, backend="cdp", executor_alive=False,
+async def test_recover_executor_failure_is_needs_human(monkeypatch, tmp_path):
+    result, _, spawned, state = await _invoke_recover(
+        monkeypatch, tmp_path, backend="cdp", executor_alive=False,
         spawn_error=RuntimeError("cannot spawn"))
 
-    assert registry.ensure_calls == ["7"]
+    assert len(spawned) == 1
     assert result["state"] == NEEDS_HUMAN
     assert result["steps"][-1]["ok"] is False
     assert "cannot spawn" in result["reason"]
-    assert machine.state_of("7") == NEEDS_HUMAN
+    assert state == NEEDS_HUMAN
 
 
 @pytest.mark.asyncio
-async def test_no_existing_tab_is_recoverable_not_a_false_success(monkeypatch):
+async def test_no_existing_tab_is_recoverable_not_a_false_success(
+        monkeypatch, tmp_path):
     """A missing tab becomes a fresh blank tab before recover says healthy."""
-    result, _, extension, _, _ = await _invoke_recover(
-        monkeypatch, tab_error=RuntimeError("no recoverable tabs"),
+    result, browser, _, _ = await _invoke_recover(
+        monkeypatch, tmp_path, tab_error=RuntimeError("no recoverable tabs"),
         executor_alive=True, initial_state="tab-gone")
 
     assert result["state"] == HEALTHY
     assert result["steps"] == [{
         "rung": "tab", "ok": True, "detail": "session has a live tab"}]
-    assert extension.calls == [
-        "7", ("open", "about:blank", "7", True)]
+    assert browser.calls[1:] == [("open", "about:blank", browser.calls[0], True)]
 
 
 @pytest.mark.parametrize("state", [
