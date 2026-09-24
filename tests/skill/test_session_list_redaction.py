@@ -9,17 +9,11 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
-from browserwright import cli, session_create
+from browserwright import cli
 from browserwright import session_registry as reg
 
 TOKEN_URL = "wss://user:s3cr3t@cloud.example.com:443/cdp?apiKey=deadbeef&x=1"
-
-
-@pytest.fixture(autouse=True)
-def _no_daemon(monkeypatch):
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
 
 
 def _attached(tmp_bs_home) -> str:

@@ -15,69 +15,30 @@ class _Proc:
         self.stderr = stderr
 
 
-def test_discover_reports_the_resolved_endpoint(monkeypatch):
-    """ADR-0011: discovery is URL resolution, not a socket-file hunt."""
-    from browserwright.mode_b_client import ModeBClient
-
-    monkeypatch.setenv("BW_DAEMON_URL", "http://10.0.0.7:19990")
-    client = ModeBClient()
-    assert client.discover() == {"transport": "tcp",
-                                 "url": "http://10.0.0.7:19990"}
-    assert client.explicit is True
-
-
-def test_discover_default_endpoint_is_not_explicit(monkeypatch, tmp_path):
-    """No configured source => the local default, and auto-start stays on."""
-    from browserwright.mode_b_client import ModeBClient
-
-    monkeypatch.delenv("BW_DAEMON_URL", raising=False)
-    monkeypatch.delenv("BD_CONFIG", raising=False)
-    # An empty runtime dir has no endpoint state file to fall back to.
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    client = ModeBClient()
-    assert client.discover() == {"transport": "tcp",
-                                 "url": "http://127.0.0.1:19990"}
-    assert client.explicit is False
-
-
-def test_ping_is_the_http_pong_probe(monkeypatch):
-    from browserwright.daemon import _ipc
-    from browserwright.mode_b_client import ModeBClient
+def test_diagnose_reads_pid_and_version_off_the_pong(monkeypatch):
+    """The one "is the daemon up / which version" answer is the `/__ping__`
+    pong, classified by `daemon_lifecycle.diagnose`."""
+    from browserwright import daemon_lifecycle as lifecycle
+    from browserwright.daemon._ipc import EndpointProbe
 
     seen = []
 
-    def fake_ping(timeout=1.0):
+    def fake_probe(host, port, timeout=1.5):
         seen.append(timeout)
-        return _ipc.PongInfo(pid=4242, version="9.9.9")
+        return EndpointProbe(kind="ours", host=host, port=port, pid=4242,
+                             version="9.9.9")
 
-    monkeypatch.setattr(_ipc, "ping_status_sync", fake_ping)
-    client = ModeBClient()
-    assert client.is_alive() is True
-    assert client.running_daemon_version() == "9.9.9"
+    monkeypatch.setattr(lifecycle, "probe", fake_probe)
+    verdict = lifecycle.diagnose(expected_version="9.9.9")
+    assert verdict.up and verdict.healthy
+    assert (verdict.pid, verdict.version) == (4242, "9.9.9")
     assert seen  # the probe actually ran
 
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
-    assert client.is_alive() is False
-    assert client.running_daemon_version() is None
-
-
-def test_explicit_endpoint_never_spawns_or_restarts(monkeypatch, capsys):
-    """The ADR-0011 rule: a daemon someone named is not ours to manage."""
-    from browserwright.mode_b_client import ModeBClient
-
-    monkeypatch.setenv("BW_DAEMON_URL", "http://10.0.0.7:19990")
-    client = ModeBClient()
-    spawned = []
-    monkeypatch.setattr(client, "installed_daemon_version", lambda: "2.0.0")
-    monkeypatch.setattr(client, "running_daemon_version", lambda: "1.0.0")
-    monkeypatch.setattr(
-        client, "_stop_daemon", lambda: spawned.append("stop"))
-
-    assert client.ensure_version_coherent() is False
-    assert spawned == []
-    # The skew is still reported — silently driving a mismatched daemon is
-    # exactly the pothole `ensure_version_coherent` exists to prevent.
-    assert "will not restart it" in capsys.readouterr().err
+    monkeypatch.setattr(lifecycle, "probe", lambda h, p, timeout=1.5: EndpointProbe(
+        kind="refused", host=h, port=p))
+    verdict = lifecycle.diagnose()
+    assert verdict.up is False
+    assert (verdict.pid, verdict.version) == (None, None)
 
 
 def test_ws_url_caches_until_invalidated_and_carries_session_query(monkeypatch):
@@ -101,101 +62,72 @@ def test_ws_url_caches_until_invalidated_and_carries_session_query(monkeypatch):
     assert client._transport == "tcp"
 
 
-def test_cli_info_methods_parse_defaults_and_command_shapes(monkeypatch):
-    from browserwright.mode_b_client import ModeBClient
-    import browserwright.mode_b_client as mb
+def test_run_verb_parses_json_and_command_shapes(monkeypatch):
+    from browserwright import daemon_lifecycle as lifecycle
 
-    outputs = deque(
-        [
-            _Proc(stdout=json.dumps({"backend": "cdp"})),
-            _Proc(stdout="browserwright-daemon 9.8.7\n"),
-        ]
-    )
+    outputs = deque([_Proc(stdout=json.dumps({"backend": "cdp"}))])
     commands = []
 
     def fake_run(cmd, **kwargs):
         commands.append((cmd, kwargs))
         return outputs.popleft()
 
-    monkeypatch.setattr(mb.subprocess, "run", fake_run)
-    client = ModeBClient()
-    client._session_id = "s-1"
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+    monkeypatch.setenv("BW_DAEMON_URL", "http://10.0.0.7:19990")
 
-    assert client.get_backend_info() == {"backend": "cdp"}
-    assert client.installed_daemon_version() == "9.8.7"
-    assert commands[0][0] == [
+    result = lifecycle.run_verb(["backend-info", "--json", "--session", "s-1"])
+    assert result.json() == {"backend": "cdp"}
+    cmd, kwargs = commands[0]
+    assert cmd == [
         "browserwright-daemon", "backend-info", "--json", "--session", "s-1",
     ]
-    assert all(call[1]["capture_output"] and call[1]["text"] for call in commands)
+    assert kwargs["capture_output"] and kwargs["text"]
+    # The child asks the SAME daemon this process is addressed at.
+    assert kwargs["env"]["BW_DAEMON_URL"] == "http://10.0.0.7:19990"
 
 
-def test_cli_info_methods_tolerate_bad_outputs_and_timeouts(monkeypatch):
-    from browserwright.mode_b_client import ModeBClient
+def test_run_verb_tolerates_bad_outputs_and_a_missing_binary(monkeypatch):
+    from browserwright import daemon_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle.subprocess, "run",
+                        lambda cmd, **kw: _Proc(returncode=1, stdout="not json"))
+    result = lifecycle.run_verb(["backend-info", "--json"])
+    assert result.returncode == 1 and result.json() is None
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError("browserwright-daemon")
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", missing)
+    result = lifecycle.run_verb(["version"])
+    assert result.missing and result.returncode == 1
+
+
+def test_a_daemon_too_old_to_advertise_a_version_is_stale(monkeypatch):
+    """A legacy daemon answers the ping without a version: stale, and — on
+    the default endpoint — replaceable, never mistaken for "no daemon"."""
+    from browserwright import daemon_lifecycle as lifecycle
+    from browserwright.daemon._ipc import EndpointProbe
+
+    monkeypatch.delenv("BW_DAEMON_URL", raising=False)
+    monkeypatch.setattr(lifecycle, "probe", lambda h, p, timeout=1.5: EndpointProbe(
+        kind="ours", host=h, port=p, pid=9, version=None))
+    verdict = lifecycle.diagnose(confirm=True)
+    assert verdict.state == lifecycle.STALE
+    assert verdict.replaceable
+
+
+def test_client_for_session_has_no_lifecycle_side_effects(monkeypatch):
+    """Constructing a Session's client must not probe, stop or spawn."""
     import browserwright.mode_b_client as mb
+    from browserwright import daemon_lifecycle as lifecycle
 
-    outputs = deque(
-        [
-            _Proc(returncode=1, stdout="{}"),
-            _Proc(returncode=1, stdout="browserwright-daemon 1.0.0"),
-        ]
-    )
-
-    def fake_run(cmd, **kwargs):
-        return outputs.popleft()
-
-    monkeypatch.setattr(mb.subprocess, "run", fake_run)
-    client = ModeBClient()
-
-    assert client.get_backend_info() is None
-    assert client.installed_daemon_version() is None
-
-
-def test_ensure_version_coherent_restarts_legacy_alive_daemon_with_backend(monkeypatch):
-    from browserwright.mode_b_client import ModeBClient
-
-    client = ModeBClient()
-    actions = []
-    monkeypatch.setattr(client, "installed_daemon_version", lambda: "2.0.0")
-    monkeypatch.setattr(client, "running_daemon_version", lambda: None)
-    monkeypatch.setattr(client, "is_alive", lambda: True)
-    monkeypatch.setattr(client, "get_backend_info", lambda: {"backend": "extension"})
-    monkeypatch.setattr(client, "_stop_daemon", lambda: actions.append(("stop", None)))
-    monkeypatch.setattr(client, "_spawn_daemon", lambda backend=None: actions.append(("spawn", backend)))
-    monkeypatch.setattr(client, "invalidate", lambda: actions.append(("invalidate", None)))
-
-    assert client.ensure_version_coherent() is True
-    assert actions == [("stop", None), ("spawn", "extension"), ("invalidate", None)]
-
-
-def test_client_for_session_is_lazy_but_runs_coherence_when_alive(monkeypatch):
-    import browserwright.mode_b_client as mb
-
-    original = mb.ModeBClient
-    made = []
-
-    class _FakeClient(original):
-        def __init__(self):
-            super().__init__()
-            self.waited = False
-            made.append(self)
-
-        def is_alive(self):
-            return True
-
-        def ensure_version_coherent(self):
-            return True
-
-        def wait_until_alive(self, timeout=8.0, interval=0.2):
-            self.waited = True
-            return True
-
-    monkeypatch.setattr(mb, "ModeBClient", _FakeClient)
+    for name in ("probe", "ensure", "run_verb", "_spawn_detached"):
+        monkeypatch.setattr(lifecycle, name, lambda *a, _n=name, **k: pytest.fail(
+            f"client_for_session called daemon_lifecycle.{_n}"))
     client = mb.client_for_session({"id": 123})
 
-    assert client is made[0]
     assert client._client_label == "skill-s123"
     assert client._session_id == "123"
-    assert client.waited is True
     assert client._cached_ws is None
 
 

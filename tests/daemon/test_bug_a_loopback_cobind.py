@@ -155,7 +155,7 @@ def test_fix_names_the_divergence_instead_of_saying_start_the_daemon(
     (tmp_path / "browserwright-daemon.endpoint").write_text(
         json.dumps({"url": "http://100.72.20.32:19990", "pid": 31305}))
 
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
     from browserwright.daemon._ipc import EndpointProbe
 
     # The daemon really was up on the tailnet address in the report; the
@@ -164,7 +164,7 @@ def test_fix_names_the_divergence_instead_of_saying_start_the_daemon(
         kind="ours" if host == "100.72.20.32" else "refused",
         host=host, port=port, pid=31305, version="0.17.1"))
 
-    fix = du.local_unreachable_fix(
+    fix = du.unreachable_fix(
         _endpoint("http://127.0.0.1:19990", "default"))
     assert "browserwright-daemon serve" not in fix
     assert "100.72.20.32:19990" in fix
@@ -178,9 +178,9 @@ def test_fix_for_a_stale_non_loopback_state_file_explains_the_interface(
     (tmp_path / "browserwright-daemon.endpoint").write_text(
         json.dumps({"url": "http://100.72.20.32:19990", "pid": 31305}))
 
-    from browserwright.daemon_url import local_unreachable_fix
+    from browserwright.daemon_lifecycle import unreachable_fix
 
-    fix = local_unreachable_fix(
+    fix = unreachable_fix(
         _endpoint("http://100.72.20.32:19990", "state_file"))
     # ADR-0013 rule 3: the text reports what the probes found (nothing at
     # the published address, nothing on loopback) and points at doctor /
@@ -199,9 +199,9 @@ def test_fix_with_no_daemon_at_all_points_at_the_on_demand_start(
     rather than telling the agent to `serve` one (ADR-0013 rule 3)."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
 
-    from browserwright.daemon_url import local_unreachable_fix
+    from browserwright.daemon_lifecycle import unreachable_fix
 
-    fix = local_unreachable_fix(
+    fix = unreachable_fix(
         _endpoint("http://127.0.0.1:19990", "default"))
     assert "browserwright-daemon serve" not in fix
     assert "on demand" in fix
@@ -214,14 +214,14 @@ def test_fix_names_a_foreign_responder_on_the_port(monkeypatch, tmp_path):
     a healthy daemon. Now the probe's HTTP status and Server header are in
     the message and the next step is to find the squatter, not restart."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
     from browserwright.daemon._ipc import EndpointProbe
 
     monkeypatch.setattr(du, "probe", lambda host, port, timeout=1.5: EndpointProbe(
         kind="foreign", host=host, port=port,
         status_line="HTTP/1.1 503 Service Unavailable", server="Surge/5.0"))
 
-    fix = du.local_unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
+    fix = du.unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
     assert "something other than browserwright" in fix
     assert "503" in fix
     assert "Surge/5.0" in fix
@@ -258,19 +258,21 @@ def test_doctor_fails_when_the_daemon_answers_but_loopback_does_not(
     """
     from browserwright import health
 
-    monkeypatch.setattr(
-        health, "daemon_endpoint",
-        lambda: _endpoint("http://100.72.20.32:19990", "state_file"),
-        raising=False)
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
+    from browserwright.daemon._ipc import EndpointProbe
+
     monkeypatch.setattr(
         du, "daemon_endpoint",
         lambda **_k: _endpoint("http://100.72.20.32:19990", "state_file"))
 
     def _probe(host, port, timeout=1.5):
-        return None if host == "100.72.20.32" else "Connection refused"
+        if host == "100.72.20.32":
+            return EndpointProbe(kind="ours", host=host, port=port, pid=1,
+                                 version="0.17.1")
+        return EndpointProbe(kind="refused", host=host, port=port,
+                             detail="Connection refused")
 
-    monkeypatch.setattr(health, "_probe_tcp", _probe)
+    monkeypatch.setattr(du, "probe", _probe)
 
     (check,) = health._endpoint_reachability_checks()
     assert check["name"] == "endpoint_reachable"
@@ -281,13 +283,14 @@ def test_doctor_fails_when_the_daemon_answers_but_loopback_does_not(
 
 def test_doctor_passes_once_loopback_is_co_bound(monkeypatch):
     from browserwright import health
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
+    from browserwright.daemon._ipc import EndpointProbe
 
     monkeypatch.setattr(
         du, "daemon_endpoint",
         lambda **_k: _endpoint("http://100.72.20.32:19990", "state_file"))
-    monkeypatch.setattr(health, "_probe_tcp",
-                        lambda host, port, timeout=1.5: None)
+    monkeypatch.setattr(du, "probe", lambda host, port, timeout=1.5: EndpointProbe(
+        kind="ours", host=host, port=port, pid=1, version="0.17.1"))
 
     (check,) = health._endpoint_reachability_checks()
     assert check["status"] == "pass"
@@ -295,14 +298,13 @@ def test_doctor_passes_once_loopback_is_co_bound(monkeypatch):
 
 def test_doctor_fails_when_nothing_answers_anywhere(monkeypatch):
     from browserwright import health
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
 
     monkeypatch.setattr(
         du, "daemon_endpoint",
         lambda **_k: _endpoint("http://127.0.0.1:19990", "default"))
-    monkeypatch.setattr(health, "_probe_tcp",
-                        lambda host, port, timeout=1.5: "Connection refused")
+    # The conftest wall answers every probe with "refused".
 
     (check,) = health._endpoint_reachability_checks()
     assert check["status"] == "fail"
-    assert "nothing answered" in check["message"]
+    assert "no browserwright daemon answered" in check["message"]

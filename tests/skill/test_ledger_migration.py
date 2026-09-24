@@ -82,14 +82,14 @@ def test_session_end_clears_a_legacy_row_without_calling_the_daemon(
     tmp_bs_home, monkeypatch,
 ):
     """The loop-breaker: no RPC, because no answer to it exists."""
-    from browserwright import session_create
+    from browserwright import daemon_lifecycle, session_create
 
     sid = reg.allocate(backend="env", owner="attach", name="cloak")
     calls = []
-    monkeypatch.setattr(session_create, "_run",
-                        lambda cmd, **kw: calls.append(cmd) or 0)
-    monkeypatch.setattr(session_create, "_ensure_daemon_running",
-                        lambda: pytest.fail("must not spawn a daemon"))
+    monkeypatch.setattr(daemon_lifecycle, "run_verb",
+                        lambda args, **kw: calls.append(args))
+    monkeypatch.setattr(daemon_lifecycle, "ensure",
+                        lambda reason, **kw: pytest.fail("must not spawn a daemon"))
 
     message = session_create.end(reg.get(sid))
 
@@ -103,7 +103,6 @@ def test_session_new_sweeps_legacy_rows(tmp_bs_home, monkeypatch):
     from browserwright import session_create
 
     stale = reg.allocate(backend="env", owner="attach", name="old")
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
 
     session_create.new(backend="extension", name="fresh")
 

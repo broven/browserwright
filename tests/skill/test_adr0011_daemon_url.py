@@ -10,17 +10,19 @@ import json
 
 import pytest
 
+from browserwright import daemon_lifecycle as lifecycle
 from browserwright import daemon_url as du
 from browserwright import session_create as _session_create
+from browserwright.daemon._ipc import EndpointProbe
 
-#: The genuine `_ensure_daemon_running`, captured at collection time — before
-#: the repo-wide wall in `tests/conftest.py` replaces it with a no-op. That
+#: The genuine `daemon_lifecycle.ensure`, captured at collection time — before
+#: the repo-wide wall in `tests/conftest.py` replaces it with a stub. That
 #: stub exists so no test accidentally starts a daemon; these tests are ABOUT
-#: that function, and reach past the stub safely because what they assert is
-#: precisely that nothing is spawned.
-_REAL_ENSURE = _session_create._ensure_daemon_running
+#: that function, and reach past the stub safely because they substitute its
+#: adapters (`probe`, `run_verb`, `_spawn_detached`) themselves.
+_REAL_ENSURE = lifecycle.ensure
 #: Likewise the real detached spawn, which the wall replaces with a tripwire.
-_REAL_SPAWN_DETACHED = _session_create._spawn_detached
+_REAL_SPAWN_DETACHED = lifecycle._spawn_detached
 
 
 @pytest.fixture(autouse=True)
@@ -141,59 +143,88 @@ def test_ws_builds_each_surface_and_drops_empty_query(monkeypatch):
 # ---- what `explicit` gates -------------------------------------------------
 
 
-def test_explicit_endpoint_that_is_down_errors_and_does_not_spawn(monkeypatch):
+def _record_adapters(monkeypatch):
+    """Substitute ensure's side-effecting adapters; return what they saw."""
     from browserwright.daemon import _ipc
+
+    actions = []
+    monkeypatch.setattr(lifecycle, "_spawn_detached",
+                        lambda args, *, initiator: actions.append(
+                            ("spawn", args, initiator)))
+    monkeypatch.setattr(lifecycle, "run_verb",
+                        lambda args, **kw: actions.append(
+                            ("run", args, kw.get("initiator"))))
+    monkeypatch.setattr(_ipc, "request_executor_handoff",
+                        lambda pid: actions.append(("handoff", pid)))
+    monkeypatch.setattr(_ipc, "log_lifecycle",
+                        lambda event, **fields: actions.append(
+                            ("log", event, fields)))
+    return actions
+
+
+def test_explicit_endpoint_that_is_down_errors_and_does_not_spawn(monkeypatch):
     from browserwright.errors import DaemonUnavailable
 
     monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:19990")
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
-
-    actions = []
-    monkeypatch.setattr(_session_create, "_spawn_detached",
-                        lambda cmd: actions.append(cmd))
-    monkeypatch.setattr(_session_create, "_run",
-                        lambda *a, **k: actions.append(a))
+    # The conftest wall answers every probe with "refused".
+    actions = _record_adapters(monkeypatch)
 
     with pytest.raises(DaemonUnavailable) as ei:
-        _REAL_ENSURE()
+        _REAL_ENSURE("session new")
     assert "will not start or restart a daemon" in str(ei.value)
     # Not even a `stop`: the daemon at that URL is someone else's process, and
     # a local `browserwright-daemon stop` would signal the wrong one.
     assert actions == []
 
 
+def test_explicit_endpoint_with_a_skewed_daemon_warns_and_does_not_replace(
+        monkeypatch, capsys):
+    monkeypatch.setenv("BW_DAEMON_URL", "http://10.0.0.7:19990")
+    monkeypatch.setattr(lifecycle, "probe", lambda h, p, timeout=1.5: EndpointProbe(
+        kind="ours", host=h, port=p, pid=7, version="0.0.1-old"))
+    actions = _record_adapters(monkeypatch)
+
+    assert _REAL_ENSURE("session new").state == lifecycle.STALE
+    assert actions == []
+    # The skew is still reported — silently driving a mismatched daemon is
+    # the pothole version coherence exists to prevent.
+    assert "will not replace it" in capsys.readouterr().err
+
+
 def test_default_endpoint_still_cold_starts_a_daemon(monkeypatch):
-    from browserwright.daemon import _ipc
-
     monkeypatch.delenv("BW_DAEMON_URL", raising=False)
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
+    actions = _record_adapters(monkeypatch)
 
-    spawns = []
-    monkeypatch.setattr(_session_create, "_spawn_detached",
-                        lambda cmd: spawns.append(cmd))
-    _REAL_ENSURE()
-    assert spawns == [["browserwright-daemon", "serve"]]
+    verdict = _REAL_ENSURE("session new")
+    assert verdict.state == lifecycle.DOWN
+    (log, spawn) = actions
+    # ADR-0012 rule 5: the spawn is logged with its reason, both probes, and
+    # the initiator the child daemon will report as its own.
+    assert log[:2] == ("log", "spawn")
+    assert log[2]["reason"] == "session new"
+    assert log[2]["probes"] == "refused,refused"
+    assert spawn[:2] == ("spawn", ["serve"])
+    assert spawn[2] == log[2]["initiator"]
+    assert spawn[2].startswith("cli:auto-start (session new) cwd=")
 
 
-def test_default_endpoint_restarts_a_version_skewed_daemon(monkeypatch):
-    """The unconfigured local daemon IS ours, so the old skew fix still runs."""
-    from browserwright.daemon import _ipc
-
+def test_default_endpoint_replaces_a_version_skewed_daemon(monkeypatch):
+    """The unconfigured local daemon IS ours, so a skew is repaired — with the
+    resident executors handed over to the replacement (ADR-0013)."""
     monkeypatch.delenv("BW_DAEMON_URL", raising=False)
-    monkeypatch.setattr(
-        _ipc, "ping_status_sync",
-        lambda timeout=1.0: _ipc.PongInfo(pid=1, version="0.0.1-old"))
+    monkeypatch.setattr(lifecycle, "probe", lambda h, p, timeout=1.5: EndpointProbe(
+        kind="ours", host=h, port=p, pid=31, version="0.0.1-old"))
+    actions = _record_adapters(monkeypatch)
 
-    actions = []
-    monkeypatch.setattr(_session_create, "_run",
-                        lambda cmd, **k: actions.append(("run", cmd)))
-    monkeypatch.setattr(_session_create, "_spawn_detached",
-                        lambda cmd: actions.append(("spawn", cmd)))
-    _REAL_ENSURE()
-    assert actions == [
-        ("run", ["browserwright-daemon", "stop"]),
-        ("spawn", ["browserwright-daemon", "serve"]),
+    _REAL_ENSURE("recover session=7")
+    assert [a[:2] for a in actions] == [
+        ("log", "replace"),
+        ("handoff", 31),
+        ("run", ["stop"]),
+        ("spawn", ["serve"]),
     ]
+    assert actions[0][2]["pid_before"] == 31
+    assert actions[0][2]["reason"] == "recover session=7"
 
 
 def test_an_unreachable_endpoint_names_itself_instead_of_errno_61(monkeypatch):
@@ -269,6 +300,7 @@ def test_child_env_does_not_export_a_non_explicit_endpoint(tmp_path):
 @pytest.mark.parametrize("call,expected_argv0", [
     (lambda sc: sc._end_daemon_session({"id": "7"}), "browserwright-daemon"),
     (lambda sc: sc.reset_executor({"id": "7"}), "browserwright-daemon"),
+    (lambda sc: sc.attach_active({"id": "7"}), "browserwright-daemon"),
 ])
 def test_layer2_shellouts_carry_the_cli_endpoint(monkeypatch, call,
                                                  expected_argv0):
@@ -281,10 +313,9 @@ def test_layer2_shellouts_carry_the_cli_endpoint(monkeypatch, call,
 
     def fake_run(cmd, **kwargs):
         seen.append((cmd, kwargs.get("env") or {}))
-        return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
 
-    monkeypatch.setattr(_session_create.subprocess, "run", fake_run)
-    monkeypatch.setattr(_session_create, "_ensure_daemon_running", lambda: None)
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
     call(_session_create)
 
     assert seen, "no browserwright-daemon subprocess was run"
@@ -305,8 +336,10 @@ def test_spawned_daemon_inherits_the_cli_endpoint(monkeypatch):
         seen["env"] = kwargs.get("env") or {}
         return _Proc()
 
-    monkeypatch.setattr(_session_create.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
     # The real spawn, not the wall's tripwire — `Popen` above is what actually
     # keeps this test from starting anything.
-    _REAL_SPAWN_DETACHED(["browserwright-daemon", "serve"])
+    _REAL_SPAWN_DETACHED(["serve"], initiator="cli:auto-start (test)")
+    assert seen["cmd"] == ["browserwright-daemon", "serve"]
     assert seen["env"]["BW_DAEMON_URL"] == "http://127.0.0.1:29990"
+    assert seen["env"]["BW_DAEMON_INITIATOR"] == "cli:auto-start (test)"

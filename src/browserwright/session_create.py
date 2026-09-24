@@ -15,8 +15,9 @@ Chrome directly. ``new()`` only:
   - ensures the single daemon is up.
 
 Teardown talks to the single daemon via the ``browserwright-daemon`` CLI
-(``end-session`` / ``disconnect``), which the daemon already understands — no
-``--name`` is passed anymore.
+(``end-session`` / ``kill-executor`` / ``attach-active``), run through
+:func:`daemon_lifecycle.run_verb`; starting or replacing the daemon itself is
+:func:`daemon_lifecycle.ensure`'s job alone.
 
 Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 """
@@ -24,9 +25,10 @@ from __future__ import annotations
 
 import json
 import socket
-import subprocess
+from dataclasses import dataclass
 from typing import Optional
 
+from . import daemon_lifecycle as lifecycle
 from . import session_registry as reg
 
 
@@ -38,65 +40,6 @@ def _free_port() -> int:
         return s.getsockname()[1]
     finally:
         s.close()
-
-
-def _daemon_child_env() -> dict:
-    """Environment for a child ``browserwright-daemon``.
-
-    ADR-0011: these helpers reach the daemon by *shelling out*, and a
-    `--daemon-url` flag lives only in this process's memory. Without this the
-    child would resolve the default endpoint — so a command could pass the
-    explicit-endpoint liveness gate here and then stop, spawn or tear down a
-    session on an entirely different daemon.
-    """
-    from .daemon._ipc import INITIATOR_ENV
-    from .daemon_url import child_env
-    out = child_env()
-    if _spawn_initiator:
-        out[INITIATOR_ENV] = _spawn_initiator
-    return out
-
-
-def _spawn_detached(cmd: list[str]) -> int:
-    """Start a long-lived background process detached from this one; return pid."""
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL, start_new_session=True,
-        env=_daemon_child_env(),
-    )
-    return proc.pid
-
-
-def _run(cmd: list[str], timeout: float = 10.0) -> int:
-    """Run a short-lived command; return its exit code (best-effort).
-    A timed-out child is reported as failure (exit 3), never a crash — the
-    caller keeps the ledger row for retry, and the retry joins the daemon-side
-    teardown (issue #32 initiate contract)."""
-    try:
-        return subprocess.run(cmd, capture_output=True, timeout=timeout,
-                              env=_daemon_child_env()).returncode
-    except FileNotFoundError:
-        # The daemon CLI binary is missing from PATH — an environment problem.
-        return 1
-    except subprocess.TimeoutExpired:
-        # The CLI was still working (end-session now legitimately covers
-        # initiate + join, issue #32). Report failure so the ledger row is
-        # kept for retry — the retry joins the daemon-side teardown.
-        return 3
-
-
-def _daemon_is_running() -> bool:
-    """True iff a daemon answers the resolved endpoint right now.
-
-    Deliberately does not care about version match — callers use it to decide
-    whether teardown has anything to talk to, not whether to upgrade.
-    """
-    from .daemon import _ipc
-    try:
-        return _ipc.ping_status_sync(timeout=1.0).pid is not None
-    except Exception:
-        return False
 
 
 def _reap_executor_locally(session_id: str) -> dict | None:
@@ -135,49 +78,6 @@ def _reap_executor_locally(session_id: str) -> dict | None:
     return {"state": "reaped", "pid": pid}
 
 
-def _ensure_daemon_running() -> None:
-    """Make sure a daemon is serving the resolved endpoint.
-
-    Two regimes, and the split is ADR-0011's central rule:
-
-    - **unconfigured default endpoint** — the local daemon is ours. Spawn
-      ``serve`` detached when nothing answers, and stop-then-respawn when what
-      answers runs a different version than the installed package. ``serve``
-      itself refuses to start beside a live daemon, so a redundant spawn is a
-      no-op; we ping first only to avoid the churn.
-    - **explicitly configured endpoint** (``--daemon-url`` / ``$BW_DAEMON_URL``
-      / the toml key) — hands off. That daemon belongs to whoever configured the
-      URL, may be on another machine, and starting a *local* one here would bind
-      a different address and quietly drive the wrong browser. Nothing answering
-      is an error the caller must see, so we raise it.
-    """
-    from .daemon import _ipc
-    from .daemon_url import daemon_endpoint, unreachable_message
-    from .errors import DaemonUnavailable
-    from .version import package_version
-
-    ep = daemon_endpoint()
-    if ep.explicit:
-        if _ipc.ping_status_sync(timeout=2.0).pid is None:
-            raise DaemonUnavailable(unreachable_message(ep))
-        return
-    try:
-        pong = _ipc.ping_status_sync(timeout=1.0)
-        if pong.pid is not None and pong.version == package_version():
-            return  # already running the installed version
-        if pong.pid is not None:
-            # Version replacement, not an operator-requested stop: leave the
-            # resident executors for the new daemon to adopt (ADR-0013).
-            _ipc.request_executor_handoff(pong.pid)
-            _run(["browserwright-daemon", "stop"])
-    except Exception:
-        pass
-    global _spawn_initiator
-    _spawn_initiator = _ipc.describe_initiator("auto-start")
-    _ipc.log_lifecycle("spawn", initiator=_spawn_initiator)
-    _spawn_detached(["browserwright-daemon", "serve"])
-
-
 #: How long `session end` may take end-to-end. The CLI under it implements
 #: the issue #32 initiate-then-join contract: initiate is fast, the join
 #: covers the daemon-side teardown worst case, and progress is printed while
@@ -196,8 +96,11 @@ def _end_daemon_session(record: dict) -> bool:
     sid = record.get("id")
     if not sid:
         return True
-    cmd = ["browserwright-daemon", "end-session", "--session", str(sid)]
-    return _run(cmd, timeout=_END_SESSION_CLI_TIMEOUT) == 0
+    # A timed-out verb is a failure (VerbResult exit 3), never a crash: the
+    # row is kept for retry, and the retry joins the daemon-side teardown
+    # (issue #32 initiate contract).
+    return lifecycle.run_verb(["end-session", "--session", str(sid)],
+                              timeout=_END_SESSION_CLI_TIMEOUT).returncode == 0
 
 
 def reset_executor(record: dict) -> str:
@@ -207,14 +110,9 @@ def reset_executor(record: dict) -> str:
     are intentionally left intact. The next ``browserwright -s <id> -e ...``
     call cold-starts a fresh executor against the same session.
     """
-    _ensure_daemon_running()
+    lifecycle.ensure("session reset")
     sid = record["id"]
-    rc = _run([
-        "browserwright-daemon",
-        "kill-executor",
-        "--session",
-        str(sid),
-    ])
+    rc = lifecycle.run_verb(["kill-executor", "--session", str(sid)]).returncode
     if rc != 0:
         # Issue #40: when the daemon is unreachable, the executor cannot be
         # reaped through it and the session is stuck — the orphan blocks the
@@ -222,7 +120,7 @@ def reset_executor(record: dict) -> str:
         # Reap it locally from the discovery record instead. (When the daemon
         # IS up, the daemon path is authoritative and a failed confirm keeps
         # the existing retry semantics.)
-        if not _daemon_is_running():
+        if not lifecycle.diagnose().up:
             outcome = _reap_executor_locally(sid)
             if outcome is not None:
                 return (
@@ -237,8 +135,8 @@ def reset_executor(record: dict) -> str:
             "session reset could not confirm that the old executor exited",
             fix=(
                 "check the global daemon with `browserwright-daemon status` "
-                "and `browserwright doctor` (the default endpoint starts one "
-                "on demand; doctor says why that did not happen), then retry "
+                "and `browserwright doctor` (reset starts one on the default "
+                "endpoint; doctor says why that did not happen), then retry "
                 f"`browserwright session reset {sid}`"
             ),
         )
@@ -266,14 +164,11 @@ def attach_active(record: dict, *, json_out: bool = False) -> str:
     Returns a human-readable confirmation line, or the daemon's payload as
     JSON when ``json_out`` is set.
     """
-    _ensure_daemon_running()
+    lifecycle.ensure("session attach-active")
     sid = str(record.get("id"))
-    cmd = ["browserwright-daemon", "attach-active", "--session", sid, "--json"]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15.0,
-            env=_daemon_child_env())
-    except subprocess.TimeoutExpired:
+    proc = lifecycle.run_verb(["attach-active", "--session", sid, "--json"],
+                              timeout=15.0)
+    if proc.timed_out:
         from .errors import DaemonUnavailable
 
         raise DaemonUnavailable(
@@ -288,10 +183,7 @@ def attach_active(record: dict, *, json_out: bool = False) -> str:
         msg = proc.stderr.strip() or (
             f"attach-active failed (exit {proc.returncode})")
         raise BrowserwrightError(msg)
-    try:
-        payload = json.loads(proc.stdout.strip())
-    except ValueError:
-        payload = {}
+    payload = proc.json() or {}
     if json_out:
         return json.dumps(payload, sort_keys=True)
     title = payload.get("title") or "(untitled)"
@@ -363,13 +255,23 @@ def find_reusable(*, backend: str, name: str,
     return matches[-1] if matches else None
 
 
+@dataclass(frozen=True)
+class NewSession:
+    """What :func:`new` did: the session id, whether ``--reuse`` handed back
+    an existing one, and the daemon verdict after :func:`daemon_lifecycle.ensure`."""
+
+    id: str
+    reused: bool
+    daemon: lifecycle.DaemonVerdict
+
+
 def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
-        name: Optional[str] = None, reuse: bool = False) -> str:
-    """Register a session and return its id.
+        name: Optional[str] = None, reuse: bool = False) -> NewSession:
+    """Register a session (or, with ``reuse``, find one) and ensure the daemon.
 
     With ``reuse`` and an existing session of the same backend and name, no
-    new row is allocated: the existing id is returned and
-    :data:`last_new_reused` records it, so the CLI can say so.
+    new row is allocated: the existing id comes back with ``reused=True``, so
+    the CLI can say so.
 
     - ``extension`` → an *attach* session sharing the one global daemon's
       relay-backed upstream; the tab group is created lazily on first use, so
@@ -383,7 +285,8 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
       or anti-detect browser (#38).
 
     In every case we only allocate the ledger entry + ensure the one daemon is
-    running. The daemon does the Chrome launch on ``ensureSession``.
+    running the installed version (this is where version coherence is
+    enforced). The daemon does the Chrome launch on ``ensureSession``.
     """
     name = name.strip() if isinstance(name, str) else None
     if not name:
@@ -397,23 +300,19 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
     # Sweeping here means the first thing a user does after upgrading clears
     # them, not only a daemon restart.
     reg.migrate_legacy_backends()
-    global last_new_reused
-    last_new_reused = None
     if reuse and backend in ("extension", "cdp"):
         owner = None
         if backend == "cdp":
             owner = "create" if create else ("attach" if attach is not None else None)
         existing = find_reusable(backend=backend, name=name, owner=owner)
         if existing is not None:
-            last_new_reused = str(existing["id"])
-            reg.touch(last_new_reused)
-            _ensure_daemon_running()
-            return last_new_reused
+            sid = str(existing["id"])
+            reg.touch(sid)
+            return NewSession(sid, True, lifecycle.ensure("session new"))
     if backend == "extension":
         sid = reg.allocate(backend="extension",
                            owner="attach", name=name)
-        _ensure_daemon_running()
-        return sid
+        return NewSession(sid, False, lifecycle.ensure("session new"))
     if backend == "cdp":
         if create and attach is not None:
             raise ValueError(
@@ -432,18 +331,8 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
             workspace = {"port": port} if port is not None else {"url": endpoint}
         sid = reg.allocate(backend="cdp", owner=owner,
                            name=name, workspace=workspace)
-        _ensure_daemon_running()
-        return sid
+        return NewSession(sid, False, lifecycle.ensure("session new"))
     raise ValueError(_unknown_backend_message(backend))
-
-
-#: Set by :func:`new` — the id it handed back through ``reuse``, else None.
-last_new_reused: Optional[str] = None
-
-#: The attribution the next on-demand `serve` spawn carries to the child
-#: (ADR-0012 rule 5). Read by :func:`_daemon_child_env`; never exported into
-#: this process's own environment.
-_spawn_initiator: Optional[str] = None
 
 
 def _checked_attach(attach: object) -> tuple[Optional[int], Optional[str]]:
@@ -518,8 +407,8 @@ def end(record: dict) -> str:
     # launched Chrome's pid died with the old daemon, so recovery really means
     # the startup orphan sweep, which is a different mechanism with different
     # failure modes than "spawn a daemon and retry the RPC".
-    if record.get("backend") == "extension" and not _daemon_is_running():
-        _ensure_daemon_running()
+    if record.get("backend") == "extension" and not lifecycle.diagnose().up:
+        lifecycle.ensure("session teardown")
     if not _end_daemon_session(record):
         from .errors import DaemonUnavailable
 
@@ -531,7 +420,8 @@ def end(record: dict) -> str:
         # torn down without the daemon, so say so honestly. When the daemon
         # IS up, its teardown is authoritative and a failed confirm keeps the
         # retry semantics (issue #32).
-        if not _daemon_is_running():
+        daemon_up = lifecycle.diagnose().up
+        if not daemon_up:
             outcome = _reap_executor_locally(sid)
             if outcome is not None:
                 reg.remove(sid)
@@ -547,12 +437,12 @@ def end(record: dict) -> str:
         # may still have live clients driving it is worse than leaving one that
         # needs another attempt.
         hint = ""
-        if not _daemon_is_running():
+        if not daemon_up:
             hint = (
-                " No daemon is answering on this XDG_RUNTIME_DIR; the default "
-                "endpoint starts one on demand for the next command "
-                "(`browserwright doctor` says why that is not happening). "
-                "Then retry ending this session."
+                " No daemon is answering on this XDG_RUNTIME_DIR; "
+                "`browserwright recover --session "
+                f"{sid}` starts the installed one (`browserwright doctor` says "
+                "why none is running). Then retry ending this session."
             )
         raise DaemonUnavailable(
             f"session {sid} termination was incomplete; its ledger entry was "
