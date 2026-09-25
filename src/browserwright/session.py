@@ -98,8 +98,8 @@ class Session:
             return self._cdp
 
     def _unreachable(self, url: str, cause: BaseException) -> DaemonUnavailable:
-        from .daemon_url import (daemon_endpoint, local_unreachable_fix,
-                                 unreachable_message)
+        from .daemon_lifecycle import unreachable_fix
+        from .daemon_url import daemon_endpoint, unreachable_message
 
         endpoint = daemon_endpoint()
         if endpoint.explicit:
@@ -109,7 +109,7 @@ class Session:
         # this client did not resolve. Diagnose the divergence instead.
         return DaemonUnavailable(
             f"no browserwright daemon answered at {url}: {cause}",
-            fix=local_unreachable_fix(endpoint))
+            fix=unreachable_fix(endpoint))
 
     def _resolve_ws_url(self) -> str:
         """Ask the underlying daemon client for a CDP ws URL.

@@ -9,8 +9,12 @@ import pytest
 from browserwright.daemon import _ipc
 from browserwright.daemon.config import Config
 from browserwright.daemon.server import listener as listener_mod
+from browserwright.daemon.errors import Unavailable
 from browserwright.daemon.server import upstream as upstream_mod
+from browserwright.daemon.server import upstream_context as upstream_context_mod
 from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+from browserwright.daemon.server.upstream import CdpUpstream
+from browserwright.daemon.server.upstream_context import UpstreamHolder, build_context
 
 
 class _Resp:
@@ -33,7 +37,7 @@ class _Router:
         self.unregistered: list[int] = []
         self.released: list[int] = []
         self.upstream_senders: list[object] = []
-        self.lifecycle: tuple[object, object, object] | None = None
+        self.lifecycle: tuple[object, object] | None = None
         self.drained = 0
         self.daemon = None
         self.upstream = None
@@ -51,9 +55,9 @@ class _Router:
         self.unregistered.append(cid)
 
     def bind_lifecycle(
-        self, ensure_upstream, trigger_disconnect, prepare_executor=None,
+        self, ensure_upstream, trigger_disconnect,
     ) -> None:
-        self.lifecycle = (ensure_upstream, trigger_disconnect, prepare_executor)
+        self.lifecycle = (ensure_upstream, trigger_disconnect)
 
     async def route_from_client(self, client, text: str) -> None:
         self.routes.append((client.client_id, text))
@@ -107,6 +111,33 @@ def test_parse_query_keeps_first_value_and_drops_empties():
     }
 
 
+class _AnsweringWS:
+    """A browser-level CDP websocket that answers every command with `{}`."""
+
+    def __init__(self):
+        self.inbox: asyncio.Queue = asyncio.Queue()
+        self.sent: list[dict] = []
+
+    async def send(self, text):
+        msg = json.loads(text)
+        self.sent.append(msg)
+        await self.inbox.put(json.dumps({"id": msg["id"], "result": {}}))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.inbox.get()
+
+    async def close(self, **_kw):
+        return None
+
+
+async def _noop_frame(_value: str) -> None:
+    return None
+
+
+
 @pytest.mark.asyncio
 async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypatch, capsys):
     cleanup_calls: list[str] = []
@@ -136,10 +167,17 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
             cleanup_calls.append("endpoint-stop")
 
     class BadRelay:
+        on_extension_hello = None
+        on_extension_closed = None
+
         def __init__(self, *, host, port):
             cleanup_calls.append(f"relay:{host}:{port}")
 
+        def add_event_listener(self, handler):
+            return None
+
         async def start(self):
+            cleanup_calls.append("relay-start")
             raise OSError("busy")
 
     monkeypatch.setattr(
@@ -154,20 +192,22 @@ async def test_run_serve_existing_pid_and_extension_relay_bind_failure(monkeypat
     monkeypatch.setattr(listener_mod, "_wire_logging", lambda: None)
     monkeypatch.setattr(listener_mod, "install_json_logging_if_requested", lambda: None)
     monkeypatch.setattr(listener_mod, "PlaywrightFacade", FakeEndpoint)
-    monkeypatch.setattr(listener_mod, "RelayServer", BadRelay)
+    monkeypatch.setattr(upstream_context_mod, "RelayServer", BadRelay)
 
     cfg = Config(backend="extension")
     cfg.backends.extension.port = 22345
 
     assert await listener_mod.run_serve(cfg) == 2
-    # The endpoint binds FIRST (its bind is the mutual exclusion between
-    # daemons), publishes its URL, and is stopped again when the relay cannot
-    # come up — a daemon with no relay would serve an extension backend that
-    # can never connect.
+    # The relay object is built with the shared context, but it BINDS only
+    # after the endpoint (whose bind is the mutual exclusion between daemons)
+    # has bound and published its URL; the endpoint is stopped again when the
+    # relay cannot come up — a daemon with no relay would serve an extension
+    # backend that can never connect.
     assert cleanup_calls == [
-        "cleanup", "orphans", f"pid:{listener_mod.os.getpid()}",
+        "cleanup", "orphans", "relay:127.0.0.1:22345",
+        f"pid:{listener_mod.os.getpid()}",
         "endpoint", "state:http://127.0.0.1:19990",
-        "relay:127.0.0.1:22345", "endpoint-stop", "cleanup",
+        "relay-start", "endpoint-stop", "cleanup",
     ]
     assert "failed to bind extension relay" in capsys.readouterr().err
 
@@ -222,9 +262,6 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
         async def trigger_close(self, reason: str) -> None:
             return None
 
-        async def prepare_executor(self, session_id: str) -> None:
-            return None
-
     class Conn:
         request = SimpleNamespace(path="/ws?client=alice&session=s-1")
 
@@ -252,8 +289,9 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
     assert router.registered == [77]
     assert router.unregistered == [77]
     assert router.released == [77]
-    assert router.lifecycle == (
-        holder.ensure_open, holder.trigger_close, holder.prepare_executor)
+    # Lifecycle slots are bound once, when the context is built — never
+    # re-bound per client connection.
+    assert router.lifecycle is None
     assert router.upstream is holder.upstream
     assert [(cid, json.loads(text)) for cid, text in router.routes] == [
         (77, {"id": 1}),
@@ -267,49 +305,60 @@ async def test_client_handler_routes_session_frames_and_releases(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_extension_upstream_success_wires_callbacks_and_ready_events(monkeypatch):
-    state = DaemonState("extension")
-    client = state.allocate_client("client")
-    router = _Router()
-    holder = listener_mod._UpstreamHolder(state, router, Config(backend="extension", timeout=0.01))
-    holder.relay = object()
     opened: list[float] = []
 
-    class FakeExtensionUpstream:
-        is_open = True
-        ws_url = "ext://ready"
+    class ReadyRelay:
+        port = 19989
+        on_extension_hello = None
+        on_extension_closed = None
 
-        def __init__(self, *, relay, on_frame, on_close):
-            assert relay is holder.relay
-            self._relay = relay
+        def __init__(self, *, host, port):
+            self.listeners: list[object] = []
+            self.handler = None
 
-        async def open(self, *, timeout):
+        def add_event_listener(self, handler):
+            self.listeners.append(handler)
+
+        async def wait_ready(self, timeout):
             opened.append(timeout)
 
-        def attach(self, router):
-            router.upstream = self
+        def set_event_handler(self, handler):
+            self.handler = handler
 
-        def detach(self, router):
-            if router.upstream is self:
-                router.upstream = None
+    monkeypatch.setattr(upstream_context_mod, "RelayServer", ReadyRelay)
+    ctx = build_context(backend="extension",
+                        cfg=Config(backend="extension", timeout=0.01))
+    relay = ctx.upstream.relay
+    # The factory hands the relay's lifecycle events to the adapter before
+    # the relay can accept a connection.
+    assert relay.on_extension_hello is not None
+    assert relay.on_extension_closed is not None
+    assert len(relay.listeners) == 1
 
-    monkeypatch.setattr(listener_mod, "ExtensionUpstream", FakeExtensionUpstream)
+    state = ctx.state
+    client = state.allocate_client("client")
+    sent: list[dict] = []
 
-    await holder.ensure_open()
+    async def send(text: str) -> None:
+        sent.append(json.loads(text))
 
+    ctx.router.register_client(client.client_id, send)
+
+    await ctx.holder.ensure_open()
+
+    # Generous open budget: the user may still have to load the extension.
     assert opened == [60.0]
+    assert relay.handler is not None
     assert state.upstream_phase == UpstreamPhase.CONNECTED
-    assert state.upstream_ws_url == "ext://ready"
-    assert router.drained == 1
-    assert [msg["method"] for _, msg in router.sent] == [
+    ws_url = "ws://127.0.0.1:19989/__extension_relay__"
+    assert state.upstream_ws_url == ws_url
+    assert [msg["method"] for msg in sent] == [
         "BrowserwrightDaemon.upstreamConnecting",
         "BrowserwrightDaemon.upstreamReady",
     ]
-    assert router.sent[0] == (
-        client.client_id,
-        {"method": "BrowserwrightDaemon.upstreamConnecting", "params": {"backend": "extension"}},
-    )
-    assert router.sent[1][1]["params"] == {"backend": "extension", "ws_url": "ext://ready"}
-    assert router.upstream is holder.upstream
+    assert sent[0]["params"] == {"backend": "extension"}
+    assert sent[1]["params"] == {"backend": "extension", "ws_url": ws_url}
+    assert ctx.router.upstream is ctx.upstream
 
 
 @pytest.mark.asyncio
@@ -322,28 +371,33 @@ async def test_cdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
         launched.append({"profile": profile, "persistent": persistent, "port": port, "timeout": timeout})
         return {"extras": {"pid": 111, "profile_path": "/tmp/profile"}}
 
+    async def fail_resolve(_cfg):
+        raise Unavailable("not listening yet")
+
     monkeypatch.setattr("browserwright.daemon.launch_chrome.launch_chrome", fake_launch_chrome)
-    holder = listener_mod._UpstreamHolder(DaemonState("cdp"), _Router(), cfg, session_id="abc")
-    await holder._launch_cdp_chrome(cfg)
+    monkeypatch.setattr("browserwright.daemon.resolver.resolve", fail_resolve)
+    up = CdpUpstream(_noop_frame, _noop_frame, cfg=cfg, session_id="abc",
+                     owns_browser=True)
+    with pytest.raises(Unavailable):
+        await up.open()
+    pinned = up.cfg.backends.cdp.port
+    assert pinned
     assert launched == [
-        {"profile": "bs-sabc", "persistent": True, "port": holder.cdp_port, "timeout": 30.0}
+        {"profile": "bs-sabc", "persistent": True, "port": pinned, "timeout": 30.0}
     ]
-    assert holder.cdp_pid == 111
-    assert holder.cdp_profile_dir == "/tmp/profile"
-    assert holder._cfg.backends.cdp.port == holder.cdp_port
+    assert up.browser_pid == 111
 
     killed: list[tuple[int, int]] = []
-    monkeypatch.setattr(listener_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
-    holder._kill_cdp_chrome()
-    assert holder.cdp_pid is None
+    monkeypatch.setattr(upstream_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    await up.close()
+    assert up.browser_pid is None
     assert killed == [(111, listener_mod.signal.SIGTERM)]
 
     state = DaemonState("cdp")
     await state.set_connected("ws://cdp")
     router = _Router()
     dropped: list[str] = []
-    router.daemon = SimpleNamespace(drop_cdp_context=lambda sid: dropped.append(sid))
-    closing_holder = listener_mod._UpstreamHolder(state, router, Config(backend="cdp"), session_id="abc")
+
     class ClosingUpstream:
         is_open = True
 
@@ -354,10 +408,11 @@ async def test_cdp_launch_kill_and_upstream_closed_drop_context(monkeypatch):
             if bound_router.upstream is self:
                 bound_router.upstream = None
 
-    closing_holder.upstream = ClosingUpstream()
+    closing_holder = UpstreamHolder(state, router, lambda _h: ClosingUpstream())
+    closing_holder.on_upstream_lost = lambda: dropped.append("abc")
     router.upstream = closing_holder.upstream
 
-    await closing_holder._on_upstream_closed("upstream-eof")
+    await closing_holder.on_upstream_closed("upstream-eof")
 
     assert dropped == ["abc"]
     assert state.upstream_phase == UpstreamPhase.DISCONNECTED
@@ -370,45 +425,33 @@ async def test_cdp_attach_session_ensure_open_does_not_launch(monkeypatch):
     cfg.backends.cdp.port = 9444
     state = DaemonState("cdp")
     router = _Router()
-    holder = listener_mod._UpstreamHolder(state, router, cfg, session_id="attach")
-    holder.cdp_owns_browser = False
     launched: list[str] = []
 
-    async def fake_launch(_cfg):
+    async def fake_launch(*_a, **_kw):
         launched.append("launch")
 
     async def fake_resolve(_cfg):
         assert _cfg.backends.cdp.port == 9444
         return SimpleNamespace(ws_url="ws://127.0.0.1:9444/devtools/browser/x")
 
-    class FakeConn:
-        is_open = True
+    async def fake_connect(url, **_kw):
+        assert url == "ws://127.0.0.1:9444/devtools/browser/x"
+        return _AnsweringWS()
 
-        def __init__(self, *, on_frame, on_close, state=None,
-                     on_end_session=None):
-            self.send_command = self._send_command
+    monkeypatch.setattr("browserwright.daemon.launch_chrome.launch_chrome", fake_launch)
+    monkeypatch.setattr("browserwright.daemon.resolver.resolve", fake_resolve)
+    monkeypatch.setattr(upstream_mod.websockets, "connect", fake_connect)
+    holder = UpstreamHolder(state, router, lambda h: CdpUpstream(
+        router.forward_from_upstream, h.on_upstream_closed, state=state,
+        cfg=cfg, session_id="attach", owns_browser=False))
 
-        async def open(self, ws_url, **kwargs):
-            assert ws_url == "ws://127.0.0.1:9444/devtools/browser/x"
+    try:
+        await holder.ensure_open()
 
-        async def _send_command(self, method, params):
-            return {}
-
-        def attach(self, bound_router):
-            bound_router.upstream = self
-
-        def detach(self, bound_router):
-            if bound_router.upstream is self:
-                bound_router.upstream = None
-
-    monkeypatch.setattr(holder, "_launch_cdp_chrome", fake_launch)
-    monkeypatch.setattr(listener_mod, "resolve", fake_resolve)
-    monkeypatch.setattr(listener_mod, "CdpUpstream", FakeConn)
-
-    await holder.ensure_open()
-
-    assert launched == []
-    assert state.upstream_phase == UpstreamPhase.CONNECTED
+        assert launched == []
+        assert state.upstream_phase == UpstreamPhase.CONNECTED
+    finally:
+        await holder.trigger_close("daemon_shutdown")
 
 
 @pytest.mark.asyncio

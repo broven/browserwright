@@ -14,17 +14,15 @@ joins it and returns the FINAL result, so the caller can never time out
 mid-teardown.
 
 These tests use the REAL client (`_rpc.call`), the REAL verb handler
-(`Router._handle_end_session`), and the REAL per-session lifecycle lock
-(`ExecutorRegistry`) over an in-process unix-socket ws — the fakes are limited
-to the upstream adapter (slow tab close) and a daemon shim carrying only
-`executors`.
+(`Router._handle_end_session`), the REAL `Daemon` (termination bookkeeping and
+`end_workspace`) and the REAL per-session lifecycle lock (`ExecutorRegistry`)
+over an in-process ws — the only fake is the upstream adapter (slow tab close).
 """
 from __future__ import annotations
 
 import asyncio
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import parse_qs
 
 import pytest
@@ -32,8 +30,9 @@ import websockets
 
 from browserwright.daemon import _rpc
 from browserwright.daemon.config import Config
-from browserwright.daemon.server.proxy import Router
-from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+from browserwright.daemon.server.daemon import Daemon
+from browserwright.daemon.server.state import UpstreamPhase
+from browserwright.daemon.server.upstream_context import build_context
 
 #: Relative mismatch only: the real CLI end-session timeout is 10.0s and the
 #: daemon teardown budget is 8.0s + reap (worst case > 10s). Scaling both down
@@ -52,8 +51,15 @@ class SlowExtensionUpstream:
         self.started = asyncio.Event()
         self.done = asyncio.Event()
 
-    async def end_session_before(
-        self, session_id: str, group_id: int | None = None, *, deadline: float,
+    def bind_recovery(self, machine, executor_alive) -> None:
+        return None
+
+    def detach(self, router) -> None:
+        if router.upstream is self:
+            router.upstream = None
+
+    async def end_session(
+        self, session_id: str, *, deadline: float | None = None,
     ) -> dict:
         self.started.set()
         try:
@@ -107,18 +113,21 @@ async def test_gh32_slow_teardown_never_outlives_the_caller(
     # it.
     runtime = Path(tempfile.mkdtemp(prefix="bw-gh32-", dir="/tmp"))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
     monkeypatch.setattr(
         session_registry, "get",
         lambda sid: {"id": sid, "backend": "extension", "name": "repro"},
     )
 
-    state = DaemonState(backend_name="extension")
-    state.upstream_phase = UpstreamPhase.CONNECTED
-    router = Router(state)
+    shared = build_context(backend="extension", cfg=Config(backend="extension"))
     upstream = SlowExtensionUpstream()
+    shared.holder.upstream = upstream
+    state, router = shared.state, shared.router
+    state.upstream_phase = UpstreamPhase.CONNECTED
     router.upstream = upstream
-    registry = ExecutorRegistry()
-    router.daemon = SimpleNamespace(executors=registry)
+    daemon = Daemon(cfg=Config(backend="extension"), shared_context=shared)
+    registry = daemon.executors
+    assert isinstance(registry, ExecutorRegistry)
 
     # ADR-0011: the control plane is a ws path on the one TCP endpoint, so the
     # stand-in server is a TCP one on an ephemeral port, pinned for the client
@@ -185,22 +194,24 @@ async def test_gh32_slow_teardown_never_outlives_the_caller(
 
 @pytest.mark.asyncio
 async def test_gh32_failed_end_call_keeps_ledger_row_although_daemon_went_terminal(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, make_verdict,
 ):
     """Layer-2 consequence (unchanged by the fix, locked as a reminder): a
     `session end` that cannot confirm completion keeps the ledger row — while
     the daemon underneath may already be terminal, so ordinary operations on
     that row are refused. The fix makes the confirm path reliable (initiate +
     join), so this only remains reachable via a genuinely unreachable daemon."""
-    from browserwright import session_create, session_registry as reg
+    from browserwright import daemon_lifecycle, session_create
+    from browserwright import session_registry as reg
     from browserwright.errors import DaemonUnavailable
 
     monkeypatch.setenv("BS_HOME", str(tmp_path))
     # Avoid the auto-start path: the daemon "is running" but its CLI exits 3
     # (main() maps the client-side TimeoutError to exit code 3 — see
     # `daemon/cli.py` main(): `except Exception` → 3).
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: True)
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: 3)
+    monkeypatch.setattr(daemon_lifecycle, "diagnose", lambda **kw: make_verdict())
+    monkeypatch.setattr(daemon_lifecycle, "run_verb",
+                        lambda args, **kwargs: daemon_lifecycle.VerbResult(3))
 
     sid = reg.allocate(backend="extension", owner="attach", name="repro")
     record = reg.get(sid)

@@ -520,7 +520,7 @@ class PlaywrightFacade:
         for the extension backend)."""
         relay = None
         if ctx is not None:
-            relay = getattr(ctx.holder, "relay", None)
+            relay = ctx.upstream.relay
         if relay is None and self._relay_getter is not None:
             relay = self._relay_getter()
         if relay is None:
@@ -645,12 +645,14 @@ class PlaywrightFacade:
     async def _resolve_cdp_ws(self, ctx: UpstreamContext | None = None) -> str:
         """Resolve the upstream Chrome CDP ws URL via the daemon resolver.
 
-        Reads the *holder's* cfg, not the daemon-wide one. That is the whole
+        Reads the *adapter's* cfg, not the daemon-wide one. That is the whole
         channel by which a per-session endpoint reaches the facade: the port or
         URL from the session's ledger record was pinned into that Config by
-        `Daemon._cdp_cfg_for`. Anything that moves the endpoint out of the
-        Config has to teach this function a second way to find it."""
-        cfg = getattr(ctx.holder, "_cfg", self._cfg) if ctx is not None else self._cfg
+        `upstream_context.cdp_cfg_for`, and a lazily allocated `--create` port
+        is pinned back into it by the adapter's launch. Anything that moves
+        the endpoint out of the Config has to teach this function a second way
+        to find it."""
+        cfg = ctx.upstream.cfg if ctx is not None else self._cfg
         rr = await resolve_upstream(cfg)
         return rr.ws_url
 

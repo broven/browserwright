@@ -102,7 +102,7 @@ def test_real_503_server_end_to_end_names_the_responder_without_banned_words(
     503 on the resolved endpoint produces a fix naming a non-browserwright
     responder, with no banned word. Restores the real probe for this test."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
     from browserwright.daemon._ipc import probe_endpoint_sync
 
     monkeypatch.setattr(du, "probe", probe_endpoint_sync)
@@ -117,7 +117,7 @@ def test_real_503_server_end_to_end_names_the_responder_without_banned_words(
     dead.close()
     monkeypatch.setattr(du, "DEFAULT_DAEMON_URL", f"http://127.0.0.1:{dead_port}")
 
-    fix = du.local_unreachable_fix(_endpoint(f"http://{host}:{port}", "default"))
+    fix = du.unreachable_fix(_endpoint(f"http://{host}:{port}", "default"))
     t.join(3.0)
     assert "something other than browserwright" in fix
     assert "503" in fix and "Surge/5.0" in fix
@@ -138,7 +138,7 @@ def test_refused_with_a_state_file_naming_another_host_reports_both_probes(
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     (tmp_path / "browserwright-daemon.endpoint").write_text(
         json.dumps({"url": "http://100.72.20.32:19990", "pid": 31305}))
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
 
     def fake_probe(host, port, timeout=1.5):
         if host == "100.72.20.32":
@@ -148,7 +148,7 @@ def test_refused_with_a_state_file_naming_another_host_reports_both_probes(
                              detail="Connection refused")
 
     monkeypatch.setattr(du, "probe", fake_probe)
-    fix = du.local_unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
+    fix = du.unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
     assert "nothing is listening at 127.0.0.1:19990" in fix
     assert "a browserwright daemon answers at 100.72.20.32:19990" in fix
     assert "export BW_DAEMON_URL=http://100.72.20.32:19990" in fix
@@ -157,17 +157,17 @@ def test_refused_with_a_state_file_naming_another_host_reports_both_probes(
 
 def test_transient_failure_says_retry_and_version_skew_says_stale(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
     from browserwright.version import package_version
 
     monkeypatch.setattr(du, "probe", lambda h, p, timeout=1.5: EndpointProbe(
         kind="ours", host=h, port=p, pid=1, version=package_version()))
-    fix = du.local_unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
+    fix = du.unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
     assert "transient" in fix and "Retry" in fix
 
     monkeypatch.setattr(du, "probe", lambda h, p, timeout=1.5: EndpointProbe(
         kind="ours", host=h, port=p, pid=1, version="0.0.1"))
-    fix = du.local_unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
+    fix = du.unreachable_fix(_endpoint("http://127.0.0.1:19990", "default"))
     assert "stale" in fix and "version check" in fix
     assert "restart" not in fix
 
@@ -177,7 +177,7 @@ def test_session_unreachable_carries_the_diagnosis(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.delenv("BW_DAEMON_URL", raising=False)
     monkeypatch.delenv("BD_CONFIG", raising=False)
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
 
     monkeypatch.setattr(du, "probe", lambda h, p, timeout=1.5: EndpointProbe(
         kind="foreign", host=h, port=p, status_line="HTTP/1.1 503 Service Unavailable",
@@ -193,12 +193,10 @@ def test_session_unreachable_carries_the_diagnosis(monkeypatch, tmp_path):
 
 def test_doctor_endpoint_check_uses_the_diagnosis(monkeypatch):
     from browserwright import health
-    import browserwright.daemon_url as du
+    import browserwright.daemon_lifecycle as du
 
     monkeypatch.setattr(du, "daemon_endpoint",
                         lambda **_k: _endpoint("http://127.0.0.1:19990", "default"))
-    monkeypatch.setattr(health, "_probe_tcp",
-                        lambda host, port, timeout=1.5: "Connection refused")
     monkeypatch.setattr(du, "probe", lambda h, p, timeout=1.5: EndpointProbe(
         kind="foreign", host=h, port=p, status_line="HTTP/1.1 503 Service Unavailable",
         server="Surge/5.0"))
@@ -226,6 +224,7 @@ def _agent_visible_sources() -> list[Path]:
     return [root / "errors.py", root / "health.py", root / "cdp.py",
             root / "session_create.py", root / "daemon_url.py",
             root / "session.py", root / "mode_b_client.py",
+            root / "daemon_lifecycle.py",
             root / "_executor" / "client.py",
             root / "_executor" / "process.py"]
 
@@ -288,8 +287,6 @@ def test_no_session_error_shows_reuse():
 @pytest.fixture
 def ledger_home(monkeypatch, tmp_path):
     monkeypatch.setenv("BS_HOME", str(tmp_path / "home"))
-    from browserwright import session_create
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
     return tmp_path
 
 
@@ -297,10 +294,10 @@ def test_session_new_reuse_returns_the_existing_id(ledger_home):
     from browserwright import session_create
 
     a = session_create.new(backend="extension", name="hn", reuse=True)
-    assert session_create.last_new_reused is None
+    assert a.reused is False
     b = session_create.new(backend="extension", name="hn", reuse=True)
-    assert b == a
-    assert session_create.last_new_reused == a
+    assert b.id == a.id
+    assert b.reused is True
 
 
 def test_session_new_without_reuse_allocates_every_time(ledger_home):
@@ -308,29 +305,30 @@ def test_session_new_without_reuse_allocates_every_time(ledger_home):
 
     a = session_create.new(backend="extension", name="hn")
     b = session_create.new(backend="extension", name="hn")
-    assert a != b
-    assert session_create.last_new_reused is None
+    assert a.id != b.id
+    assert not a.reused and not b.reused
 
 
 def test_session_new_reuse_matches_backend_and_name_only(ledger_home):
     from browserwright import session_create
 
-    ext = session_create.new(backend="extension", name="hn")
-    other = session_create.new(backend="extension", name="other", reuse=True)
+    ext = session_create.new(backend="extension", name="hn").id
+    other = session_create.new(backend="extension", name="other", reuse=True).id
     assert other != ext
-    cdp = session_create.new(backend="cdp", name="hn", create=True, reuse=True)
+    cdp = session_create.new(backend="cdp", name="hn", create=True, reuse=True).id
     assert cdp != ext
     # cdp: create and attach are different sessions even under one name
-    attached = session_create.new(backend="cdp", name="hn", attach=9222, reuse=True)
+    attached = session_create.new(backend="cdp", name="hn", attach=9222, reuse=True).id
     assert attached != cdp
-    assert session_create.new(backend="cdp", name="hn", create=True, reuse=True) == cdp
+    assert session_create.new(backend="cdp", name="hn", create=True,
+                              reuse=True).id == cdp
 
 
 def test_session_new_reuse_skips_a_session_that_needs_human(ledger_home):
     from browserwright import session_create
     from browserwright import session_registry as reg
 
-    blocked = session_create.new(backend="extension", name="hn")
+    blocked = session_create.new(backend="extension", name="hn").id
     reg.update(blocked, recovery={
         "state": "needs-human",
         "since": 1,
@@ -340,8 +338,8 @@ def test_session_new_reuse_skips_a_session_that_needs_human(ledger_home):
     replacement = session_create.new(
         backend="extension", name="hn", reuse=True)
 
-    assert replacement != blocked
-    assert session_create.last_new_reused is None
+    assert replacement.id != blocked
+    assert replacement.reused is False
 
 
 @pytest.mark.parametrize("state", [
@@ -355,11 +353,11 @@ def test_session_new_reuse_accepts_recoverable_states(ledger_home, state):
     from browserwright import session_create
     from browserwright import session_registry as reg
 
-    existing = session_create.new(backend="extension", name="hn")
+    existing = session_create.new(backend="extension", name="hn").id
     reg.update(existing, recovery={"state": state, "since": 1, "reason": ""})
 
     assert session_create.new(
-        backend="extension", name="hn", reuse=True) == existing
+        backend="extension", name="hn", reuse=True).id == existing
 
 
 def test_daemon_log_lines_share_the_iso_timestamp_shape(monkeypatch, tmp_path, capsys):

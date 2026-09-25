@@ -84,7 +84,9 @@ class _Harness:
 
     async def _setup(self):
         await asyncio.start_unix_server(self._executor, self.sock)
-        daemon = type("_D", (), {"executors": _Registry(self.sock)})()
+        registry = _Registry(self.sock)
+        daemon = type("_D", (), {"executors": registry,
+                                 "ensure_executor": staticmethod(registry.ensure)})()
         self._endpoint = PlaywrightFacade(
             cfg=Config(), port=0, host="127.0.0.1", daemon=daemon)
         self.port = await self._endpoint.start()

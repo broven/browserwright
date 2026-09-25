@@ -9,27 +9,19 @@ propagating verbatim with a non-zero exit code.
 from __future__ import annotations
 
 import json
-import subprocess
 
 import pytest
 
-from browserwright import cli, session_create
+from browserwright import cli, daemon_lifecycle
 from browserwright import session_registry as reg
-
-
-@pytest.fixture(autouse=True)
-def _no_daemon(monkeypatch):
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
 
 
 @pytest.fixture
 def _fake_daemon_cli(monkeypatch):
     def _install(returncode=0, stdout="", stderr=""):
-        proc = subprocess.CompletedProcess(
-            ["browserwright-daemon", "attach-active"], returncode,
-            stdout=stdout, stderr=stderr)
-        monkeypatch.setattr(session_create.subprocess, "run",
-                            lambda *a, **k: proc)
+        proc = daemon_lifecycle.VerbResult(returncode, stdout, stderr)
+        monkeypatch.setattr(daemon_lifecycle, "run_verb",
+                            lambda args, **k: proc)
     return _install
 
 

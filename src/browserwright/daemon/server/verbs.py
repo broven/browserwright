@@ -7,8 +7,6 @@ belongs to ``CdpUpstream``, not to this dispatcher.
 """
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 import secrets
@@ -16,7 +14,6 @@ import time
 from functools import partial
 from typing import Any, Awaitable, Callable, Protocol
 
-from ... import session_registry
 from .extension_upstream import session_group_title
 from .state import ClientState, UpstreamPhase
 
@@ -28,19 +25,6 @@ logger = logging.getLogger(__name__)
 #: the original #32 symptom. Note this deadline is computed BEFORE the executor
 #: reap, which can spend ~4s of it.
 _END_SESSION_BUDGET_S = 60.0
-
-
-def _teardown_budget_result(backend: str) -> dict:
-    return {
-        "ok": False,
-        "partial": True,
-        "timedOut": True,
-        "closed": [],
-        "failed": [],
-        "unknown": ["workspace"],
-        "kept": [],
-        "backend": backend,
-    }
 
 
 class Handler(Protocol):
@@ -421,16 +405,20 @@ class SessionVerbsMixin:
     async def _handle_recover_session(
         self, client: ClientState, params: dict, req_id: int | None,
     ) -> None:
-        """Session-reconnect-recovery.
+        """Session-reconnect-recovery: the tab-level entry to the drivable
+        path (ADR-0013 rule 1).
 
         After a reconnect / daemon restart the in-memory session→tab bindings
-        are gone, but the Chrome tab group id persisted in the session ledger
-        may still identify a live group.
-        Recover the tabs from that group, re-attach, and register a regular
-        client-side binding for the representative tab so subsequent CDP
-        commands route through the normal sessionId translation path (mirrors
-        openBackgroundTab). The adapter decides whether recovery means durable
-        group reconstruction or raw-CDP current-page rebinding."""
+        are gone. This verb is what the client's bind
+        (``session_runtime.ensure_session_target``) calls to get them back, so
+        it runs the same path every other entry runs —
+        ``Daemon.ensure_session_drivable(force=True)`` — and registers a
+        regular client-side binding for the representative tab it returns, so
+        subsequent CDP commands route through the normal sessionId translation
+        path (mirrors openBackgroundTab). The adapter decides what converging
+        means: durable group reconstruction (or a fresh tab in the session's
+        group) on extension, the current live page on raw CDP. It never spawns
+        an executor — its caller usually IS the executor, binding."""
         # ADR-0009: recovery finds the group by the session's title, so there
         # is no id to pass. Reject a lingering `groupId` loudly rather than
         # ignoring it — a client still sending one is working from a model of
@@ -447,13 +435,26 @@ class SessionVerbsMixin:
             client, req_id, "BrowserwrightDaemon.recoverSession", params)
         if session_id is None:
             return
-        result = await self._invoke_upstream(
-            client, req_id, "recoverSession failed",
-            lambda upstream: upstream.recover(
-                session_id,
-            ),
-            value_error_code=-32602)
-        if result is None:
+        ensure_drivable = getattr(self.daemon, "ensure_session_drivable", None)
+        if not callable(ensure_drivable):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                "recoverSession unavailable: router is not attached to a "
+                "daemon"))
+            return
+        try:
+            result = await ensure_drivable(session_id, force=True)
+        except ValueError as e:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32602, f"recoverSession failed: {e}"))
+            return
+        except Exception as e:  # noqa: BLE001 - surface adapter failures
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, f"recoverSession failed: {e!r}"))
+            return
+        if not isinstance(result, dict):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603, "recoverSession returned malformed result"))
             return
         await self._register_and_respond(
             client, req_id, result,
@@ -474,11 +475,11 @@ class SessionVerbsMixin:
         in-flight teardown and returns the FINAL result, so the caller can
         never time out mid-teardown and never mistakes slow for hung.
 
-        extension: close every tab in the session's adapter-owned tab group.
-
-        cdp: the per-session context owns a dedicated Chrome. Close that Chrome
-        (SIGTERM the launched pid), close the upstream, and drop the context —
-        the uniform, non-`-32601` success shape (docs §RPCs)."""
+        The workspace teardown itself is one call — ``Daemon.end_workspace``
+        — and the session's adapter applies the owner rule there: extension
+        closes the session's tab group, a create-owned cdp session's Chrome is
+        killed, an attach-owned browser is left running. Every backend answers
+        the same uniform, non-`-32601` result shape (docs §RPCs)."""
         session = params.get("session")
         if not isinstance(session, str) or not session:
             await self._send_to_client(client.client_id, _error_response(
@@ -491,7 +492,11 @@ class SessionVerbsMixin:
             return
 
         daemon = self.daemon
-        registry = getattr(daemon, "executors", None) if daemon is not None else None
+        if daemon is None:
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                "endSession unavailable: router is not attached to a daemon"))
+            return
 
         # Adapters stop cooperatively at this deadline, after committing every
         # confirmed mutation. The registry deliberately never hard-cancels the
@@ -499,152 +504,47 @@ class SessionVerbsMixin:
         teardown_deadline = time.monotonic() + _END_SESSION_BUDGET_S - 0.5
 
         async def teardown_workspace() -> dict:
-            # This readiness + teardown runs under ExecutorRegistry's lifecycle
-            # gate in production. A queued ensure therefore cannot reopen the
-            # workspace between executor reap and terminal teardown.
-            record = session_registry.get(session)
-            record_backend = (
-                record.get("backend") if isinstance(record, dict) else None)
-            attach_owned_raw = (
-                isinstance(record, dict)
-                and record.get("owner") == "attach"
-                and record_backend == "cdp"
-            )
-            if attach_owned_raw and self.upstream is None:
-                # Every raw-CDP session has a per-session context now, so there
-                # is no longer a branch where teardown is skipped. `env` used to
-                # fall through here with `ended = None` — it routed to the
-                # shared context and had nothing of its own to drop — which also
-                # meant it could never report failure. It can now, and that is
-                # honest: a context that fails to close is a real partial.
-                ended: bool | None = False
-                teardown_cdp = getattr(daemon, "teardown_cdp_context", None)
-                if callable(teardown_cdp):
-                    ended = await teardown_cdp(
-                        session, deadline=teardown_deadline)
-                ok = ended is not False
-                return {
-                    "ok": ok,
-                    "partial": not ok,
-                    "timedOut": (
-                        not ok and time.monotonic() >= teardown_deadline),
-                    "closed": [],
-                    "failed": [] if ok else ["workspace"],
-                    "unknown": [] if ok else ["workspace"],
-                    "kept": [],
-                    "backend": record_backend,
-                }
-            if (self.upstream is None and self._ensure_upstream is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                remaining = max(0.0, teardown_deadline - time.monotonic())
-                if remaining <= 0:
-                    return _teardown_budget_result(self.state.backend_name)
-                try:
-                    await asyncio.wait_for(
-                        self._ensure_upstream(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    # ensure_open may have been cancelled *after* publishing an
-                    # adapter — assigned and attached — but before
-                    # set_connected. Keying the reset on `upstream is None`
-                    # left exactly that case in CONNECTING permanently, where
-                    # _gate_upstream_ready neither forwards frames nor starts
-                    # another open, so client traffic piles up unanswered in
-                    # the pre-open buffer. Reset whenever the open did not
-                    # finish, and take the half-published adapter down with it.
-                    # No workspace mutation follows this result.
-                    if self.state.upstream_phase != UpstreamPhase.CONNECTED:
-                        partial = self.upstream
-                        self.upstream = None
-                        if partial is not None:
-                            with contextlib.suppress(Exception):
-                                partial.detach(self)
-                            with contextlib.suppress(Exception):
-                                await partial.close(reason="open_timeout")
-                        await self.state.set_disconnected()
-                    return _teardown_budget_result(self.state.backend_name)
-            upstream = self.upstream
-            if upstream is None:
-                raise RuntimeError("upstream not attached")
-            # Declared on the protocol, so called directly — see the
-            # target_belongs_to_session note below on why probing is wrong.
-            return await upstream.end_session_before(
+            # Runs under ExecutorRegistry's lifecycle gate, so a queued ensure
+            # cannot reopen the workspace between executor reap and terminal
+            # teardown.
+            return await daemon.end_workspace(
                 session, deadline=teardown_deadline)
 
-        daemon_terminate = getattr(daemon, "terminate_session", None)
-        terminate = (
-            daemon_terminate if callable(daemon_terminate)
-            else getattr(registry, "terminate_session", None))
-        if callable(terminate):
-            try:
-                if callable(daemon_terminate):
-                    reap, result = await terminate(
-                        session, teardown_workspace,
-                        caller_token=client.connection_token,
-                        budget=_END_SESSION_BUDGET_S,
-                        # Issue #32: return at the initiate boundary. The
-                        # bounded fast phase (revoke + reap) completed; the
-                        # bounded workspace teardown continues daemon-side
-                        # and the caller polls/joins for the final result — a
-                        # slow teardown can no longer outlive this RPC.
-                        wait=False)
-                else:
-                    reap, result = await terminate(
-                        session, teardown_workspace,
-                        budget=_END_SESSION_BUDGET_S)
-                if reap.get("reaped") is not True:
-                    await self._send_to_client(
-                        client.client_id,
-                        _error_response(
-                            req_id, -32603,
-                            "endSession could not confirm executor death: "
-                            f"{reap!r}"),
-                    )
-                    return
-                if isinstance(result, dict):
-                    result.setdefault("backend", self.state.backend_name)
-            except Exception as e:  # noqa: BLE001 - executor kill is best-effort
-                await self._send_to_client(client.client_id, _error_response(
-                    req_id, -32603,
-                    f"endSession failed: {e!r}"))
-                return
-        else:
-            # Lightweight test doubles and old embedders retain the prior
-            # sequence; the real daemon registry always takes the atomic path.
-            if registry is not None:
-                try:
-                    reap = await registry.kill_current_and_wait(session)
-                    if reap.get("reaped") is not True:
-                        await self._send_to_client(
-                            client.client_id,
-                            _error_response(
-                                req_id, -32603,
-                                "endSession could not confirm executor death: "
-                                f"{reap!r}"),
-                        )
-                        return
-                except Exception as e:  # noqa: BLE001
-                    await self._send_to_client(client.client_id, _error_response(
+        try:
+            reap, result = await daemon.terminate_session(
+                session, teardown_workspace,
+                caller_token=client.connection_token,
+                budget=_END_SESSION_BUDGET_S,
+                # Issue #32: return at the initiate boundary. The bounded fast
+                # phase (revoke + reap) completed; the bounded workspace
+                # teardown continues daemon-side and the caller polls/joins for
+                # the final result — a slow teardown can no longer outlive
+                # this RPC.
+                wait=False)
+            if reap.get("reaped") is not True:
+                await self._send_to_client(
+                    client.client_id,
+                    _error_response(
                         req_id, -32603,
-                        f"endSession executor reap failed: {e!r}"))
-                    return
-            result = await self._invoke_upstream(
-                client, req_id, "endSession failed",
-                lambda upstream: upstream.end_session(session))
-            if result is None:
+                        "endSession could not confirm executor death: "
+                        f"{reap!r}"),
+                )
                 return
+            if isinstance(result, dict):
+                result.setdefault("backend", self.state.backend_name)
+        except Exception as e:  # noqa: BLE001 - executor kill is best-effort
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                f"endSession failed: {e!r}"))
+            return
         if (isinstance(result, dict) and result.get("ok") is True
-                and not result.get("initiated") and daemon is not None):
-            machine = getattr(daemon, "recovery", None)
-            if machine is not None:
-                from .session_state import SESSION_ENDED
-                machine.note(session, SESSION_ENDED)
+                and not result.get("initiated")):
+            from .session_state import SESSION_ENDED
+            daemon.recovery.note(session, SESSION_ENDED)
         await self._send_to_client(client.client_id, _result_response(req_id, result))
         if (isinstance(result, dict) and result.get("ok") is True
-                and client.connection_token is not None
-                and daemon is not None):
-            revoke = getattr(daemon, "revoke_session_lease", None)
-            if callable(revoke):
-                await revoke(client.connection_token)
+                and client.connection_token is not None):
+            await daemon.revoke_session_lease(client.connection_token)
 
     async def _handle_ensure_executor(
         self, client: ClientState, params: dict, req_id: int | None,
@@ -667,54 +567,23 @@ class SessionVerbsMixin:
         if session is None:
             return
         daemon = self.daemon
-        registry = getattr(daemon, "executors", None) if daemon is not None else None
-        if registry is None:
+        ensure_executor = getattr(daemon, "ensure_executor", None)
+        if not callable(ensure_executor):
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603,
                 "ensureExecutor unavailable: daemon has no executor registry"))
             return
-        # Failure #4 fix: ensure the session's UPSTREAM (cdp Chrome) is launched
-        # + ready BEFORE we spawn the executor. The executor's cold-start
-        # `connect_over_cdp(facade)` resolves the cdp Chrome's DYNAMIC port,
-        # which is only pinned once `_ensure_upstream` (→ `_launch_cdp_chrome`)
-        # has run. Pre-restart, ordinary client frames launched Chrome before
-        # the executor connected; post-restart the executor path is hit FIRST,
-        # so without this the facade probes the stale default port (9222), 404s,
-        # and the executor exits during cold-start. Mirror the other verbs'
-        # lazy-open (openBackgroundTab / closeTab). Best-effort + bounded: a
-        # launch failure surfaces as a proper error envelope, never a crash.
-        async def preflight() -> None:
-            if (self._prepare_executor is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                try:
-                    await self._prepare_executor(session)
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"upstream readiness: {e}") from e
-            if (self._ensure_upstream is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                try:
-                    await self._ensure_upstream()
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(f"upstream open: {e!r}") from e
-            context_for = getattr(daemon, "context_for_required", None)
-            if callable(context_for):
-                holder = context_for(session).holder
-                converge = getattr(holder, "converge_session_tab", None)
-                if callable(converge):
-                    await converge(session)
+        # The drivable path runs BEFORE the spawn (failure #4): an executor's
+        # cold-start `connect_over_cdp` resolves a cdp Chrome's dynamic port,
+        # which exists only once the adapter has launched it. A readiness or
+        # open failure surfaces as a proper error envelope, never a crash.
         try:
-            ensure_with_preflight = getattr(
-                registry, "ensure_with_preflight", None)
-            if callable(ensure_with_preflight):
-                await ensure_with_preflight(session, preflight)
-            else:
-                await preflight()
-                await registry.ensure(session)
+            await ensure_executor(session)
         except Exception as e:  # noqa: BLE001
             await self._send_to_client(client.client_id, _error_response(
                 req_id, -32603, f"ensureExecutor failed: {e!r}"))
             return
+        registry = getattr(daemon, "executors", None)
         result = {"ready": True}
         get_handle = getattr(registry, "get", None)
         handle = get_handle(session) if callable(get_handle) else None
@@ -730,14 +599,21 @@ class SessionVerbsMixin:
         """ADR-0013 rule 2: the one recovery verb, for ONE session.
 
         Escalation ladder, each rung bounded, stops at the first rung that
-        leaves the session drivable:
+        leaves the session ``healthy``. It never asks which backend it is
+        recovering: what a rung means is the adapter's business.
 
-          1. extension backend only: wait for the extension to (re)connect
-             within the relay's reconnect window;
-          2. re-attach the session's tab group by title (`recover_session`);
-             "no recoverable tabs" is NOT a failure — the next call opens one;
-          3. keep a live executor (its `state` survives), otherwise cold-start
-             one — a failure here is what `needs-human` means.
+          1. ``browser`` — ``Upstream.reconnect``: wait for the daemon↔browser
+             connection within the backend's reconnect window (the extension
+             relay; nothing to wait for on raw CDP);
+          2. ``tab`` — when the machine says ``tab-gone`` (or knows nothing):
+             the forced drivable path, ``Daemon.ensure_session_drivable``;
+          3. ``executor`` — keep a live executor (its `state` survives),
+             otherwise ``Daemon.ensure_executor``;
+          4. ``binding`` — when the machine is still not ``healthy``: one
+             no-op round trip through the executor, whose reported
+             ``recovery_event`` settles the state.
+
+        Any failing rung ends the ladder in ``needs-human``.
 
         Never touches another session; never restarts the daemon (the client
         side of `browserwright recover` owns the daemon self-check, because a
@@ -747,173 +623,108 @@ class SessionVerbsMixin:
             client, req_id, "BrowserwrightDaemon.recover", params)
         if session is None:
             return
-        from .session_state import (EXECUTOR_READY, EXTENSION_DISCONNECTED,
-                                    EXTENSION_HELLO, HEALTHY, NEEDS_HUMAN,
+        from .exec_relay import probe_executor_binding
+        from .session_state import (EXECUTOR_READY, HEALTHY, NEEDS_HUMAN,
                                     RECOVERY_FAILED, TAB_GONE,
-                                    TAB_RECOVER_FAILED, TAB_RECOVERED)
+                                    TAB_RECOVER_FAILED)
         daemon = self.daemon
-        machine = getattr(daemon, "recovery", None)
-        registry = getattr(daemon, "executors", None) if daemon is not None else None
+        if not callable(getattr(daemon, "ensure_executor", None)):
+            await self._send_to_client(client.client_id, _error_response(
+                req_id, -32603,
+                "recover unavailable: router is not attached to a daemon"))
+            return
+        machine = daemon.recovery
+        registry = daemon.executors
+        upstream = daemon.context_for_required(session).upstream
         steps: list[dict] = []
-        reason = ""
 
         def note(event: str, **kw) -> None:
-            if machine is not None:
-                try:
-                    machine.note(session, event, **kw)
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                machine.note(session, event, **kw)
+            except Exception:  # noqa: BLE001
+                pass
 
-        rec = session_registry.get(session) or {}
-        is_extension = rec.get("backend") == "extension"
-        context_for = getattr(daemon, "context_for_required", None)
-        context = context_for(session) if callable(context_for) else getattr(
-            daemon, "shared_context", None)
-        holder = getattr(context, "holder", None)
-        relay = getattr(holder, "relay", None)
-
-        def current_state() -> str | None:
-            return machine.state_of(session) if machine is not None else None
+        def healthy() -> bool:
+            return machine.state_of(session) == HEALTHY
 
         async def finish(state: str, why: str = "") -> None:
             await self._send_to_client(client.client_id, _result_response(
                 req_id, {"sessionId": session, "state": state,
                          "steps": steps, "reason": why}))
 
+        async def fail(rung: str, reason: str, *, tab: bool = False) -> None:
+            steps.append({"rung": rung, "ok": False, "detail": reason})
+            if tab:
+                note(TAB_RECOVER_FAILED, reason=reason)
+            note(RECOVERY_FAILED, reason=reason)
+            await finish(NEEDS_HUMAN, reason)
+
         # State-directed ladder: a healthy session is already converged.  In
         # particular, do not force a tab re-attach merely because a user asked
         # for a diagnosis.
-        if current_state() == HEALTHY:
+        if healthy():
             await finish(HEALTHY, "session is already healthy")
             return
 
-        # rung 1 — extension connectivity
-        if (is_extension and relay is not None
-                and (current_state() == EXTENSION_DISCONNECTED
-                     or not bool(getattr(relay, "is_ready", False)))):
-            ready = bool(getattr(relay, "is_ready", False))
-            if not ready:
-                from .relay import RECONNECT_WAIT_TIMEOUT
-                try:
-                    await relay.wait_ready(timeout=RECONNECT_WAIT_TIMEOUT)
-                    ready = True
-                except Exception:  # noqa: BLE001 - timeout
-                    ready = False
-            steps.append({"rung": "extension", "ok": ready,
-                          "detail": "extension connected" if ready else
-                          "no extension connected to the daemon within the "
-                          "reconnect window"})
-            if not ready:
-                reason = ("the Chrome extension is not connected: is Chrome "
-                          "running with the browserwright extension enabled? "
-                          "`browserwright doctor` shows the relay state")
-                note(RECOVERY_FAILED, reason=reason)
-                await finish(NEEDS_HUMAN, reason)
-                return
-            note(EXTENSION_HELLO, reason="extension connected during recover",
-                 generation=getattr(relay, "connection_generation", None))
-            if current_state() == HEALTHY:
+        # rung 1 — the daemon↔browser connection; the adapter knows what that
+        # means for its backend and how long its reconnect window is.
+        try:
+            detail = await upstream.reconnect(session)
+        except Exception as e:  # noqa: BLE001
+            await fail("browser", str(e)[:300])
+            return
+        if detail:
+            steps.append({"rung": "browser", "ok": True, "detail": detail})
+            if healthy():
                 await finish(HEALTHY)
                 return
 
-        # rung 2 — tab binding (extension sessions)
-        if is_extension and current_state() in (None, TAB_GONE):
+        # rung 2 — the session's tab, through the one drivable path.
+        if machine.state_of(session) in (None, TAB_GONE):
             try:
-                if self._ensure_upstream is not None:
-                    await self._ensure_upstream()
-                converge = getattr(holder, "converge_session_tab", None)
-                if callable(converge):
-                    await converge(session, force=True)
-                else:
-                    ext = getattr(holder, "_extension_adapter", None)
-                    try:
-                        await ext.recover_session(session)
-                    except Exception:
-                        await ext.open_background_tab(
-                            "about:blank", session_id=session, background=True)
-                    note(TAB_RECOVERED, reason="tab group re-attached by recover",
-                         executor_alive=(registry is not None and
-                                         registry.get(session) is not None and
-                                         registry.get(session).is_alive()))
-                steps.append({"rung": "tab", "ok": True,
-                              "detail": "session has a live tab"})
+                await daemon.ensure_session_drivable(session, force=True)
             except Exception as e:  # noqa: BLE001
-                reason = f"tab recovery failed: {str(e)[:200]}"
-                steps.append({"rung": "tab", "ok": False, "detail": reason})
-                note(TAB_RECOVER_FAILED, reason=reason)
-                note(RECOVERY_FAILED, reason=reason)
-                await finish(NEEDS_HUMAN, reason)
+                await fail("tab", f"tab recovery failed: {str(e)[:200]}",
+                           tab=True)
                 return
-            if current_state() == HEALTHY:
+            steps.append({"rung": "tab", "ok": True,
+                          "detail": "session has a live tab"})
+            if healthy():
                 await finish(HEALTHY)
                 return
 
-        # rung 3 — executor
-        if registry is not None:
-            handle = registry.get(session)
-            if handle is not None and handle.is_alive():
-                steps.append({"rung": "executor", "ok": True,
-                              "detail": "resident executor alive; its state is kept"})
-                note(EXECUTOR_READY, reason="resident executor verified alive",
-                     executor_alive=True)
-            else:
-                try:
-                    await registry.ensure_with_preflight(
-                        session, self._executor_preflight(session))
-                    steps.append({"rung": "executor", "ok": True,
-                                  "detail": "executor cold-started"})
-                except Exception as e:  # noqa: BLE001
-                    reason = f"executor could not be started: {e!r}"
-                    steps.append({"rung": "executor", "ok": False, "detail": reason})
-                    note(RECOVERY_FAILED, reason=reason)
-                    await finish(NEEDS_HUMAN, reason)
-                    return
-
-        # The cdp browser/tab is re-created or re-resolved by the replacement
-        # daemon.  Executor liveness alone cannot prove its Playwright binding;
-        # one no-op round-trip performs the same lazy connect+bind as a real
-        # command, without touching user state.
-        if not is_extension and registry is not None:
+        # rung 3 — keep a live executor (its `state` survives), otherwise
+        # cold-start one through the same drivable path.
+        handle = registry.get(session)
+        if handle is not None and handle.is_alive():
+            steps.append({"rung": "executor", "ok": True,
+                          "detail": "resident executor alive; its state is kept"})
+            note(EXECUTOR_READY, reason="resident executor verified alive",
+                 executor_alive=True)
+        else:
             try:
-                from .exec_relay import probe_executor_binding
+                await daemon.ensure_executor(session)
+            except Exception as e:  # noqa: BLE001
+                await fail("executor", f"executor could not be started: {e!r}")
+                return
+            steps.append({"rung": "executor", "ok": True,
+                          "detail": "executor cold-started"})
 
+        # rung 4 — a live tab and a live executor still do not prove the
+        # executor's Playwright binding (a replacement daemon re-creates or
+        # re-resolves the browser under a resident executor). One no-op round
+        # trip performs the same lazy connect+bind as a real command, and the
+        # executor reports the outcome to the state machine itself.
+        if not healthy():
+            try:
                 await probe_executor_binding(daemon, session)
-                steps.append({"rung": "tab", "ok": True,
-                              "detail": "executor re-bound to a live cdp tab"})
             except Exception as e:  # noqa: BLE001
-                reason = f"cdp tab recovery failed: {str(e)[:200]}"
-                steps.append({"rung": "tab", "ok": False, "detail": reason})
-                note(RECOVERY_FAILED, reason=reason)
-                await finish(NEEDS_HUMAN, reason)
+                await fail("binding", f"tab binding failed: {str(e)[:200]}")
                 return
+            steps.append({"rung": "binding", "ok": True,
+                          "detail": "executor bound to a live tab"})
 
-        state = machine.state_of(session) if machine is not None else HEALTHY
-        await finish(state or HEALTHY, reason)
-
-    def _executor_preflight(self, session: str):
-        """The upstream-readiness preflight `ensureExecutor` runs before a
-        spawn, shared with `recover` (rung 3)."""
-        async def preflight() -> None:
-            if (self._prepare_executor is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                try:
-                    await self._prepare_executor(session)
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(f"upstream readiness: {e}") from e
-            if (self._ensure_upstream is not None
-                    and self.state.upstream_phase != UpstreamPhase.CONNECTED):
-                try:
-                    await self._ensure_upstream()
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(f"upstream open: {e!r}") from e
-            daemon = self.daemon
-            context_for = getattr(daemon, "context_for_required", None)
-            if callable(context_for):
-                holder = context_for(session).holder
-                converge = getattr(holder, "converge_session_tab", None)
-                if callable(converge):
-                    await converge(session)
-        return preflight
+        await finish(machine.state_of(session) or HEALTHY)
 
     async def _handle_kill_executor(
         self, client: ClientState, params: dict, req_id: int | None,

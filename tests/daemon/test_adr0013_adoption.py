@@ -299,7 +299,10 @@ while True:
         assert (adopted.pid, adopted.executor_id, adopted.sock_path) == (
             proc.pid, executor_id, str(sock))
 
-        daemon = SimpleNamespace(executors=registry)
+        # The daemon's drivable path is out of scope (no browser here); the
+        # registry's ensure is what must find the adopted process.
+        daemon = SimpleNamespace(executors=registry,
+                                 ensure_executor=registry.ensure)
         facade = PlaywrightFacade(
             cfg=Config(), port=0, host="127.0.0.1", daemon=daemon)
         port = await facade.start()

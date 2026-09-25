@@ -3,8 +3,8 @@
 Running `mise run test` used to kill the machine-global daemon and leave a
 stray one behind. Two independent vectors, both of which had to be closed:
 
-**A — a test spawns a real daemon on the production ports.** `session_create`
-and `ModeBClient` both cold-start `browserwright-daemon serve` on demand, and
+**A — a test spawns a real daemon on the production ports.**
+`daemon_lifecycle.ensure` cold-starts `browserwright-daemon serve` on demand, and
 with no `BD_EXTENSION_PORT` in the environment that binds **19989**, the port
 the user's real Chrome extension dials. The new daemon then takes over the
 control socket, the LaunchAgent-managed one exits with "already running", and
@@ -16,7 +16,7 @@ a worktree daemon squats on the port until someone runs `mise run teardown`.
 client-facing transport onto one TCP port, so isolation is now **port-based**
 rather than socket-path-based. Unpinned, `daemon_url()` resolves to
 `http://127.0.0.1:19990` — the developer's live daemon — and an innocuous
-`is_alive()` in a unit test would talk to it. We publish an endpoint state file
+`diagnose()` in a unit test would talk to it. We publish an endpoint state file
 inside the isolated runtime dir naming a *dead* port, so every in-process
 resolution lands there instead. It is deliberately the state file and not
 `$BW_DAEMON_URL`: the env var is an **explicit** source, which would switch the
@@ -25,8 +25,8 @@ regime and change the behavior under test. The state file ranks below every
 configured source and is not explicit, so tests see the default regime pointed
 somewhere harmless.
 
-Both were previously defended against *per test*: eight files monkeypatch
-`_ensure_daemon_running` one by one, and `e2e/helpers.py` builds its own port
+Both were previously defended against *per test*: eight files monkeypatched
+the cold-start entry point one by one, and `e2e/helpers.py` builds its own port
 "isolation wall" and documents this exact hazard. Per-test opt-in means the
 protection is only as good as the next author's memory, and two tests in
 `test_coverage_cli_runtime.py` had already forgotten it. This makes the wall the
@@ -37,7 +37,7 @@ subprocesses whose environment it controls itself (`TEST_EXT_PORT`, its own
 runtime dirs), and in-process monkeypatching would not reach them anyway.
 
 **Boundary.** This wall is in-process. A test that shells out to `browserwright`
-/ `browserwright-daemon` gets a child whose own `_ensure_daemon_running` we
+/ `browserwright-daemon` gets a child whose own `daemon_lifecycle.ensure` we
 cannot patch — such a child could still bind port 19989. It inherits the
 redirected `XDG_RUNTIME_DIR` (that part *is* environmental), so it reads the
 same dead-port endpoint state file and cannot reach the real daemon. No test in
@@ -101,6 +101,28 @@ def isolated_runtime_dir() -> str:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def _verdict(**overrides):
+    """A `DaemonVerdict` for a current daemon on the resolved endpoint — what
+    the stubbed `daemon_lifecycle.ensure` returns. `overrides` builds any
+    other verdict (e.g. ``state="down"``)."""
+    from browserwright import daemon_lifecycle
+    from browserwright.daemon_url import daemon_endpoint
+    from browserwright.version import package_version
+
+    fields = {"state": daemon_lifecycle.UP, "endpoint": daemon_endpoint(),
+              "installed": package_version(), "detail": "stubbed",
+              "pid": 4242, "version": package_version(),
+              "probes": ("ours", "ours")}
+    fields.update(overrides)
+    return daemon_lifecycle.DaemonVerdict(**fields)
+
+
+@pytest.fixture
+def make_verdict():
+    """Factory for `daemon_lifecycle.DaemonVerdict` stand-ins (see `_verdict`)."""
+    return _verdict
+
+
 @pytest.fixture(autouse=True)
 def never_touch_the_global_daemon(request, monkeypatch, isolated_runtime_dir):
     """Autouse: no test may reach the real control socket or spawn a real daemon.
@@ -128,7 +150,7 @@ def never_touch_the_global_daemon(request, monkeypatch, isolated_runtime_dir):
     monkeypatch.setattr(_daemon_url, "_cli_override", None)
     monkeypatch.setattr(_daemon_url, "_cli_config_path", None)
 
-    from browserwright import mode_b_client, session_create
+    from browserwright import daemon_lifecycle
 
     def _forbidden(*args, **kwargs):
         raise AssertionError(
@@ -138,23 +160,22 @@ def never_touch_the_global_daemon(request, monkeypatch, isolated_runtime_dir):
             "under tests/daemon/e2e/ which isolates ports properly."
         )
 
-    # Layer 1: the two cold-start entry points do nothing.
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    monkeypatch.setattr(mode_b_client.ModeBClient, "_spawn_daemon",
-                        lambda self, backend=None: None)
+    # Layer 1: the one start/replace entry point does nothing and reports a
+    # daemon that is up, so callers take their ordinary path.
+    monkeypatch.setattr(daemon_lifecycle, "ensure",
+                        lambda reason, **_kw: _verdict())
     # Layer 2: anything that still reaches a real spawn is a bug, not a leak.
-    monkeypatch.setattr(session_create, "_spawn_detached", _forbidden)
+    monkeypatch.setattr(daemon_lifecycle, "_spawn_detached", _forbidden)
 
     # Vector B, second door (ADR-0013 rule 3): the endpoint *diagnosis* probes
     # not only the resolved endpoint but the alternatives a local client
     # could have meant — including the built-in default 127.0.0.1:19990,
     # which the state-file pin above cannot redirect. Default every probe to
     # "refused"; a test that wants a specific observation overrides
-    # `daemon_url.probe` itself.
-    from browserwright import daemon_url as _du
+    # `daemon_lifecycle.probe` itself.
     from browserwright.daemon._ipc import EndpointProbe as _EP
 
     monkeypatch.setattr(
-        _du, "probe",
+        daemon_lifecycle, "probe",
         lambda host, port, timeout=1.5: _EP(kind="refused", host=host,
                                             port=port, detail="stubbed"))

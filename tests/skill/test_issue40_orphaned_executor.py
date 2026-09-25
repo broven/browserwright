@@ -13,8 +13,8 @@ orphan sweep — and `session end` force-drops the ledger entry when the
 executor is provably gone instead of keeping it for a retry that can never
 succeed.
 
-These tests mock only the daemon-CLI boundary (`_run` fails,
-`_daemon_is_running` says no, `_ensure_daemon_running` is a no-op). The
+These tests mock only the daemon-lifecycle boundary (`run_verb` fails,
+`diagnose` says down, `ensure` is the conftest no-op). The
 executor is a REAL subprocess and the discovery files are real, so the local
 reap is exercised for real.
 """
@@ -78,13 +78,14 @@ def _dead_pid() -> int:
 
 
 @pytest.fixture
-def daemon_down(monkeypatch):
+def daemon_down(monkeypatch, make_verdict):
     """The daemon-CLI boundary: every daemon call fails, the daemon is
     unreachable, and nothing tries to auto-start a real daemon."""
-    from browserwright import session_create
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: 3)
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
+    from browserwright import daemon_lifecycle, session_create
+    monkeypatch.setattr(daemon_lifecycle, "run_verb",
+                        lambda args, **kwargs: daemon_lifecycle.VerbResult(3))
+    monkeypatch.setattr(daemon_lifecycle, "diagnose",
+                        lambda **kw: make_verdict(state=daemon_lifecycle.DOWN))
     yield session_create
 
 

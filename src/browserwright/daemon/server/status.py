@@ -50,13 +50,13 @@ class _BareContext:
     every caller gets a context-shaped object.
     """
 
-    __slots__ = ("state", "backend", "session_id", "holder")
+    __slots__ = ("state", "backend", "session_id", "upstream")
 
     def __init__(self, state: object):
         self.state = state
         self.backend = getattr(state, "backend_name", None)
         self.session_id = None
-        self.holder = None
+        self.upstream = None
 
 
 def snapshot(daemon: object | None, *, state: object | None = None) -> dict:
@@ -124,8 +124,8 @@ def _session_rows(daemon: object | None) -> list[dict]:
     if recovery is not None:
         try:
             from ... import session_registry
-            holder = getattr(getattr(daemon, "shared_context", None), "holder", None)
-            relay = getattr(holder, "relay", None)
+            upstream = getattr(getattr(daemon, "shared_context", None), "upstream", None)
+            relay = getattr(upstream, "relay", None)
             for row in session_registry.list_all():
                 recovery.ensure(
                     row, extension_connected=bool(
@@ -300,7 +300,7 @@ def _relay_row(contexts: list) -> dict:
     inflight: list[dict] = []
     running = False
     for ctx in contexts:
-        relay = getattr(getattr(ctx, "holder", None), "relay", None)
+        relay = getattr(getattr(ctx, "upstream", None), "relay", None)
         if relay is None:
             continue
         running = True

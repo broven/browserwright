@@ -174,7 +174,7 @@ def test_issue40_session_end_recovers_after_daemon_sigkill(scenario):
     end` must reap the executor locally and drop the ledger row."""
     env = scenario.env
     # 1. Create a session (allocates the ledger row; auto-spawns the isolated
-    #    daemon via `_ensure_daemon_running`).
+    #    daemon via `daemon_lifecycle.ensure`).
     created = _cli(["session", "new", "--backend=cdp", "--name=issue40-e2e",
                     "--create"], env)
     assert created.returncode == 0, created.stderr

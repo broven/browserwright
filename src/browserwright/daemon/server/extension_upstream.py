@@ -28,15 +28,45 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import secrets
 import time
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from ... import session_registry
 from .. import __version__
+from ..errors import Unavailable
 from .relay import RelayServer, GhostTarget, _CommandError
 
 logger = logging.getLogger(__name__)
+
+# A (auto-recovery): wait this long after an extension hello before
+# re-attaching sessions, so a version-drift reload (which kills the SW right
+# after this hello) has time to land first; and throttle consecutive recovery
+# sweeps so a reconnect burst (maintainLoop backoff) does not hammer the
+# extension with attach round-trips.
+_AUTO_RECOVER_DELAY_S = 3.0
+_AUTO_RECOVER_THROTTLE_S = 10.0
+
+
+def _executor_ready_budget_s() -> float:
+    """Bound extension reconnect grace below the control-plane deadline."""
+    try:
+        return float(os.environ.get("BW_EXT_READY_BUDGET_S", "") or 10.0)
+    except (TypeError, ValueError):
+        return 10.0
+
+
+_EXECUTOR_READY_BUDGET_S = _executor_ready_budget_s()
+
+_NO_EXTENSION_CONNECTED_MSG = (
+    "no browserwright extension is connected to the daemon (session {sid}). "
+    "Open the browser where the extension is installed and ensure it is "
+    "enabled; if you just installed or upgraded browserwright, reload the "
+    "extension at chrome://extensions so its service worker reconnects to the "
+    "daemon relay. Then retry. (Use --backend=cdp --create for an isolated "
+    "Chrome that needs no extension.)"
+)
 
 if TYPE_CHECKING:
     from .proxy import Router
@@ -195,11 +225,26 @@ class ExtensionUpstream:
         on_close: Callable[[str], Awaitable[None]],
         *,
         group_owner: "ExtensionUpstream | None" = None,
+        open_timeout: float = 30.0,
     ):
         self._relay = relay
         self._on_frame = on_frame
         self._on_close = on_close
         self._open = False
+        self._open_timeout = open_timeout
+        # Set by the first successful open. Until then no client has asked for
+        # this browser, so relay events have nothing to re-attach for (the
+        # hello still updates the recovery state).
+        self._opened_once = False
+        # ADR-0013: the daemon's recovery state machine and its executor
+        # liveness oracle (`bind_recovery`). None on a facade bridge's
+        # secondary adapter, which reports nothing.
+        self._recovery: Any | None = None
+        self._executor_alive: Callable[[str], bool] = lambda _sid: False
+        self._last_auto_recover: float = 0.0
+        # A sweep is queued and has not started yet; later hellos ride on it.
+        self._auto_recover_queued: bool = False
+        self._auto_recover_hello: tuple[str, bool] = ("", False)
         # Map: upstream sessionId → tabId (for the rare path where commands
         # specify sessionId without our naming convention).
         self._sessions: dict[str, int] = {}
@@ -475,20 +520,38 @@ class ExtensionUpstream:
         for sid in [s for s, t in self._sessions.items() if t == tab_id]:
             self._sessions.pop(sid, None)
 
-    async def end_session(self, session_id: str) -> dict:
+    async def end_session(self, session_id: str, *,
+                          deadline: float | None = None) -> dict:
         """Tear down a session's browser (DECIDED): close the WHOLE tab group —
         every member tab — then the group disappears. The group is found by its
         title (ADR-0009); membership comes from the live group, never from an
         owned/borrowed set. Returns an honest ``{ok, closed, failed, kept}``
         result (``kept`` is always empty — there is no borrowed distinction;
-        drag a tab out of the group to spare it)."""
-        async with self._lock_for(session_id):
-            return await self._end_session_locked(session_id)
+        drag a tab out of the group to spare it). The user's Chrome is never
+        ours to close: extension sessions are always attach-owned.
 
-    async def end_session_before(
-        self, session_id: str, *, deadline: float,
-    ) -> dict:
-        """Run teardown cooperatively within the daemon RPC's deadline."""
+        Readiness is part of the teardown: with a ``deadline`` a disconnected
+        extension gets until then to reconnect (the #32 budget). Without one
+        (the unattended auto-prune sweep) a disconnected extension is not
+        waited for — a session that never bound a tab has nothing to prove and
+        is clean; any other is deferred, because a group we cannot see is not
+        a group we may declare gone.
+        """
+        if deadline is None and not self._relay.is_ready:
+            record = session_registry.get(session_id)
+            if isinstance(record, dict) and not record.get("runtime"):
+                # ADR-0009: an empty `runtime` is the "never touched Chrome"
+                # signal — not a missing `runtime.group_id`, a field that no
+                # longer exists and would read as unbound for every session.
+                return {"ok": True, "backend": "extension", "closed": [],
+                        "failed": [], "kept": []}
+            raise RuntimeError("extension not connected; deferring teardown")
+        if deadline is not None and not self._relay.is_ready:
+            try:
+                await self._relay.wait_ready(
+                    timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:  # noqa: BLE001 - timeout: honest budget miss
+                return self._budget_exhausted_result(session_id)
         async with self._lock_for(session_id):
             return await self._end_session_locked(
                 session_id, deadline=deadline)
@@ -758,23 +821,142 @@ class ExtensionUpstream:
 
     # ---- lifecycle -------------------------------------------------------
 
+    @property
+    def relay(self) -> RelayServer:
+        """The relay this adapter speaks through (status, doctor, cdp surface)."""
+        return self._relay
+
+    async def start(self) -> None:
+        """Bind the relay's listening socket (daemon lifetime, not connection
+        lifetime: it stays up across idle close so the extension's persistent
+        ws to us stays warm). Only the agent adapter that owns the relay calls
+        this; facade bridges share it."""
+        port = await self._relay.start()
+        logger.info("extension relay started on port %d", port)
+
+    async def stop(self) -> None:
+        await self._relay.stop()
+
+    def observe_relay(self) -> None:
+        """Take the relay's lifecycle events: extension hello, extension
+        closed, and Target attach/detach. Called once, by the context factory,
+        before the relay starts accepting connections — a hello that arrives
+        before this is lost."""
+        self._relay.on_extension_hello = self._on_extension_hello
+        self._relay.on_extension_closed = self._on_extension_closed
+        self._relay.add_event_listener(self._on_target_event)
+
+    def bind_recovery(self, machine: Any,
+                      executor_alive: Callable[[str], bool]) -> None:
+        self._recovery = machine
+        self._executor_alive = executor_alive
+
+    async def await_browser(self, session_id: str) -> None:
+        """Step 1 of the drivable path.
+
+        Give the extension's service worker a short reconnect grace, then fail
+        with the useful diagnosis before the normal 60-second interactive open
+        can outlive the control-plane response deadline. Never mutates the
+        upstream state machine, so a later reconnect stays recoverable.
+        """
+        if self._relay.is_ready:
+            return
+        try:
+            await self._relay.wait_ready(timeout=_EXECUTOR_READY_BUDGET_S)
+        except Exception:  # noqa: BLE001 - timeout + relay reconnect hiccups
+            pass
+        if not self._relay.is_ready:
+            raise Unavailable(
+                _NO_EXTENSION_CONNECTED_MSG.format(sid=session_id))
+
+    async def converge(self, session_id: str, *,
+                       force: bool = False) -> dict | None:
+        """Make an extension session own one live tab, once and bounded.
+
+        Step 3 of the drivable path, after ``await_browser`` and the open;
+        forced by the explicit recovery verbs. Existing healthy
+        sessions stay on the fast path. If the prior group vanished, opening
+        one blank tab is the deterministic replacement; returning ``healthy``
+        while merely promising that a later call might open it was the
+        ambiguity ADR-0013 removes.
+        """
+        machine = self._recovery
+        if (not force and machine is not None
+                and machine.state_of(session_id) == "healthy"):
+            return None
+        generation = getattr(self._relay, "connection_generation", None)
+        try:
+            result = await self.recover_session(session_id)
+            detail = "tab group re-attached"
+        except Exception:
+            result = await self.open_background_tab(
+                "about:blank", session_id=session_id, background=True)
+            detail = "fresh tab opened in the session group"
+        self._note(session_id, "tab_recovered", generation=generation,
+                   reason=detail)
+        logger.info("recovery: converged session %s (%s, target=%s)",
+                    session_id, detail,
+                    result.get("targetId") if isinstance(result, dict) else "-")
+        return result
+
+    async def reconnect(self, session_id: str) -> str | None:
+        """Recovery rung 1: wait for the extension within the relay's
+        reconnect window.
+
+        Also corrects a stale ``extension-disconnected`` diagnosis when the
+        relay is in fact ready: the hello that would have said so may have
+        predated this session's record.
+        """
+        from .relay import RECONNECT_WAIT_TIMEOUT
+        from .session_state import EXTENSION_DISCONNECTED, EXTENSION_HELLO
+
+        machine = self._recovery
+        stale = (machine is not None and machine.state_of(session_id)
+                 == EXTENSION_DISCONNECTED)
+        if self._relay.is_ready and not stale:
+            return None
+        if not self._relay.is_ready:
+            try:
+                await self._relay.wait_ready(timeout=RECONNECT_WAIT_TIMEOUT)
+            except Exception:  # noqa: BLE001 - timeout + reconnect hiccups
+                pass
+        if not self._relay.is_ready:
+            raise Unavailable(
+                "the Chrome extension is not connected: is Chrome running "
+                "with the browserwright extension enabled? "
+                "`browserwright doctor` shows the relay state")
+        self._note(session_id, EXTENSION_HELLO,
+                   generation=getattr(self._relay, "connection_generation",
+                                      None),
+                   reason="extension connected during recover")
+        return "extension connected"
+
     async def open(self, ws_url: str | None = None, *,
-                   timeout: float = 30.0) -> None:
+                   timeout: float | None = None) -> None:
         """Wait for the relay to have at least one extension connected.
 
-        `ws_url` is ignored; `timeout` matches the shared protocol shape.
+        `ws_url` is ignored. `timeout` defaults to the adapter's open budget,
+        generous on purpose (spec §8.4 'extension-permission' ux_cost: the
+        user may have to load or enable the extension first).
         """
-        await self._relay.wait_ready(timeout=timeout)
+        try:
+            await self._relay.wait_ready(
+                timeout=self._open_timeout if timeout is None else timeout)
+        except asyncio.TimeoutError:
+            raise Unavailable(
+                "no extension connected within timeout — load the daemon's "
+                "Chrome extension from `chrome-extension/`") from None
         # Wire event fan-in so async events (Page.frameNavigated etc.) get
         # surfaced into the daemon's normal event router.
         self._relay.set_event_handler(self._handle_extension_event)
         self._open = True
+        self._opened_once = True
 
     async def close(self, *, code: int = 1000, reason: str = "") -> None:
         self._open = False
         self._relay.set_event_handler(None)
-        # We don't stop the relay here — the listener may want to keep it
-        # alive across reconnects. The listener owns relay lifecycle.
+        # The relay is not stopped here: it outlives connections (see
+        # `start` / `stop`).
 
     async def userscript_request(self, verb: str, payload: dict, **kw):
         return await self._relay.userscript_request(verb, payload, **kw)
@@ -1169,12 +1351,6 @@ class ExtensionUpstream:
             "recovered": recovered,
         }
 
-    async def recover(self, session_id: str | None = None) -> dict:
-        # ADR-0009: the verbs layer calls recover with only the session id and
-        # the group is found by its TITLE; the numeric groupId param is gone
-        # (a leftover signature would have made title recovery unreachable).
-        return await self.recover_session(session_id)
-
     async def close_tab(self, target: str) -> dict:
         """Close a tab addressed by upstream sessionId or targetId.
 
@@ -1232,6 +1408,172 @@ class ExtensionUpstream:
         return {}
 
     # ---- helpers ---------------------------------------------------------
+
+    # ---- relay lifecycle events (ADR-0013 inputs) ------------------------
+
+    async def _on_extension_hello(
+        self, *, install_id: str = "", first_seen: bool = False,
+    ) -> None:
+        """A (auto-recovery): extension (re)connected with a fresh SW.
+
+        A reloaded/updated SW reconnects with an EMPTY ``attachedTabs`` set,
+        so the relay's ghost table for every extension session's tabs is gone
+        and nothing re-announces it. Re-attach each session's tab group by
+        its title (ADR-0009) so the tabs become drivable again WITHOUT any
+        client action. Idempotent: sessions whose ghost survived (same-SW ws
+        reconnect, re-announce) short-circuit in ``attach_tab``.
+
+        Runs fire-and-forget with a short delay: a version-drift reload may
+        land right after this hello and would kill the SW mid-recovery; and
+        a reconnect burst (maintainLoop backoff) is throttled so we don't
+        hammer the extension with attach round-trips.
+        """
+        from .session_state import EXTENSION_HELLO
+        generation = getattr(self._relay, "connection_generation", None)
+        self._note_extension_sessions(EXTENSION_HELLO, generation=generation,
+                                      reason="extension connected; re-attaching tabs")
+
+        # GH#106: the throttle defers, it never drops. It used to `return` for
+        # a hello inside the window, so a service worker that restarted within
+        # 10s of the previous sweep (e.g. a drift reload right after the first
+        # hello) lost its tabs for good: nothing else re-attaches them.
+        self._auto_recover_hello = (install_id, first_seen)
+        if self._auto_recover_queued:
+            return
+        self._auto_recover_queued = True
+
+        async def _recover() -> None:
+            try:
+                await asyncio.sleep(_AUTO_RECOVER_DELAY_S)
+                wait = (self._last_auto_recover + _AUTO_RECOVER_THROTTLE_S
+                        - time.monotonic())
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            except asyncio.CancelledError:
+                self._auto_recover_queued = False
+                return
+            # Unqueue before sweeping: a hello that lands mid-sweep may come
+            # from a SW that lost the tabs this sweep is re-attaching.
+            self._auto_recover_queued = False
+            self._last_auto_recover = time.monotonic()
+            install_id, first_seen = self._auto_recover_hello
+            generation = getattr(self._relay, "connection_generation", None)
+            if not self._opened_once:
+                return
+            try:
+                rows = session_registry.list_all()
+            except Exception as e:  # noqa: BLE001 - recovery is best-effort
+                logger.warning("auto-recover: ledger unreadable: %r", e)
+                return
+            for rec in rows:
+                sid = str(rec.get("id") or "")
+                if rec.get("backend") != "extension":
+                    continue
+                try:
+                    await self.recover_session(sid)
+                    self._note(sid, "tab_recovered", generation=generation,
+                               reason="tab group re-attached after extension hello")
+                    # GH#79: say which of the two it was. This line used to
+                    # read "after extension reconnect" unconditionally — it
+                    # fires on EVERY hello, including the very first one from
+                    # a brand-new browser profile, and reading it in a
+                    # session-scoped e2e log is what made a fresh Chrome per
+                    # test look like a service worker churning between
+                    # commands.
+                    logger.info(
+                        "auto-recovered session %s after extension %s "
+                        "(install_id=%s)",
+                        sid,
+                        "first connect" if first_seen else "reconnect",
+                        install_id or "(unknown)")
+                except Exception as e:  # noqa: BLE001 - no group / empty group /
+                    # still reconnecting -- the next hello retries.
+                    self._note(sid, "tab_recover_failed", generation=generation,
+                               reason=str(e)[:200])
+
+        asyncio.create_task(_recover())
+
+    async def _on_extension_closed(self, *, install_id: str = "") -> None:
+        """The last ready extension connection went away (ADR-0013)."""
+        self._note_extension_sessions(
+            "extension_lost",
+            reason=f"extension disconnected (install_id={install_id or 'unknown'})")
+
+    async def _on_target_event(self, msg: dict) -> None:
+        """Validate Target lifecycle against the canonical tab group."""
+        kind = msg.get("type")
+        tab_id = msg.get("tabId")
+        if kind not in ("attached", "detached") or not isinstance(tab_id, int):
+            return
+        if not self._opened_once:
+            # Before the first open nobody drives this browser; the hello
+            # recovery sweep will establish and report the facts.
+            return
+        generation = msg.get("_relay_generation")
+        if not isinstance(generation, int):
+            generation = getattr(self._relay, "connection_generation", None)
+        target_id = f"ext-tab-{tab_id}"
+        try:
+            from .session_state import TAB_RECOVER_FAILED, TAB_RECOVERED
+
+            for row in session_registry.list_all():
+                if row.get("backend") != "extension":
+                    continue
+                runtime = row.get("runtime") or {}
+                if runtime.get("current_target_id") != target_id:
+                    continue
+                sid = str(row.get("id") or "")
+                current = (self._recovery.get(sid)
+                           if self._recovery is not None else None)
+                if (isinstance(generation, int) and current is not None
+                        and isinstance(current.get("generation"), int)
+                        and generation < current["generation"]):
+                    continue
+                if kind == "detached":
+                    # `chrome.debugger` detached can mean tab removal OR a
+                    # DevTools takeover. Re-resolve the named group and attempt
+                    # the normal bounded re-attach before deciding which.
+                    try:
+                        await self.recover_session(sid)
+                    except Exception as e:  # noqa: BLE001
+                        self._note(sid, TAB_RECOVER_FAILED,
+                                   generation=generation,
+                                   reason=f"current target could not be re-attached: {e}")
+                    else:
+                        self._note(sid, TAB_RECOVERED, generation=generation,
+                                   reason="current target re-attached after Target detach")
+                else:
+                    # An attached debugger says nothing about workspace
+                    # ownership. Promote only after the live tab group proves
+                    # this target belongs to the session.
+                    if await self.target_belongs_to_session(sid, target_id):
+                        self._note(sid, TAB_RECOVERED, generation=generation,
+                                   reason="current target attached in session group")
+        except Exception as e:  # noqa: BLE001 - observation cannot break relay
+            logger.debug("recovery: target event could not be recorded: %r", e)
+
+    def _note(self, sid: str, event: str, *, generation=None, reason: str = "") -> None:
+        machine = self._recovery
+        if machine is None:
+            return
+        try:
+            machine.note(sid, event, reason=reason, generation=generation,
+                         executor_alive=self._executor_alive(sid))
+        except Exception as e:  # noqa: BLE001 - never let bookkeeping break the relay path
+            logger.debug("recovery note %s for %s failed: %r", event, sid, e)
+
+    def _note_extension_sessions(self, event: str, *, generation=None,
+                                 reason: str = "") -> None:
+        if self._recovery is None:
+            return
+        try:
+            rows = session_registry.list_all()
+        except Exception:  # noqa: BLE001
+            return
+        for rec in rows:
+            if rec.get("backend") == "extension":
+                self._note(str(rec.get("id") or ""), event,
+                           generation=generation, reason=reason)
 
     async def _respond(self, req_id: int | None, result: dict) -> None:
         await self._on_frame(json.dumps({"id": req_id, "result": result}))

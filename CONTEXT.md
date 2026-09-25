@@ -23,7 +23,7 @@ driven by one resident **executor**.
       │  downstream
       ▼
  ┌──────────────────────────────── daemon ───────────────────────────────┐
- │  ledger ──► session ──► UpstreamContext { state · Router · holder }   │
+ │  ledger ──► session ──► UpstreamContext { state·Router·holder·adapter}│
  │                                    │                                  │
  │  executor (one per session)        │ upstream                         │
  │  endpoint (/control · /exec · /cdp) │                                 │
@@ -159,22 +159,56 @@ all backend divergence is absorbed inside the daemon.
 
 ### upstream
 The daemon's connection **out toward the browser**. The mirror of downstream.
+Spoken through the `Upstream` protocol (below) by one adapter per backend.
 
-Two implementations exist today, playing the same role:
+### Upstream (protocol)
+The declared, session-shaped interface (`daemon/server/upstream.py`) every
+backend adapter satisfies, and the only way anything outside the adapters
+touches a browser. Two adapters:
 
-- `UpstreamConnection` (`daemon/server/upstream.py`) — a raw websocket to a real
-  browser-level CDP endpoint. Used by `cdp`.
-- `ExtensionUpstream` (`daemon/server/extension_upstream.py`) — the relay plus
-  the Chrome extension's `chrome.debugger`, adapted to look like the above.
+| adapter | backend | owns |
+|---|---|---|
+| `CdpUpstream` (`upstream.py`) | `cdp` | one raw CDP websocket; the Chrome a `--create` session launched (`owns_browser`, `browser_pid`); the endpoint `cfg` |
+| `ExtensionUpstream` (`extension_upstream.py`) | `extension` | the relay; extension hello/closed and Target events; the session→tab-group binding |
 
-**Trap:** that "same role" is currently only a docstring claim. There is no
-declared interface — `Router` is wired to whichever one by assigning twelve
-mutable attributes in a required order. See *Being introduced* below.
+Members, grouped:
+
+- **lifecycle** — `start`/`stop` (daemon-lifetime resources: the relay's
+  listening socket) · `open`/`close` (one connection) · `attach`/`detach`
+  (atomic publication to `Router`) · `is_open` · `relay` (or `None`)
+- **readiness / recovery** — `bind_recovery` · `await_browser` and
+  `converge(session, force)` (steps 1 and 3 of the **drivable path**) ·
+  `reconnect` (rung 1 of `recover`)
+- **tabs** — `open_tab` · `close_session_tab` · `list_tabs` · `get_targets` ·
+  `target_belongs_to_session` · `current_page` · `attach_active`
+- **teardown** — `end_session(session, deadline=None)`: the adapter applies
+  the owner rule to the browser
+- **wire / misc** — `send_cdp` · `wait_session_announce` ·
+  `userscript_request` · `reload_extensions`
+
+**Trap:** the adapter object is long-lived — built with its context, opened
+and closed many times (lazy open, idle close). Browser ownership therefore sits
+on the adapter, not on a connection: a `CdpUpstream` kills only a pid it
+launched, on every close path, and an attach-owned one never has a pid.
+
+**Trap:** never ask which adapter you hold (`isinstance`, `backend ==`,
+`relay is None`) outside the adapters and `upstream_context.py`'s factory. If
+a caller needs a backend difference, it is a missing protocol member.
 
 ### UpstreamContext
-One bundle per live upstream: `{ state, router, holder }`. `extension` sessions
-share the daemon's one context; each `cdp` session gets its own,
-created lazily from its ledger record.
+One bundle per live upstream (`daemon/server/upstream_context.py`):
+`{ state, router, holder, upstream }`. `extension` sessions share the daemon's
+one context; each `cdp` session gets its own, built lazily from its ledger
+record by `context_for_record` — the one place a backend name maps to an
+adapter class. A per-session context's connection *is* its session's
+workspace, so `end_session` closes it and the daemon drops it.
+
+The `holder` (`UpstreamHolder`) is the backend-agnostic part: lazy open, the
+§6.5 close etiquette, and the state/publication transitions around the adapter.
+
+**Trap:** the holder has no backend fields, on purpose. Launch/kill, relay
+events and tab convergence belong to the adapter; putting one back on the
+holder recreates the side-by-side lifecycle this split removed.
 
 ### relay
 The websocket server (default port **19989**) that the unpacked Chrome
@@ -211,6 +245,35 @@ The daemon's persisted per-session answer to which layer is currently broken:
 events are inputs to this state; `status`, `doctor`, and `browserwright recover`
 read it. `since` is when the diagnosis last changed and `reason` is evidence,
 not a remediation guess. ADR-0013.
+
+The state machine (`session_state.RecoveryStateMachine`) is the only
+authority. Every other hop *reports*: the relay (hello, closed, Target
+detach), the executor registry (ready, exited, reaped), the drivable path's
+`converge`, and the executor itself, through `ExecuteResponse.recovery_event`
+— `bound` (a call completed on the held page), `rebound` (the tab died and
+`page` was re-bound in place, before or during the call), `target-gone` (the
+rebind failed; the executor recycles). The exec relay feeds that event to the
+machine (`bound`/`rebound` → tab recovered, `target-gone` → tab lost) and
+strips it from the agent's frame.
+
+**Trap:** never infer recovery from the agent-facing response. An in-place
+rebind answers the agent with an *error* ("RETRY the call") and is a
+*recovery*; reading `error` / `terminal_reason` misfiled it as neither.
+
+### drivable path
+The one sequence that makes a session's browser side usable:
+`Daemon.ensure_session_drivable(session, force=False)` = the adapter's
+`await_browser` (bounded grace for the browser to be reachable) → the holder's
+`ensure_open` → the adapter's `converge` (one live tab; `force` skips the
+healthy fast path). `Daemon.ensure_executor` runs it inside the executor
+registry's per-session lifecycle lock and then spawns the executor. Every
+entry uses it: `ensureExecutor`, the `/exec` relay, `recoverSession`
+(forced, no spawn — its caller is usually the executor binding), and
+`recover` (rungs 2 and 3).
+
+**Trap:** do not add a second copy "because this caller is usually warmed
+up". The `/exec` relay's copy skipped `converge` whenever the upstream was
+connected, and handed out executors for sessions whose tab was gone.
 
 ### endpoint
 The daemon's **single TCP front door** (default `http://127.0.0.1:19990`) — the
@@ -256,11 +319,32 @@ executor's Playwright controller while preserving its Python `state`.
 Who caused a daemon lifecycle event: `launchd` (parent pid 1, nothing
 stamped), or `cli:<verb> cwd=… parent=…` for `restart` / `stop` / an
 on-demand `serve` spawn (`_ipc.describe_initiator`, carried to a child
-through `BW_DAEMON_INITIATOR`). ADR-0012 rule 5.
+through `BW_DAEMON_INITIATOR` by `daemon_lifecycle.ensure`). ADR-0012 rule 5.
 
 **Trap:** launchd relaunches the daemon after a CLI `restart`, so the new
 daemon's own start line says `launchd`; the CLI's `LIFECYCLE restart` line
 just before it is the attribution.
+
+### daemon lifecycle
+The client side's one owner of "is the daemon up, and make it so"
+(`src/browserwright/daemon_lifecycle.py`). Three calls: `diagnose()` returns
+one `DaemonVerdict` (`up` · `stale` · `down` · `foreign` · `unreachable` ·
+`undecided`), `ensure(reason)` is the **only** Layer 2 code that starts or
+replaces the daemon (executor handoff, initiator, `LIFECYCLE` line, child env),
+and `unreachable_fix()` builds the agent-facing diagnosis text. Every
+`browserwright-daemon <verb>` a Layer 2 module runs goes through its
+`run_verb` adapter, which carries the resolved endpoint into the child.
+
+**Trap:** constructing a `Session` (or its `ModeBClient`) has no lifecycle side
+effect — no probe, no version check, no restart. Version coherence is enforced
+by `ensure()` at `session new` / `recover` (and the session verbs that already
+talk to the daemon CLI), never by opening a connection. An explicitly
+configured endpoint (see `endpoint`) is diagnosed, never started or replaced.
+
+**Trap:** `diagnose(confirm=True)` takes two probes and concludes nothing when
+they disagree (`undecided`); only `down` and `stale` on the default endpoint
+are `replaceable`. `foreign` (something that is not browserwright holds the
+port) is never replaced by `recover` — ADR-0013 rule 2.
 
 ### activity gate
 The daemon's own answer to "would interrupting me hurt someone right now":
@@ -378,18 +462,8 @@ Chrome, it is either a test (mock it) or a mistake (don't).
 
 ## Being introduced
 
-Named here so nine parallel agents use the same word. Neither exists in code
-yet — check before you reference them.
-
-### Upstream (protocol)
-The declared interface both upstream implementations will satisfy, replacing
-`Router`'s twelve mutable callback slots. Session-shaped, not transport-shaped:
-`open_tab` · `close_tab` · `list_tabs` · `current_page` · `attach_active` ·
-`end_session` · `recover` · `send_cdp`. Its two adapters are
-`ExtensionUpstream` and `CdpUpstream`.
-
-The adapter also becomes the **owner of the live binding** — the tab group is an
-implementation detail of `ExtensionUpstream`; `cdp` has no such concept.
+Named here so parallel agents use the same word. It does not exist in code
+yet — check before you reference it.
 
 ### in-flight registry
 One place holding every in-flight request with a start time, readable through a
@@ -407,6 +481,8 @@ table with no timestamp, so a hung daemon is indistinguishable from an idle one.
 | the unix control socket (`browserwright-daemon.sock`) | Deleted with the facade. One TCP endpoint, `/control` path. Its `--facade-port 0` "disable" value is gone too: `0` now means an ephemeral port. |
 | `ensureExecutor` returning `exec_sock` | Gone. It returns `{ready, executor_id}`; the data plane is the endpoint's `/exec` relay. |
 | `--name` as an identity key | It is a human label only. Use session id, or `group_id` for extension recovery. |
+| backend fields on the upstream holder (`holder.relay`, `holder.cdp_pid`, `cdp_owns_browser`, `_extension_adapter`, `make_context`) | Moved into the adapters and `upstream_context.py`. The holder is backend-agnostic; see *UpstreamContext*. |
+| `end_session_before` / `teardown_cdp_context` | Collapsed into `Upstream.end_session(session, deadline=None)` behind `Daemon.end_workspace`. |
 | `_owned` / `_borrowed` tab sets | Being deleted — group membership (`chrome.tabs.query({groupId})`) is the single source of truth. |
 | Querying a tab group by title | Gone from `background.js`. Titles are user-editable and not unique; key on numeric `groupId`. |
 | `backend == "rdp"` as "speaks raw CDP" | Use `_raw_cdp_backend` (`!= "extension"`). A name check excluded `env` for a whole release. |

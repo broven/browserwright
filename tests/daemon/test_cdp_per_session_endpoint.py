@@ -1,8 +1,8 @@
 """How a per-session CDP endpoint reaches the code that dials it (#38).
 
-The endpoint travels in the session's `Config`, not as an attribute on the
-holder, and that is load-bearing rather than incidental: `facade._resolve_cdp_ws`
-reads `ctx.holder._cfg`, so the Config is the one channel that already reached
+The endpoint travels in the session's `Config`, not as a separate attribute,
+and that is load-bearing rather than incidental: `facade._resolve_cdp_ws` reads
+the adapter's `CdpUpstream.cfg`, so the Config is the one channel that reaches
 both the agent path and the Playwright facade. Anything that moves the endpoint
 elsewhere has to teach the facade a second way to find it — which is what the
 last test here exists to notice.
@@ -15,33 +15,29 @@ from types import SimpleNamespace
 import pytest
 
 from browserwright.daemon.config import Config
-from browserwright.daemon.server.daemon import Daemon, _endpoint_from_workspace
 from browserwright.daemon.server.state import DaemonState
+from browserwright.daemon.server.upstream_context import (
+    UpstreamContext,
+    cdp_cfg_for,
+    endpoint_from_workspace as _endpoint_from_workspace,
+)
+
+#: The daemon-wide Config per-session pinning starts from.
+_BASE = Config(backend="extension")
 
 
 class _Router:
     daemon = None
 
 
-def _daemon() -> Daemon:
-    shared = _ctx("extension")
-
-    def make_context(*, backend, cfg, session_id=None):
-        return _ctx(backend, cfg=cfg, session_id=session_id)
-
-    return Daemon(cfg=Config(backend="extension"), shared_context=shared,
-                  make_context=make_context)
-
-
 def _ctx(backend, *, cfg=None, session_id=None):
-    from browserwright.daemon.server.daemon import UpstreamContext
-
     async def _ensure_open():
         return None
 
     return UpstreamContext(
         backend=backend, state=DaemonState(backend), router=_Router(),
-        holder=SimpleNamespace(_cfg=cfg, ensure_open=_ensure_open),
+        holder=SimpleNamespace(upstream=SimpleNamespace(cfg=cfg),
+                               ensure_open=_ensure_open),
         session_id=session_id)
 
 
@@ -87,7 +83,7 @@ def test_url_wins_when_a_record_somehow_has_both():
 
 
 def test_port_record_pins_the_port_only():
-    cfg = _daemon()._cdp_cfg_for({"workspace": {"port": 9444}})
+    cfg = cdp_cfg_for({"workspace": {"port": 9444}}, _BASE)
 
     assert cfg.backend == "cdp"
     assert cfg.backends.cdp.port == 9444
@@ -95,7 +91,7 @@ def test_port_record_pins_the_port_only():
 
 
 def test_url_record_pins_the_endpoint():
-    cfg = _daemon()._cdp_cfg_for({"workspace": {"url": "wss://cloud/x?t=1"}})
+    cfg = cdp_cfg_for({"workspace": {"url": "wss://cloud/x?t=1"}}, _BASE)
 
     assert cfg.backends.cdp.endpoint == "wss://cloud/x?t=1"
 
@@ -106,20 +102,16 @@ def test_per_session_pinning_never_mutates_the_shared_config():
     `replace` shares the nested BackendsConfig, so pinning in place would leak
     one session's browser into every other session's config.
     """
-    daemon = _daemon()
+    cdp_cfg_for({"workspace": {"port": 9444}}, _BASE)
+    cdp_cfg_for({"workspace": {"url": "ws://cloud/x"}}, _BASE)
 
-    daemon._cdp_cfg_for({"workspace": {"port": 9444}})
-    daemon._cdp_cfg_for({"workspace": {"url": "ws://cloud/x"}})
-
-    assert daemon.cfg.backends.cdp.port == 9222
-    assert daemon.cfg.backends.cdp.endpoint is None
+    assert _BASE.backends.cdp.port == 9222
+    assert _BASE.backends.cdp.endpoint is None
 
 
 def test_two_sessions_do_not_cross_talk():
-    daemon = _daemon()
-
-    a = daemon._cdp_cfg_for({"workspace": {"url": "ws://a.example/cdp"}})
-    b = daemon._cdp_cfg_for({"workspace": {"url": "ws://b.example/cdp"}})
+    a = cdp_cfg_for({"workspace": {"url": "ws://a.example/cdp"}}, _BASE)
+    b = cdp_cfg_for({"workspace": {"url": "ws://b.example/cdp"}}, _BASE)
 
     assert a.backends.cdp.endpoint == "ws://a.example/cdp"
     assert b.backends.cdp.endpoint == "ws://b.example/cdp"
@@ -128,7 +120,7 @@ def test_two_sessions_do_not_cross_talk():
 
 def test_workspaceless_record_uses_the_daemon_default_port():
     """Still legal, and the e2e harness relies on it."""
-    cfg = _daemon()._cdp_cfg_for({"workspace": None})
+    cfg = cdp_cfg_for({"workspace": None}, _BASE)
 
     assert cfg.backends.cdp.port == 9222
     assert cfg.backends.cdp.endpoint is None
@@ -144,7 +136,7 @@ async def test_facade_bridges_a_client_to_the_sessions_own_endpoint(
     """The proof that "the endpoint lives in the Config" is sufficient.
 
     A Playwright client on the facade never sees the ledger; it gets here only
-    because `_resolve_cdp_ws` reads the holder's Config. This drives a real
+    because `_resolve_cdp_ws` reads the adapter's Config. This drives a real
     frame through a real websocket to a per-session endpoint and back.
     """
     import websockets
@@ -152,9 +144,8 @@ async def test_facade_bridges_a_client_to_the_sessions_own_endpoint(
     from browserwright.daemon.server.facade import PlaywrightFacade
 
     upstream_url = await mock_browser_cdp()
-    daemon = _daemon()
     ctx = _ctx("cdp",
-               cfg=daemon._cdp_cfg_for({"workspace": {"url": upstream_url}}))
+               cfg=cdp_cfg_for({"workspace": {"url": upstream_url}}, _BASE))
 
     # A daemon stub that resolves any session to that context — the ledger
     # lookup itself is covered elsewhere; what is under test is whether the

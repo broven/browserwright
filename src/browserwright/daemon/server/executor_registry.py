@@ -614,7 +614,7 @@ class ExecutorRegistry:
         own — e.g. the Fork-4 facade-death self-exit, or a segfault). Returns
         the session ids dropped. The next `ensure()` for those sessions
         cold-starts a fresh executor — mirrors `_on_upstream_closed` →
-        `drop_cdp_context`."""
+        `drop_context`."""
         dead: list[str] = []
         for session_id, handle in list(self._handles.items()):
             if not handle.is_alive():

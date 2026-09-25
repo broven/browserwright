@@ -380,6 +380,14 @@ def test_state_note_target_info_ignores_non_string_target_id():
     assert state.targets == {}
 
 
+
+def _fake_holder():
+    """A holder stand-in: the Daemon wires its recovery machine into every
+    context's adapter, so the adapter must accept it."""
+    return SimpleNamespace(upstream=SimpleNamespace(
+        bind_recovery=lambda _machine, _alive: None))
+
+
 def test_daemon_context_for_cdp_lazily_creates_isolated_config(monkeypatch):
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext
     from browserwright.daemon.server.state import DaemonState
@@ -387,13 +395,7 @@ def test_daemon_context_for_cdp_lazily_creates_isolated_config(monkeypatch):
     class Router:
         daemon = None
 
-    shared = UpstreamContext(backend="extension", state=DaemonState("extension"), router=Router(), holder=object())
-    made = []
-
-    def make_context(backend, cfg, session_id):
-        holder = type("Holder", (), {})()
-        made.append((backend, cfg.backends.cdp.port, session_id))
-        return UpstreamContext(backend=backend, state=DaemonState(backend), router=Router(), holder=holder, session_id=session_id)
+    shared = UpstreamContext(backend="extension", state=DaemonState("extension"), router=Router(), holder=_fake_holder())
 
     cfg = Config()
     cfg.backends.cdp.port = 9222
@@ -401,20 +403,22 @@ def test_daemon_context_for_cdp_lazily_creates_isolated_config(monkeypatch):
         "browserwright.daemon.server.daemon.session_registry.get",
         lambda sid: {"backend": "cdp", "owner": "attach", "workspace": {"port": 9444}},
     )
-    daemon = Daemon(cfg=cfg, shared_context=shared, make_context=make_context)
+    daemon = Daemon(cfg=cfg, shared_context=shared)
     ctx = daemon.context_for("s-cdp")
     assert ctx is daemon.context_for("s-cdp")
-    assert made == [("cdp", 9444, "s-cdp")]
+    assert list(daemon.contexts) == ["s-cdp"]
+    assert (ctx.backend, ctx.session_id) == ("cdp", "s-cdp")
+    assert ctx.upstream.cfg.backends.cdp.port == 9444
     assert cfg.backends.cdp.port == 9222
     assert ctx.router.daemon is daemon
-    assert ctx.holder.cdp_owns_browser is False
+    assert ctx.upstream.owns_browser is False
 
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
         lambda sid: {"backend": "cdp", "owner": "create", "workspace": {"port": 9555}},
     )
     ctx2 = daemon.context_for("s-create")
-    assert ctx2.holder.cdp_owns_browser is True
+    assert ctx2.upstream.owns_browser is True
 
 
 def test_daemon_context_for_unknown_or_non_cdp_uses_shared(monkeypatch):
@@ -428,8 +432,8 @@ def test_daemon_context_for_unknown_or_non_cdp_uses_shared(monkeypatch):
     class Router:
         daemon = None
 
-    shared = UpstreamContext(backend="extension", state=DaemonState("extension"), router=Router(), holder=object())
-    daemon = Daemon(cfg=Config(), shared_context=shared, make_context=lambda **kw: pytest.fail("should not create"))
+    shared = UpstreamContext(backend="extension", state=DaemonState("extension"), router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(), shared_context=shared)
     monkeypatch.setattr("browserwright.daemon.server.daemon.session_registry.get", lambda sid: None)
     assert daemon.context_for(None) is shared
     assert daemon.context_for("missing") is shared
@@ -449,10 +453,8 @@ def test_daemon_context_for_preserves_multi_extension_shared_context(monkeypatch
 
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
+        router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(), shared_context=shared)
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
         lambda sid: {"id": sid, "backend": "extension"},
@@ -476,8 +478,6 @@ def test_raw_cdp_sessions_get_own_contexts_whatever_the_shared_backend(
     conditioned on nothing else. So an extension-backed daemon can hold several
     at once, each pointed somewhere different.
     """
-    from types import SimpleNamespace
-
     from browserwright.daemon.server.daemon import (
         Daemon,
         UnknownSessionError,
@@ -490,15 +490,9 @@ def test_raw_cdp_sessions_get_own_contexts_whatever_the_shared_backend(
 
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
+        router=Router(), holder=_fake_holder())
 
-    def make_context(*, backend, cfg, session_id=None):
-        return UpstreamContext(
-            backend=backend, state=DaemonState(backend), router=Router(),
-            holder=SimpleNamespace(_cfg=cfg), session_id=session_id)
-
-    daemon = Daemon(cfg=Config(backend="extension"), shared_context=shared,
-                    make_context=make_context)
+    daemon = Daemon(cfg=Config(backend="extension"), shared_context=shared)
     records = {
         "a": {"id": "a", "backend": "cdp", "owner": "attach",
               "workspace": {"url": "ws://cloud-a.example/cdp"}},
@@ -519,16 +513,16 @@ def test_raw_cdp_sessions_get_own_contexts_whatever_the_shared_backend(
     assert {id(ctx_a), id(ctx_b), id(ctx_local)}.isdisjoint({id(shared)})
     assert len({id(ctx_a), id(ctx_b), id(ctx_local)}) == 3
     # ...pointed at its own endpoint, with no cross-talk.
-    assert ctx_a.holder._cfg.backends.cdp.endpoint == "ws://cloud-a.example/cdp"
-    assert ctx_b.holder._cfg.backends.cdp.endpoint == "ws://cloud-b.example/cdp"
-    assert ctx_local.holder._cfg.backends.cdp.endpoint is None
-    assert ctx_local.holder._cfg.backends.cdp.port == 9444
+    assert ctx_a.upstream.cfg.backends.cdp.endpoint == "ws://cloud-a.example/cdp"
+    assert ctx_b.upstream.cfg.backends.cdp.endpoint == "ws://cloud-b.example/cdp"
+    assert ctx_local.upstream.cfg.backends.cdp.endpoint is None
+    assert ctx_local.upstream.cfg.backends.cdp.port == 9444
     # The daemon-wide cfg is never mutated by any of that.
     assert daemon.cfg.backends.cdp.endpoint is None
     assert daemon.cfg.backends.cdp.port == 9222
     # Ownership still crosses the ledger→context boundary.
-    assert ctx_a.holder.cdp_owns_browser is False
-    assert ctx_local.holder.cdp_owns_browser is True
+    assert ctx_a.upstream.owns_browser is False
+    assert ctx_local.upstream.owns_browser is True
     # A retired backend value fails closed rather than inheriting anything.
     with pytest.raises(UnknownSessionError):
         daemon.context_for_required("retired")
@@ -554,10 +548,8 @@ def test_daemon_context_for_rejects_backend_context_mismatch(
 
     shared = UpstreamContext(
         backend=shared_backend, state=DaemonState(shared_backend),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(backend=shared_backend), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
+        router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(backend=shared_backend), shared_context=shared)
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
         lambda sid: {"id": sid, "backend": record_backend},
@@ -589,10 +581,8 @@ async def test_daemon_termination_revokes_only_the_ended_session_and_gates_races
 
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
+        router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(), shared_context=shared)
     daemon.executors = Registry()
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
@@ -670,10 +660,8 @@ async def test_concurrent_session_terminators_do_not_deadlock_each_other(
 
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
+        router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(), shared_context=shared)
     daemon.executors = Registry()
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",
@@ -712,101 +700,83 @@ async def test_concurrent_session_terminators_do_not_deadlock_each_other(
     assert second[1]["ok"] is True
 
 
-@pytest.mark.asyncio
-async def test_daemon_teardown_missing_cdp_context_returns_false():
+async def _owned_cdp_daemon(monkeypatch, killed):
+    """A daemon with one create-owned cdp session whose Chrome was launched
+    (pid 4242) but never connected — the real open path, stopped early."""
+    import os
+
+    from browserwright.daemon.errors import Unavailable
     from browserwright.daemon.server.daemon import Daemon, UpstreamContext
     from browserwright.daemon.server.state import DaemonState
 
     class Router:
         daemon = None
 
-    shared = UpstreamContext(backend="extension", state=DaemonState("extension"), router=Router(), holder=object())
-    daemon = Daemon(cfg=Config(), shared_context=shared, make_context=lambda **kw: pytest.fail("should not create"))
-    assert await daemon.teardown_cdp_context("missing") is False
+    async def fake_launch(cfg, **_kw):
+        return {"extras": {"pid": 4242, "profile_path": "/tmp/bs-ssess"}}
 
+    async def fail_resolve(_cfg):
+        raise Unavailable("nothing listening yet")
 
-@pytest.mark.asyncio
-async def test_daemon_teardown_failure_retains_cdp_context_for_retry():
-    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
-    from browserwright.daemon.server.state import DaemonState
-
-    class Router:
-        daemon = None
-
-    class Holder:
-        def __init__(self):
-            self.killed = False
-
-        def _kill_cdp_chrome(self):
-            self.killed = True
-            return True
-
-        async def trigger_close(self, _reason):
-            assert self.killed is True
-            raise RuntimeError("Chrome refused to terminate")
-
-        async def abort_cdp_teardown(self):
-            return None
-
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(
+        "browserwright.daemon.launch_chrome.launch_chrome", fake_launch)
+    monkeypatch.setattr("browserwright.daemon.resolver.resolve", fail_resolve)
+    monkeypatch.setattr(
+        "browserwright.daemon.server.daemon.session_registry.get",
+        lambda sid: {"id": sid, "backend": "cdp", "owner": "create",
+                     "workspace": {"port": 9444}},
+    )
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
-    ctx = UpstreamContext(
-        backend="cdp", state=DaemonState("cdp"),
-        router=Router(), holder=Holder())
-    daemon.contexts["sess"] = ctx
+        router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(), shared_context=shared)
+    ctx = daemon.context_for_required("sess")
+    with pytest.raises(Unavailable):
+        await ctx.holder.ensure_open()
+    assert ctx.upstream.browser_pid == 4242
+    return daemon, ctx
+
+
+@pytest.mark.asyncio
+async def test_daemon_teardown_failure_retains_cdp_context_for_retry(monkeypatch):
+    killed: list[int] = []
+    daemon, ctx = await _owned_cdp_daemon(monkeypatch, killed)
+
+    async def refuse(_reason):
+        # The owned Chrome is terminated before the first close await.
+        assert killed == [4242]
+        raise RuntimeError("Chrome refused to terminate")
+
+    ctx.holder.trigger_close = refuse
 
     with pytest.raises(RuntimeError, match="refused to terminate"):
-        await daemon.teardown_cdp_context("sess")
+        await daemon.end_workspace("sess")
     assert daemon.contexts["sess"] is ctx
 
 
 @pytest.mark.asyncio
-async def test_daemon_teardown_budget_restores_retryable_cdp_context():
+async def test_daemon_teardown_budget_restores_retryable_cdp_context(monkeypatch):
     import time
 
-    from browserwright.daemon.server.daemon import Daemon, UpstreamContext
-    from browserwright.daemon.server.state import DaemonState, UpstreamPhase
+    from browserwright.daemon.server.state import UpstreamPhase
 
-    class Router:
-        daemon = None
+    killed: list[int] = []
+    daemon, ctx = await _owned_cdp_daemon(monkeypatch, killed)
+    state = ctx.state
 
-    state = DaemonState("cdp")
+    async def hang(_reason):
+        await state.begin_closing("skill_disconnect")
+        await asyncio.Event().wait()
 
-    class Holder:
-        def __init__(self):
-            self.killed = False
+    ctx.holder.trigger_close = hang
 
-        def _kill_cdp_chrome(self):
-            self.killed = True
-            return True
-
-        async def trigger_close(self, _reason):
-            await state.begin_closing("skill_disconnect")
-            await asyncio.Event().wait()
-
-        async def abort_cdp_teardown(self):
-            await state.set_disconnected()
-
-    shared = UpstreamContext(
-        backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
-    holder = Holder()
-    ctx = UpstreamContext(
-        backend="cdp", state=state, router=Router(), holder=holder)
-    daemon.contexts["sess"] = ctx
-
-    ended = await daemon.teardown_cdp_context(
+    result = await daemon.end_workspace(
         "sess", deadline=time.monotonic() + 0.01)
 
-    assert ended is False
-    assert holder.killed is True
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert killed == [4242]
     assert daemon.contexts["sess"] is ctx
     assert state.upstream_phase is UpstreamPhase.DISCONNECTED
 
@@ -889,10 +859,8 @@ def _make_daemon(registry):
 
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **kw: pytest.fail("should not create"))
+        router=Router(), holder=_fake_holder())
+    daemon = Daemon(cfg=Config(), shared_context=shared)
     daemon.executors = registry
     return daemon
 

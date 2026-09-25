@@ -23,10 +23,8 @@ Detection is minimal — we ask the user.
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -79,24 +77,16 @@ def chrome_extension_path() -> Optional[str]:
         return env_path
 
     # (2) Ask the daemon itself.
-    try:
-        proc = subprocess.run(
-            ["browserwright-daemon", "extension-path", "--json"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            try:
-                data = json.loads(proc.stdout)
-                p = data.get("path") if isinstance(data, dict) else None
-                if p and os.path.isdir(p):
-                    return p
-            except json.JSONDecodeError:
-                # Some daemon builds may emit a bare path on stdout.
-                p = proc.stdout.strip().splitlines()[0]
-                if os.path.isdir(p):
-                    return p
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    from . import daemon_lifecycle as lifecycle
+
+    proc = lifecycle.run_verb(["extension-path", "--json"], timeout=5)
+    if proc.returncode == 0 and proc.stdout.strip():
+        data = proc.json()
+        # Some daemon builds may emit a bare path on stdout.
+        p = (data.get("path") if data is not None
+             else proc.stdout.strip().splitlines()[0])
+        if p and os.path.isdir(p):
+            return p
 
     # (3) Best-effort walk from the installed binary.
     bin_path = shutil.which("browserwright-daemon")

@@ -17,6 +17,11 @@ import websockets
 
 from browserwright.daemon import _ipc
 from browserwright.daemon.config import Config
+from browserwright.daemon.server.session_state import (
+    HEALTHY,
+    TAB_GONE,
+    RecoveryStateMachine,
+)
 from browserwright.daemon.server.facade import (
     CONTROL_PATH,
     EXEC_PATH,
@@ -80,6 +85,19 @@ class _FakeRegistry:
         return self._sock
 
 
+class _FakeDaemon:
+    """The daemon's side of the relay: its one drivable path (here, just the
+    registry's ensure) and its recovery state machine."""
+
+    executors: _FakeRegistry | None = None
+    recovery: RecoveryStateMachine | None = None
+
+    async def ensure_executor(self, session_id: str) -> str:
+        if self.executors is None:
+            raise RuntimeError("daemon has no executor registry")
+        return await self.executors.ensure(session_id)
+
+
 @pytest.fixture
 def short_tmp(tmp_path_factory):
     """A short-path dir for AF_UNIX sockets (see `_FakeExecutorServer.start`)."""
@@ -102,7 +120,7 @@ async def endpoint():
         async for raw in conn:
             await conn.send(json.dumps({"echo": json.loads(raw)}))
 
-    daemon = type("_D", (), {"executors": None})()
+    daemon = _FakeDaemon()
     server = PlaywrightFacade(cfg=Config(), port=0, host="127.0.0.1",
                               daemon=daemon, control_handler=control_handler)
     port = await server.start()
@@ -245,6 +263,47 @@ async def test_exec_relay_carries_a_frame_above_the_old_100mib_ceiling(
             await ws.send(json.dumps({"code": "screenshot()"}))
             reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=60.0))
         assert reply["console"] == big
+    finally:
+        await executor.stop()
+
+
+async def test_exec_relay_hands_recovery_events_to_the_machine_not_the_agent(
+        endpoint, short_tmp):
+    """The executor reports what it saw about the tab binding in an explicit
+    `recovery_event`; the relay feeds it to the daemon's state machine — the
+    only authority on recovery state — and the agent's frame never carries
+    it. A lost tab is `tab-gone`; an in-place rebind, whose agent-facing
+    answer is an error asking for a retry, is a recovered tab."""
+    machine = RecoveryStateMachine()
+    machine.load([{"id": "s-4", "backend": "extension",
+                   "recovery": {"state": HEALTHY}}],
+                 extension_connected=True, executor_alive=lambda _sid: True)
+    endpoint.fake_daemon.recovery = machine
+    executor = _FakeExecutorServer()
+    sock = await executor.start(short_tmp)
+    endpoint.fake_daemon.executors = _FakeRegistry(sock)
+    lost = {"console": "", "error": {"type": "TabRebindFailed", "msg": "gone"},
+            "terminal_reason": "target_closed",
+            "recovery_event": {"kind": "target-gone", "detail": "tab closed"}}
+    rebound = {"console": "", "error": {"type": "TargetClosedError",
+                                        "msg": "closed", "fix": "RETRY"},
+               "recovery_event": {"kind": "rebound", "detail": "re-bound"}}
+    try:
+        url = f"ws://{endpoint.base}{EXEC_PATH}?session=s-4"
+        async with websockets.connect(url, max_size=None) as ws:
+            executor.reply = lost
+            await ws.send(json.dumps({"code": "page.title()"}))
+            reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert "recovery_event" not in reply
+            assert reply["terminal_reason"] == "target_closed"
+            assert machine.state_of("s-4") == TAB_GONE
+
+            executor.reply = rebound
+            await ws.send(json.dumps({"code": "page.title()"}))
+            reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+            assert reply == {k: v for k, v in rebound.items()
+                             if k != "recovery_event"}
+            assert machine.state_of("s-4") == HEALTHY
     finally:
         await executor.stop()
 

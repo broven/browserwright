@@ -230,8 +230,8 @@ class CDPError(BrowserwrightError):
     exit_code = 3
     default_fix = (
         "if the message mentions an unknown method (-32601) the daemon is "
-        "likely stale — `browserwright-daemon stop` then re-run; otherwise check "
-        "the method name and params"
+        "likely stale — `browserwright recover --session <id>` replaces it; "
+        "otherwise check the method name and params"
     )
 
     def __init__(self, method: str = "", params=None, cdp_message: str = "", fix: str = ""):

@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
 
 from browserwright.daemon.server.daemon import Daemon
-from browserwright.daemon.server.exec_relay import _report_executor_result
-from browserwright.daemon.server.listener import _UpstreamHolder
+from browserwright.daemon.server.extension_upstream import ExtensionUpstream
 from browserwright.daemon.server.relay import RelayServer
 from browserwright.daemon.server.session_state import (
     EXECUTOR_DEAD,
@@ -46,6 +44,31 @@ def _machine(initial: str = EXECUTOR_UNBOUND):
     return machine, writes
 
 
+async def _noop(_value: str) -> None:
+    return None
+
+
+class _Relay:
+    """Just enough relay for an adapter to open and read its generation."""
+
+    def __init__(self, generation: int):
+        self.connection_generation = generation
+
+    async def wait_ready(self, timeout: float) -> None:
+        return None
+
+    def set_event_handler(self, handler) -> None:
+        return None
+
+
+async def _open_adapter(generation: int, machine) -> ExtensionUpstream:
+    """An opened extension adapter wired to ``machine`` — target events are
+    only acted on once a client has opened the browser."""
+    adapter = ExtensionUpstream(_Relay(generation), _noop, _noop)
+    adapter.bind_recovery(machine, lambda _sid: True)
+    await adapter.open()
+    return adapter
+
 def test_transition_table_names_the_broken_layer_and_recovers():
     machine, _ = _machine()
 
@@ -81,23 +104,6 @@ def test_tab_failure_dominates_executor_reap_and_respawn():
     assert machine.note("7", EXECUTOR_READY) == TAB_GONE
 
 
-def test_exec_relay_reports_live_and_lost_tab_outcomes():
-    machine, _ = _machine(HEALTHY)
-    daemon = SimpleNamespace(recovery=machine)
-
-    _report_executor_result(daemon, "7", json.dumps({
-        "error": {"msg": "page disappeared"},
-        "terminal_reason": "target_closed",
-    }).encode())
-    assert machine.state_of("7") == TAB_GONE
-
-    _report_executor_result(daemon, "7", json.dumps({
-        "error": None,
-        "terminal_reason": None,
-    }).encode())
-    assert machine.state_of("7") == HEALTHY
-
-
 def test_terminal_session_removes_recovery_state():
     machine, _ = _machine(HEALTHY)
     Daemon._mark_session_ended(SimpleNamespace(recovery=machine), "7")
@@ -112,22 +118,18 @@ async def test_extension_target_detach_reports_current_tab_gone(monkeypatch):
           "runtime": {"current_target_id": "ext-tab-42"},
           "recovery": {"state": HEALTHY}}],
         extension_connected=True, executor_alive=lambda _sid: True)
-    holder = _UpstreamHolder.__new__(_UpstreamHolder)
-    holder.recovery = machine
-    holder.executor_alive = lambda _sid: True
-    holder.relay = SimpleNamespace(connection_generation=3)
+    adapter = await _open_adapter(3, machine)
 
-    class MissingTab:
-        async def recover_session(self, _sid):
-            raise RuntimeError("group has no tab")
+    async def missing_tab(_sid):
+        raise RuntimeError("group has no tab")
 
-    holder._extension_adapter = MissingTab()
+    adapter.recover_session = missing_tab
     monkeypatch.setattr(
         "browserwright.session_registry.list_all",
         lambda: [{"id": "ext", "backend": "extension",
                   "runtime": {"current_target_id": "ext-tab-42"}}])
 
-    await holder._on_target_event({
+    await adapter._on_target_event({
         "type": "detached", "tabId": 42, "_relay_generation": 3})
 
     assert machine.state_of("ext") == TAB_GONE
@@ -156,28 +158,26 @@ async def test_extension_target_event_requires_live_group_and_fresh_generation(
             self.calls += 1
             return False
 
-    adapter = GroupAware()
-    holder = _UpstreamHolder.__new__(_UpstreamHolder)
-    holder.recovery = machine
-    holder.executor_alive = lambda _sid: True
-    holder.relay = SimpleNamespace(connection_generation=6)
-    holder._extension_adapter = adapter
+    group = GroupAware()
+    adapter = await _open_adapter(6, machine)
+    adapter.recover_session = group.recover_session
+    adapter.target_belongs_to_session = group.target_belongs_to_session
     monkeypatch.setattr(
         "browserwright.session_registry.list_all",
         lambda: [{"id": "ext", "backend": "extension",
                   "runtime": {"current_target_id": "ext-tab-42"}}])
 
     # Old connection event is discarded before it can perform recovery.
-    await holder._on_target_event({
+    await adapter._on_target_event({
         "type": "detached", "tabId": 42, "_relay_generation": 4})
-    assert adapter.calls == 0
+    assert group.calls == 0
     assert machine.state_of("ext") == EXTENSION_DISCONNECTED
 
     # A current `attached` event without canonical group membership cannot
     # promote the session either.
-    await holder._on_target_event({
+    await adapter._on_target_event({
         "type": "attached", "tabId": 42, "_relay_generation": 6})
-    assert adapter.calls == 1
+    assert group.calls == 1
     assert machine.state_of("ext") == EXTENSION_DISCONNECTED
 
 

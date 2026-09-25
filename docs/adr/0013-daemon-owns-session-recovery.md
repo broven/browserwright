@@ -3,7 +3,11 @@
 Status: accepted and implemented (2026-09-02) by #92 and #94. ADR-0012 first
 removed development-induced daemon churn; the recovery state machine, executor
 adoption, recovery verb, and diagnosis-gated restart then implemented rules 1,
-2, and 5.
+2, and 5. Rule 1's "no hop decides recovery on its own" was completed on
+2026-09-24: one drivable path (`Daemon.ensure_session_drivable`) serves
+`ensureExecutor`, `/exec`, `recoverSession` and `recover`, and the executor
+reports its rebind outcome as an explicit `ExecuteResponse.recovery_event`
+instead of the daemon inferring it from agent-facing error text.
 
 ## Context
 

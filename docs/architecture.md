@@ -363,7 +363,9 @@ src/browserwright/
 ├── cli.py                ← argv dispatch — start here when wiring a new subcommand
 ├── __init__.py           ← `EXPORTS` = the `from browserwright import *` surface
 ├── install.py            ← the wizard (doctor-driven option detection)
-├── mode_b_client.py      ← Mode B socket client + client_for_session() resolver
+├── mode_b_client.py      ← control-surface client + client_for_session() (no lifecycle side effects)
+├── daemon_lifecycle.py   ← the ONE client-side owner of daemon start/replace: diagnose() / ensure()
+│                           / unreachable_fix(), plus the `browserwright-daemon <verb>` adapter
 ├── session_create.py / session_registry.py / session_runtime.py
 │                         ← session ledger: creation, immutable backend, runtime state
 ├── repl/                 ← inline heredoc execution + long-lived REPL daemon
@@ -377,7 +379,7 @@ src/browserwright/
 │   ├── _stale.py         ← detect + reclaim a half-alive daemon's relay/endpoint ports
 │   ├── launchagent.py    ← macOS service registration (install / uninstall / restart)
 │   ├── relay_status.py   ← the relay's /__status__ endpoint, fetched from one place
-│   └── server/           ← endpoint server, listener/Router, relay, exec relay, executor registry
+│   └── server/           ← endpoint server, listener/Router, Upstream adapters + contexts, relay, exec relay, executor registry
 └── site_skills_starter/  ← bundled site dirs (names = eTLD+1 stems)
 
 tests/

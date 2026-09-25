@@ -49,6 +49,25 @@ TERMINAL_REASONS = frozenset(
     }
 )
 
+#: What the executor observed about the session's tab binding during one call
+#: — reported, never decided (ADR-0013 rule 1: the daemon's recovery state
+#: machine is the only authority on a session's recovery state). The exec relay
+#: forwards the event to that machine and strips it from the agent-facing
+#: response.
+#:
+#: - ``bound``: the call completed on the page the executor already held.
+#: - ``rebound``: the held page's tab was gone and the executor re-bound
+#:   ``page`` to a live tab of the session in place (before the call, or
+#:   mid-call — the "RETRY the call" answer).
+#: - ``target-gone``: the tab was gone and re-binding failed; the executor
+#:   recycles itself.
+RECOVERY_BOUND = "bound"
+RECOVERY_REBOUND = "rebound"
+RECOVERY_TARGET_GONE = "target-gone"
+RECOVERY_EVENT_KINDS = frozenset(
+    {RECOVERY_BOUND, RECOVERY_REBOUND, RECOVERY_TARGET_GONE}
+)
+
 _LEN = struct.Struct(">I")
 _MAX_FRAME = 256 * 1024 * 1024  # generous: screenshots land here in PR3
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -217,6 +236,10 @@ class ExecuteResponse:
     # JSON encoding of a task's result.  ``None`` means this was not a
     # successful task response; the JSON string ``"null"`` is a valid result.
     task_result_json: str | None = None
+    # ``{"kind": RECOVERY_*, "detail": str}`` or None when the call says
+    # nothing about the tab binding. Addressed to the daemon, not the agent:
+    # the exec relay consumes it (see ``RECOVERY_EVENT_KINDS``).
+    recovery_event: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -229,6 +252,7 @@ class ExecuteResponse:
             "truncated": self.truncated,
             "terminal_reason": self.terminal_reason,
             "task_result_json": self.task_result_json,
+            "recovery_event": self.recovery_event,
         }
 
     @classmethod
@@ -246,6 +270,13 @@ class ExecuteResponse:
                 raise ValueError(
                     "ExecuteResponse.task_result_json must contain valid JSON"
                 ) from e
+        # Lenient on purpose: this field is observation for the daemon, and a
+        # client that rejected an unknown kind would treat the whole response
+        # as malformed and reap a healthy executor.
+        recovery_event = d.get("recovery_event")
+        if not (isinstance(recovery_event, dict)
+                and recovery_event.get("kind") in RECOVERY_EVENT_KINDS):
+            recovery_event = None
         return cls(
             console=str(d.get("console") or ""),
             return_value=d.get("return_value"),
@@ -256,6 +287,10 @@ class ExecuteResponse:
             truncated=bool(d.get("truncated") or False),
             terminal_reason=terminal_reason,
             task_result_json=task_result_json,
+            recovery_event=(
+                {"kind": str(recovery_event["kind"]),
+                 "detail": str(recovery_event.get("detail") or "")}
+                if recovery_event is not None else None),
         )
 
 

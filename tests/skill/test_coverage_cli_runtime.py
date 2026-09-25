@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from browserwright import daemon_lifecycle
+
 
 def test_parse_kv_args_coerces_json_space_values_and_flags():
     from browserwright import cli
@@ -561,10 +563,12 @@ def test_session_reset_uses_bd_session_fallback(tmp_bs_home, monkeypatch, capsys
     assert capsys.readouterr().out == f"reset {sid}\n"
 
 
-def test_cmd_session_new_stderr_keeps_stdout_bare(monkeypatch, tmp_bs_home, capsys):
+def test_cmd_session_new_stderr_keeps_stdout_bare(
+        monkeypatch, tmp_bs_home, capsys, make_verdict):
     from browserwright import cli, session_create
 
-    monkeypatch.setattr(session_create, "new", lambda **kwargs: "17")
+    monkeypatch.setattr(session_create, "new", lambda **kwargs: session_create.NewSession(
+        "17", False, make_verdict()))
 
     assert cli._cmd_session(["new", "--backend=cdp", "--name=job"]) == 0
     streams = capsys.readouterr()
@@ -603,7 +607,7 @@ def test_cmd_userscript_verify_skips_reload_after_push_failure(monkeypatch, caps
         calls.append((argv, kwargs))
         return SimpleNamespace(returncode=7)
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon_lifecycle.subprocess, "run", fake_run)
 
     monkeypatch.setenv("BW_DAEMON_URL", "http://100.72.20.32:19990")
     assert cli._cmd_userscript(["push", "script.js", "--verify"]) == 7
@@ -629,8 +633,7 @@ def test_cmd_userscript_verify_binds_bd_session(monkeypatch, tmp_bs_home, capsys
             return SimpleNamespace(returncode=1, stdout="", stderr="")
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    monkeypatch.setattr("browserwright.mode_b_client.ModeBClient.is_alive", lambda self: False)
+    monkeypatch.setattr(daemon_lifecycle.subprocess, "run", fake_run)
 
     # --verify is queued on the same resident executor as -e and task.
     executor_calls = []
@@ -663,7 +666,7 @@ def test_cmd_userscript_verify_failure_preserves_successful_push(
     sid = reg.allocate(backend="cdp", owner="create")
     monkeypatch.setenv("BD_SESSION", sid)
     monkeypatch.setattr(
-        cli.subprocess,
+        daemon_lifecycle.subprocess,
         "run",
         lambda argv, **kwargs: SimpleNamespace(
             returncode=0, stdout="", stderr="",
@@ -690,7 +693,7 @@ def test_daemon_doctor_synthetic_for_spawn_failure(monkeypatch):
     def fail(*args, **kwargs):
         raise FileNotFoundError("missing daemon")
 
-    monkeypatch.setattr(health.subprocess, "run", fail)
+    monkeypatch.setattr(daemon_lifecycle.subprocess, "run", fail)
 
     info = health.daemon_doctor()
     assert info["skill_synthetic"] is True
@@ -702,7 +705,7 @@ def test_daemon_doctor_synthetic_for_nonzero_exit(monkeypatch):
     from browserwright import health
 
     monkeypatch.setattr(
-        health.subprocess,
+        daemon_lifecycle.subprocess,
         "run",
         lambda *a, **k: SimpleNamespace(returncode=4, stdout="", stderr="bad daemon\n"),
     )
@@ -716,7 +719,7 @@ def test_daemon_doctor_synthetic_for_invalid_json(monkeypatch):
     from browserwright import health
 
     monkeypatch.setattr(
-        health.subprocess,
+        daemon_lifecycle.subprocess,
         "run",
         lambda *a, **k: SimpleNamespace(returncode=0, stdout="{nope", stderr=""),
     )
@@ -863,6 +866,17 @@ def test_cmd_doctor_no_daemon_reports_daemon_running_as_headline(monkeypatch, ca
     assert "doctor: FAIL" in out
 
 
+def _fake_verbs(monkeypatch, *, rc=0, calls=None):
+    """Substitute the `browserwright-daemon` adapter: every verb exits `rc`,
+    and its argv (without the binary) is appended to `calls`."""
+    def run_verb(args, **kwargs):
+        if calls is not None:
+            calls.append(list(args))
+        return daemon_lifecycle.VerbResult(rc)
+
+    monkeypatch.setattr(daemon_lifecycle, "run_verb", run_verb)
+
+
 def test_session_create_reset_fix_no_longer_loops_through_doctor(monkeypatch):
     """Secondary (issue #28): `session reset`'s fix text used to say 'run
     `browserwright doctor`' — which reported `✓ daemon` on a down daemon, so
@@ -873,9 +887,7 @@ def test_session_create_reset_fix_no_longer_loops_through_doctor(monkeypatch):
     from browserwright import session_create
 
     sid = "deadbeef"
-    monkeypatch.setattr(session_create, "_run", lambda cmd: 1)
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
+    _fake_verbs(monkeypatch, rc=1)
     monkeypatch.setattr(session_create, "_reap_executor_locally", lambda _sid: None)
     from browserwright.errors import DaemonUnavailable
 
@@ -971,18 +983,17 @@ def test_doctor_checks_show_per_session_recovery_state(monkeypatch):
     assert "browserwright recover --session <id>" in sessions["fix"]
 
 
-def test_session_create_run_returns_three_for_timeout(monkeypatch):
+def test_run_verb_returns_three_for_timeout(monkeypatch):
     """A timed-out end-session subprocess is a failure (exit 3, matching the
     CLI's own TimeoutError mapping), never a crash — the ledger row is kept
     for retry, and the retry joins the daemon-side teardown (issue #32)."""
-    from browserwright import session_create
-
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(args[0], timeout=10)
 
-    monkeypatch.setattr(session_create.subprocess, "run", timeout)
+    monkeypatch.setattr(daemon_lifecycle.subprocess, "run", timeout)
 
-    assert session_create._run(["browserwright-daemon", "end-session"]) == 3
+    result = daemon_lifecycle.run_verb(["end-session"])
+    assert result.returncode == 3 and result.timed_out
 
 
 def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monkeypatch):
@@ -996,13 +1007,13 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
     reg._with_entry(ext_sid, lambda e: e.update(last_seen=0.0))
     ended = []
 
-    def _run(cmd, **kwargs):
-        sid = cmd[cmd.index("--session") + 1]
+    def _run(args, **kwargs):
+        sid = args[args.index("--session") + 1]
         assert reg.get(sid) is not None
         ended.append(sid)
-        return 0
+        return daemon_lifecycle.VerbResult(0)
 
-    monkeypatch.setattr(session_create, "_run", _run)
+    monkeypatch.setattr(daemon_lifecycle, "run_verb", _run)
 
     pruned = session_create.reap(idle_seconds=1)
 
@@ -1014,7 +1025,7 @@ def test_session_create_reap_tears_down_before_removing_ledger(tmp_bs_home, monk
 
 
 def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
-    tmp_bs_home, monkeypatch,
+    tmp_bs_home, monkeypatch, make_verdict,
 ):
     """The daemon is UP (so #40's daemon-down force-drop does not apply) but
     its teardown comes back partial: the row is kept for the #32 retry."""
@@ -1023,8 +1034,8 @@ def test_create_owned_end_keeps_ledger_when_daemon_teardown_is_partial(
 
     sid = reg.allocate(backend="cdp", owner="create", name="owned")
     record = reg.get(sid)
-    monkeypatch.setattr(session_create, "_run", lambda _cmd, **kwargs: 3)
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: True)
+    _fake_verbs(monkeypatch, rc=3)
+    monkeypatch.setattr(daemon_lifecycle, "diagnose", lambda **kw: make_verdict())
 
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):
         session_create.end(record)
@@ -1036,12 +1047,14 @@ def test_session_create_reset_executor_keeps_ledger(tmp_bs_home, monkeypatch):
 
     sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     calls = []
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: calls.append(["ensure"]))
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
+    monkeypatch.setattr(daemon_lifecycle, "ensure",
+                        lambda reason, **kw: calls.append(["ensure", reason]))
+    _fake_verbs(monkeypatch, calls=calls)
 
     message = session_create.reset_executor(reg.get(sid))
 
-    assert calls == [["ensure"], ["browserwright-daemon", "kill-executor", "--session", sid]]
+    assert calls == [["ensure", "session reset"],
+                     ["kill-executor", "--session", sid]]
     assert "left untouched" in message
     assert reg.get(sid) is not None
 
@@ -1056,9 +1069,7 @@ def test_session_create_reset_executor_refuses_unconfirmed_reap(
     from browserwright.errors import DaemonUnavailable
 
     sid = reg.allocate(backend="cdp", owner="attach", name="attached")
-    monkeypatch.setattr(session_create, "_ensure_daemon_running", lambda: None)
-    monkeypatch.setattr(session_create, "_run", lambda _cmd: 1)
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
+    _fake_verbs(monkeypatch, rc=1)
     monkeypatch.setattr(session_create, "_reap_executor_locally", lambda _sid: None)
 
     with pytest.raises(DaemonUnavailable, match="could not confirm"):
@@ -1093,7 +1104,7 @@ def test_session_create_end_extension_passes_no_group_id(tmp_bs_home, monkeypatc
     sid = reg.allocate(backend="extension", owner="attach", name="shared")
     reg.update(sid, runtime={"current_target_id": "ext-tab-7"})
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
+    _fake_verbs(monkeypatch, calls=calls)
 
     message = session_create.end(reg.get(sid))
 
@@ -1103,7 +1114,7 @@ def test_session_create_end_extension_passes_no_group_id(tmp_bs_home, monkeypatc
     # title from the ledger, so Layer 2 has nothing to pass and cannot pass a
     # stale one.
     assert calls == [
-        ["browserwright-daemon", "end-session", "--session", sid],
+        ["end-session", "--session", sid],
     ]
     # The browser survives, but the session's TABS do not — say both. The old
     # text reused the cdp-attach line ("left untouched"), which described a
@@ -1179,10 +1190,10 @@ def test_session_create_end_attach_cdp_reaps_executor(tmp_bs_home, monkeypatch):
 
     sid = reg.allocate(backend="cdp", owner="attach", name="attached")
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
+    _fake_verbs(monkeypatch, calls=calls)
     message = session_create.end(reg.get(sid))
 
-    assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
+    assert calls == [["end-session", "--session", sid]]
     assert "still running" in message  # browser untouched (semantics preserved)
     assert reg.get(sid) is None
 
@@ -1196,12 +1207,12 @@ def test_session_create_end_create_cdp_does_not_double_reap(tmp_bs_home, monkeyp
     sid = reg.allocate(backend="cdp", owner="create", name="owned",
                        workspace={"port": 12345})
     calls = []
-    monkeypatch.setattr(session_create, "_run", lambda cmd, **kwargs: calls.append(cmd) or 0)
+    _fake_verbs(monkeypatch, calls=calls)
 
     message = session_create.end(reg.get(sid))
 
     # Only the create-owned browser teardown (end-session); no kill-executor.
-    assert calls == [["browserwright-daemon", "end-session", "--session", sid]]
+    assert calls == [["end-session", "--session", sid]]
     assert "was closed" in message
     assert reg.get(sid) is None
 
@@ -1220,8 +1231,7 @@ def test_session_create_end_keeps_attach_ledger_when_daemon_is_unconfirmed(
     def boom(*_a, **_k):
         raise subprocess.TimeoutExpired("browserwright-daemon", timeout=10)
 
-    monkeypatch.setattr(session_create.subprocess, "run", boom)
-    monkeypatch.setattr(session_create, "_daemon_is_running", lambda: False)
+    monkeypatch.setattr(daemon_lifecycle.subprocess, "run", boom)
     monkeypatch.setattr(session_create, "_reap_executor_locally", lambda _sid: None)
 
     with pytest.raises(DaemonUnavailable, match="ledger entry was kept"):

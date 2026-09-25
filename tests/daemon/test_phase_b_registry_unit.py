@@ -762,6 +762,158 @@ async def test_spawn_readiness_timeout_confirms_exact_process_death(monkeypatch)
 # ---- ensureExecutor verb dispatch ------------------------------------------
 
 
+def _daemon_with_cdp_session(monkeypatch, tmp_path, *, open_error=None,
+                             spawn_error=None):
+    """A real daemon — context factory, per-session cdp context, holder,
+    adapter, drivable path, executor registry — hosting one cdp session, with a
+    control client bound to it. Stood in for: the browser (``CdpUpstream.open``)
+    and the executor subprocess (``ExecutorRegistry._spawn``). Both record
+    into ``order`` so the drivable path's sequencing is observable."""
+    from browserwright import session_registry
+    from browserwright.daemon.config import Config
+    from browserwright.daemon.server.daemon import Daemon
+    from browserwright.daemon.server.upstream import CdpUpstream
+    from browserwright.daemon.server.upstream_context import build_context
+
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    sid = session_registry.allocate(backend="cdp", owner="create", name="t")
+    order: list[str] = []
+
+    async def _open(self, ws_url=None, *, timeout=None):
+        order.append("ensure_upstream")
+        if open_error is not None:
+            raise open_error
+        self._ws = object()  # the connection is live from here on
+
+    monkeypatch.setattr(CdpUpstream, "open", _open)
+    cfg = Config()
+    daemon = Daemon(cfg=cfg, shared_context=build_context(
+        backend="extension", cfg=cfg))
+
+    async def _spawn(session_id):
+        order.append("registry.ensure")
+        if spawn_error is not None:
+            raise spawn_error
+        return _handle(session_id, f"/tmp/bw-exec-{session_id}.sock",
+                       executor_id=f"executor-{session_id}")
+
+    monkeypatch.setattr(daemon.executors, "_spawn", _spawn)
+    ctx = daemon.context_for_required(sid)
+    captured: list[dict] = []
+    client = ctx.state.allocate_client("c")
+    client.session_id = sid
+
+    async def _send(text: str) -> None:
+        captured.append(json.loads(text))
+
+    ctx.router.register_client(client.client_id, _send)
+    return ctx, client, captured, order
+
+
+async def _ensure_executor(ctx, client, **params):
+    await ctx.router.route_from_client(client, json.dumps({
+        "id": 1,
+        "method": "BrowserwrightDaemon.ensureExecutor",
+        "params": params,
+    }))
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_verb_confirms_readiness(monkeypatch, tmp_path):
+    ctx, client, captured, _ = _daemon_with_cdp_session(monkeypatch, tmp_path)
+    await _ensure_executor(ctx, client, session=client.session_id)
+    # ADR-0011: readiness + instance identity. The executor socket is a
+    # daemon-internal detail now; the client reaches it through `/exec`.
+    assert captured[-1]["result"] == {
+        "ready": True,
+        "executor_id": f"executor-{client.session_id}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_rejects_mismatched_browserwright_session_param(
+        monkeypatch, tmp_path):
+    ctx, client, captured, order = _daemon_with_cdp_session(
+        monkeypatch, tmp_path)
+    await _ensure_executor(ctx, client, bsSession="other")
+    err = captured[-1]["error"]
+    assert err["code"] == -32602
+    assert "session mismatch" in err["message"]
+    assert order == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_verb_requires_ws_session(monkeypatch, tmp_path):
+    ctx, client, captured, order = _daemon_with_cdp_session(
+        monkeypatch, tmp_path)
+    client.session_id = None  # no ws ?session=
+    await _ensure_executor(ctx, client)
+    # Missing session → -32602 (NOT -32601: the verb is known/registered).
+    assert captured[-1]["error"]["code"] == -32602
+    assert order == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_verb_surfaces_registry_failure(
+        monkeypatch, tmp_path):
+    ctx, client, captured, _ = _daemon_with_cdp_session(
+        monkeypatch, tmp_path, spawn_error=RuntimeError("spawn boom"))
+    await _ensure_executor(ctx, client, session=client.session_id)
+    err = captured[-1]["error"]
+    assert err["code"] == -32603
+    assert "spawn boom" in err["message"]
+
+
+# ---- Failure #4: ensureExecutor launches the upstream BEFORE spawning -------
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_launches_upstream_before_registry(
+        monkeypatch, tmp_path):
+    """Failure #4: the executor's cold-start `connect_over_cdp(facade)` needs a
+    LIVE cdp Chrome (its dynamic port pinned). So `ensureExecutor` must open
+    the upstream (→ launch the cdp Chrome) BEFORE spawning, or the facade
+    resolves the stale default port and the executor exits during
+    cold-start. Assert the ordering."""
+    ctx, client, captured, order = _daemon_with_cdp_session(
+        monkeypatch, tmp_path)
+    await _ensure_executor(ctx, client, session=client.session_id)
+    assert order == ["ensure_upstream", "registry.ensure"], (
+        "ensureExecutor must launch the upstream (cdp Chrome) BEFORE spawning "
+        "the executor")
+    assert captured[-1]["result"]["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_skips_upstream_when_already_connected(
+        monkeypatch, tmp_path):
+    """When the upstream is already open (warm), `ensureExecutor` does NOT
+    re-open it — it goes straight to the registry."""
+    ctx, client, _, order = _daemon_with_cdp_session(monkeypatch, tmp_path)
+    await ctx.holder.ensure_open()
+    order.clear()
+    await _ensure_executor(ctx, client, session=client.session_id)
+    assert order == ["registry.ensure"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_executor_upstream_failure_returns_error_envelope(
+        monkeypatch, tmp_path):
+    """A Chrome-launch failure during the pre-spawn upstream open surfaces as a
+    proper -32603 error envelope (never crashes the client ws), and the
+    registry is NOT consulted."""
+    ctx, client, captured, order = _daemon_with_cdp_session(
+        monkeypatch, tmp_path, open_error=RuntimeError("chrome launch boom"))
+    await _ensure_executor(ctx, client, session=client.session_id)
+    assert "registry.ensure" not in order
+    err = captured[-1]["error"]
+    assert err["code"] == -32603
+    assert "upstream open" in err["message"]
+
+
+# ---- killExecutor verb (Phase B / Failure #3 hardening) --------------------
+
+
 def _router_with_client():
     """Minimal Router + one registered client, exercised through the real
     `route_from_client` dispatch path (no daemon process / upstream)."""
@@ -790,238 +942,6 @@ def _router_with_client():
     router.register_client(client.client_id, _send)
     return router, client, captured
 
-
-@pytest.mark.asyncio
-async def test_ensure_executor_verb_confirms_readiness():
-    router, client, captured = _router_with_client()
-
-    class _Daemon:
-        class _Reg:
-            async def ensure(self, session_id):
-                assert session_id == "sess"
-                return "/tmp/bw-exec-sess.sock"
-
-            def get(self, session_id):
-                assert session_id == "sess"
-                return type("Handle", (), {"executor_id": "executor-sess"})()
-
-        executors = _Reg()
-
-    router.daemon = _Daemon()
-    await router.route_from_client(
-        client,
-        json.dumps(
-            {
-                "id": 1,
-                "method": "BrowserwrightDaemon.ensureExecutor",
-                "params": {"session": "sess"},
-            }
-        ),
-    )
-    # ADR-0011: readiness + instance identity. The executor socket is a
-    # daemon-internal detail now; the client reaches it through `/exec`.
-    assert captured[client.client_id][-1]["result"] == {
-        "ready": True,
-        "executor_id": "executor-sess",
-    }
-
-
-@pytest.mark.asyncio
-async def test_ensure_executor_rejects_mismatched_browserwright_session_param():
-    router, client, captured = _router_with_client()
-
-    class _Daemon:
-        class _Reg:
-            async def ensure(self, session_id):
-                raise AssertionError("registry must not be reached")
-
-        executors = _Reg()
-
-    router.daemon = _Daemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {"bsSession": "other"},
-    }))
-    err = captured[client.client_id][-1]["error"]
-    assert err["code"] == -32602
-    assert "session mismatch" in err["message"]
-
-
-@pytest.mark.asyncio
-async def test_ensure_executor_verb_requires_ws_session():
-    router, client, captured = _router_with_client()
-    client.session_id = None  # no ws ?session=
-
-    router.daemon = object()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {},
-    }))
-    # Missing session → -32602 (NOT -32601: the verb is known/registered).
-    assert captured[client.client_id][-1]["error"]["code"] == -32602
-
-
-@pytest.mark.asyncio
-async def test_ensure_executor_verb_surfaces_registry_failure():
-    router, client, captured = _router_with_client()
-
-    class _Daemon:
-        class _Reg:
-            async def ensure(self, session_id):
-                raise RuntimeError("spawn boom")
-
-        executors = _Reg()
-
-    router.daemon = _Daemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {"session": "sess"},
-    }))
-    assert captured[client.client_id][-1]["error"]["code"] == -32603
-
-
-# ---- Failure #4: ensureExecutor launches the upstream BEFORE spawning -------
-
-
-def _router_disconnected():
-    """Like `_router_with_client` but upstream is DISCONNECTED, with an
-    `_ensure_upstream` callback that records its call ordering vs the registry
-    and (mimicking the cdp holder) flips the phase to CONNECTED."""
-    from browserwright.daemon.server.proxy import Router
-    from browserwright.daemon.server.state import DaemonState, UpstreamPhase
-
-    captured: dict[int, list] = {}
-    order: list[str] = []
-    state = DaemonState(backend_name="cdp")
-    state.upstream_phase = UpstreamPhase.DISCONNECTED
-    router = Router(state)
-
-    async def _ensure():
-        order.append("ensure_upstream")
-        # The cdp holder's ensure_open launches Chrome + marks connected.
-        state.upstream_phase = UpstreamPhase.CONNECTED
-
-    async def _disc(_reason):
-        return None
-
-    router.bind_lifecycle(_ensure, _disc)
-    client = state.allocate_client("c")
-    client.session_id = "sess"
-    captured[client.client_id] = []
-
-    async def _send(text: str) -> None:
-        captured[client.client_id].append(json.loads(text))
-
-    router.register_client(client.client_id, _send)
-    return router, client, captured, order
-
-
-@pytest.mark.asyncio
-async def test_ensure_executor_launches_upstream_before_registry():
-    """Failure #4: the executor's cold-start `connect_over_cdp(facade)` needs a
-    LIVE cdp Chrome (its dynamic port pinned). So `ensureExecutor` must call
-    `_ensure_upstream` (→ `_launch_cdp_chrome`) BEFORE `registry.ensure`, or the
-    facade resolves the stale default port and the executor exits during
-    cold-start. Assert the ordering."""
-    router, client, captured, order = _router_disconnected()
-
-    class _Daemon:
-        class _Reg:
-            async def ensure(self, session_id):
-                order.append("registry.ensure")
-                return "/tmp/bw-exec-sess.sock"
-
-        executors = _Reg()
-
-    router.daemon = _Daemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {"session": "sess"},
-    }))
-    assert order == ["ensure_upstream", "registry.ensure"], (
-        "ensureExecutor must launch the upstream (cdp Chrome) BEFORE spawning "
-        "the executor")
-    assert captured[client.client_id][-1]["result"] == {"ready": True}
-
-
-@pytest.mark.asyncio
-async def test_ensure_executor_skips_upstream_when_already_connected():
-    """When the upstream is already CONNECTED (warm), `ensureExecutor` does NOT
-    re-trigger `_ensure_upstream` — it goes straight to the registry."""
-    from browserwright.daemon.server.proxy import Router
-    from browserwright.daemon.server.state import DaemonState, UpstreamPhase
-
-    captured: dict[int, list] = {}
-    order: list[str] = []
-    state = DaemonState(backend_name="cdp")
-    state.upstream_phase = UpstreamPhase.CONNECTED
-    router = Router(state)
-
-    async def _ensure():
-        order.append("ensure_upstream")  # must NOT be called
-
-    router.bind_lifecycle(_ensure, lambda _r: None)
-    client = state.allocate_client("c")
-    client.session_id = "sess"
-    captured[client.client_id] = []
-    router.register_client(
-        client.client_id,
-        lambda text: captured[client.client_id].append(json.loads(text)))
-
-    class _Daemon:
-        class _Reg:
-            async def ensure(self, session_id):
-                order.append("registry.ensure")
-                return "/tmp/bw-exec-sess.sock"
-
-        executors = _Reg()
-
-    router.daemon = _Daemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {"session": "sess"},
-    }))
-    assert order == ["registry.ensure"]  # ensure_upstream skipped
-
-
-@pytest.mark.asyncio
-async def test_ensure_executor_upstream_failure_returns_error_envelope():
-    """A Chrome-launch failure during the pre-spawn upstream open surfaces as a
-    proper -32603 error envelope (never crashes the client ws), and the
-    registry is NOT consulted."""
-    router, client, captured, order = _router_disconnected()
-
-    async def _boom():
-        raise RuntimeError("chrome launch boom")
-
-    router._ensure_upstream = _boom  # type: ignore[attr-defined]
-
-    class _Daemon:
-        class _Reg:
-            async def ensure(self, session_id):
-                order.append("registry.ensure")  # must NOT be reached
-                return "/tmp/x.sock"
-
-        executors = _Reg()
-
-    router.daemon = _Daemon()
-    await router.route_from_client(client, json.dumps({
-        "id": 1,
-        "method": "BrowserwrightDaemon.ensureExecutor",
-        "params": {"session": "sess"},
-    }))
-    assert "registry.ensure" not in order
-    err = captured[client.client_id][-1]["error"]
-    assert err["code"] == -32603
-    assert "upstream open" in err["message"]
-
-
-# ---- killExecutor verb (Phase B / Failure #3 hardening) --------------------
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ class _TitleRelay:
 
     port = 19989
     connection_generation = 1
+    is_ready = True
 
     def __init__(self, groups: dict[str, tuple[int, list[int]]] | None = None):
         self.groups = dict(groups or {})

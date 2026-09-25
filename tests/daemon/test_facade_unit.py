@@ -182,8 +182,8 @@ async def test_session_query_routes_facade_to_session_context(monkeypatch):
     shared_cfg = Config(backend="extension")
     session_cfg = Config(backend="cdp")
     session_cfg.backends.cdp.port = 9444
-    holder = SimpleNamespace(_cfg=session_cfg, relay=None)
-    ctx = SimpleNamespace(backend="cdp", holder=holder)
+    ctx = SimpleNamespace(backend="cdp",
+                          upstream=SimpleNamespace(cfg=session_cfg, relay=None))
     calls = []
 
     class _Daemon:
@@ -290,10 +290,10 @@ async def test_ending_session_revokes_parked_facade_client(monkeypatch):
 
     shared = UpstreamContext(
         backend="extension", state=DaemonState("extension"),
-        router=_Router(), holder=object())
-    daemon = Daemon(
-        cfg=Config(), shared_context=shared,
-        make_context=lambda **_kw: pytest.fail("should not create"))
+        router=_Router(),
+        holder=SimpleNamespace(upstream=SimpleNamespace(
+            bind_recovery=lambda _machine, _alive: None)))
+    daemon = Daemon(cfg=Config(), shared_context=shared)
     daemon.executors = _Registry()
     monkeypatch.setattr(
         "browserwright.daemon.server.daemon.session_registry.get",

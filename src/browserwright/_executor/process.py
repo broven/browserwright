@@ -44,6 +44,9 @@ from .._text import spill_text, truncate_hard
 from ..errors import BrowserwrightError, TabRebindFailed, serialize
 from .protocol import (
     MAX_TEXT_CHARS,
+    RECOVERY_BOUND,
+    RECOVERY_REBOUND,
+    RECOVERY_TARGET_GONE,
     TERMINAL_DEADLINE_EXCEEDED,
     TERMINAL_RESET_REQUESTED,
     TERMINAL_TARGET_CLOSED,
@@ -264,6 +267,11 @@ class _Worker:
         # not yet processed the target's destruction (its `pages` cache is fed
         # by channel events that only drain while a sync call is in flight).
         self._page_maybe_dead = False
+        # ADR-0013 rule 1: what this call observed about the tab binding, for
+        # the daemon's recovery state machine (``ExecuteResponse
+        # .recovery_event``). The executor reports; it never decides the
+        # session's recovery state.
+        self._call_recovery_event: dict[str, str] | None = None
         # The globals dict of the CURRENTLY executing heredoc, so a mid-call
         # rebind can swap its ``page`` name (issue #21 same-call visibility).
         self._active_globals: dict[str, Any] | None = None
@@ -671,7 +679,14 @@ class _Worker:
         finally:
             self._rebinding_page = False
         self._page_maybe_dead = False
+        self._report_recovery(
+            RECOVERY_REBOUND, "executor re-bound page to a live session tab")
         return True
+
+    def _report_recovery(self, kind: str, detail: str) -> None:
+        """Record this call's tab-binding outcome for the daemon. A later
+        outcome in the same call supersedes an earlier one."""
+        self._call_recovery_event = {"kind": kind, "detail": detail}
 
     def _reconcile_page_binding(self) -> None:
         """Before each execute, rebind the live page if the session's DURABLE
@@ -810,6 +825,7 @@ class _Worker:
         self._call_warnings = []
         self._call_screenshots = []
         self._rebinds_this_call = 0
+        self._call_recovery_event = None
         try:
             self._ensure_cold_started()
         except BrowserwrightError as e:
@@ -842,6 +858,7 @@ class _Worker:
             # cold-restart (terminal recycle) instead of attempting another
             # rebind, and answer with the DISTINCT error so the caller can tell
             # "the tab died" from "the browser cannot give me a tab at all".
+            self._report_recovery(RECOVERY_TARGET_GONE, str(e)[:200])
             return self._finish(
                 io.StringIO(), error=serialize(e), exit_code=e.exit_code,
                 terminal_reason=TERMINAL_TARGET_CLOSED)
@@ -958,6 +975,8 @@ class _Worker:
                 f"`browserwright recover --session {sid}`; it re-attaches or "
                 "opens the session tab and returns healthy before you retry."
             )
+            self._report_recovery(
+                RECOVERY_TARGET_GONE, f"tab gone; rebind failed: {failure}"[:200])
             return self._finish(
                 buf, error=error, exit_code=exit_code,
                 terminal_reason=TERMINAL_TARGET_CLOSED,
@@ -1046,6 +1065,14 @@ class _Worker:
             )
         capped_warnings, warn_cut = _cap_warnings(raw_warnings)
 
+        # Only a completed call proves the held page is live; a failed one
+        # makes no claim unless a rebind above already reported one.
+        recovery_event = self._call_recovery_event
+        if (recovery_event is None and error is None
+                and terminal_reason is None and self._page is not None):
+            recovery_event = {"kind": RECOVERY_BOUND,
+                              "detail": "executor completed a call on a live tab"}
+
         return ExecuteResponse(
             console=console,
             return_value=return_value,
@@ -1056,6 +1083,7 @@ class _Worker:
             truncated=console_cut or rv_cut or warn_cut or task_cut,
             terminal_reason=terminal_reason,
             task_result_json=task_result_json,
+            recovery_event=recovery_event,
         )
 
     def _run_task_on_live_surface(

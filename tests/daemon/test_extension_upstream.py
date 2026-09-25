@@ -904,6 +904,9 @@ async def test_end_session_refuses_to_treat_unknown_membership_as_empty():
     class _DisconnectedRelay:
         port = 19989
         connection_generation = 1
+        # The extension socket is up; it is the membership answer that is
+        # missing.
+        is_ready = True
 
         async def query_group_tabs(self, group_name=None, *, timeout=10.0):
             return None
@@ -1088,6 +1091,7 @@ async def test_end_session_stops_writes_at_generation_boundary(monkeypatch):
     class _Relay:
         port = 19989
         connection_generation = 1
+        is_ready = True
 
         def __init__(self):
             self.sent: list[int] = []

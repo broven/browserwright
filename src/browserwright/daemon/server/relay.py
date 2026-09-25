@@ -281,15 +281,17 @@ class RelayServer:
         self._session_announce_events: dict[str, asyncio.Event] = {}
         self._reload_attempts: set[tuple[str, str, str]] = set()
         # A (auto-recovery): invoked fire-and-forget on every extension hello
-        # (fresh SW after a reload/update, or a ws reconnect). The listener
-        # uses it to re-attach extension sessions whose ghost table was lost
-        # with the previous connection. Set by the listener.
-        self._on_extension_hello: (
+        # (fresh SW after a reload/update, or a ws reconnect). The extension
+        # adapter uses it to re-attach extension sessions whose ghost table was
+        # lost with the previous connection. Set by
+        # `ExtensionUpstream.observe_relay`.
+        self.on_extension_hello: (
             Callable[..., Awaitable[None]] | None) = None
         # ADR-0013: invoked when a connection that had said hello goes away
         # and no other extension is ready — every extension session is now
-        # undrivable and the recovery state must say so. Set by the listener.
-        self._on_extension_closed: (
+        # undrivable and the recovery state must say so. Set by
+        # `ExtensionUpstream.observe_relay`.
+        self.on_extension_closed: (
             Callable[..., Awaitable[None]] | None) = None
         # GH#79: install_ids that have said hello to THIS daemon before, so a
         # reconnect can be told apart from a first connect. background.js
@@ -1297,9 +1299,9 @@ class RelayServer:
                 if not fut.done():
                     fut.set_exception(ConnectionError("extension disconnected"))
             if (ext.hello_received.is_set() and not self.is_ready
-                    and self._on_extension_closed is not None):
+                    and self.on_extension_closed is not None):
                 try:
-                    await self._on_extension_closed(install_id=ext.install_id or "")
+                    await self.on_extension_closed(install_id=ext.install_id or "")
                 except Exception as e:  # noqa: BLE001 - a reporter must not break the relay
                     logger.debug("extension-closed hook failed: %r", e)
 
@@ -1417,9 +1419,9 @@ class RelayServer:
                     e,
                 )
             await self._maybe_reload_for_version_drift(ext)
-            if self._on_extension_hello is not None:
+            if self.on_extension_hello is not None:
                 try:
-                    await self._on_extension_hello(
+                    await self.on_extension_hello(
                         install_id=ext.install_id, first_seen=first_seen)
                 except Exception as e:  # noqa: BLE001 - never break hello
                     logger.warning(

@@ -14,6 +14,7 @@ import json
 
 import pytest
 
+from browserwright import daemon_lifecycle
 from browserwright.daemon import _ipc
 from browserwright.daemon.config import (
     DEFAULT_FACADE_HOST,
@@ -131,11 +132,17 @@ def test_pong_roundtrip_carries_pid_and_version():
     assert _ipc.parse_pong(json.dumps({"pong": True}).encode()) is _ipc.NO_PONG
 
 
+def _ours(host, port, timeout=1.5):
+    """A `daemon_lifecycle.probe` that finds our daemon."""
+    return _ipc.EndpointProbe(kind="ours", host=host, port=port, pid=4242,
+                              version="0.15.1")
+
+
 def test_cdp_ws_url_carries_bound_browserwright_session(monkeypatch):
     import browserwright.repl.playwright_handle as ph
 
     monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:19990")
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _pong())
+    monkeypatch.setattr(daemon_lifecycle, "probe", _ours)
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "cdp 7")
 
     # The daemon parses the query with parse_qs, which decodes both `+` and
@@ -153,7 +160,7 @@ def test_cdp_ws_url_follows_a_remote_endpoint(monkeypatch):
     import browserwright.repl.playwright_handle as ph
 
     monkeypatch.setenv("BW_DAEMON_URL", "http://100.72.20.32:19990")
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _pong())
+    monkeypatch.setattr(daemon_lifecycle, "probe", _ours)
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: "s-1")
 
     assert ph._facade_ws_url() == (
@@ -166,7 +173,7 @@ def test_cdp_ws_url_on_an_explicit_endpoint_says_it_will_not_start_one(monkeypat
     import browserwright.repl.playwright_handle as ph
 
     monkeypatch.setenv("BW_DAEMON_URL", "http://100.72.20.32:19990")
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
+    # The conftest wall answers every `daemon_lifecycle.probe` with "refused".
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: None)
 
     with pytest.raises(ph.FacadeUnavailable) as ei:
@@ -181,7 +188,6 @@ def test_cdp_ws_url_reports_a_dead_default_daemon_as_such(monkeypatch, tmp_path)
 
     monkeypatch.delenv("BW_DAEMON_URL", raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(_ipc, "ping_status_sync", lambda timeout=1.0: _ipc.NO_PONG)
     monkeypatch.setattr(ph, "_current_browserwright_session_id", lambda: None)
 
     with pytest.raises(ph.FacadeUnavailable) as ei:

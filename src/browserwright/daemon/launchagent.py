@@ -517,11 +517,15 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
     # move that on 2026-09-01 took out another agent's session. Name the
     # per-session states and the verb that acts on them instead.
     if not force:
-        verdict = daemon_self_check(cfg, expected_version=want)
-        if verdict["healthy"]:
+        from .. import daemon_lifecycle
+
+        verdict = daemon_lifecycle.diagnose(
+            confirm=True, endpoint=restart_endpoint(cfg),
+            expected_version=want)
+        if verdict.healthy:
             states = _session_states_text(cfg)
             raise LaunchAgentError(
-                f"refusing to restart: {verdict['detail']}. A healthy daemon "
+                f"refusing to restart: {verdict.detail}. A healthy daemon "
                 "is not what is wrong.\n"
                 f"{states}"
                 "For a broken session run `browserwright recover --session "
@@ -581,70 +585,24 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
         expected=want, timeout=timeout), 3)
 
 
-def daemon_self_check(cfg, *, expected_version: str | None = None) -> dict:
-    """The three daemon diagnoses of ADR-0013 rule 2, each confirmed by TWO
-    consecutive probes so a transient glitch never triggers replacement.
+def restart_endpoint(cfg):
+    """The endpoint `restart` diagnoses: THIS command's configured port.
 
-    Returns ``{"healthy": bool, "criterion": None|"gone"|"foreign"|
-    "version", "detail": str, "probes": [kind, kind]}``. ``healthy`` is True
-    only when both probes found our daemon on the expected version. ``gone``
-    and ``version`` permit automatic replacement; ``foreign`` is reported for
-    human resolution because an unidentified process is never signalled.
+    Wildcards and specific remote binds are reached locally through the
+    co-bound loopback listener; a configured loopback/hostname is used
+    verbatim. The port must come from this command's ``cfg``, never a stale
+    global endpoint state file belonging to another dev instance (ADR-0012
+    rule 6).
     """
-    from . import _ipc
-    from .. import __version__
-    from ..daemon_url import DaemonEndpoint, daemon_endpoint
+    from ..daemon_url import DaemonEndpoint
     from .config import LOOPBACK_HOST, needs_loopback_cobind
 
-    want = expected_version or __version__
-    if cfg is None or not hasattr(cfg, "resolved_facade_port"):
-        ep = daemon_endpoint()
-    else:
-        host = str(getattr(cfg, "facade_host", LOOPBACK_HOST) or LOOPBACK_HOST)
-        # Wildcards and specific remote binds are locally reached through the
-        # co-bound loopback listener; a configured loopback/hostname is used
-        # verbatim.  The port must come from THIS command's cfg, never a stale
-        # global endpoint state file belonging to another dev instance.
-        probe_host = LOOPBACK_HOST if (
-            needs_loopback_cobind(host) or host in ("0.0.0.0", "::", "::0", "*")) else host
-        port = int(cfg.resolved_facade_port())
-        ep = DaemonEndpoint(url=f"http://{probe_host}:{port}",
-                            explicit=True, source="restart_config")
-    probes = [_ipc.probe_endpoint_sync(ep.host, ep.port, timeout=1.5)
-              for _ in range(2)]
-    kinds = [p.kind for p in probes]
-
-    def _classification(probe) -> tuple[str, str | None]:
-        if probe.kind == "ours":
-            return "ours", probe.version
-        if probe.kind in ("foreign", "garbage", "timeout"):
-            return "foreign", None
-        return "gone", None
-
-    conclusions = [_classification(p) for p in probes]
-    if conclusions[0] != conclusions[1]:
-        return {"healthy": False, "criterion": None,
-                "detail": ("two consecutive probes disagree "
-                           f"({conclusions[0]} then {conclusions[1]}); "
-                           "nothing is concluded from that"),
-                "probes": kinds}
-    p = probes[1]
-    if p.kind == "ours":
-        if p.version != want:
-            return {"healthy": False, "criterion": "version",
-                    "detail": (f"the daemon at {ep.host}:{ep.port} runs "
-                               f"{p.version}, installed is {want}"),
-                    "probes": kinds}
-        return {"healthy": True, "criterion": None,
-                "detail": (f"the daemon answers at {ep.host}:{ep.port} "
-                           f"(pid {p.pid}, version {p.version or 'unknown'}) "
-                           "on both probes"),
-                "probes": kinds}
-    if p.kind in ("foreign", "garbage", "timeout"):
-        return {"healthy": False, "criterion": "foreign",
-                "detail": p.describe(), "probes": kinds}
-    return {"healthy": False, "criterion": "gone",
-            "detail": p.describe(), "probes": kinds}
+    host = str(getattr(cfg, "facade_host", LOOPBACK_HOST) or LOOPBACK_HOST)
+    probe_host = LOOPBACK_HOST if (
+        needs_loopback_cobind(host) or host in ("0.0.0.0", "::", "::0", "*")) else host
+    port = int(cfg.resolved_facade_port())
+    return DaemonEndpoint(url=f"http://{probe_host}:{port}",
+                          explicit=True, source="restart_config")
 
 
 def _session_states_text(cfg) -> str:
