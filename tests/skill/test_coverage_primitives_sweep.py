@@ -386,3 +386,16 @@ def test_cdp_send_attach_close_and_read_loop():
     reader._read_loop()
     assert reader._inflight[99]["result"] == {"ok": True}
     assert reader._closed is True
+
+
+def test_site_memory_for_ip_hosts_is_keyed_by_the_whole_address(tmp_bs_home):
+    """eTLD+1 is meaningless for an IP: 192.168.0.1 and 10.0.0.1 both reduced
+    to "0.1", so two LAN devices shared (and overwrote) one memory.md."""
+    from browserwright.memory.site_mem import memory_path
+
+    router = memory_path("http://192.168.0.1/index.html#home")
+    other = memory_path("10.0.0.1")
+    assert router.parent.name == "192.168.0.1"
+    assert other.parent.name == "10.0.0.1"
+    assert memory_path("http://[::1]:8080/").parent.name == "::1"
+    assert memory_path("https://news.ycombinator.com").parent.name == "ycombinator.com"

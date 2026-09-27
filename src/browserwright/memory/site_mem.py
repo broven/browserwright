@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import ipaddress
 import re
 from pathlib import Path
 from typing import Optional
@@ -103,6 +104,13 @@ def host_stem(host_or_url: str) -> str:
     host = _split_host(host_or_url)
     if host in _STEM_OVERRIDES:
         return _STEM_OVERRIDES[host]
+    try:
+        # An IP has no registered name: its eTLD+1 would be the last two
+        # octets, so every x.x.0.1 LAN device would share one directory.
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
     parts = host.split(".") if host else []
     if len(parts) < 2:
         return host or "unknown"
