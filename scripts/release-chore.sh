@@ -44,39 +44,55 @@ version="${release_tag#v}"
 echo "Pushing $release_tag to origin to trigger the release workflow..."
 git push origin "$release_tag"
 
-timeout_seconds="${BROWSERWRIGHT_PYPI_WAIT_TIMEOUT:-1800}"
-poll_interval="${BROWSERWRIGHT_PYPI_POLL_INTERVAL:-15}"
-pypi_url="${BROWSERWRIGHT_PYPI_URL:-https://pypi.org/pypi/browserwright/json}"
-
-python3 - "$version" "$timeout_seconds" "$poll_interval" "$pypi_url" <<'PY'
+# The release workflow publishes PyPI and npm from independent jobs, and
+# upgrade-global needs both: the CLI/daemon from PyPI, the pi extension from
+# npm. v0.19.1 showed npm can land minutes after PyPI, failing the pi step.
+wait_for_release() {
+  local package="$1" kind="$2" url="$3" timeout="$4" interval="$5"
+  python3 - "$version" "$package" "$kind" "$url" "$timeout" "$interval" <<'PY'
 import json
 import sys
 import time
 import urllib.error
 import urllib.request
 
-expected, timeout, interval, url = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+expected, package, kind, url, timeout, interval = sys.argv[1:7]
+label = f"{package} {expected} on {'PyPI' if kind == 'pypi' else 'npm'}"
+timeout, interval = float(timeout), float(interval)
 deadline = time.monotonic() + timeout
 
-print(f"Waiting for browserwright {expected} on PyPI (timeout {int(timeout)}s)...")
+print(f"Waiting for {label} (timeout {int(timeout)}s)...")
 while True:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "browserwright-release-chore"})
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = json.load(response)
-        if payload.get("releases", {}).get(expected):
-            print(f"PyPI now has browserwright {expected}.")
+        if kind == "pypi":
+            published = payload.get("releases", {}).get(expected)
+            current = payload.get("info", {}).get("version", "unknown")
+        else:  # npm registry document
+            published = expected in payload.get("versions", {})
+            current = payload.get("dist-tags", {}).get("latest", "unknown")
+        if published:
+            print(f"{label} is published.")
             break
-        current = payload.get("info", {}).get("version", "unknown")
-        print(f"PyPI does not have {expected} yet (currently {current}); retrying...")
+        print(f"{label} not published yet (latest {current}); retrying...")
     except (OSError, ValueError, urllib.error.URLError) as exc:
-        print(f"Could not check PyPI ({exc}); retrying...")
+        print(f"Could not check {label} ({exc}); retrying...")
 
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise SystemExit(f"Timed out waiting for browserwright {expected} on PyPI")
+        raise SystemExit(f"Timed out waiting for {label}")
     time.sleep(min(interval, remaining))
 PY
+}
+
+wait_for_release browserwright pypi \
+  "${BROWSERWRIGHT_PYPI_URL:-https://pypi.org/pypi/browserwright/json}" \
+  "${BROWSERWRIGHT_PYPI_WAIT_TIMEOUT:-1800}" "${BROWSERWRIGHT_PYPI_POLL_INTERVAL:-15}"
+wait_for_release @browserwright/pi npm \
+  "${BROWSERWRIGHT_NPM_URL:-https://registry.npmjs.org/@browserwright/pi}" \
+  "${BROWSERWRIGHT_NPM_WAIT_TIMEOUT:-1800}" "${BROWSERWRIGHT_NPM_POLL_INTERVAL:-15}"
 
 production_tmpdir="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
 if [[ -z "$production_tmpdir" ]]; then

@@ -7,7 +7,7 @@ as unset under `set -u` -- so the global install was never updated.
 
 The fakes: a scratch repo whose HEAD already carries the release tag (the
 chore's resume path, so no version bump), a local bare repo as `origin`, a
-`file://` PyPI response, and `browserwright-daemon` / `mise` stubs on PATH.
+`file://` PyPI and npm responses, and `browserwright-daemon` / `mise` stubs on PATH.
 """
 from __future__ import annotations
 
@@ -33,7 +33,9 @@ def _stub(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def _run_chore(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess, str]:
+def _run_chore(tmp_path: Path, *args: str,
+               npm_versions: tuple[str, ...] = ("9.9.9",),
+               ) -> tuple[subprocess.CompletedProcess, str]:
     work = tmp_path / "work"
     (work / "scripts").mkdir(parents=True)
     shutil.copy(REPO / "scripts" / "release-chore.sh", work / "scripts")
@@ -47,6 +49,10 @@ def _run_chore(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess,
 
     pypi = tmp_path / "pypi.json"
     pypi.write_text(json.dumps({"releases": {"9.9.9": [{}]}}))
+    npm = tmp_path / "npm.json"
+    npm.write_text(json.dumps({
+        "dist-tags": {"latest": npm_versions[-1] if npm_versions else "9.9.8"},
+        "versions": {v: {} for v in npm_versions}}))
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     mise_log = tmp_path / "mise.log"
@@ -57,6 +63,9 @@ def _run_chore(tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "BROWSERWRIGHT_PYPI_URL": pypi.as_uri(),
         "BROWSERWRIGHT_PYPI_POLL_INTERVAL": "0",
+        "BROWSERWRIGHT_NPM_URL": npm.as_uri(),
+        "BROWSERWRIGHT_NPM_POLL_INTERVAL": "0",
+        "BROWSERWRIGHT_NPM_WAIT_TIMEOUT": "1",
     }
     proc = subprocess.run([BASH, "scripts/release-chore.sh", *args], cwd=work,
                           env=env, capture_output=True, text=True, timeout=60)
@@ -73,3 +82,12 @@ def test_forced_chore_passes_force_through(tmp_path):
     proc, mise_calls = _run_chore(tmp_path, "true")
     assert proc.returncode == 0, proc.stderr
     assert mise_calls.splitlines() == ["run upgrade-global --force"]
+
+
+def test_chore_waits_for_the_pi_package_on_npm(tmp_path):
+    """v0.19.1: PyPI had the release, npm did not yet, and the upgrade's pi
+    step failed. Without the npm release the chore must not start it."""
+    proc, mise_calls = _run_chore(tmp_path, "false", npm_versions=("9.9.8",))
+    assert proc.returncode != 0
+    assert "Timed out waiting for @browserwright/pi 9.9.9 on npm" in proc.stderr
+    assert mise_calls == ""
