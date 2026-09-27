@@ -351,13 +351,20 @@ class ExecutorRegistry:
             "--executor-id",
             executor_id,
         ]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            **_spawn_kwargs(),
-        )
+        # stderr goes to a per-session log (not /dev/null): a bind timeout or
+        # a crash inside the executor is otherwise unrecoverable after the fact.
+        log = _ipc.open_executor_log(session_id)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=log if log is not None else subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **_spawn_kwargs(),
+            )
+        finally:
+            if log is not None:
+                log.close()  # the child holds its own descriptor
         handle = ExecutorHandle(
             session_id=session_id,
             proc=proc,

@@ -696,6 +696,7 @@ class SessionVerbsMixin:
         # rung 3 — keep a live executor (its `state` survives), otherwise
         # cold-start one through the same drivable path.
         handle = registry.get(session)
+        cold_started = False
         if handle is not None and handle.is_alive():
             steps.append({"rung": "executor", "ok": True,
                           "detail": "resident executor alive; its state is kept"})
@@ -707,6 +708,7 @@ class SessionVerbsMixin:
             except Exception as e:  # noqa: BLE001
                 await fail("executor", f"executor could not be started: {e!r}")
                 return
+            cold_started = True
             steps.append({"rung": "executor", "ok": True,
                           "detail": "executor cold-started"})
 
@@ -714,8 +716,11 @@ class SessionVerbsMixin:
         # executor's Playwright binding (a replacement daemon re-creates or
         # re-resolves the browser under a resident executor). One no-op round
         # trip performs the same lazy connect+bind as a real command, and the
-        # executor reports the outcome to the state machine itself.
-        if not healthy():
+        # executor reports the outcome to the state machine itself. A cold
+        # start always takes this rung: `executor_ready` marks the machine
+        # healthy the moment the process is up, before it has bound anything,
+        # so "healthy" there would promise a retry that fails the same bind.
+        if cold_started or not healthy():
             try:
                 await probe_executor_binding(daemon, session)
             except Exception as e:  # noqa: BLE001

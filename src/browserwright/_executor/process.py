@@ -1308,6 +1308,12 @@ def main(argv: list[str] | None = None) -> int:
     # Keep the env marker for helper code that still reads it; the --session
     # flag is authoritative for binding.
     os.environ["BD_SESSION"] = session_id
+    import logging
+    # stderr is the daemon-kept executor log; stamp each line so a post-mortem
+    # can line it up with the daemon log.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format=f"%(asctime)s session={session_id} %(levelname)s %(name)s: %(message)s")
 
     executor_id = args.executor_id
     worker = _Worker(session_id, executor_id=executor_id)

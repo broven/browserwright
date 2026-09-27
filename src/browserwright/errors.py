@@ -58,14 +58,15 @@ class PageBindTimeout(BrowserwrightError):
     retryable = True
     # BUG B: `retryable` has to be honest. A retry only helps when the daemon
     # was still going to announce the tab — a cold/reconnecting extension
-    # service worker is exactly that case, and the bind budget
-    # (`$BW_PAGE_BIND_TIMEOUT`) is the knob for it. If retries do NOT help, the
+    # service worker is exactly that case. If retries do NOT help, the
     # extension side is not answering at all, and recycling an executor will not
     # change that — say what to check instead of looping the user.
+    # Do not advertise `$BW_PAGE_BIND_TIMEOUT` here: the bind almost always
+    # runs in the resident executor, which inherits the DAEMON's environment,
+    # so an agent's `export` never reaches it.
     default_fix = (
         "retry the same browserwright command (a cold extension service worker "
-        "can miss the bind window; raise it with `export "
-        "BW_PAGE_BIND_TIMEOUT=30`). If EVERY retry fails, the extension is not "
+        "can miss the bind window). If EVERY retry fails, the extension is not "
         "answering: check `browserwright doctor` and that the browserwright "
         "extension is enabled and its Chrome window is open, then run "
         "`browserwright recover --session <id>`"
