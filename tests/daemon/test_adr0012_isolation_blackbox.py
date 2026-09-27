@@ -289,16 +289,19 @@ esac
     ]
 
 
-@pytest.mark.parametrize(("running_version", "expects_restart", "pi_manifest", "expected_rc", "reported"), [
-    ("1.2.3", False, '{"version":"1.2.3"}', 0, "1.2.3"),
-    ("1.2.2", True, '{"version":"1.2.3"}', 0, "1.2.3"),
-    ("1.2.3", False, '{"version":"1.2.2"}', 1, "1.2.2"),
-    ("1.2.3", False, None, 1, "unknown"),
-    ("1.2.3", False, "not json", 1, "unknown"),
+@pytest.mark.parametrize(("running_version", "expects_restart", "pi_manifest", "expected_rc", "reported", "pnpm_fixes"), [
+    ("1.2.3", False, '{"version":"1.2.3"}', 0, "1.2.3", False),
+    ("1.2.2", True, '{"version":"1.2.3"}', 0, "1.2.3", False),
+    ("1.2.3", False, '{"version":"1.2.2"}', 1, "1.2.2", False),
+    ("1.2.3", False, None, 1, "unknown", False),
+    ("1.2.3", False, "not json", 1, "unknown", False),
+    # `pi update` left the old version (seen on v0.19.0); the explicit pnpm
+    # add of the released version is what completes the upgrade.
+    ("1.2.3", False, '{"version":"1.2.2"}', 0, "1.2.3", True),
 ])
 def test_upgrade_global_restarts_only_when_running_version_differs(
         tmp_path, running_version, expects_restart, pi_manifest, expected_rc,
-        reported):
+        reported, pnpm_fixes):
     fake_path = tmp_path / "fake-path"
     fake_repo = tmp_path / "checkout"
     activated_bin = tmp_path / "activated-checkout" / ".venv" / "bin"
@@ -362,6 +365,17 @@ exit 99
         fake_path / "pi",
         f"#!/bin/sh\nprintf 'pi %s|age-exclude=%s\\n' \"$*\" "
         f"\"${{PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE-unset}}\" >> {calls!s}\n",
+    )
+    fixed_manifest = (home / ".pi" / "agent" / "npm" / "node_modules" /
+                      "@browserwright" / "pi" / "package.json")
+    _executable(
+        fake_path / "pnpm",
+        f"#!/bin/sh\nprintf 'pnpm %s|age-exclude=%s\\n' \"$*\" "
+        f"\"${{PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE-unset}}\" >> {calls!s}\n"
+        + "[ \"$1\" = --dir ] || exit 0\n"  # `pnpm bin -g`: PATH probe only
+        + (f"mkdir -p {fixed_manifest.parent!s} && "
+           f"echo '{{\"version\":\"1.2.3\"}}' > {fixed_manifest!s}\n"
+           if pnpm_fixes else "exit 1\n"),
     )
     _executable(fake_path / "uname", "#!/bin/sh\necho Linux\n")
     _executable(
@@ -435,6 +449,13 @@ exit 99
             assert line.endswith(
                 f"unset|unset|unset|{canonical_tmp!s}/|"
                 "unset|unset|unset|unset|unset|unset")
+    pnpm_add = [line for line in lines if line.startswith("pnpm --dir ")]
+    if pi_manifest == '{"version":"1.2.3"}':
+        assert pnpm_add == []
+    else:
+        assert pnpm_add == [
+            f"pnpm --dir {home!s}/.pi/agent/npm add @browserwright/pi@1.2.3"
+            "|age-exclude=@browserwright/pi"]
     if expected_rc:
         assert f"Pi extension version {reported} does not match" in proc.stderr
 
