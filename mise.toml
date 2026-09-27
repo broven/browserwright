@@ -670,6 +670,18 @@ if command -v pi >/dev/null 2>&1; then
       pi update npm:@browserwright/pi
     pi_pkg="$HOME/.pi/agent/npm/node_modules/@browserwright/pi/package.json"
     pi_version="$(global_cmd python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$pi_pkg" 2>/dev/null || true)"
+    # `pi update` can finish without resolving at all — v0.19.0, minutes after
+    # publish: "Lockfile is up to date, resolution step is skipped", package
+    # left on 0.18.6. Asking pnpm for the exact released version forces the
+    # resolution. settings.json stays unversioned, so the package remains
+    # update-eligible for pi.
+    if [[ "$pi_version" != "$installed_cli_version" ]]; then
+      echo "pi kept @browserwright/pi ${pi_version:-unknown} (outside its recorded range); moving it to ${installed_cli_version}..."
+      PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE='@browserwright/pi' \
+        pnpm --dir "$HOME/.pi/agent/npm" add "@browserwright/pi@${installed_cli_version}" \
+        || true  # a failure here is reported by the version check below
+      pi_version="$(global_cmd python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$pi_pkg" 2>/dev/null || true)"
+    fi
     if [[ "$pi_version" != "$installed_cli_version" ]]; then
       echo "Pi extension version ${pi_version:-unknown} does not match installed browserwright ${installed_cli_version}." >&2
       exit 1
