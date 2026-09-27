@@ -210,6 +210,37 @@ def executor_inflight_path(session_id: str) -> Path:
     return _executor_inflight_dir() / f"bw-exec-{_exec_shortid(session_id)}.inflight"
 
 
+#: An executor log past this is rotated to ``.1`` on the next spawn, so a
+#: long-lived session keeps its recent history without growing forever.
+EXECUTOR_LOG_MAX_BYTES = 1_000_000
+
+
+def executor_log_path(session_id: str) -> Path:
+    """The executor's stderr: its warnings and any crash traceback.
+
+    Lives with the other private sidecars and deliberately survives
+    ``cleanup_executor`` — a log is only needed after the executor is gone."""
+    return _executor_inflight_dir() / f"bw-exec-{_exec_shortid(session_id)}.log"
+
+
+def open_executor_log(session_id: str):
+    """Open the session's executor log for appending (rotating an oversized
+    one). Returns a binary file object, or ``None`` when the private directory
+    is unusable — losing the log must never block spawning the executor."""
+    try:
+        _ensure_executor_inflight_dir()
+        path = executor_log_path(session_id)
+        try:
+            if path.stat().st_size > EXECUTOR_LOG_MAX_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        return os.fdopen(fd, "ab")
+    except OSError:
+        return None
+
+
 def _executor_inflight_dir() -> Path:
     """Per-user private home for executor observability sidecars."""
     return runtime_dir() / f"browserwright-{os.geteuid()}"

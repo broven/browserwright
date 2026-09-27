@@ -173,7 +173,26 @@ async def test_recover_cold_starts_only_the_requested_executor(
     assert len(spawned) == 1
     assert result["state"] == HEALTHY
     assert state == HEALTHY
-    assert [s["rung"] for s in result["steps"]] == ["executor"]
+    assert [s["rung"] for s in result["steps"]] == ["executor", "binding"]
+
+
+@pytest.mark.asyncio
+async def test_recover_cold_start_still_proves_the_tab_binding(
+        monkeypatch, tmp_path):
+    """A cold-started executor flips the machine to healthy on `executor_ready`
+    alone, before it has bound anything. Recover must not report that as
+    healthy: the next call would fail the same bind (seen live: recover said
+    "healthy — retry your call", then PageBindTimeout, twice)."""
+    result, _, spawned, state = await _invoke_recover(
+        monkeypatch, tmp_path, backend="extension", executor_alive=False,
+        probe_error=RuntimeError("PageBindTimeout: timed out binding"))
+
+    assert len(spawned) == 1
+    assert result["state"] == NEEDS_HUMAN
+    assert [s["rung"] for s in result["steps"]] == ["executor", "binding"]
+    assert result["steps"][-1]["ok"] is False
+    assert "PageBindTimeout" in result["reason"]
+    assert state == NEEDS_HUMAN
 
 
 @pytest.mark.asyncio

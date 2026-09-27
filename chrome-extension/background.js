@@ -447,28 +447,37 @@ async function usAppendLog(entry) {
   await chrome.storage.local.set({ [US_LOG]: log });
 }
 
-function usWrapCode(rec) {
-  return (
-    "try{chrome.runtime.sendMessage({type:'userscript.injected',id:" +
-    JSON.stringify(rec.id) + ",url:location.href});}catch(e){}\n" +
-    "(function(){\n" + rec.code + "\n})();"
-  );
+const US_INJECTED_PING = (rec) =>
+  "try{chrome.runtime.sendMessage({type:'userscript.injected',id:" +
+  JSON.stringify(rec.id) + ",url:location.href});}catch(e){}\n";
+
+function usWrapCode(rec, { ping = true } = {}) {
+  return (ping ? US_INJECTED_PING(rec) : "") + "(function(){\n" + rec.code + "\n})();";
 }
 
-
-function usToRegistration(rec) {
-  const registration = {
-    id: rec.id,
+// `@inject-into page` scripts run in the MAIN world, where chrome.runtime does
+// not exist, so the injected-audit ping rides a companion USER_SCRIPT-world
+// registration with the same matches/runAt.
+function usToRegistrations(rec) {
+  const main = rec.world === "MAIN";
+  const base = {
     matches: rec.matches,
-    js: [{ code: usWrapCode(rec) }],
     runAt: rec.runAt || "document_idle",
-    world: "USER_SCRIPT",
     allFrames: false,
   };
   if (rec.excludeMatches && rec.excludeMatches.length) {
-    registration.excludeMatches = rec.excludeMatches;
+    base.excludeMatches = rec.excludeMatches;
   }
-  return registration;
+  const regs = [{
+    ...base,
+    id: rec.id,
+    js: [{ code: usWrapCode(rec, { ping: !main }) }],
+    world: main ? "MAIN" : "USER_SCRIPT",
+  }];
+  if (main) {
+    regs.push({ ...base, id: rec.id + "-log", js: [{ code: US_INJECTED_PING(rec) }], world: "USER_SCRIPT" });
+  }
+  return regs;
 }
 
 async function usSyncAll() {
@@ -492,7 +501,7 @@ async function usSyncAll() {
   // registration contains the blast radius to the offending script.
   for (const rec of enabled) {
     try {
-      await chrome.userScripts.register([usToRegistration(rec)]);
+      await chrome.userScripts.register(usToRegistrations(rec));
       registered += 1;
       await usAppendLog({ event: "registered", id: rec.id, identity: rec.identity });
     } catch (e) {
