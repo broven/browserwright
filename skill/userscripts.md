@@ -7,7 +7,7 @@ Resident userscripts are the persistent automation leg of browserwright: an agen
 - Source of truth is the local `.user.js` file you edit.
 - `browserwright userscript push path/to/file.user.js` parses the header, sends it through `browserwright-daemon`, and the extension stores and registers it.
 - Identity is `@namespace/@name`; pushing the same identity updates the existing script.
-- Scripts run in Chrome's `USER_SCRIPT` world on matching pages, without a CDP session attached.
+- Scripts run in Chrome's isolated `USER_SCRIPT` world on matching pages (or the page's own world with `@inject-into page`), without a CDP session attached.
 
 ## Header spec
 
@@ -21,6 +21,7 @@ Supported v1 metadata directives:
 // @include      https://example.org/*
 // @exclude      https://example.com/admin/*
 // @run-at       document-idle
+// @inject-into  content
 // @version      1.0
 // @description  Adds a useful page affordance
 // ==/UserScript==
@@ -30,6 +31,7 @@ Supported v1 metadata directives:
 - `@namespace` defaults to `bd.userscripts` when absent.
 - At least one `@match` or `@include` is required.
 - `@run-at` accepts `document-start`, `document-end`, or `document-idle`; default is `document-idle`.
+- `@inject-into page` runs the script in the page's MAIN world, so it can read and patch page-owned globals (`window.jQuery`, app state, `fetch`). `content` and `auto` keep the isolated `USER_SCRIPT` world, which is the default. Use `page` only when you must hook page code: the page can see and tamper with the script there. The isolated world also enforces its own CSP, so injecting an inline `<script>` from it to reach the page does **not** work; use `@inject-into page` instead.
 - Unsupported directives such as `@grant`, `@require`, `@resource`, and `@connect` are ignored with warnings so pasted scripts degrade gracefully.
 
 ## Capability boundary

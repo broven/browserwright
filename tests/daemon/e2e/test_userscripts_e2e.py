@@ -133,7 +133,9 @@ def _enable_user_scripts_toggle(e2e_chrome) -> None:
 
 class _E2EPageHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"<body>userscript e2e</body>"
+        # The page-owned global lets a test tell the MAIN world (sees it) from
+        # the isolated USER_SCRIPT world (does not).
+        body = b"<script>window.pageToken = 'from-page';</script><body>userscript e2e</body>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(body)))
@@ -285,3 +287,74 @@ def test_userscript_install_inject_toggle_logs_remove(ext_ready, e2e_daemon, e2e
     assert json.loads(listed.stdout)["scripts"] == []
 
     _cleanup_ext_session(us_sid)
+
+
+def test_userscript_inject_into_page_runs_in_main_world(ext_ready, e2e_daemon, e2e_chrome, tmp_path):
+    """`@inject-into page` must reach page-owned JS globals (MAIN world); the
+    default stays isolated. Also proves MAIN-world scripts still leave an
+    `injected` audit-log row even though chrome.runtime is absent there."""
+    _enable_user_scripts_toggle(e2e_chrome)
+    rd = e2e_daemon.runtime_dir
+    us_sid = _seed_ext_session()
+
+    def write(name: str, extra_header: str, attr: str) -> Path:
+        path = tmp_path / f"{name}.user.js"
+        path.write_text(
+            "// ==UserScript==\n"
+            f"// @name {name}\n"
+            "// @namespace bd.e2e\n"
+            "// @match http://127.0.0.1/*\n"
+            f"{extra_header}"
+            "// ==/UserScript==\n"
+            f"document.documentElement.setAttribute('{attr}', String(window.pageToken));\n",
+            encoding="utf-8",
+        )
+        return path
+
+    main_js = write("E2E Main World", "// @inject-into page\n", "data-us-main")
+    iso_js = write("E2E Isolated World", "", "data-us-iso")
+
+    ids = []
+    for path in (main_js, iso_js):
+        pushed = _daemon_userscript(["push", str(path)], runtime_dir=rd, session=us_sid)
+        assert pushed.returncode == 0, pushed.stderr
+        payload = json.loads(pushed.stdout)
+        assert payload.get("sync", {}).get("ok") is True, payload
+        ids.append((payload["id"], payload["identity"]))
+    main_id = ids[0][0]
+
+    try:
+        with _local_page_server() as url:
+            probe = run_skill(
+                script=(
+                    "import json\n"
+                    "from browserwright.session import current_session\n"
+                    "from browserwright.session_runtime import eval_js, open_session_tab, wait_for_ready\n"
+                    "sess = current_session()\n"
+                    f"open_session_tab(sess, {url!r})\n"
+                    "wait_for_ready(sess)\n"
+                    "attr = lambda n: eval_js(sess, f\"document.documentElement.getAttribute('{n}')\")\n"
+                    'print(json.dumps({"main": attr("data-us-main"), "iso": attr("data-us-iso")}))\n'
+                ),
+                backend="extension",
+                timeout=60,
+                runtime_dir=rd,
+                extra_env={"BD_SESSION": us_sid},
+            )
+            assert probe.returncode == 0, probe.stderr
+            seen = _last_json(probe.stdout)
+            assert seen == {"main": "from-page", "iso": "undefined"}, seen
+
+            deadline = time.monotonic() + 5.0
+            while True:
+                logs = _daemon_userscript(["logs", "--id", main_id, "--limit=20"], runtime_dir=rd, session=us_sid)
+                assert logs.returncode == 0, logs.stderr
+                if any(e.get("event") == "injected" for e in json.loads(logs.stdout)["logs"]):
+                    break
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"no injected audit row for MAIN-world script: {logs.stdout}")
+                time.sleep(0.2)
+    finally:
+        for _sid, identity in ids:
+            _daemon_userscript(["remove", identity], runtime_dir=rd, session=us_sid)
+        _cleanup_ext_session(us_sid)

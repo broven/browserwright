@@ -19,6 +19,14 @@ _RUN_AT = {
     "document_end": "document_end",
     "document_idle": "document_idle",
 }
+# Violentmonkey's @inject-into: ``page`` runs in the page's own JS world (can
+# reach page globals, but the page can see the script too); ``content``/``auto``
+# keep Chrome's isolated USER_SCRIPT world, which is also the default.
+_INJECT_INTO = {
+    "page": "MAIN",
+    "content": "USER_SCRIPT",
+    "auto": "USER_SCRIPT",
+}
 _SUPPORTED = {
     "name",
     "namespace",
@@ -26,6 +34,7 @@ _SUPPORTED = {
     "include",
     "exclude",
     "run-at",
+    "inject-into",
     "version",
     "description",
 }
@@ -60,6 +69,7 @@ class Userscript:
     version: str
     description: str
     code: str
+    world: str = "USER_SCRIPT"
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -79,6 +89,7 @@ class Userscript:
             "matches": self.matches,
             "excludeMatches": self.exclude_matches,
             "runAt": self.run_at,
+            "world": self.world,
             "version": self.version,
             "description": self.description,
             "code": self.code,
@@ -98,6 +109,7 @@ def parse_userscript(text: str) -> Userscript:
     version = ""
     description = ""
     run_at = "document_idle"
+    world = "USER_SCRIPT"
     matches: list[str] = []
     excludes: list[str] = []
     warnings: list[str] = []
@@ -125,6 +137,12 @@ def parse_userscript(text: str) -> Userscript:
                     f"@exclude {value!r} is not a valid match pattern (ignored)")
         elif key == "run-at":
             run_at = _RUN_AT.get(value, "document_idle")
+        elif key == "inject-into":
+            if value.lower() in _INJECT_INTO:
+                world = _INJECT_INTO[value.lower()]
+            else:
+                warnings.append(
+                    f"@inject-into {value!r} is not page/content/auto (ignored)")
         elif key == "version":
             version = value
         elif key == "description":
@@ -146,5 +164,6 @@ def parse_userscript(text: str) -> Userscript:
         version=version,
         description=description,
         code=code,
+        world=world,
         warnings=warnings,
     )
