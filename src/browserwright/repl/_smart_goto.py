@@ -27,10 +27,17 @@ _ORIG_NEW_PAGE = "_bw_orig_new_page"
 _STABLE_WINDOW_MS = 1500
 _DEFAULT_TIMEOUT_MS = SMART_GOTO_TIMEOUT_S * 1000
 _DOMCONTENTLOADED_TIMEOUT_MS = 10_000
+# What the agent set with the public `set_default_timeout()` /
+# `set_default_navigation_timeout()`, recorded on the page / context object by
+# our wrappers (`_track_default_timeouts`). `None` = not set.
+_DEFAULT_TIMEOUT_ATTR = "_bw_default_timeout"
+_DEFAULT_NAV_TIMEOUT_ATTR = "_bw_default_navigation_timeout"
+_TRACKED = "_bw_tracks_default_timeouts"
 
 
 def patch_context_pages(context: Any) -> None:
     """Patch existing pages and future ``context.new_page()`` results."""
+    _track_default_timeouts(context)
     for page in list(getattr(context, "pages", []) or []):
         patch_page_goto(page)
     if getattr(context, _CONTEXT_PATCHED, False):
@@ -57,11 +64,16 @@ def patch_page_goto(page: Any) -> Any:
         return page
 
     orig_goto = page.goto
+    _track_default_timeouts(page)
+    try:
+        _track_default_timeouts(page.context)
+    except Exception:  # noqa: BLE001 - best effort; the page's own still apply
+        pass
 
     def smart_goto(self: Any, url: str, *, timeout: int | float | timedelta | None = None,
                    wait_until: str | None = None, referer: str | None = None) -> Any:
         if timeout is None:
-            timeout = _page_default_navigation_timeout_ms(self)
+            timeout = _default_navigation_timeout_ms(self)
         timeout_ms = _normalize_timeout(timeout)
         network = _NetworkMonitor(self)
         deadline = _deadline_for(timeout_ms)
@@ -108,27 +120,55 @@ def _normalize_timeout(timeout: int | float | timedelta | None) -> int:
     return timeout_ms if timeout_ms >= 0 else _DEFAULT_TIMEOUT_MS
 
 
-def _page_default_navigation_timeout_ms(page: Any) -> float | None:
-    """The navigation timeout the agent set on this page or its context with
-    ``set_default_navigation_timeout()`` / ``set_default_timeout()``, or
-    ``None`` when it set none (the smart default, 60s, then applies).
+def _track_default_timeouts(obj: Any) -> None:
+    """Wrap a page's or context's public ``set_default_timeout()`` /
+    ``set_default_navigation_timeout()`` so smart goto knows what the agent set.
 
     ADR-0014: an operation timeout is the agent's own value when it set one.
-    Smart goto always passes an explicit ``timeout`` to Playwright, which
-    would otherwise shadow those defaults. Playwright keeps them on its
-    private ``TimeoutSettings``; if that ever moves, the smart default
-    applies, exactly as before.
+    Smart goto always passes an explicit ``timeout`` to Playwright (its 60s
+    default differs from Playwright's 30s), which would otherwise shadow those
+    defaults. Playwright keeps them in private state, so — like ``goto`` itself
+    — the public setters are wrapped and the values remembered here.
+    """
+    if obj is None or getattr(obj, _TRACKED, False):
+        return
+
+    def wrap(method_name: str, attr: str) -> None:
+        orig = getattr(obj, method_name)
+
+        def setter(timeout: float | None) -> None:
+            orig(timeout)
+            setattr(obj, attr, timeout)
+
+        setattr(obj, method_name, setter)
+
+    try:
+        wrap("set_default_timeout", _DEFAULT_TIMEOUT_ATTR)
+        wrap("set_default_navigation_timeout", _DEFAULT_NAV_TIMEOUT_ATTR)
+        setattr(obj, _TRACKED, True)
+    except Exception:  # noqa: BLE001 - best effort; the smart default applies
+        return
+
+
+def _default_navigation_timeout_ms(page: Any) -> float | None:
+    """The navigation timeout the agent set, or ``None`` (the smart default,
+    60s, then applies).
+
+    Same precedence as Playwright's own: the page's navigation default, then
+    the page's default, then the context's navigation default, then the
+    context's default — a page setting always overrides the context's.
     """
     try:
-        settings = page._impl_obj._timeout_settings
+        context = page.context
     except Exception:  # noqa: BLE001
-        return None
-    while settings is not None:
-        for attr in ("_default_navigation_timeout", "_default_timeout"):
-            value = getattr(settings, attr, None)
-            if isinstance(value, (int, float)):
+        context = None
+    for obj in (page, context):
+        if obj is None:
+            continue
+        for attr in (_DEFAULT_NAV_TIMEOUT_ATTR, _DEFAULT_TIMEOUT_ATTR):
+            value = getattr(obj, attr, None)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
                 return value
-        settings = getattr(settings, "_parent", None)
     return None
 
 

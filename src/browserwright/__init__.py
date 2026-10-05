@@ -44,7 +44,6 @@ from .errors import (  # noqa: F401
     ElementNotFound,
     NeedsUserConfirm,
     NetworkError,
-    OperationTimeout,
     PageLoadFailed,
     UnsupportedContentType,
 )
@@ -82,3 +81,14 @@ EXPORTS = [
 ]
 
 __all__ = EXPORTS
+
+
+def __getattr__(name: str):
+    # `OperationTimeout` subclasses Playwright's TimeoutError, so building it
+    # imports `playwright.sync_api`; `errors` defers that to first use, and so
+    # does this re-export (see `errors._make_operation_timeout`).
+    if name == "OperationTimeout":
+        from . import errors
+
+        return errors.OperationTimeout
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

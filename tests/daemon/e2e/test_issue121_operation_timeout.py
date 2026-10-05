@@ -1,13 +1,16 @@
 """Issue #121 / ADR-0014 (extension backend, real Chrome): one Playwright call
-running out of its own timeout is an `OperationTimeout`, exit 8 — catchable,
-and the executor survives. It is never confused with the call deadline.
+running out of its own timeout is catchable in code as Playwright's
+`TimeoutError`, and when it escapes the code the call reports it as
+`OperationTimeout`, exit 8 — the executor survives. It is never confused with
+the call deadline.
 
-- `page.click("#does-not-exist", timeout=1000)` raises `OperationTimeout`
-  after ~1s; it is a Playwright `TimeoutError`; uncaught it exits 8 with a
-  `[fix]` naming `timeout=` and `snapshot()`; `state` survives.
+- `page.click("#does-not-exist", timeout=1000)` raises after ~1s and
+  `except TimeoutError` catches it; uncaught it exits 8 with a `[fix]` naming
+  `timeout=` and `snapshot()`; `state` survives.
 - An unset `timeout=` is Playwright's 30s even under `--timeout 300`.
-- A smart `goto` that cannot commit in time raises `OperationTimeout` too
-  (`PageLoadFailed(reason="timeout")` is gone).
+- A smart `goto` that cannot commit in time reports `OperationTimeout` too
+  (`PageLoadFailed(reason="timeout")` is gone), and it honours the agent's
+  `set_default_navigation_timeout()`.
 - When the call deadline is the binding cap — including a Playwright timeout
   that lands right at it — the answer is `DeadlineExceeded`, exit 7.
 
@@ -93,16 +96,12 @@ def test_click_timeout_is_a_catchable_operation_timeout_and_exits_8(
             "t = time.monotonic()\n"
             "try:\n"
             "    page.click('#does-not-exist', timeout=1000)\n"
-            "except PWTimeout as e:\n"
-            "    print('CAUGHT=' + type(e).__name__)\n"
-            "    print('IS_OP=' + str(isinstance(e, OperationTimeout)))\n"
-            "    print('SCOPE=' + e.scope)\n"
+            "except PWTimeout:\n"
+            "    print('CAUGHT=yes')\n"
             "print('ELAPSED=%.2f' % (time.monotonic() - t))\n"
         )], runtime_dir)
         assert caught.returncode == 0, _detail(caught, 0)
-        assert _grep(caught.stdout, "CAUGHT") == "OperationTimeout"
-        assert _grep(caught.stdout, "IS_OP") == "True"
-        assert _grep(caught.stdout, "SCOPE") == "operation"
+        assert _grep(caught.stdout, "CAUGHT") == "yes"
         in_code = float(_grep(caught.stdout, "ELAPSED"))
         _record("click-1s-caught", elapsed_in_code_s=in_code)
         assert 0.9 <= in_code <= 3.0, in_code
@@ -171,6 +170,31 @@ def test_goto_that_cannot_commit_in_time_is_an_operation_timeout(
         assert slow in proc.stderr
         fix = [ln for ln in proc.stderr.splitlines() if ln.startswith("[fix]")][-1]
         assert "page.url" in fix and "new_page" not in fix
+        assert 2.0 <= elapsed <= 2.0 + _OVERHEAD_S, _detail(proc, elapsed)
+        _state_survived(sid, runtime_dir)
+    finally:
+        _cleanup_session("extension", sid)
+
+
+def test_goto_honours_set_default_navigation_timeout(
+    _ext_autofacade_ready,  # noqa: F811 - imported pytest fixture
+    local_site,  # noqa: F811 - imported pytest fixture
+):
+    """An unset goto `timeout=` is the agent's own default when it set one
+    (ADR-0014), not smart goto's 60s."""
+    pytest.importorskip("playwright.sync_api")
+    runtime_dir, _ = _ext_autofacade_ready
+    sid = _seed_session(runtime_dir, "extension")
+    try:
+        _warm(sid, runtime_dir, local_site + "/fast")
+        slow = local_site + "/slow"
+        proc, elapsed = _cli(["-s", sid, "-e", (
+            "page.set_default_navigation_timeout(2000)\n"
+            f"page.goto({slow!r})\n"
+        )], runtime_dir)
+        _record("goto-default-nav-2s", elapsed_s=round(elapsed, 2),
+                returncode=proc.returncode, stderr_tail=proc.stderr[-400:])
+        _assert_operation_timeout(proc, elapsed)
         assert 2.0 <= elapsed <= 2.0 + _OVERHEAD_S, _detail(proc, elapsed)
         _state_survived(sid, runtime_dir)
     finally:

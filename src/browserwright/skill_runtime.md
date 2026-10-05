@@ -166,7 +166,7 @@ The two run out differently, and the exit code tells you which one did:
 | | exit **7** — `DeadlineExceeded` | exit **8** — `OperationTimeout` |
 |---|---|---|
 | what ran out | the whole call (`--timeout`), `"scope": "call"` | one Playwright call (`timeout=`), `"scope": "operation"` |
-| inside your code | cannot be caught: the code is cut off wherever it was | an ordinary exception: `except TimeoutError` (Playwright's, from `playwright.sync_api`) or `except OperationTimeout` catches it |
+| inside your code | cannot be caught: the code is cut off wherever it was | Playwright's own `TimeoutError`, an ordinary exception: catch it with `from playwright.sync_api import TimeoutError` / `except TimeoutError:`. `OperationTimeout` is the type the CLI **reports** (exit 8) when you do not catch it |
 | executor and `state` | executor terminated (fail-stop): `state` is gone, `finally` blocks are not guaranteed | executor survives: `state` is intact |
 | next move | raise `--timeout`, or split the work into smaller calls | `snapshot()` to check the page and that the target exists, then retry with the current ref; if the page is just slow, raise that call's `timeout=` |
 
@@ -222,9 +222,9 @@ stable or requests have been quiet. The default timeout is 60s (or what you set
 with `page.set_default_navigation_timeout()` / `set_default_timeout()`), but
 normal pages return much earlier; if final stability is not reached, `goto`
 still returns the Playwright `Response | None` so you can inspect the page with
-`snapshot()`. A page that does not even commit in time raises
-`OperationTimeout` (exit 8 if uncaught); the navigation may still land, so check
-`page.url` / `snapshot()` before retrying.
+`snapshot()`. A page that does not even commit in time raises a `TimeoutError`
+(catch it as above; reported as `OperationTimeout`, exit 8, if uncaught); the
+navigation may still land, so check `page.url` / `snapshot()` before retrying.
 
 ### Same live objects across calls (mental model)
 

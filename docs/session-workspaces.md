@@ -63,9 +63,11 @@ CLI returns. The caller sees `DeadlineExceeded` (`scope="call"`, exit code 7);
 `terminal_reason="deadline_exceeded"` stays an internal signal that tells the
 client to reap the executor. Browser tabs survive, but executor `state` is lost, Python
 `finally` blocks are not guaranteed, and webpage side effects are not rolled
-back. A Playwright call that runs out of its own timeout raises
-`OperationTimeout` (`scope="operation"`, exit code 8 when uncaught); it is an
-ordinary request error and does not recycle the executor. The classification
+back. A Playwright call that runs out of its own timeout raises Playwright's
+own `TimeoutError` inside the code (browserwright does not patch Playwright);
+uncaught, the executor reports it as `OperationTimeout` (`scope="operation"`,
+exit code 8). It is an ordinary request error and does not recycle the
+executor. The classification
 is by the clock, in `_Worker.submit`: a call that fails once its deadline has
 run out is `DeadlineExceeded`, whatever it failed with, so a Playwright timeout
 or a relay command that lands at or after the deadline can never surface as

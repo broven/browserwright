@@ -91,10 +91,6 @@ def build_globals(
     ``_load_agent_helpers`` seeds each helper module's own ``__dict__`` from
     ``g``, so any name replaced *after* it runs stays lazy inside every helper.
     """
-    # ADR-0014: a Playwright call that runs out of its own timeout raises
-    # `OperationTimeout` (exit 8) in the agent's code, not a bare TimeoutError.
-    from ._operation_timeout import install as _install_operation_timeout
-    _install_operation_timeout()
     g: dict[str, Any] = {}
     # Every primitive + every error class.
     for name in browserwright.EXPORTS:

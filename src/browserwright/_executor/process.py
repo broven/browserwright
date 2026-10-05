@@ -933,8 +933,8 @@ class _Worker:
                             buf, serialize(e), e.exit_code)
                     error = serialize(e)
                     if isinstance(e, OperationTimeout):
-                        # A Playwright call in the agent's code: keep the
-                        # traceback, which says WHICH call ran out.
+                        # Smart goto's timeout: keep the traceback, which
+                        # says WHICH call ran out.
                         error["traceback"] = traceback.format_exc()
                     return self._finish(
                         buf, error=error, exit_code=e.exit_code)
@@ -946,21 +946,21 @@ class _Worker:
                     # `traceback.format_exc()` to stderr; a shipped heredoc must
                     # show the SAME traceback. We carry it on the serialized error.
                     from ..errors import (
-                        PlaywrightTimeoutError,
+                        operation_timeout_from,
                         playwright_error_fix,
                     )
 
-                    if isinstance(e, PlaywrightTimeoutError):
-                        # A Playwright timeout that bypassed the sync-API
-                        # funnel (`repl/_operation_timeout.py`), e.g. one the
-                        # code raised itself: still an operation timeout.
-                        from ..repl._operation_timeout import (
-                            as_operation_timeout,
-                        )
-
-                        op = as_operation_timeout(e)
+                    op = operation_timeout_from(e)
+                    if op is not e:
+                        # ADR-0014: inside the code a Playwright call raises
+                        # Playwright's own TimeoutError (we never patch it);
+                        # escaping the code, it is REPORTED as an operation
+                        # timeout — exit 8, executor kept. The traceback (the
+                        # original frames, ending in the reported type) says
+                        # which call ran out.
                         error = serialize(op)
-                        error["traceback"] = traceback.format_exc()
+                        error["traceback"] = "".join(
+                            traceback.format_exception(op))
                         return self._finish(
                             buf, error=error, exit_code=op.exit_code)
                     error = {
