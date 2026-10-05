@@ -1,5 +1,13 @@
 """Skill exception hierarchy (spec §A.4)."""
 
+import re
+
+# Playwright's public ``TimeoutError`` (``playwright.sync_api.TimeoutError``
+# is this same class). Imported from its defining module because that module
+# is dependency-free: ``errors`` is loaded by every CLI invocation, and the
+# public ``sync_api`` package would drag the whole driver stack in with it.
+from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
+
 
 class BrowserwrightError(Exception):
     """Root of every exception Skill itself raises.
@@ -158,6 +166,61 @@ class DeadlineExceeded(BrowserwrightError):
             f"{timeout:g}s (--timeout) and was stopped (fail-stop)",
             fix=fix,
         )
+
+
+#: Playwright's own default for an action (``click``, ``fill``, ``wait_for``…)
+#: when the agent sets no ``timeout=``. Restated here only for messages; the
+#: value Playwright uses is its own.
+PLAYWRIGHT_ACTION_TIMEOUT_S = 30
+#: browserwright's smart ``page.goto`` default (``repl/_smart_goto.py``).
+SMART_GOTO_TIMEOUT_S = 60
+
+_TIMEOUT_MS_RE = re.compile(r"Timeout (\d+(?:\.\d+)?)ms exceeded")
+
+
+class OperationTimeout(BrowserwrightError, PlaywrightTimeoutError):
+    """One Playwright call ran out of its own timeout (ADR-0014).
+
+    The operation timeout is the agent's ``timeout=`` /
+    ``set_default_timeout()``, or Playwright's default (30s for an action, 60s
+    for browserwright's smart ``goto``), capped by what is left of the call
+    deadline. When the call deadline is the smaller of the two, running out is
+    ``DeadlineExceeded`` (exit 7), never this.
+
+    It subclasses Playwright's ``TimeoutError``, so code that already does
+    ``except TimeoutError`` (imported from ``playwright.sync_api``) keeps
+    catching it. It is an ordinary exception: the code can catch it and carry
+    on, and the executor survives with its ``state``. Only when it escapes the
+    code does the call exit with its own code (8).
+
+    The executor produces it at the one funnel every sync Playwright call
+    returns through (``repl/_operation_timeout.py``), so ``page.click``,
+    ``locator.wait_for``, ``expect_*`` and the smart ``goto`` all raise it.
+
+    Constructible from a single message, because Playwright's
+    ``rewrite_error`` rebuilds an error as ``type(error)(message)``.
+    """
+
+    exit_code = 8
+    default_fix = (
+        "a single Playwright call ran out of its own timeout; the executor and "
+        "`state` survived. Call snapshot() to check the page and that the "
+        "target exists (a wrong selector waits the full timeout), then retry "
+        "with the current ref; if the page is just slow, raise that call's "
+        "timeout= (default 30s for actions, 60s for page.goto; it can never "
+        "outlast the call deadline `--timeout`)"
+    )
+
+    def __init__(self, message: str = "", *, scope: str = "operation",
+                 url: str = "", detail: str = "",
+                 timeout: float | None = None, fix: str = ""):
+        self.scope, self.detail = scope, detail
+        self.url = url or None
+        if timeout is None:
+            m = _TIMEOUT_MS_RE.search(message)
+            timeout = float(m.group(1)) / 1000.0 if m else None
+        self.timeout = timeout
+        super().__init__(message or "operation timed out", fix=fix)
 
 
 class ElementNotFound(BrowserwrightError):

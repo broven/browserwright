@@ -137,28 +137,45 @@ call cannot see the values unless it selects them again. Values travel directly
 over the local executor socket and are not written to persistent `state`,
 discovery files, or Browserwright logs.
 
-## Call deadline: `--timeout`
+## Timeouts: the call deadline and the operation timeout
 
-Every `-e` / `-f` / `--code-stdin` call has one **call deadline** for the whole
-call: `--timeout <seconds>`, default **90**. It is a ceiling, not a default for
-the Playwright calls inside your code — `click`, `wait_for` and friends keep
-Playwright's own `timeout=` (30s unless you pass one), and `page.goto` keeps
-its 60s.
+You own exactly two timeouts.
+
+**Call deadline: `--timeout`.** Every `-e` / `-f` / `--code-stdin` call has one
+deadline for the whole call: `--timeout <seconds>`, default **90**.
 
 ```bash
 browserwright -s "$sid" --timeout 300 -f long_crawl.py   # a known-slow job
 ```
 
-When the deadline runs out the call is **fail-stopped**: the code is cut off
-wherever it was, its executor is terminated, and the command exits with code
-**7** and a `DeadlineExceeded` error (`"scope": "call"`). It cannot be caught
-from inside the code. Browser tabs survive; `state` does not, and `finally`
-blocks are not guaranteed. The next call starts a fresh executor on the same
-tab, so it works normally.
+**Operation timeout: `timeout=`.** Each Playwright call inside your code
+(`click`, `fill`, `wait_for`, `goto`, …) has its own timeout:
 
-What to do with exit 7: raise `--timeout` if the work is legitimately slow, or
-split it into several smaller calls (keep progress with `state` or
-`remember()`). Do not re-run the same call unchanged.
+```
+operation timeout = min(your timeout= / page.set_default_timeout(), or Playwright's default,
+                        what is left of the call deadline)
+```
+
+Playwright's default is **30s** for an action and **60s** for `page.goto`. The
+call deadline is a ceiling, never the default: an unset `timeout=` is still 30s
+under `--timeout 300`, so a wrong selector fails in 30s, not in 5 minutes. A
+`timeout=` larger than what is left of the call deadline does not extend it.
+
+The two run out differently, and the exit code tells you which one did:
+
+| | exit **7** — `DeadlineExceeded` | exit **8** — `OperationTimeout` |
+|---|---|---|
+| what ran out | the whole call (`--timeout`), `"scope": "call"` | one Playwright call (`timeout=`), `"scope": "operation"` |
+| inside your code | cannot be caught: the code is cut off wherever it was | an ordinary exception: `except TimeoutError` (Playwright's, from `playwright.sync_api`) or `except OperationTimeout` catches it |
+| executor and `state` | executor terminated (fail-stop): `state` is gone, `finally` blocks are not guaranteed | executor survives: `state` is intact |
+| next move | raise `--timeout`, or split the work into smaller calls | `snapshot()` to check the page and that the target exists, then retry with the current ref; if the page is just slow, raise that call's `timeout=` |
+
+When the call deadline is the smaller of the two — a `goto(url,
+timeout=60_000)` under `--timeout 3` — running out is exit 7, never 8: any
+failure that lands once the call deadline has run out is reported as the call
+deadline's. Browser tabs survive both. After exit 7 the next call starts a
+fresh executor on the same tab and works normally; keep progress across calls
+with `state` or `remember()`, and do not re-run the same call unchanged.
 
 | exit | meaning |
 |---|---|
@@ -168,6 +185,7 @@ split it into several smaller calls (keep progress with `state` or
 | 3 | the code raised (a Playwright error, an `ElementNotFound`, …) |
 | 4 / 5 | auth wall / captcha — stop and ask the user |
 | 7 | `DeadlineExceeded`: the call deadline (`--timeout`) ran out |
+| 8 | `OperationTimeout`: one Playwright call ran out of its `timeout=` and your code did not catch it |
 
 ## Driving The Browser: real Playwright
 
@@ -200,10 +218,13 @@ Browserwright keeps the normal Playwright API, but transparently patches
 `page` and on pages returned by `context.new_page()`. Any `wait_until` value you
 pass is accepted for compatibility and ignored: Browserwright always navigates
 to commit, waits briefly for DOMContentLoaded, then returns once rendering is
-stable or requests have been quiet. The default timeout is 60s, but normal
-pages return much earlier; if final stability is not reached, `goto` still
-returns the Playwright `Response | None` so you can inspect the page with
-`snapshot()`.
+stable or requests have been quiet. The default timeout is 60s (or what you set
+with `page.set_default_navigation_timeout()` / `set_default_timeout()`), but
+normal pages return much earlier; if final stability is not reached, `goto`
+still returns the Playwright `Response | None` so you can inspect the page with
+`snapshot()`. A page that does not even commit in time raises
+`OperationTimeout` (exit 8 if uncaught); the navigation may still land, so check
+`page.url` / `snapshot()` before retrying.
 
 ### Same live objects across calls (mental model)
 
@@ -255,7 +276,7 @@ page.goto("https://example.com")
 
 If the executor itself is wedged and cannot run `reset()`, use `browserwright session reset <id>`. Both reset paths recycle only the executor; the browser, tab group, and tabs stay open.
 
-The call deadline (`--timeout`, see above) follows the same fail-stop rule: Browserwright terminates that executor and waits for daemon confirmation before the command exits 7 with `DeadlineExceeded`. The next command starts fresh on the same browser tabs. An ordinary Playwright action timeout that is caught and returned normally does **not** recycle the executor. After fail-stop, Python `finally` blocks are not guaranteed to run and webpage side effects are not rolled back.
+The call deadline (`--timeout`, see above) follows the same fail-stop rule: Browserwright terminates that executor and waits for daemon confirmation before the command exits 7 with `DeadlineExceeded`. The next command starts fresh on the same browser tabs. An operation timeout (`OperationTimeout`, exit 8), caught or not, does **not** recycle the executor. After fail-stop, Python `finally` blocks are not guaranteed to run and webpage side effects are not rolled back.
 
 ### Tabs are workstreams, not steps
 

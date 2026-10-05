@@ -1148,6 +1148,49 @@ def test_submit_deadline_includes_cold_start(monkeypatch):
     assert captured[-1] == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("late", [False, True], ids=["before-deadline", "at-deadline"])
+def test_submit_classifies_a_timeout_by_the_clock_not_the_handoff(monkeypatch, late):
+    """ADR-0014's 7-vs-8 race (#121). An `OperationTimeout` the worker hands
+    over before the call deadline is the agent's (exit 8, executor kept). One
+    that reaches `submit` only once the deadline has run out — a Playwright
+    timeout that landed right at it, which `queue.get` can still return at the
+    boundary — is the deadline's: `DeadlineExceeded`, exit 7, fail-stop. The
+    real queue cannot be made to hit that boundary on demand, so this box
+    hands the response over exactly when asked to."""
+    import time as _time
+
+    import browserwright._executor.process as proc
+    from browserwright.errors import OperationTimeout, serialize
+
+    op = OperationTimeout("Locator.click: Timeout 50ms exceeded.")
+
+    class _HandoffBox:
+        def __init__(self, *a, **k):
+            pass
+
+        def put(self, *a, **k):
+            pass
+
+        def get(self, timeout=None):
+            _time.sleep(timeout + 0.02 if late else 0)
+            return protocol.ExecuteResponse(
+                console="partial\n", error=serialize(op), exit_code=op.exit_code)
+
+    monkeypatch.setattr(proc.queue, "Queue", _HandoffBox)
+    w = _Worker("sess-race")
+    w._connected = True
+    r = w.submit(protocol.ExecuteRequest("page.click('#x')", timeout_ms=50))
+
+    if late:
+        assert r.error["type"] == "DeadlineExceeded" and r.exit_code == 7
+        assert r.terminal_reason == "deadline_exceeded"
+    else:
+        assert r.error["type"] == "OperationTimeout" and r.exit_code == 8
+        assert r.error["scope"] == "operation"
+        assert r.terminal_reason is None
+    assert r.console == "partial\n"
+
+
 # ---- lazy cold-start decoupling (control-plane / data-plane split) ---------
 
 

@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import pytest
 
-from browserwright.errors import PageLoadFailed
+from browserwright.errors import (
+    OperationTimeout,
+    PageLoadFailed,
+    PlaywrightTimeoutError,
+)
 from browserwright.repl import _smart_goto
 
 
@@ -25,8 +29,17 @@ class TimeoutError(Exception):  # noqa: A001 - mirrors playwright's class name
     pass
 
 
-def _fail(exc: BaseException) -> PageLoadFailed:
-    return _smart_goto._page_load_failed("https://example.com/p", "commit", exc)
+def _fail(exc: BaseException) -> PageLoadFailed | OperationTimeout:
+    return _smart_goto._navigation_failed("https://example.com/p", "commit", exc)
+
+
+def _bucket(err: PageLoadFailed | OperationTimeout) -> str:
+    """The `timeout` bucket is an `OperationTimeout` (ADR-0014), which has no
+    `reason`; every other bucket is a `PageLoadFailed` reason."""
+    if isinstance(err, OperationTimeout):
+        assert not isinstance(err, PageLoadFailed)
+        return "timeout"
+    return err.reason
 
 
 CASES = [
@@ -75,14 +88,14 @@ CASES = [
         # out" — which does NOT contain the substring "timeout", so the old
         # classifier's timeout check missed it and it landed in "network".
         # Since ADR-0014 its bound is the caller's remaining call deadline, so
-        # it is an ordinary timeout (reason = the phase), not "network" and
-        # not a transport fault.
+        # it is an ordinary operation timeout, not "network" and not a
+        # transport fault.
         _PWError(
             "Protocol error (Page.navigate): chrome.debugger.sendCommand "
             "timed out after 58000ms (Page.navigate tabId=42); the command may "
             "still land in Chrome"
         ),
-        "commit",
+        "timeout",
         id="extension-deadline-timeout",
     ),
     pytest.param(
@@ -103,12 +116,21 @@ CASES = [
 
 @pytest.mark.parametrize("exc,expected_reason", CASES)
 def test_reason_matches_real_cause(exc, expected_reason):
-    assert _fail(exc).reason == expected_reason
+    assert _bucket(_fail(exc)) == expected_reason
 
 
-def test_timeout_keeps_the_phase_as_its_reason():
-    err = _fail(TimeoutError("Page.goto: Timeout 60000ms exceeded."))
-    assert err.reason == "commit"
+def test_timeout_is_an_operation_timeout_not_a_page_load_failure():
+    """ADR-0014: `PageLoadFailed(reason="timeout")` folds into
+    `OperationTimeout` — exit 8, catchable as Playwright's TimeoutError, and a
+    fix naming the two knobs (`timeout=`, `snapshot()`)."""
+    err = _fail(PlaywrightTimeoutError("Page.goto: Timeout 60000ms exceeded."))
+    assert isinstance(err, OperationTimeout)
+    assert isinstance(err, PlaywrightTimeoutError)
+    assert err.exit_code == 8 and err.scope == "operation"
+    assert err.url == "https://example.com/p"
+    assert err.timeout == 60.0
+    assert "commit" in str(err)
+    assert "timeout=" in err.fix and "snapshot()" in err.fix
     assert "http_get" in err.fix
 
 
@@ -142,7 +164,7 @@ def test_extension_timeout_fix_does_not_advise_a_fresh_tab():
         "Protocol error (Page.navigate): chrome.debugger.sendCommand timed "
         "out after 58000ms (Page.navigate tabId=7); the command may still "
         "land in Chrome"))
-    assert err.reason == "commit"
+    assert isinstance(err, OperationTimeout)
     assert "new_page" not in err.fix
     assert "fresh tab" not in err.fix
     assert "page.url" in err.fix or "snapshot()" in err.fix
@@ -153,7 +175,7 @@ def test_transport_timeouts_are_not_reported_as_the_site_timing_out():
     not respond"."""
     err = _fail(_PWError(
         "Protocol error (Page.navigate): relay send failed: TimeoutError()"))
-    assert err.reason not in ("network", "commit", "timeout"), err.reason
+    assert _bucket(err) not in ("network", "timeout"), _bucket(err)
     assert "site did not respond" not in err.fix
 
 

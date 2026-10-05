@@ -68,7 +68,7 @@ def remaining_s(session_id: str | None) -> float | None:
 #: fail-stopped and the caller gets `DeadlineExceeded` (exit 7). An inner wait
 #: that ended *at* the deadline would race that — and the extension, which by
 #: construction settles before the relay, would win it, surfacing the expiry
-#: as a command timeout inside the agent's code (`PageLoadFailed`, exit 3)
+#: as an operation timeout inside the agent's code (`OperationTimeout`, exit 8)
 #: instead. So the inner waits are derived from the deadline but end this much
 #: after it: the executor always fires first, and the inner bounds stay what
 #: they are for — a net for a wedged extension or Chrome. The relay's margin

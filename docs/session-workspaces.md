@@ -63,8 +63,13 @@ CLI returns. The caller sees `DeadlineExceeded` (`scope="call"`, exit code 7);
 `terminal_reason="deadline_exceeded"` stays an internal signal that tells the
 client to reap the executor. Browser tabs survive, but executor `state` is lost, Python
 `finally` blocks are not guaranteed, and webpage side effects are not rolled
-back. A Playwright action timeout that returns before the outer request
-deadline is an ordinary request error and does not recycle the executor.
+back. A Playwright call that runs out of its own timeout raises
+`OperationTimeout` (`scope="operation"`, exit code 8 when uncaught); it is an
+ordinary request error and does not recycle the executor. The classification
+is by the clock, in `_Worker.submit`: a call that fails once its deadline has
+run out is `DeadlineExceeded`, whatever it failed with, so a Playwright timeout
+or a relay command that lands at or after the deadline can never surface as
+exit 8.
 
 `reset()` is also terminal for its current code request; statements after it do
 not run. Both `reset()` and `browserwright session reset <id>` use the same

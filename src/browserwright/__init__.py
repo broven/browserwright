@@ -44,6 +44,7 @@ from .errors import (  # noqa: F401
     ElementNotFound,
     NeedsUserConfirm,
     NetworkError,
+    OperationTimeout,
     PageLoadFailed,
     UnsupportedContentType,
 )
@@ -77,6 +78,7 @@ EXPORTS = [
     "BrowserwrightError", "PageLoadFailed", "ElementNotFound", "AuthWall",
     "Captcha", "NetworkError", "DaemonUnavailable", "CDPError",
     "NeedsUserConfirm", "UnsupportedContentType", "TabMatchError",
+    "OperationTimeout",
 ]
 
 __all__ = EXPORTS

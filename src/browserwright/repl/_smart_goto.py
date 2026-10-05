@@ -12,7 +12,12 @@ import types
 from datetime import timedelta
 from typing import Any
 
-from ..errors import PageLoadFailed
+from ..errors import (
+    SMART_GOTO_TIMEOUT_S,
+    OperationTimeout,
+    PageLoadFailed,
+    PlaywrightTimeoutError,
+)
 
 
 _PATCHED = "_bw_smart_goto"
@@ -20,7 +25,7 @@ _ORIG_GOTO = "_bw_orig_goto"
 _CONTEXT_PATCHED = "_bw_smart_new_page"
 _ORIG_NEW_PAGE = "_bw_orig_new_page"
 _STABLE_WINDOW_MS = 1500
-_DEFAULT_TIMEOUT_MS = 60_000
+_DEFAULT_TIMEOUT_MS = SMART_GOTO_TIMEOUT_S * 1000
 _DOMCONTENTLOADED_TIMEOUT_MS = 10_000
 
 
@@ -53,20 +58,27 @@ def patch_page_goto(page: Any) -> Any:
 
     orig_goto = page.goto
 
-    def smart_goto(self: Any, url: str, *, timeout: int | float | timedelta | None = _DEFAULT_TIMEOUT_MS,
+    def smart_goto(self: Any, url: str, *, timeout: int | float | timedelta | None = None,
                    wait_until: str | None = None, referer: str | None = None) -> Any:
+        if timeout is None:
+            timeout = _page_default_navigation_timeout_ms(self)
         timeout_ms = _normalize_timeout(timeout)
         network = _NetworkMonitor(self)
         deadline = _deadline_for(timeout_ms)
+        before_url = _url_of(self)
         try:
             response = orig_goto(url, timeout=timeout_ms,
                                  wait_until="commit", referer=referer)
         except Exception as exc:  # noqa: BLE001 - translate Playwright failures.
-            if _looks_loaded(self):
+            # A timeout on a page still at its pre-goto URL never committed:
+            # skip the probe (see `_looks_loaded`).
+            if _looks_loaded(
+                    self,
+                    before_url if isinstance(exc, PlaywrightTimeoutError) else None):
                 response = None
             else:
                 network.detach()
-                raise _page_load_failed(url, "commit", exc) from exc
+                raise _navigation_failed(url, "commit", exc) from exc
 
         _wait_for_domcontentloaded(self, _remaining_timeout_ms(deadline))
         try:
@@ -96,6 +108,30 @@ def _normalize_timeout(timeout: int | float | timedelta | None) -> int:
     return timeout_ms if timeout_ms >= 0 else _DEFAULT_TIMEOUT_MS
 
 
+def _page_default_navigation_timeout_ms(page: Any) -> float | None:
+    """The navigation timeout the agent set on this page or its context with
+    ``set_default_navigation_timeout()`` / ``set_default_timeout()``, or
+    ``None`` when it set none (the smart default, 60s, then applies).
+
+    ADR-0014: an operation timeout is the agent's own value when it set one.
+    Smart goto always passes an explicit ``timeout`` to Playwright, which
+    would otherwise shadow those defaults. Playwright keeps them on its
+    private ``TimeoutSettings``; if that ever moves, the smart default
+    applies, exactly as before.
+    """
+    try:
+        settings = page._impl_obj._timeout_settings
+    except Exception:  # noqa: BLE001
+        return None
+    while settings is not None:
+        for attr in ("_default_navigation_timeout", "_default_timeout"):
+            value = getattr(settings, attr, None)
+            if isinstance(value, (int, float)):
+                return value
+        settings = getattr(settings, "_parent", None)
+    return None
+
+
 def _deadline_for(timeout_ms: int) -> float | None:
     if timeout_ms == 0:
         return None
@@ -118,16 +154,32 @@ def _wait_for_domcontentloaded(page: Any, remaining_timeout_ms: int) -> None:
         pass
 
 
-def _looks_loaded(page: Any) -> bool:
+def _url_of(page: Any) -> str | None:
+    try:
+        return page.url
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _looks_loaded(page: Any, before_url: str | None = None) -> bool:
     """Detect successful navigations masked by commit watcher races.
 
     Some redirects/client transitions can leave Playwright's commit wait in an
     error state even after the document is usable. Treat any probe failure as
-    not loaded so true failures still follow the existing PageLoadFailed path.
+    not loaded so true failures still follow the existing failure path.
+
+    ``before_url`` is passed for a timeout only. A page that timed out still on
+    the URL it had before the ``goto`` never committed the navigation, so there
+    is nothing to detect — and probing it is not free: the navigation is still
+    pending, and the ``evaluate`` below waits for it (on the extension backend,
+    until the slow page finally commits). That turned a 2s ``goto`` timeout
+    into a 12s one (#121).
     """
     try:
         url = page.url
         if not url or url == "about:blank":
+            return False
+        if before_url is not None and url == before_url:
             return False
         ready_state = page.evaluate("() => document.readyState")
         return ready_state != "loading"
@@ -179,6 +231,11 @@ def _bounded_timeout(total_ms: int, cap_ms: int) -> int:
 # derived from the caller's remaining call deadline. Its breach is therefore
 # the caller's own deadline running out, and lands in the ordinary `timeout`
 # bucket — see `_TIMEOUT_NEEDLES`.
+#
+# The `timeout` bucket is not a PageLoadFailed at all: it is raised as
+# `OperationTimeout` (ADR-0014, exit 8), the same error every other Playwright
+# call raises when it runs out of its own `timeout=`. Its fix keeps #123's rule:
+# never suggest a fresh tab, check whether the navigation landed first.
 _REASON_TIMEOUT = "timeout"
 _REASON_NETWORK = "network"
 _REASON_NAV_INTERRUPTED = "navigation-interrupted"
@@ -270,16 +327,20 @@ def _classify(exc: BaseException) -> tuple[str, str]:
     lower = str(exc).lower()
     timeout = (
         _REASON_TIMEOUT,
-        "site did not respond at commit in time; the navigation may still "
-        "land, so check page.url / snapshot() before retrying page.goto(url), "
-        "and verify the site with http_get(url)",
+        "the navigation ran out of its timeout before the page committed; it "
+        "may still land, so check page.url / snapshot() before retrying "
+        "page.goto(url) (do not open a new tab). If the site is just slow, "
+        "raise this goto's timeout= (default 60s; it can never outlast the "
+        "call deadline `--timeout`), and verify the site with http_get(url)",
     )
     if any(needle in lower for needle in _TIMEOUT_NEEDLES):
         return timeout
     for reason, fix, needles in _CLASSIFIERS:
         if any(needle in lower for needle in needles):
             return reason, fix
-    if "timeout" in lower or "timed out" in lower or type(exc).__name__ == "TimeoutError":
+    if ("timeout" in lower or "timed out" in lower
+            or isinstance(exc, PlaywrightTimeoutError)
+            or type(exc).__name__ == "TimeoutError"):
         return timeout
     return (
         _REASON_UNKNOWN,
@@ -289,13 +350,17 @@ def _classify(exc: BaseException) -> tuple[str, str]:
     )
 
 
-def _page_load_failed(url: str, phase: str, exc: BaseException) -> PageLoadFailed:
+def _navigation_failed(
+    url: str, phase: str, exc: BaseException,
+) -> PageLoadFailed | OperationTimeout:
     reason, fix = _classify(exc)
-    # `phase` ("commit") is only meaningful for the timeout bucket, where it
-    # says how far the navigation got. Every other bucket names its own cause.
+    detail = _detail_for(exc)
     if reason == _REASON_TIMEOUT:
-        reason = phase or _REASON_TIMEOUT
-    return PageLoadFailed(url, reason, fix=fix, detail=_detail_for(exc))
+        # `phase` ("commit") says how far the navigation got.
+        return OperationTimeout(
+            f"page.goto timed out at {phase or 'commit'}: {url}: {detail}",
+            url=url, detail=detail, fix=fix)
+    return PageLoadFailed(url, reason, fix=fix, detail=detail)
 
 
 class _NetworkMonitor:
