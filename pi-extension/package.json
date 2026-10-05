@@ -1,7 +1,7 @@
 {
   "name": "@browserwright/pi",
   "version": "0.0.0",
-  "description": "bw_web_fetch and bw_web_search for the pi coding agent, using browserwright plus a raw text fallback",
+  "description": "bw_web_fetch and bw_web_search for the pi coding agent: thin wrappers over `browserwright markdown` / `browserwright search`",
   "license": "AGPL-3.0-only",
   "type": "module",
   "keywords": [
@@ -28,13 +28,7 @@
   },
   "files": [
     "index.ts",
-    "verify.ts",
-    "probe-run.ts",
-    "core/",
-    "!core/*.test.ts",
-    "providers/",
-    "config.json",
-    "probe-cases.json",
+    "browserwright.ts",
     "README.md",
     "LICENSE"
   ],
@@ -46,6 +40,6 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --test 'core/*.test.ts'"
+    "test": "node --test '*.test.ts'"
   }
 }

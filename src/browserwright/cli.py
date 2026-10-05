@@ -49,6 +49,12 @@ Usage:
       One page as Markdown. Creates and tears down its own session, so it takes
       no -s. Absolute links, shadow DOM flattened in, HTML only.
 
+  browserwright search <query> [--limit=N] [--json] [--backend=extension|cdp]
+                               [--attach=<port|url>] [--search-url=TEMPLATE]
+                               [--name=LABEL] [--timeout=SECONDS]
+      One results page as ranked links (+ answer box / knowledge panel).
+      Self-sessioned like markdown. Captcha/consent walls exit 5.
+
   browserwright -s <session-id> task <site>/<name> [--env NAME ...] [--key=value ...] [--isolated]
   browserwright list-tasks [--site SITE] [--query Q] [--json]
 
@@ -595,6 +601,79 @@ for _n in _r.notes:
 """
 
 
+def _throwaway_options(kw: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Parse the flags every self-sessioned command shares (``markdown``,
+    ``search``): ``--backend``, ``--attach``, ``--timeout``.
+
+    Returns ``(options, None)`` or ``(None, usage_error)``. Everything is
+    validated here so a bad value is refused before anything touches the
+    ledger or the daemon.
+    """
+    attach = kw.get("attach")
+    backend = str(kw.get("backend", "cdp" if attach is not None else "extension"))
+    if backend not in ("extension", "cdp"):
+        return None, f"--backend must be extension or cdp, got {backend!r}"
+    if attach is not None:
+        if backend != "cdp":
+            return None, (f"--attach borrows a CDP browser, so it implies "
+                          f"--backend=cdp; got --backend={backend}")
+        from .daemon.config import check_cdp_attach
+        from .daemon.errors import UserError
+
+        try:
+            check_cdp_attach(attach)
+        except UserError as e:
+            return None, str(e)
+
+    from .errors import DEFAULT_CALL_TIMEOUT_S
+
+    timeout_s: float = DEFAULT_CALL_TIMEOUT_S
+    if "timeout" in kw:
+        parsed, err = _parse_timeout_value(kw["timeout"])
+        if err:
+            return None, err
+        timeout_s = parsed  # type: ignore[assignment]
+    return {"backend": backend, "attach": attach, "timeout_s": timeout_s}, None
+
+
+def _open_throwaway_session(opts: dict, name: str) -> tuple[Optional[str], int]:
+    """Mint the session a self-sessioned command uses and then ends.
+
+    ``cdp`` has no meaning without an owner: it must either launch a browser or
+    attach to one. Without --attach there is nobody to attach to, so it
+    launches — a real Chrome, which on macOS takes the active window; the
+    default backend is ``extension`` precisely so the common path never does
+    that. With --attach (e.g. a remote CloakBrowser endpoint) it borrows that
+    browser and leaves it be.
+    """
+    from . import session_create
+    from .errors import BrowserwrightError
+
+    try:
+        return session_create.new(
+            backend=opts["backend"],
+            create=(opts["backend"] == "cdp" and opts["attach"] is None),
+            attach=opts["attach"],
+            name=name,
+        ).id, 0
+    except (ValueError, BrowserwrightError) as e:
+        print(str(e), file=sys.stderr)
+        return None, 1
+
+
+def _end_throwaway_session(cmd: str, sid: str) -> None:
+    """Always called from a ``finally``: a leaked session leaves a tab group
+    behind in the user's real Chrome (issue #53)."""
+    from . import session_create
+    from .session_ctx import resolve_session_or_env
+
+    try:
+        session_create.end(resolve_session_or_env(sid))
+    except Exception as e:  # noqa: BLE001 — never mask the real result
+        print(f"[{cmd}] warning: could not end throwaway session {sid}: {e}",
+              file=sys.stderr)
+
+
 def _cmd_markdown(args: list[str]) -> int:
     """``browserwright markdown <url>`` — one page, as Markdown (ADR-0006).
 
@@ -621,27 +700,10 @@ def _cmd_markdown(args: list[str]) -> int:
         print(f"usage error: --mode must be one of {'|'.join(MODES)}, "
               f"got {mode!r}", file=sys.stderr)
         return 1
-    attach = kw.get("attach")
-    backend = str(kw.get("backend", "cdp" if attach is not None else "extension"))
-    if backend not in ("extension", "cdp"):
-        print(f"usage error: --backend must be extension or cdp, got "
-              f"{backend!r}", file=sys.stderr)
+    opts, err = _throwaway_options(kw)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
         return 1
-    if attach is not None:
-        if backend != "cdp":
-            print(f"usage error: --attach borrows a CDP browser, so it implies "
-                  f"--backend=cdp; got --backend={backend}", file=sys.stderr)
-            return 1
-        # Validate here, not only in session_create.new: a bad target must be
-        # refused before anything touches the ledger or the daemon.
-        from .daemon.config import check_cdp_attach
-        from .daemon.errors import UserError
-
-        try:
-            check_cdp_attach(attach)
-        except UserError as e:
-            print(f"usage error: {e}", file=sys.stderr)
-            return 1
     try:
         max_chars = int(kw.get("max-chars", DEFAULT_MAX_CHARS))
     except (TypeError, ValueError):
@@ -649,50 +711,24 @@ def _cmd_markdown(args: list[str]) -> int:
               file=sys.stderr)
         return 1
 
-    from .errors import DEFAULT_CALL_TIMEOUT_S
-
-    timeout_s: float = DEFAULT_CALL_TIMEOUT_S
-    if "timeout" in kw:
-        parsed, err = _parse_timeout_value(kw["timeout"])
-        if err:
-            print(f"usage error: {err}", file=sys.stderr)
-            return 1
-        timeout_s = parsed  # type: ignore[assignment]
-
     out = kw.get("out")
     keep_file = out is not None
     out_path = str(out) if keep_file else spill_path(url)
 
     import contextlib
 
-    from . import session_create
-    from .errors import BrowserwrightError
     from .repl import inline
-    from .session_ctx import resolve_session_or_env
 
-    try:
-        sid = session_create.new(
-            backend=backend,
-            # `cdp` has no meaning without an owner: it must either launch a
-            # browser or attach to one. Without --attach there is nobody to
-            # attach to, so it launches — a real Chrome, which on macOS takes
-            # the active window; the default backend is `extension` precisely
-            # so the common path never does that. With --attach (e.g. a remote
-            # CloakBrowser endpoint) it borrows that browser and leaves it be.
-            create=(backend == "cdp" and attach is None),
-            attach=attach,
-            name=str(kw.get("name", "markdown")),
-        ).id
-    except (ValueError, BrowserwrightError) as e:
-        print(str(e), file=sys.stderr)
-        return 1
+    sid, rc = _open_throwaway_session(opts, str(kw.get("name", "markdown")))
+    if sid is None:
+        return rc
 
     try:
         rc = inline.run_code(
             _MARKDOWN_CODE,
             session_id=sid,
             env={"BW_MD_URL": url, "BW_MD_OUT": out_path, "BW_MD_MODE": mode},
-            timeout_s=timeout_s,
+            timeout_s=opts["timeout_s"],
         )
         if rc != 0:
             return rc
@@ -716,11 +752,126 @@ def _cmd_markdown(args: list[str]) -> int:
         if not keep_file:
             with contextlib.suppress(OSError):
                 Path(out_path).unlink()
+        _end_throwaway_session("markdown", sid)
+
+
+SEARCH_HELP = """Usage:
+  browserwright search <query> [--limit=N] [--json] [--backend=extension|cdp]
+                               [--attach=<port|url>] [--search-url=TEMPLATE]
+                               [--name=LABEL] [--timeout=SECONDS]
+
+Search the web in a real browser and print the results page as ranked links:
+title, URL, date and snippet, plus the engine's AI Overview, knowledge panel,
+"people also ask" and related searches when the query triggered them. Links
+only, never page bodies — read the ones worth it with `browserwright markdown`.
+
+Owns its whole lifecycle like `markdown`: a throwaway session, torn down after.
+Google's opaque `/goto?url=…` links (what a signed-out browser gets) are
+resolved to the real URL. A captcha or consent wall fails with exit 5 instead
+of returning an empty list; "nothing matched" is reported as zero results.
+
+Flags:
+  --limit=N        max results (default 10)
+  --json           print the structured payload instead of text
+  --backend        extension (default, the user's real Chrome) | cdp
+  --attach=TARGET  borrow a CDP browser (port or ws/http(s) URL); implies
+                   --backend=cdp, left running afterwards. Same values as
+                   `session new --attach`.
+  --search-url=T   results page template; {query} (URL-encoded) and {limit}
+                   are substituted. Default: Google. The extraction expects
+                   Google's markup.
+  --name=LABEL     session label; shows as the Chrome tab group title
+  --timeout=SECONDS
+                   the call deadline for the search (default 90); running out
+                   exits 7 (DeadlineExceeded)
+"""
+
+# Runs inside the session's executor; same value-passing discipline as
+# _MARKDOWN_CODE, and the payload rides back on disk for the same reason.
+_SEARCH_CODE = """
+import json, os
+from browserwright.repl.search import search_page
+
+_p = search_page(page, os.environ["BW_SEARCH_QUERY"],
+                 limit=int(os.environ["BW_SEARCH_LIMIT"]),
+                 search_url=os.environ["BW_SEARCH_URL"])
+with open(os.environ["BW_SEARCH_OUT"], "w", encoding="utf-8") as _f:
+    json.dump(_p, _f, ensure_ascii=False)
+_bw_warn("search: %d results%s" % (len(_p["results"]), " (engine: nothing matched)" if _p["noMatch"] else ""))
+"""
+
+
+def _cmd_search(args: list[str]) -> int:
+    """``browserwright search <query>`` — one results page, as ranked links.
+
+    Self-sessioned like ``markdown``. Every query word goes in the first
+    argument (quote it); flags follow.
+    """
+    if not args or args[0] in {"-h", "--help"}:
+        sys.stdout.write(SEARCH_HELP)
+        return 0 if args else 1
+
+    query = args[0].strip()
+    if not query or query.startswith("-"):
+        print(f"usage error: expected a query, got {args[0]!r}", file=sys.stderr)
+        print(SEARCH_HELP, file=sys.stderr)
+        return 1
+    kw = _parse_kv_args(args[1:])
+
+    from .repl.search import DEFAULT_LIMIT, DEFAULT_SEARCH_URL, render_results
+
+    try:
+        limit = int(kw.get("limit", DEFAULT_LIMIT))
+        if limit < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        print("usage error: --limit must be a positive integer", file=sys.stderr)
+        return 1
+    search_url = kw.get("search-url", DEFAULT_SEARCH_URL)
+    if not isinstance(search_url, str) or "{query}" not in search_url:
+        print("usage error: --search-url must contain {query}", file=sys.stderr)
+        return 1
+    opts, err = _throwaway_options(kw)
+    if err:
+        print(f"usage error: {err}", file=sys.stderr)
+        return 1
+
+    import contextlib
+    import tempfile
+
+    from .repl import inline
+
+    fd, out_path = tempfile.mkstemp(prefix="browserwright-search-", suffix=".json")
+    os.close(fd)
+    sid, rc = _open_throwaway_session(opts, str(kw.get("name", "search")))
+    if sid is None:
+        Path(out_path).unlink(missing_ok=True)
+        return rc
+
+    try:
+        rc = inline.run_code(
+            _SEARCH_CODE,
+            session_id=sid,
+            env={"BW_SEARCH_QUERY": query, "BW_SEARCH_LIMIT": str(limit),
+                 "BW_SEARCH_URL": search_url, "BW_SEARCH_OUT": out_path},
+            timeout_s=opts["timeout_s"],
+        )
+        if rc != 0:
+            return rc
         try:
-            session_create.end(resolve_session_or_env(sid))
-        except Exception as e:  # noqa: BLE001 — never mask the real result
-            print(f"[markdown] warning: could not end throwaway session {sid}: "
-                  f"{e}", file=sys.stderr)
+            payload = json.loads(Path(out_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"search: could not read the results: {e}", file=sys.stderr)
+            return 3
+        if kw.get("json"):
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        else:
+            sys.stdout.write(render_results(payload))
+        return 0
+    finally:
+        with contextlib.suppress(OSError):
+            Path(out_path).unlink()
+        _end_throwaway_session("search", sid)
 
 
 def _cmd_doctor(args: list[str]) -> int:
@@ -1359,10 +1510,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(_cmd_index(rest))
     if cmd == "memory":
         sys.exit(_cmd_memory(rest))
-    # Deliberately NOT under the -s branch: this is the one browser-driving
-    # command that owns its own throwaway session (ADR-0006).
+    # Deliberately NOT under the -s branch: these browser-driving commands own
+    # their own throwaway session (ADR-0006).
     if cmd == "markdown":
         sys.exit(_cmd_markdown(rest))
+    if cmd == "search":
+        sys.exit(_cmd_search(rest))
     if cmd == "session":
         sys.exit(_cmd_session(rest, session_id=global_session))
     if cmd == "whoami":

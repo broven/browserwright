@@ -355,6 +355,16 @@ use the one-shot command — it makes and destroys its own session:
 browserwright markdown https://docs.example.com/api/auth
 ```
 
+To find pages in the first place, `browserwright search` is the same kind of
+one-shot command for a web search: ranked links (title, URL, date, snippet)
+plus the answer box / knowledge panel when Google showed one, never page
+bodies. `--json` for the structured payload. A captcha or consent wall exits 5
+rather than returning an empty list.
+
+```bash
+browserwright search "playwright aria snapshot" --limit=5
+```
+
 ### Acting: `snapshot()`, not screenshots
 
 `snapshot()` returns a compact accessibility tree where every actionable node carries a `[ref=eN]` token. Act on a ref with Playwright's `aria-ref=` selector engine on the SAME page:

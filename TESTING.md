@@ -38,7 +38,7 @@ Chrome / extension / RDP browser
 | Daemon unit/contract tests (`tests/daemon/`) | yes | `mise run test:daemon` |
 | Agent-layer tests (`tests/skill/`) | yes | `mise run test:skill` |
 | Mocked skill evals (`evals/`) | yes | `mise run test:evals` |
-| pi extension unit tests (`pi-extension/core/`) | yes | `mise run test:pi` |
+| pi extension CLI-contract tests (`pi-extension/*.test.ts`) | yes | `mise run test:pi` |
 | Real-Chrome E2E (`tests/daemon/e2e/`) | no — opt-in | `mise run test:e2e` |
 
 ## Fast Local Gate
@@ -135,26 +135,19 @@ tests/skill/test_release_versioning.py         release stamping contract for all
 ## pi Extension Tests
 
 ```bash
-mise run test:pi                       # or: cd pi-extension && node --test 'core/*.test.ts'
+mise run test:pi                       # or: cd pi-extension && node --test '*.test.ts'
 ```
 
 TypeScript, run by `node --test` with native type stripping — no build step, no
 test framework, no network. Needs Node >= 23.6 for unflagged stripping; `node`
 is pinned in `mise.toml` for exactly this reason.
 
-The executor is injected throughout `pi-extension/core/`, so the fallback engine
-is testable without a browser. That is deliberately where the tests are: a rung
-never tried, a JS shell accepted as success, or an empty search result list
-returned as an answer all produce **no error** — just quietly worse answers.
-
-Two live harnesses sit outside the gate because they hit real sites and open
-tabs in the user's Chrome:
-
-```bash
-cd pi-extension
-node verify.ts                         # real fetch chain
-node verify.ts --search "some query"   # real search chain
-```
+The extension is one CLI call per tool (ADR-0015), so these tests pin only its
+side of the CLI contract — the argv it sends and how a CLI error envelope
+becomes the thrown sentence — against a stub `browserwright` on `PATH`. The CLI
+side is pinned by the real-Chrome e2e tests for `search`
+(`test_search_command_cdp.py`) and `markdown`
+(`test_markdown_command_extension.py`).
 
 ---
 
