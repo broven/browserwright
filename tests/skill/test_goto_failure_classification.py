@@ -71,17 +71,19 @@ CASES = [
         id="cdp",
     ),
     pytest.param(
-        # THE field case. The extension caps every chrome.debugger command at
-        # 9000ms (background.js DEBUGGER_COMMAND_TIMEOUT_MS) and says "timed
+        # THE field case. The extension's chrome.debugger timeout says "timed
         # out" — which does NOT contain the substring "timeout", so the old
         # classifier's timeout check missed it and it landed in "network".
+        # Since ADR-0014 its bound is the caller's remaining call deadline, so
+        # it is an ordinary timeout (reason = the phase), not "network" and
+        # not a transport fault.
         _PWError(
             "Protocol error (Page.navigate): chrome.debugger.sendCommand "
-            "timed out after 9000ms (Page.navigate tabId=42); the command may "
+            "timed out after 58000ms (Page.navigate tabId=42); the command may "
             "still land in Chrome"
         ),
-        "extension-budget",
-        id="extension-9s-budget",
+        "commit",
+        id="extension-deadline-timeout",
     ),
     pytest.param(
         _PWError(
@@ -129,32 +131,30 @@ def test_non_network_causes_do_not_tell_the_user_to_check_the_network():
     assert "check the URL and network" not in err.fix
 
 
-def test_extension_budget_fix_does_not_advise_a_fresh_tab():
+def test_extension_timeout_fix_does_not_advise_a_fresh_tab():
     """GH#116: the old fix told agents to open a fresh tab
     (``context.new_page()``). That is a real, user-visible tab in the user's
     Chrome, no agent verb closes one tab, and following the advice piled up
     tabs the agent could not see or clean up. The fix must instead tell the
-    agent to verify whether the navigation landed before retrying."""
+    agent to verify whether the navigation landed before retrying. Since
+    ADR-0014 the extension's timeout is an ordinary `timeout`-bucket failure."""
     err = _fail(_PWError(
         "Protocol error (Page.navigate): chrome.debugger.sendCommand timed "
-        "out after 9000ms (Page.navigate tabId=7); the command may still "
+        "out after 58000ms (Page.navigate tabId=7); the command may still "
         "land in Chrome"))
-    assert err.reason == "extension-budget"
+    assert err.reason == "commit"
     assert "new_page" not in err.fix
     assert "fresh tab" not in err.fix
     assert "page.url" in err.fix or "snapshot()" in err.fix
 
 
 def test_transport_timeouts_are_not_reported_as_the_site_timing_out():
-    """A relay/extension budget expiring is not "the site did not respond"."""
-    for msg in (
-        "Protocol error (Page.navigate): chrome.debugger.sendCommand timed out "
-        "after 9000ms (Page.navigate tabId=7)",
-        "Protocol error (Page.navigate): relay send failed: TimeoutError()",
-    ):
-        err = _fail(_PWError(msg))
-        assert err.reason not in ("network", "commit", "timeout"), err.reason
-        assert "site did not respond" not in err.fix
+    """A relay transport fault that mentions a timeout is not "the site did
+    not respond"."""
+    err = _fail(_PWError(
+        "Protocol error (Page.navigate): relay send failed: TimeoutError()"))
+    assert err.reason not in ("network", "commit", "timeout"), err.reason
+    assert "site did not respond" not in err.fix
 
 
 @pytest.mark.parametrize("exc,_reason", CASES)

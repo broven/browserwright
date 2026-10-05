@@ -102,6 +102,30 @@ RECONNECT_WAIT_TIMEOUT = 35.0
 # `onclose`, so closing a superseded socket makes them dial again.
 SOCKET_BOUND_HANDLERS_VERSION = "0.17.2"
 
+# ADR-0014: how long `send_cdp` waits for one forwarded CDP command.
+#
+# An agent's command waits on a bound derived from its call deadline (the
+# caller passes it, see `call_deadline.command_wait_s`). This default is only for work that has no
+# caller deadline: daemon-internal commands and sessionless raw-CDP clients.
+COMMAND_WAIT_S = 10.0
+
+# The extension must answer BEFORE the relay stops waiting, so a breach comes
+# back as its distinguishable -32001 error frame rather than the relay's bare
+# `TimeoutError`. The relay therefore hands the extension a budget this much
+# shorter than its own wait, on the command frame itself (`timeoutMs`). The
+# margin shrinks with short waits so the extension's budget never collapses
+# to nothing: at most 1s, at most a tenth of the wait.
+EXTENSION_SETTLE_MARGIN_S = 1.0
+
+
+def extension_command_budget_ms(wait_s: float) -> int:
+    """The `timeoutMs` the relay puts on a command frame whose own wait is
+    ``wait_s``: always below it, so the extension settles first."""
+    wait_s = max(0.0, wait_s)
+    margin = min(EXTENSION_SETTLE_MARGIN_S, wait_s / 10.0)
+    return max(1, int((wait_s - margin) * 1000))
+
+
 # D (reload verification): after sending reloadExtension we wait this long for
 # the SW to come back before declaring it dead. Chrome does not reliably
 # restart a reloaded MV3 SW (the alarm net is cleared by the reload), so this
@@ -728,30 +752,37 @@ class RelayServer:
         ext.tabs.pop(tab_id, None)
 
     async def send_cdp(self, tab_id: int, method: str, params: dict,
-                       *, timeout: float = 10.0) -> dict:
+                       *, timeout: float | None = None) -> dict:
         """Forward a CDP method+params through the extension's
         `chrome.debugger.sendCommand(tabId, method, params)`.
 
-        Timeout pairing with the extension (chrome-extension/background.js,
-        "bounded chrome.debugger calls"): the extension bounds each
-        chrome.debugger call BELOW this wait — sendCommand 9000ms vs 10.0s,
-        attach/detach 3000ms vs the 5.0s attach/detach waits — and answers
-        with an error frame carrying code -32001 when its budget expires, so
-        this future normally settles with a distinguishable `_CommandError`
-        instead of a bare `asyncio.TimeoutError`. This timeout is the
-        last-resort net for a wedged extension, not the primary bound; a test
-        locks the two sides' agreement.
+        ``timeout`` is how long to wait: derived from the caller's call
+        deadline when the command is an agent's (ADR-0014,
+        `call_deadline.command_wait_s`), else `COMMAND_WAIT_S`.
+        The frame carries the extension's budget for the command
+        (`timeoutMs`, from `extension_command_budget_ms`), strictly shorter
+        than this wait, so the extension answers first with a -32001 error
+        frame that surfaces here as a `_CommandError` instead of a bare
+        `asyncio.TimeoutError`. This wait is the last-resort net for a wedged
+        extension, not the primary bound; a test locks the agreement.
         """
+        wait_s = COMMAND_WAIT_S if timeout is None else max(0.0, timeout)
         ext = self._extension_for_tab(tab_id)
         if ext is None:
             raise RuntimeError(f"no extension owns tab {tab_id}")
-        ext = await self._ensure_extension_fresh_or_raise(ext, timeout=timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        ext = await self._ensure_extension_fresh_or_raise(ext, timeout=wait_s)
+        # A freshness wait spends part of the budget: derive the extension's
+        # share from what is actually left.
+        wait_s = max(0.0, deadline - loop.time())
         return await self._request(ext, {
             "type": "command",
             "tabId": tab_id,
             "method": method,
             "params": params,
-        }, timeout=timeout) or {}
+            "timeoutMs": extension_command_budget_ms(wait_s),
+        }, timeout=wait_s) or {}
 
     async def userscript_request(self, verb: str, payload: dict,
                                  *, timeout: float = 5.0,
