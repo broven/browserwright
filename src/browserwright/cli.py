@@ -40,7 +40,8 @@ Usage:
   browserwright userscript {push|list|remove|toggle|logs} ...
 
   browserwright markdown <url> [--mode=auto|article|full] [--backend=extension|cdp]
-                               [--out=PATH] [--max-chars=N]
+                               [--attach=<port|url>] [--out=PATH] [--max-chars=N]
+                               [--name=LABEL]
       One page as Markdown. Creates and tears down its own session, so it takes
       no -s. Absolute links, shadow DOM flattened in, HTML only.
 
@@ -491,7 +492,8 @@ def _cmd_task(args: list[str], *, session_id: Optional[str] = None) -> int:
 
 MARKDOWN_HELP = """Usage:
   browserwright markdown <url> [--mode=auto|article|full] [--backend=extension|cdp]
-                              [--out=PATH] [--max-chars=N] [--name=LABEL]
+                              [--attach=<port|url>] [--out=PATH] [--max-chars=N]
+                              [--name=LABEL]
 
 Fetch one page and print it as Markdown. Owns its whole lifecycle: it creates a
 throwaway session, navigates, converts, and tears the session down again — so
@@ -508,6 +510,12 @@ Flags:
   --mode=full      the page verbatim — use it when you want the navigation,
                    a form, or every link
   --backend        extension (default, the user's real Chrome) | cdp
+                   (cdp alone launches an isolated Chrome we own)
+  --attach=TARGET  borrow a browser someone else owns instead: a local port
+                   (9222) or a CDP URL (ws://…, or http(s)://… whose
+                   /json/version names the ws). Implies --backend=cdp; the
+                   browser is left running afterwards. Same values as
+                   `session new --attach`.
   --out=PATH       write the full Markdown here instead of a temp file
   --max-chars=N    cap what is printed (default 8000; 0 prints everything).
                    The FULL text is always written to the file either way.
@@ -558,11 +566,27 @@ def _cmd_markdown(args: list[str]) -> int:
         print(f"usage error: --mode must be one of {'|'.join(MODES)}, "
               f"got {mode!r}", file=sys.stderr)
         return 1
-    backend = str(kw.get("backend", "extension"))
+    attach = kw.get("attach")
+    backend = str(kw.get("backend", "cdp" if attach is not None else "extension"))
     if backend not in ("extension", "cdp"):
         print(f"usage error: --backend must be extension or cdp, got "
               f"{backend!r}", file=sys.stderr)
         return 1
+    if attach is not None:
+        if backend != "cdp":
+            print(f"usage error: --attach borrows a CDP browser, so it implies "
+                  f"--backend=cdp; got --backend={backend}", file=sys.stderr)
+            return 1
+        # Validate here, not only in session_create.new: a bad target must be
+        # refused before anything touches the ledger or the daemon.
+        from .daemon.config import check_cdp_attach
+        from .daemon.errors import UserError
+
+        try:
+            check_cdp_attach(attach)
+        except UserError as e:
+            print(f"usage error: {e}", file=sys.stderr)
+            return 1
     try:
         max_chars = int(kw.get("max-chars", DEFAULT_MAX_CHARS))
     except (TypeError, ValueError):
@@ -585,12 +609,13 @@ def _cmd_markdown(args: list[str]) -> int:
         sid = session_create.new(
             backend=backend,
             # `cdp` has no meaning without an owner: it must either launch a
-            # browser or attach to one, and a throwaway session has nobody to
-            # attach to. NOTE this launches a real Chrome, which on macOS takes
-            # the active window — the default backend is `extension` precisely
-            # so the common path never does that.
-            create=(backend == "cdp"),
-            attach=None,
+            # browser or attach to one. Without --attach there is nobody to
+            # attach to, so it launches — a real Chrome, which on macOS takes
+            # the active window; the default backend is `extension` precisely
+            # so the common path never does that. With --attach (e.g. a remote
+            # CloakBrowser endpoint) it borrows that browser and leaves it be.
+            create=(backend == "cdp" and attach is None),
+            attach=attach,
             name=str(kw.get("name", "markdown")),
         ).id
     except (ValueError, BrowserwrightError) as e:

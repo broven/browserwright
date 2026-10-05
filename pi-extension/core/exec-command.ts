@@ -12,17 +12,34 @@
  */
 
 import { spawn } from "node:child_process";
-import { interpolate, subjectTokens } from "./predicates.ts";
+import { fillTemplate, missingEnvReason, subjectTokens } from "./predicates.ts";
 import type { CommandProvider, ProviderOutcome, Role } from "./types.ts";
 
 export async function execCommand(
 	provider: CommandProvider,
 	subject: string,
-	options: { dir: string; role: Role; timeoutMs: number; signal?: AbortSignal },
+	options: {
+		dir: string;
+		role: Role;
+		timeoutMs: number;
+		signal?: AbortSignal;
+		env?: Record<string, string | undefined>;
+	},
 ): Promise<ProviderOutcome<string>> {
+	const env = options.env ?? process.env;
 	const tokens = subjectTokens(options.role, subject, options.dir);
-	const argv = provider.command.map((part) => interpolate(part, tokens));
+	const missing: string[] = [];
+	const fill = (template: string) => {
+		const resolved = fillTemplate(template, tokens, env);
+		missing.push(...resolved.missing);
+		return resolved.value;
+	};
+	const argv = provider.command.map(fill);
+	const cwd = provider.cwd ? fill(provider.cwd) : options.dir;
 	if (argv.length === 0) return { ok: false, reason: "empty command" };
+	// Same rule as the http kind: an argv that names an unset variable is a rung
+	// this machine does not have, not a process worth spawning with "$NAME" in it.
+	if (missing.length > 0) return { ok: false, reason: missingEnvReason(missing) };
 
 	const [bin, ...args] = argv;
 	const timeoutMs = provider.timeoutMs ?? options.timeoutMs;
@@ -38,8 +55,8 @@ export async function execCommand(
 		};
 
 		const child = spawn(bin, args, {
-			cwd: provider.cwd ? interpolate(provider.cwd, tokens) : options.dir,
-			env: { ...process.env, ...(provider.env ?? {}) },
+			cwd,
+			env: { ...env, ...(provider.env ?? {}) },
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 

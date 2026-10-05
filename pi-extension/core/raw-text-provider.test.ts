@@ -25,10 +25,12 @@ async function withFetch(
 }
 
 describe("raw text provider", () => {
-	it("is registered after browserwright in the shipped fetch chain", () => {
+	it("is registered after every browser rung in the shipped fetch chain", () => {
 		const config = loadConfig(EXTENSION_DIR);
 		const providers = loadProviders(EXTENSION_DIR);
-		assert.deepEqual(config.order.fetch, ["browserwright", "raw"]);
+		// raw accepts text/html verbatim, so any browser rung placed after it
+		// would never run for an HTML page.
+		assert.deepEqual(config.order.fetch, ["browserwright", "browserwright-remote", "raw"]);
 		assert.equal(providers.get("raw")?.kind, "module");
 		assert.equal(providers.get("raw")?.returns, "text");
 	});

@@ -109,12 +109,13 @@ truncated: 382 of 480 lines (49.7KB of 71.5KB) · full: /tmp/browserwright-pi-xx
 ## What ships, and what does not
 
 This package ships the browserwright-backed rungs plus a text fallback for fetch.
-There is one browserwright rung per tool:
+Each tool has one local browserwright rung, and one optional remote rung that
+stays inert until `BW_REMOTE_CDP` is set (see [Remote browser](#remote-browser-bw_remote_cdp)):
 
 | tool | provider | kind |
 |------|----------|------|
-| `bw_web_fetch` | `browserwright` → `raw` | `command` — browser-rendered HTML, then `module` — text body verbatim |
-| `bw_web_search` | `browserwright-search` | `module` — a session lifecycle in TS |
+| `bw_web_fetch` | `browserwright` → `browserwright-remote` → `raw` | `command` — browser-rendered HTML (your Chrome, then the remote browser), then `module` — text body verbatim |
+| `bw_web_search` | `browserwright-search` → `browserwright-search-remote` | `module` — a session lifecycle in TS |
 
 That is a real trade-off, and it points the wrong way for casual HTML fetches: a
 browserwright `bw_web_fetch` opens a tab in the daily browser and takes ~4-7s,
@@ -122,6 +123,40 @@ where a hosted reader API answers in ~1s without touching Chrome. What you get
 for the browser rung is login state and full JS rendering. Text endpoints such
 as GitHub Raw skip the browser conversion failure and are returned verbatim by
 the `raw` fallback.
+
+### Remote browser (`BW_REMOTE_CDP`)
+
+Set `BW_REMOTE_CDP` to a CDP endpoint and both tools gain a fallback rung that
+runs in that browser instead of yours — for example a CloakBrowser instance on
+another host:
+
+```bash
+export BW_REMOTE_CDP=https://cdp-host.example.ts.net   # or ws(s)://…/devtools/browser/…
+```
+
+An `http(s)://` value is resolved through its `/json/version`; a `ws(s)://` one
+is used as-is. It is passed to `browserwright markdown --attach=…` (fetch) and
+`browserwright session new --backend=cdp --attach=…` (search). The executor and
+daemon stay local; only the browser is remote, and it is borrowed — left
+running when the throwaway session ends. Needs a browserwright CLI with
+`markdown --attach` (newer than 0.20.0).
+
+- **Unset means absent.** The rungs report `missing env BW_REMOTE_CDP` and the
+  chain moves on without spawning anything.
+- **Fallback by default.** They run only after the local rung failed. To make
+  the remote browser primary, put it first in `config.json`:
+  `"fetch": ["browserwright-remote", "browserwright", "raw"]`,
+  `"search": ["browserwright-search-remote", "browserwright-search"]`.
+  Keep `browserwright-remote` ahead of `raw`: raw accepts `text/html` verbatim,
+  so any browser rung after it never runs for an HTML page.
+- **No login state.** It is not your browser profile, so pages behind your
+  logins come back logged out.
+- **Slow on purpose.** Both rungs allow 240s, because an endpoint at its
+  concurrency limit may queue the connection for minutes and the browser starts
+  lazily on first connect. The daemon's own upstream connect timeout is
+  separate and short (default 5s): raise it via `BD_TIMEOUT` in the daemon's
+  environment, or `timeout` in its config, if attaches fail fast while the
+  endpoint is queueing.
 
 **The chain engine is still here.** Drop your own JSON into `providers/` to add a
 cheaper or anonymous rung ahead of the browser one — nothing needs to be
@@ -149,7 +184,8 @@ rather than ignored.
 - `role` is `fetch` (the default) or `search`. It decides which tool can reach
   the provider, and which tokens it may use: `{url}`/`{urlEncoded}` for fetch,
   `{query}`/`{queryEncoded}` for search. `{dir}` is available to both.
-- Tokens are substituted first, then `$ENV_VAR`.
+- `$ENV_VAR` is substituted in the declaration first, then the tokens — so a
+  `$NAME` inside the requested URL or query is never read as an env reference.
 - A referenced env var that is unset makes the rung **skip** with
   `missing env NAME` rather than sending the literal `$NAME`. A literal value
   passes through untouched — but prefer `$ENV` for anything secret, since these
@@ -172,6 +208,10 @@ rather than ignored.
   "returns": "html"
 }
 ```
+
+`command` and `cwd` support the same tokens and `$ENV_VAR` as the http kind,
+including the `missing env NAME` skip — that is how `browserwright-remote`
+stays inert until `BW_REMOTE_CDP` is set.
 
 Exit code contract — this is what lets a shell script participate without the
 core knowing anything about the tool it wraps:
@@ -200,7 +240,12 @@ The module default-exports `(subject, ctx) => Promise<ProviderOutcome<T>>`.
 declaration) and `onProgress`. Cancellation is cooperative: there is no process
 to kill, so the runner must unwind its own resources when `ctx.signal` fires.
 
-`providers/browserwright-search.ts` is the worked example. Its header documents
+`providers/browserwright-search.ts` is the worked example. Its `options`:
+`limit`, `searchUrl` (a template), and `sessionArgs` — the argv after
+`browserwright session new`, default `["--backend=extension",
+"--name=pi-websearch"]`. Each `sessionArgs` element supports `$ENV_VAR` with the
+same `missing env NAME` skip, which is what `browserwright-search-remote.json`
+uses to point the same runner at `--backend=cdp --attach=$BW_REMOTE_CDP`. Its header documents
 the six measured executor behaviours it is built around, and its declaration
 records why each SERP extractor anchors where it does — including the finding
 that Google's AI Overview body is **not** in the server-rendered HTML at all, so
@@ -292,7 +337,7 @@ Constraints:
 ## Tests
 
 ```bash
-node --test 'core/*.test.ts'    # 83 cases, no network, no browser
+node --test 'core/*.test.ts'    # 105 cases, no network, no browser
 node verify.ts                  # real fetch chain against a real URL
 node verify.ts --search "…"     # real search chain, opens a tab
 ```

@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
 	failureReason,
+	fillTemplate,
 	globMatchesAny,
 	inspectSearch,
 	inspectText,
@@ -379,6 +380,17 @@ describe("interpolateEnv", () => {
 	it("leaves a literal key untouched — the documented way to store one", () => {
 		const literal = "abc123DEF";
 		assert.equal(interpolateEnv(literal, {}).value, literal);
+	});
+});
+
+describe("fillTemplate", () => {
+	it("never reads env references out of the subject", () => {
+		// The URL is model-chosen. Expanding $ENV after the tokens would put a
+		// secret into the request, or skip the rung for any URL with a `$` in it.
+		const tokens = subjectTokens("fetch", "https://x.test/?k=$SECRET", "/ext");
+		const filled = fillTemplate("https://r/{url}?key=$KEY", tokens, { KEY: "k1", SECRET: "s3cr3t" });
+		assert.equal(filled.value, "https://r/https://x.test/?k=$SECRET?key=k1");
+		assert.deepEqual(filled.missing, []);
 	});
 });
 

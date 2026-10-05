@@ -24,8 +24,8 @@ const LOG_PREFIX = "[browserwright-pi]";
 
 const DEFAULT_CONFIG: PiConfig = {
 	order: {
-		fetch: ["browserwright", "raw"],
-		search: ["browserwright-search"],
+		fetch: ["browserwright", "browserwright-remote", "raw"],
+		search: ["browserwright-search", "browserwright-search-remote"],
 	},
 	// The default line of defence. minChars stays 0 on purpose: a false positive
 	// escalates to a rung that opens a tab in the user's real Chrome, so

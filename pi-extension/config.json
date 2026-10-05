@@ -1,7 +1,7 @@
 {
   "order": {
-    "fetch": ["browserwright", "raw"],
-    "search": ["browserwright-search"]
+    "fetch": ["browserwright", "browserwright-remote", "raw"],
+    "search": ["browserwright-search", "browserwright-search-remote"]
   },
   "defaultFailWhen": {
     "minChars": 0,

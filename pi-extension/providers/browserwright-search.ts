@@ -1,5 +1,7 @@
 /**
- * The `bw_web_search` rung: drive a real search engine in the user's own Chrome.
+ * The `bw_web_search` rung: drive a real search engine in the user's own Chrome
+ * — or, with `options.sessionArgs`, in any browser `session new` can reach
+ * (e.g. a remote CDP endpoint via `--backend=cdp --attach=…`).
  *
  * This is a `kind: "module"` provider rather than a `kind: "command"` one
  * because a search is not one shot at a subprocess. It is: mint a session,
@@ -31,11 +33,47 @@ import { spawn } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { interpolateEnv, missingEnvReason } from "../core/predicates.ts";
 import { normalizeSearchPayload } from "../core/results.ts";
 import type { ModuleContext, ProviderOutcome, SearchPayload } from "../core/types.ts";
 
 const BIN = "browserwright";
 const READY_MARKER = "BW_SEARCH_OK";
+
+/**
+ * What follows `session new` when the declaration does not say. The user's own
+ * Chrome via the extension: login state is the reason this rung exists, and the
+ * isolated cdp backend would launch a Chrome that steals the active window.
+ */
+export const DEFAULT_SESSION_ARGS: readonly string[] = ["--backend=extension", "--name=pi-websearch"];
+
+/**
+ * Resolve `options.sessionArgs` into the argv tail of `session new`.
+ *
+ * Each element supports $ENV_VAR with the same semantics as the http and
+ * command kinds: an unset variable means this rung does not exist on this
+ * machine, so it is reported as `missing env NAME` rather than spawning a
+ * session against the literal string "$NAME". That is what lets a remote rung
+ * (`--attach=$BW_REMOTE_CDP`) ship in the default chain and stay inert until
+ * the variable is set.
+ */
+export function sessionNewArgs(
+	options: Record<string, unknown>,
+	env: Record<string, string | undefined>,
+): { ok: true; args: string[] } | { ok: false; reason: string } {
+	const declared = options.sessionArgs ?? DEFAULT_SESSION_ARGS;
+	if (!Array.isArray(declared) || !declared.every((part) => typeof part === "string")) {
+		return { ok: false, reason: "options.sessionArgs must be an array of strings" };
+	}
+	const missing: string[] = [];
+	const args = declared.map((part: string) => {
+		const resolved = interpolateEnv(part, env);
+		missing.push(...resolved.missing);
+		return resolved.value;
+	});
+	if (missing.length > 0) return { ok: false, reason: missingEnvReason(missing) };
+	return { ok: true, args };
+}
 
 /** Error types that mean "the plumbing broke", not "the page said no". */
 const TRANSIENT = new Set(["ExecutorUnavailable", "PageBindTimeout", "DaemonUnavailable", "CDPError"]);
@@ -313,9 +351,23 @@ function buildScript(query: string, limit: number, outPath: string, searchUrl: s
 		'    elif "neterror" in html and "error-code" in html:',
 		'        payload = {"blocked": "the browser could not reach the search engine"}',
 		"    else:",
-		"        rows = data.get(\"results\") or []",
+		"        rows = (data.get(\"results\") or [])[:LIMIT]",
+		// A signed-out profile (e.g. a remote CloakBrowser) gets opaque
+		// `/goto?url=<token>` hrefs with the target nowhere in the DOM. The
+		// redirect answers with a 302 to the real URL inside this same browser
+		// context; on any failure keep the goto link rather than drop the row.
+		"        for row in rows:",
+		'            if "/goto?" not in (row.get("url") or ""):',
+		"                continue",
+		"            try:",
+		'                r = page.request.get(row["url"], max_redirects=0, timeout=10000)',
+		'                loc = r.headers.get("location")',
+		'                if r.status in (301, 302, 303, 307, 308) and loc and loc.startswith("http"):',
+		'                    row["url"] = loc',
+		"            except Exception:",
+		"                pass",
 		"        payload = {",
-		'            "results": rows[:LIMIT],',
+		'            "results": rows,',
 		'            "url": page.url,',
 		'            "answerBox": data.get("answerBox"),',
 		'            "knowledgeGraph": data.get("knowledgeGraph"),',
@@ -400,14 +452,17 @@ const runner = async (query: string, ctx: ModuleContext): Promise<ProviderOutcom
 		.replaceAll("{queryEncoded}", encodeURIComponent(query))
 		.replaceAll("{limit}", String(limit));
 
+	const session = sessionNewArgs(ctx.options, process.env);
+	if (!session.ok) return { ok: false, reason: session.reason };
+
 	const outPath = join(tmpdir(), `bw-search-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
 	const script = buildScript(query, limit, outPath, searchUrl);
 
 	ctx.onProgress?.("opening a search session");
-	const created = await run(
-		["session", "new", "--backend=extension", "--name=pi-websearch"],
-		{ signal: ctx.signal, timeoutMs: ctx.timeoutMs },
-	);
+	const created = await run(["session", "new", ...session.args], {
+		signal: ctx.signal,
+		timeoutMs: ctx.timeoutMs,
+	});
 	if (created.code !== 0) {
 		return { ok: false, reason: explain(created.stderr).message };
 	}
