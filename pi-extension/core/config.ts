@@ -19,6 +19,30 @@ import { ROLES, type PiConfig, type Provider, type Role } from "./types.ts";
  */
 export const EXTENSION_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
+/**
+ * browserwright's own call deadline when `--timeout` is not given (ADR-0014).
+ * Mirrors `DEFAULT_CALL_TIMEOUT_S` in the Python package.
+ */
+export const DEFAULT_CALL_TIMEOUT_S = 90;
+
+/**
+ * How much longer than the call deadline a browserwright rung's process may
+ * run. The deadline covers the code; a rung also opens and ends a session
+ * around it. The slack lets browserwright report `DeadlineExceeded` (exit 7)
+ * itself instead of being SIGKILLed with no explanation.
+ */
+const CALL_DEADLINE_SLACK_MS = 30_000;
+
+/**
+ * The process budget for one rung once the caller set a call deadline: never
+ * shorter than the provider's own, and always long enough for the deadline to
+ * expire inside browserwright first.
+ */
+export function withCallDeadline(baseMs: number, callTimeoutS?: number): number {
+	if (callTimeoutS === undefined) return baseMs;
+	return Math.max(baseMs, Math.ceil(callTimeoutS * 1000) + CALL_DEADLINE_SLACK_MS);
+}
+
 const CONFIG_FILE = "config.json";
 const LOG_PREFIX = "[browserwright-pi]";
 

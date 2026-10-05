@@ -20,6 +20,7 @@
 
 import { pathToFileURL } from "node:url";
 import { isAbsolute, resolve } from "node:path";
+import { withCallDeadline } from "./config.ts";
 import type { ModuleContext, ModuleProvider, ModuleRunner, ProviderOutcome, Role } from "./types.ts";
 
 /**
@@ -100,13 +101,14 @@ export async function execModule<T>(
 		timeoutMs: number;
 		signal?: AbortSignal;
 		onProgress?: (text: string) => void;
+		callTimeoutS?: number;
 	},
 ): Promise<ProviderOutcome<T>> {
 	if (!provider.module) return { ok: false, reason: "module provider has no `module` path" };
 
 	if (options.signal?.aborted) return { ok: false, reason: "aborted" };
 
-	const timeoutMs = provider.timeoutMs ?? options.timeoutMs;
+	const timeoutMs = withCallDeadline(provider.timeoutMs ?? options.timeoutMs, options.callTimeoutS);
 	const controller = new AbortController();
 	const onOuterAbort = () => controller.abort();
 	// Registering on an already-aborted signal never fires, so the check above is
@@ -126,6 +128,7 @@ export async function execModule<T>(
 		const ctx: ModuleContext = {
 			dir: options.dir,
 			timeoutMs,
+			callTimeoutS: options.callTimeoutS,
 			signal: controller.signal,
 			options: provider.options ?? {},
 			onProgress: options.onProgress,

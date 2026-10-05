@@ -32,6 +32,20 @@ import type { PiConfig, Provider, Role, SearchPayload } from "./core/types.ts";
  */
 class ToolFailure extends Error {}
 
+/**
+ * The call deadline for the browserwright call behind a tool (ADR-0014): the
+ * same knob as `browserwright -e --timeout`. Forwarded as `--timeout`; when it
+ * runs out browserwright fails the rung with DeadlineExceeded.
+ */
+const CALL_TIMEOUT_PARAM = Type.Optional(
+	Type.Number({
+		minimum: 1,
+		description:
+			"Call deadline in seconds for the browserwright call (default 90). Raise it for a page " +
+			"known to be slow; when it runs out the attempt fails with DeadlineExceeded.",
+	}),
+);
+
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 	const providers = loadProviders();
@@ -69,6 +83,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "HTTP(S) URL to fetch" }),
+			timeout: CALL_TIMEOUT_PARAM,
 			provider: Type.Optional(
 				Type.String({
 					description:
@@ -88,7 +103,12 @@ export default function (pi: ExtensionAPI) {
 				subject: url,
 				inspect: inspectText,
 				forced: params.provider,
-				executor: makeExecutor<string>(config, { dir: EXTENSION_DIR, role: "fetch", signal }),
+				executor: makeExecutor<string>(config, {
+					dir: EXTENSION_DIR,
+					role: "fetch",
+					signal,
+					callTimeoutS: params.timeout,
+				}),
 				onAttempt: (provider, index, total) =>
 					setStatus(`🌐 ${provider.label ?? provider.name} (${index + 1}/${total})`),
 			});
@@ -135,6 +155,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			query: Type.String({ description: "What to search for" }),
+			timeout: CALL_TIMEOUT_PARAM,
 			provider: Type.Optional(
 				Type.String({
 					description:
@@ -159,6 +180,7 @@ export default function (pi: ExtensionAPI) {
 					dir: EXTENSION_DIR,
 					role: "search",
 					signal,
+					callTimeoutS: params.timeout,
 					// Only module providers stream, and the search rung is why
 					// that capability exists: it is slow enough that the user
 					// deserves to see which phase it is in.

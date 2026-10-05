@@ -9,7 +9,8 @@
     "{url}",
     "--max-chars=0",
     "--name=pi-webfetch-remote",
-    "--attach=$BW_REMOTE_CDP"
+    "--attach=$BW_REMOTE_CDP",
+    "--timeout={timeout}"
   ],
   "returns": "markdown",
   "timeoutMs": 240000,
