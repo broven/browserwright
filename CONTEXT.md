@@ -224,7 +224,7 @@ Playwright controller. Requests run FIFO. Every browser-driving path — `-e`
 code, CLI tasks, inline `run_task()`, userscript verification — reuses its live
 `page` / `context`.
 
-**Trap:** the request deadline is fail-stop. On expiry the daemon terminates
+**Trap:** the request deadline (the **call deadline**) is fail-stop. On expiry the daemon terminates
 that exact executor and waits for confirmed process death. Tabs survive;
 executor `state` does not, and `finally` blocks are not guaranteed.
 
@@ -237,6 +237,26 @@ which is exactly what made remote use impossible before ADR-0011.
 record has a matching pid start-time fingerprint, socket, and executor id. A
 real daemon stop still reaps it; request deadlines and session reset/end remain
 fail-stop and deliberately lose executor `state`.
+
+### call deadline
+The one absolute deadline of an agent's call: set by `-e --timeout` (default
+90s) and propagated down through the executor, relay, and extension (ADR-0014).
+Expiry fail-stops the executor and surfaces as `DeadlineExceeded`, exit code 7.
+
+**Trap:** no inner layer may have its own budget that expires before it. If a
+fixed internal timer can beat the caller's deadline, that is the #116 bug
+coming back. Daemon-internal work with no caller (connect, teardown, heartbeat)
+is not under a call deadline.
+
+### operation timeout
+The timeout of one Playwright call inside the agent's code (`goto`, `click`,
+…). It is the agent's `timeout=` or Playwright's own default, capped by what
+remains of the call deadline. Expiry raises `OperationTimeout`, exit code 8. The
+code can catch it, and the executor survives.
+
+**Trap:** the call deadline is a *ceiling*, never the default. An unset
+operation timeout is Playwright's default (30s, 60s for `goto`), not "whatever
+is left".
 
 ### recovery state
 The daemon's persisted per-session answer to which layer is currently broken:
