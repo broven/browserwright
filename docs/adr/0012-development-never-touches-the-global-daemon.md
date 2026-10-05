@@ -1,6 +1,6 @@
 # Development never touches the global daemon, the global binary, or the daily Chrome
 
-Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 and 6 implemented (#91). Amended the same day: remote use over the tailnet is a real requirement (a VPS drives this Mac's Chrome), so rule 3 keeps the non-loopback bind and makes it durable instead of removing it; rule 4 became an activity gate rather than a concurrency cap; rule 6 was added after the maintainer's own verification run stopped the global daemon. Supersedes the partial
+Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 and 6 implemented (#91). Amended the same day: remote use over the tailnet is a real requirement (a VPS drives this Mac's Chrome), so rule 3 keeps the non-loopback bind and makes it durable instead of removing it; rule 4 became an activity gate rather than a concurrency cap (rule 4 was later withdrawn, 2026-10-05); rule 6 was added after the maintainer's own verification run stopped the global daemon. Supersedes the partial
 isolation in `tests/conftest.py` (kept) by extending the same rule to every
 developer-facing verb.
 
@@ -121,13 +121,26 @@ Rules, one per leak found:
    client never resolves the tailnet IP and a VPN outage only affects the
    remote side. Remote clients set `BW_DAEMON_URL` explicitly and never read
    that file.
-4. **e2e does not start while production is busy.** The ports are
-   isolated, the CPU is not. Rather than a concurrency cap (which would not
-   have stopped 20 leaked executors from competing), the e2e runner asks the
-   machine-global daemon `browserwright-daemon activity` — the same gate
-   `restart` uses — and refuses with exit 4 while any session is mid-task.
-   `E2E_FORCE=1` overrides for a human. The rule is still the outcome: an
-   e2e run must not measurably slow a production session.
+4. **~~e2e does not start while production is busy.~~ Withdrawn
+   2026-10-05.** The original rule had the e2e runner ask the machine-global
+   daemon `browserwright-daemon activity` and refuse with exit 4 while any
+   session was mid-task (`E2E_FORCE=1` to override), on the grounds that the
+   ports are isolated but the CPU is not. The maintainer withdrew it:
+   - It contradicts this ADR's own premise. e2e already owns its ports,
+     runtime dir, ledger and Chrome for Testing; making it consult the
+     global daemon couples development back to production.
+   - In practice it blocked for no reason. On 2026-10-05 a one-file e2e run
+     was refused for over ten minutes because the global daemon reported
+     `1 other client(s) connected` — a long-lived client connection, not a
+     run of 20 leaked executors.
+   - The incident behind the rule (09-02: 20 executors + 31 e2e children
+     alive at once) was a leak, and leaks are handled at their source:
+     `run.sh` reclaims this worktree's stale e2e processes before starting,
+     and `mise run teardown` does the same on demand.
+
+   The e2e runner no longer talks to the global daemon at all. The
+   `activity` verb stays: it is rule 2's gate for `restart` and
+   `upgrade-global`.
 5. **Every daemon start, stop, and restart is attributed.** The daemon log
    gains timestamps and, for each lifecycle event, the initiator (launchd
    spawn, CLI verb with its cwd and parent process, self-exit watchdog). This

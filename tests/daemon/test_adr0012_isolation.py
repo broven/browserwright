@@ -136,7 +136,7 @@ def test_plist_serve_args_survives_a_damaged_plist(tmp_path):
     assert launchagent.plist_serve_args(bad) == {}
 
 
-# ---- rule 4: the activity gate --------------------------------------------
+# ---- rule 2: the activity gate --------------------------------------------
 
 
 def test_activity_verb_exits_4_when_busy_and_0_when_idle(monkeypatch, capsys):
@@ -156,7 +156,7 @@ def test_activity_verb_exits_4_when_busy_and_0_when_idle(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "idle"
 
 
-# ---- rules 1, 2, 4 as text: the mise tasks and the e2e runner -------------
+# ---- rules 1, 2 as text: the mise tasks ----------------------------------
 
 
 def test_upgrade_global_only_forces_when_explicit():
@@ -185,8 +185,3 @@ def test_dev_link_never_writes_the_global_binary_names():
     assert "BW_DAEMON_URL=http://127.0.0.1:$DEV_FACADE_PORT" in run
     assert "~/.agents/skills/browserwright" not in run
 
-
-def test_e2e_runner_consults_the_activity_gate():
-    text = (REPO / "tests/daemon/e2e/run.sh").read_text()
-    assert "browserwright-daemon activity" in text
-    assert "E2E_FORCE" in text
