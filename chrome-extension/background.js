@@ -645,7 +645,8 @@ async function handleDaemonMessage(msg) {
     case "detach":
       return await doDetach(id, msg.tabId);
     case "command":
-      return await doCommand(id, msg.tabId, msg.method, msg.params || {});
+      return await doCommand(
+        id, msg.tabId, msg.method, msg.params || {}, msg.timeoutMs);
     case "attachActive":
       return await doAttachActive(id, msg.groupName);
     case "createTab":
@@ -694,11 +695,19 @@ async function handleDaemonMessage(msg) {
 // caller eats the full `_request(timeout)` while this side leaks.
 //
 // Budgets are deliberately SMALLER than the daemon's matching `_request`
-// timeout (relay.py: send_cdp 10.0s, attach_tab/detach_tab 5.0s) so the
-// extension always answers FIRST with a distinguishable error frame; the
-// daemon's own timeout stays as a last-resort net for a wedged extension.
-// The agreement is locked by a test that parses both files
-// (test_extension_debugger_timeout_unit.py).
+// wait so the extension always answers FIRST with a distinguishable error
+// frame; the daemon's own wait stays as a last-resort net for a wedged
+// extension. The agreement is locked by test_extension_debugger_timeout_unit.py.
+//
+// A relayed `command` (an agent's CDP command, ADR-0014) has NO fixed budget
+// here: the daemon derives one from the caller's remaining call deadline and
+// sends it on the frame as `timeoutMs`, already shorter than its own wait
+// (relay.py `extension_command_budget_ms`) yet still past the caller's
+// deadline (call_deadline.py `INNER_GRACE_S`), so the caller's own deadline
+// always fires first. A fixed constant here would be an inner budget that can
+// expire before the caller's timeout — #116. Attach and
+// detach are daemon-internal work and keep their own budgets (relay.py
+// attach_tab/detach_tab 5.0s).
 //
 // Timeout semantics: the budget error carries code -32001 (CDP's
 // implementation-defined range -32000..-32099; Chrome itself never sends
@@ -718,7 +727,10 @@ async function handleDaemonMessage(msg) {
 // by its own per-tab tokens. Do not merge the two without re-running the
 // marker unit tests.
 
-const DEBUGGER_COMMAND_TIMEOUT_MS = 9000;  // daemon send_cdp: 10.0s
+// The extension's OWN chrome.debugger commands (title marker, keep-rendered,
+// reload cleanup), and a relayed command from a daemon too old to send
+// `timeoutMs` (whose send_cdp waits 10.0s).
+const DEBUGGER_INTERNAL_COMMAND_TIMEOUT_MS = 9000;
 const DEBUGGER_ATTACH_TIMEOUT_MS = 3000;   // daemon attach paths: >= 5.0s
 const DEBUGGER_DETACH_TIMEOUT_MS = 3000;   // daemon detach_tab: 5.0s
 // Shared budget for Target.setDiscoverTargets + Target.setAutoAttach after
@@ -771,10 +783,19 @@ function boundedDebuggerCall(start, { timeoutMs, op, detail }) {
   });
 }
 
-function debuggerCommand(target, method, params, { timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS } = {}) {
+function debuggerCommand(target, method, params, { timeoutMs = DEBUGGER_INTERNAL_COMMAND_TIMEOUT_MS } = {}) {
   return boundedDebuggerCall(
     () => chrome.debugger.sendCommand(target, method, params || {}),
     { timeoutMs, op: "sendCommand", detail: method + " tabId=" + target.tabId });
+}
+
+// The budget for a relayed command: the `timeoutMs` the daemon derived from
+// the caller's remaining call deadline. Absent only from a daemon that
+// predates ADR-0014.
+function relayedCommandBudgetMs(timeoutMs) {
+  return (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0)
+    ? timeoutMs
+    : DEBUGGER_INTERNAL_COMMAND_TIMEOUT_MS;
 }
 
 function debuggerAttach(tabId) {
@@ -1128,9 +1149,10 @@ async function doDetach(id, tabId) {
   }
 }
 
-async function doCommand(id, tabId, method, params) {
+async function doCommand(id, tabId, method, params, timeoutMs) {
   try {
-    const result = await debuggerCommand({ tabId }, method, params);
+    const result = await debuggerCommand(
+      { tabId }, method, params, { timeoutMs: relayedCommandBudgetMs(timeoutMs) });
     safeSend({ type: "response", id, result: result || {} });
   } catch (e) {
     safeSend({

@@ -72,6 +72,10 @@ could not explain:
 `_page_load_failed()` now classifies by actual source, most-specific-first, and
 every bucket carries a fix that points at **its own** layer:
 
+> *Superseded in part by #120 (ADR-0014): the `extension-budget` row below no
+> longer exists. Its budget is now the caller's remaining call deadline, so a
+> `-32001` lands in the `timeout` bucket.*
+
 | `reason` | meaning | matched on |
 |---|---|---|
 | `extension-budget` | the extension's 9s `chrome.debugger` budget expired | `chrome.debugger.sendCommand timed out`, `-32001` |
@@ -212,6 +216,9 @@ not the departure page.
    on, against sites whose full `goto` measures 10–18 s here. Either give
    navigation its own caller-derived budget or let the caller's `goto` timeout
    be the authority.
+   — *DONE in #120 (ADR-0014): the 9 s constant is gone for relayed commands;
+   the extension's bound is derived from the caller's remaining call deadline,
+   and the `extension-budget` reason was folded into `timeout`.*
 3. **`session new` need not warn about concurrency.** Two concurrent extension
    sessions were not the cause here, and the repo's multi-session e2e coverage
    passes.

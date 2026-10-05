@@ -12,11 +12,14 @@ extract the real handlers from ``chrome-extension/background.js`` and run
 them in Node with a mock `chrome` whose `chrome.debugger` promises NEVER
 settle (or settle late, for the stale-completion semantics).
 
-The daemon-side tests at the bottom lock the two sides' agreement: the
-extension's budgets must stay below the matching `_request` timeouts in
-relay.py (so the extension answers FIRST with a distinguishable -32001
-error frame), and a -32001 error frame must survive the relay as a
-`_CommandError` rather than the daemon's own bare `TimeoutError`.
+The tests at the bottom lock the two sides' agreement. A relayed agent
+command has no fixed budget on either side (ADR-0014): the relay waits for the
+caller's remaining call deadline and hands the extension a budget derived from
+it on the frame, and the extension must still answer FIRST with a
+distinguishable -32001 error frame. Daemon-internal attach/detach keep fixed
+budgets, which must stay below the matching relay waits. A -32001 error frame
+must survive the relay as a `_CommandError` rather than the daemon's own bare
+`TimeoutError`.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from browserwright.daemon.server import call_deadline
 from browserwright.daemon.server.relay import _CommandError
 
 from .test_relay_reconnect_paths import _FakeExtension, _relay_running
@@ -131,14 +135,12 @@ const realm = vm.createContext({
   console: { info() {}, warn() {}, error: console.error },
   safeSend: (frame) => frames.push(frame),
 });
-const wrapper = input.wrapperRegion
-  .replace("const DEBUGGER_COMMAND_TIMEOUT_MS = 9000;",
-           "const DEBUGGER_COMMAND_TIMEOUT_MS = 30;");
 vm.runInContext(
-  wrapper + "\n" + input.errMessage + "\n" + input.doCommand, realm);
+  input.wrapperRegion + "\n" + input.errMessage + "\n" + input.doCommand, realm);
 (async () => {
+  // 30 = the frame's `timeoutMs`, i.e. the budget the relay propagated.
   const call = vm.runInContext(
-    'doCommand(9, 17, "Page.navigate", {url: "http://x/"})', realm);
+    'doCommand(9, 17, "Page.navigate", {url: "http://x/"}, 30)', realm);
   const deadline = Date.now() + 2000;
   while (frames.length === 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -589,8 +591,141 @@ def test_epoch_abandons_attach_when_detach_races_the_arm() -> None:
 # ---- two sides agree -------------------------------------------------------
 
 
-def test_extension_budgets_stay_below_daemon_request_timeouts() -> None:
-    """The extension must answer FIRST: each DEBUGGER_*_TIMEOUT_MS budget in
+#: A Node process standing in for the extension's command handler: it loads
+#: the REAL `doCommand` + wrappers from background.js, signals ready, then
+#: runs one relay command frame read from stdin against a chrome.debugger
+#: whose sendCommand never settles, and writes the response frame it sends.
+#: Started before the command is issued, so its startup cost is not counted
+#: against the relay's wait.
+_EXTENSION_COMMAND_PEER = r"""
+const vm = require("node:vm");
+const readline = require("node:readline");
+const lines = readline.createInterface({ input: process.stdin });
+let input = null;
+let realm = null;
+lines.on("line", async (line) => {
+  if (input === null) {
+    input = JSON.parse(line);
+    realm = vm.createContext({
+      chrome: { debugger: { sendCommand() { return new Promise(() => {}); } } },
+      setTimeout, clearTimeout,
+      console: { info() {}, warn() {}, error: console.error },
+      safeSend: (frame) => process.stdout.write(JSON.stringify(frame) + "\n"),
+    });
+    vm.runInContext(
+      input.wrapperRegion + "\n" + input.errMessage + "\n" + input.doCommand,
+      realm);
+    process.stdout.write("ready\n");
+    return;
+  }
+  realm.msg = JSON.parse(line);
+  await vm.runInContext(
+    "doCommand(msg.id, msg.tabId, msg.method, msg.params || {}, msg.timeoutMs)",
+    realm);
+  process.exit(0);
+});
+"""
+
+
+async def _attached_relay_tab(relay, ext, tab_id: int) -> None:
+    attach_task = asyncio.create_task(relay.attach_tab(tab_id, timeout=5.0))
+    attach_cmd = await ext.next_command(timeout=5.0)
+    assert attach_cmd["type"] == "attach"
+    await ext.respond(attach_cmd["id"], result={
+        "targetInfo": {"url": "http://x/", "title": "Page"},
+    })
+    await asyncio.wait_for(attach_task, timeout=5.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_deadline_ms", [2_000, 60_000])
+async def test_relayed_command_waits_derive_from_the_call_deadline(
+    call_deadline_ms: int,
+) -> None:
+    """ADR-0014: an agent's command carries the caller's remaining call
+    deadline down to `chrome.debugger`, and no fixed budget on the way can
+    expire first.
+
+    One command across the real seams: the call deadline bound to the session
+    (as the `/exec` relay does) -> the wait the facade passes to `send_cdp`
+    (`command_wait_s`) -> the `timeoutMs` the relay puts on the frame -> the
+    real `doCommand` in background.js, against a Chrome that never answers.
+    The extension's budget must be the frame's (derived from the deadline,
+    not a constant): past the deadline, so the executor's fail-stop wins and
+    the caller gets `DeadlineExceeded`, and below the relay's wait, so the
+    extension settles first and the relay caller sees its -32001
+    `_CommandError`, never the relay's bare `TimeoutError`.
+    """
+    sid = f"deadline-{call_deadline_ms}"
+    token: int | None = None
+    peer = await asyncio.create_subprocess_exec(
+        "node", "-e", _EXTENSION_COMMAND_PEER, cwd=ROOT,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+    try:
+        assert peer.stdin is not None and peer.stdout is not None
+        peer.stdin.write((json.dumps(_sources()) + "\n").encode())
+        await peer.stdin.drain()
+        assert (await asyncio.wait_for(peer.stdout.readline(), 15.0)) == b"ready\n"
+
+        async with _relay_running() as relay:
+            ext = _FakeExtension()
+            await ext.connect(relay.port, install_id="ext-A")
+            await relay.wait_ready(timeout=5.0)
+            await _attached_relay_tab(relay, ext, 17)
+
+            token = call_deadline.bind(sid, call_deadline_ms)
+            remaining_s = call_deadline.remaining_s(sid)
+            wait_s = call_deadline.command_wait_s(sid)
+            assert remaining_s is not None and wait_s is not None
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            call = asyncio.create_task(relay.send_cdp(
+                17, "Page.navigate", {"url": "http://x/"}, timeout=wait_s))
+            cmd = await ext.next_command(timeout=5.0)
+            assert cmd["type"] == "command"
+
+            budget_ms = cmd["timeoutMs"]
+            # Derived from the propagated deadline: past it, so the caller's
+            # own deadline (the executor's fail-stop -> DeadlineExceeded)
+            # always fires first, but within the grace and below the relay's
+            # wait, so the extension still settles before the relay. A fixed
+            # 9000ms breaks one bound or another at each parameter.
+            assert remaining_s * 1000 < budget_ms
+            assert budget_ms <= (remaining_s + call_deadline.INNER_GRACE_S) * 1000
+            assert budget_ms < wait_s * 1000
+
+            if call_deadline_ms > 10_000:
+                # Far beyond the old fixed 9s/10s budgets: the wait is not
+                # run out here (60s), the command just stays in flight.
+                assert not call.done()
+                call.cancel()
+                return
+
+            peer.stdin.write((json.dumps(cmd) + "\n").encode())
+            await peer.stdin.drain()
+            frame = json.loads(
+                await asyncio.wait_for(peer.stdout.readline(), wait_s + 5.0))
+            assert frame["id"] == cmd["id"]
+            assert frame["error"]["code"] == -32001
+            assert f"timed out after {budget_ms}ms" in frame["error"]["message"]
+            await ext.ws.send(json.dumps(frame))
+
+            with pytest.raises(_CommandError) as exc_info:
+                await asyncio.wait_for(call, timeout=wait_s + 5.0)
+            elapsed = loop.time() - started
+            assert exc_info.value.code == -32001
+            assert elapsed < wait_s, "the relay gave up before the extension"
+    finally:
+        if token is not None:
+            call_deadline.release(sid, token)
+        if peer.returncode is None:
+            peer.kill()
+        await peer.wait()
+
+
+def test_daemon_internal_budgets_stay_below_daemon_request_timeouts() -> None:
+    """Attach/detach are daemon-internal work with no caller deadline
+    (ADR-0014 keeps their budgets): each DEBUGGER_*_TIMEOUT_MS budget in
     background.js must stay below the matching `_request` timeout in
     relay.py, so the daemon receives a distinguishable -32001 error frame
     instead of giving up with its own bare TimeoutError."""
@@ -608,13 +743,9 @@ def test_extension_budgets_stay_below_daemon_request_timeouts() -> None:
         assert match is not None, f"{func} timeout not found in relay.py"
         return float(match.group(1))
 
-    command_ms = js_const("DEBUGGER_COMMAND_TIMEOUT_MS")
     attach_ms = js_const("DEBUGGER_ATTACH_TIMEOUT_MS")
     detach_ms = js_const("DEBUGGER_DETACH_TIMEOUT_MS")
 
-    assert command_ms < py_timeout("send_cdp") * 1000, (
-        "sendCommand budget must stay below relay send_cdp's timeout"
-    )
     assert attach_ms < min(
         py_timeout("attach_tab"),
         py_timeout("attach_active_tab"),

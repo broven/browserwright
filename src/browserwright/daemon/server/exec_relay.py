@@ -23,7 +23,9 @@ and the relay forwards it untouched, so the executor enforces exactly what the
 caller asked for. When it runs out the response carries a ``DeadlineExceeded``
 error (``scope="call"``, ``exit_code`` 7) plus the internal
 ``terminal_reason="deadline_exceeded"``, which tells the client to reap that
-executor.
+executor. While the call runs, the relay also binds its absolute deadline to
+the session (`call_deadline.RelayedCalls`), so the CDP commands the call's
+code sends wait on a bound derived from it, down to `chrome.debugger`.
 
 Consequences the caller must know (ADR-0011 "What this does NOT change"):
 execute payloads and large outputs now cross the daemon's event loop, and a
@@ -42,6 +44,7 @@ import websockets
 from websockets.asyncio.server import ServerConnection
 
 from ..._executor.protocol import ExecuteRequest, ExecuteResponse, _MAX_FRAME
+from .call_deadline import RelayedCalls
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +113,12 @@ async def serve_exec_relay(conn: ServerConnection, *, daemon,
         return
 
     logger.info("exec relay: session %s bridged to %s", session_id, sock_path)
-    c2e = asyncio.create_task(_ws_to_executor(conn, writer))
+    # ADR-0014: bind each call's deadline to the session while it runs, so
+    # the CDP commands its code sends wait on what is left of it.
+    calls = RelayedCalls(session_id)
+    c2e = asyncio.create_task(_ws_to_executor(conn, writer, calls=calls))
     e2c = asyncio.create_task(_executor_to_ws(
-        reader, conn, daemon=daemon, session_id=session_id))
+        reader, conn, daemon=daemon, session_id=session_id, calls=calls))
     try:
         await asyncio.wait({c2e, e2c}, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -120,6 +126,7 @@ async def serve_exec_relay(conn: ServerConnection, *, daemon,
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await t
+        calls.close()
         with contextlib.suppress(Exception):
             writer.close()
             await writer.wait_closed()
@@ -127,7 +134,8 @@ async def serve_exec_relay(conn: ServerConnection, *, daemon,
             await conn.close()
 
 
-async def _ws_to_executor(conn: ServerConnection, writer) -> None:
+async def _ws_to_executor(conn: ServerConnection, writer,
+                          calls: RelayedCalls | None = None) -> None:
     """One ws message → one length-prefixed executor frame."""
     try:
         async for raw in conn:
@@ -135,6 +143,8 @@ async def _ws_to_executor(conn: ServerConnection, writer) -> None:
             if len(payload) > _MAX_FRAME:
                 raise ExecRelayError(
                     f"exec frame too large: {len(payload)} > {_MAX_FRAME}")
+            if calls is not None:
+                calls.request(payload)
             writer.write(_LEN.pack(len(payload)) + payload)
             await writer.drain()
     except websockets.exceptions.ConnectionClosed:
@@ -145,7 +155,8 @@ async def _ws_to_executor(conn: ServerConnection, writer) -> None:
 
 
 async def _executor_to_ws(reader, conn: ServerConnection, *, daemon=None,
-                          session_id: str | None = None) -> None:
+                          session_id: str | None = None,
+                          calls: RelayedCalls | None = None) -> None:
     """One length-prefixed executor frame → one ws message."""
     try:
         while True:
@@ -155,6 +166,8 @@ async def _executor_to_ws(reader, conn: ServerConnection, *, daemon=None,
                 raise ExecRelayError(
                     f"executor frame too large: {length} > {_MAX_FRAME}")
             payload = await reader.readexactly(length)
+            if calls is not None:
+                calls.response()
             payload = report_recovery_event(daemon, session_id, payload)
             await conn.send(payload.decode("utf-8", errors="replace"))
     except (asyncio.IncompleteReadError, ConnectionResetError):
