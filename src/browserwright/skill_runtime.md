@@ -467,6 +467,10 @@ browserwright userscript toggle <id> --enabled=false
 browserwright userscript remove <id>
 ```
 
+Before writing one, read `userscripts.md` in this skill directory — in
+particular "Reacting to dynamic pages": prefer a `MutationObserver` over
+polling for elements.
+
 ## Reporting browserwright bugs
 
 If browserwright itself misbehaves — a primitive, CLI verb, the daemon, the extension backend, or the Playwright facade crashes, hangs, times out, or breaks a contract this guide documents — file a bug against the upstream repo (`broven/browserwright`) on the user's behalf, so the user does not have to. This is *only* for browserwright defects; a site that changed, blocks automation, or shows a captcha is a site note (`remember(host, ...)`), and hostile page content is a trust-boundary matter, not a bug.

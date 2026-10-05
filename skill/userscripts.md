@@ -42,6 +42,34 @@ Supported v1 metadata directives:
 - No automatic watch mode; push explicitly after each edit.
 - The popup shows matching scripts for the current site with per-script toggles and a master switch.
 
+## Reacting to dynamic pages
+
+Most target sites render after load, swap content in place, or route without a full page load (SPAs), so the element a script wants often is not there at `document-idle`. Prefer a `MutationObserver` over polling (`setInterval`, `setTimeout` retry loops) to wait for it: the observer fires exactly when the DOM changes, costs nothing while the page is idle, and keeps working across SPA navigations, whereas polling burns CPU on every tick and still fires late.
+
+A reusable helper — call `cb` once for every element matching `selector`, now and whenever one appears later:
+
+```javascript
+function onElement(selector, cb, root = document) {
+  const handle = (el) => {
+    if (el.dataset.usSeen) return; // idempotent: each element handled once
+    el.dataset.usSeen = "1";
+    cb(el);
+  };
+  root.querySelectorAll(selector).forEach(handle);
+  const observer = new MutationObserver(() =>
+    root.querySelectorAll(selector).forEach(handle));
+  observer.observe(root === document ? document.documentElement : root,
+    { childList: true, subtree: true });
+  return observer; // call observer.disconnect() once you are done
+}
+
+onElement("article.post", (post) => post.classList.add("us-highlight"));
+```
+
+- Observe the narrowest stable container you can (a feed list, not `document`) — every mutation under it re-runs the callback.
+- Mark handled elements (`dataset`) so repeated callbacks never double-apply a change.
+- `disconnect()` when the job is one-shot (waiting for a single element); keep the observer when content keeps arriving (feeds, infinite scroll, SPA route changes).
+
 ## Golden workflow
 
 1. Write or edit `something.user.js`.
