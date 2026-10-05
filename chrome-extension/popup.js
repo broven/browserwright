@@ -11,6 +11,7 @@ const list = document.getElementById("attached-list");
 const usMaster = document.getElementById("us-master");
 const usList = document.getElementById("us-list");
 const usEmpty = document.getElementById("us-empty");
+const muteGroups = document.getElementById("mute-groups");
 
 async function refreshUserscripts() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -107,6 +108,14 @@ usMaster.addEventListener("change", (event) => {
     type: "userscript.popupMaster",
     enabled: event.target.checked,
   }, () => setTimeout(refreshUserscripts, 100));
+});
+
+muteGroups.addEventListener("change", (event) => {
+  chrome.runtime.sendMessage({ type: "mute.set", enabled: event.target.checked });
+});
+
+chrome.runtime.sendMessage({ type: "mute.get" }, (resp) => {
+  muteGroups.checked = resp?.enabled !== false;
 });
 
 refresh();

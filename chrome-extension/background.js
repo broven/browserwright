@@ -1877,6 +1877,97 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // dissolves, its tabs fire per-tab onUpdated (groupId change) above, which
 // handles the detach.
 
+// ---- mute session groups ---------------------------------------------------
+//
+// Agent tabs must not make noise at the user. While the popup setting is on
+// (the default), every tab in a session group — any group titled
+// `<name>-BW<sid>` (ADR-0009), whoever put the tab there — is muted. Only the
+// audio output is silenced: page-level media (`play`, `el.muted`) is untouched,
+// so agents asserting on media behaviour are unaffected.
+//
+// We only ever unmute what WE muted (`mutedInfo.reason === "extension"` with
+// our own id), so a tab the user muted themselves stays muted when it leaves
+// the group or the setting is turned off.
+
+const MUTE_KEY = "muteSessionGroups";
+const SESSION_GROUP_TITLE_RE = /-BW\S+$/;
+
+async function muteEnabled() {
+  const v = await chrome.storage.local.get([MUTE_KEY]);
+  return v[MUTE_KEY] !== false;
+}
+
+function _mutedByUs(tab) {
+  const info = tab?.mutedInfo;
+  return !!info?.muted && info.reason === "extension"
+    && info.extensionId === chrome.runtime.id;
+}
+
+async function _syncTabMute(tab, inSessionGroup, enabled) {
+  if (!tab || typeof tab.id !== "number") return;
+  let muted = null;
+  if (inSessionGroup && enabled) {
+    if (!tab.mutedInfo?.muted) muted = true;
+  } else if (_mutedByUs(tab)) {
+    muted = false;
+  }
+  if (muted === null) return;
+  try {
+    await chrome.tabs.update(tab.id, { muted });
+  } catch (_e) {
+    // Tab closed meanwhile — nothing to mute.
+  }
+}
+
+async function _isSessionGroup(groupId) {
+  if (typeof groupId !== "number" || groupId < 0) return false;
+  try {
+    const group = await chrome.tabGroups.get(groupId);
+    return SESSION_GROUP_TITLE_RE.test(group?.title || "");
+  } catch (_e) {
+    return false;
+  }
+}
+
+// Re-derive every tab's mute state: on setting toggle and on SW start (tabs
+// may have been grouped while the worker was asleep).
+async function syncAllTabMute() {
+  const enabled = await muteEnabled();
+  const groups = await chrome.tabGroups.query({});
+  const sessionGroups = new Set(
+    groups.filter((g) => SESSION_GROUP_TITLE_RE.test(g.title || ""))
+      .map((g) => g.id));
+  const tabs = await chrome.tabs.query({});
+  await Promise.all(tabs.map((tab) =>
+    _syncTabMute(tab, sessionGroups.has(tab.groupId), enabled)));
+}
+
+async function setMuteEnabled(enabled) {
+  await chrome.storage.local.set({ [MUTE_KEY]: !!enabled });
+  await syncAllTabMute();
+}
+
+// A tab joined or left a group.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!("groupId" in changeInfo)) return;
+  (async () => {
+    await _syncTabMute(tab, await _isSessionGroup(changeInfo.groupId),
+      await muteEnabled());
+  })().catch((e) => console.warn("[bd-relay] tab mute sync failed:", e));
+});
+
+// A group got (or lost) a session title. `_ensureTabInGroup` groups the tab
+// first and titles the group after, so the groupId change above sees an
+// untitled group — this catches the title landing.
+chrome.tabGroups.onUpdated.addListener((group) => {
+  (async () => {
+    const enabled = await muteEnabled();
+    const inSession = SESSION_GROUP_TITLE_RE.test(group.title || "");
+    const tabs = await chrome.tabs.query({ groupId: group.id });
+    await Promise.all(tabs.map((tab) => _syncTabMute(tab, inSession, enabled)));
+  })().catch((e) => console.warn("[bd-relay] group mute sync failed:", e));
+});
+
 // onRemoved fires when a tab is closed outright. If we were driving it, tell
 // the daemon so its ghost-target table stays in sync even when chrome.debugger
 // onDetach didn't fire first (rare close-ordering races).
@@ -1975,6 +2066,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true, sync });
       return;
     }
+    if (msg?.type === "mute.get") {
+      sendResponse({ enabled: await muteEnabled() });
+      return;
+    }
+    if (msg?.type === "mute.set") {
+      await setMuteEnabled(msg.enabled);
+      sendResponse({ ok: true });
+      return;
+    }
     sendResponse({ ok: false, error: "unknown message type" });
   })();
   return true; // async response
@@ -1990,6 +2090,8 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.runtime.onInstalled.addListener(() => {
   if (!ws) connect();
 });
+syncAllTabMute().catch((e) =>
+  console.warn("[bd-relay] initial mute sync failed:", e));
 // maintainLoop applies it on its next tick once nothing is using the extension.
 chrome.runtime.onUpdateAvailable.addListener((details) => {
   pendingUpdate = { version: details?.version || "", since: Date.now() };
