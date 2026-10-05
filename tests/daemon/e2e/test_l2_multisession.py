@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from pathlib import Path
 
 from browserwright.cdp import CDPSession
 
-from .helpers import SkillResult, run_skill
+from .helpers import (
+    SkillResult,
+    bs_home,
+    drop_ledger_session,
+    run_skill,
+    seed_ledger_session,
+)
 
 
 def _extract_payload(result: SkillResult) -> dict:
@@ -104,49 +109,15 @@ def _chrome_close_tabs(chrome, extension_id: str, tab_ids: list[int]) -> None:
         cdp.close()
 
 
-def _bs_home() -> Path:
-    return Path(__file__).resolve().parent / "_bs_home" / "extension"
-
-
-def _seed_sessions(records: dict[str, str]) -> list[tuple[Path, bool]]:
-    seeded = []
-    now = time.time()
-    ledger = _bs_home() / "sessions" / "ledger.json"
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    existed = ledger.exists()
-    data = json.loads(ledger.read_text()) if existed else {
-        "next_id": 1,
-        "sessions": {},
-    }
+def _seed_sessions(records: dict[str, str]) -> None:
     for sid, name in records.items():
-        data["sessions"][sid] = {
-            "id": sid,
-            "backend": "extension",
-            "workspace": None,
-            "owner": "attach",
-            "name": name,
-            "created_at": now,
-            "last_seen": now,
-        }
-    ledger.write_text(json.dumps(data), encoding="utf-8")
-    seeded.append((ledger, existed))
-    return seeded
+        seed_ledger_session(bs_home("extension"), sid,
+                            backend="extension", name=name)
 
 
-def _cleanup_seeded_sessions(
-    seeded: list[tuple[Path, bool]],
-    session_ids: set[str],
-) -> None:
-    for ledger, existed in seeded:
-        if not ledger.exists():
-            continue
-        data = json.loads(ledger.read_text())
-        for sid in session_ids:
-            data.get("sessions", {}).pop(sid, None)
-        if not existed and not data.get("sessions"):
-            ledger.unlink(missing_ok=True)
-        else:
-            ledger.write_text(json.dumps(data), encoding="utf-8")
+def _cleanup_seeded_sessions(session_ids: set[str]) -> None:
+    for sid in session_ids:
+        drop_ledger_session(bs_home("extension"), sid)
 
 
 def test_extension_backend_multiple_sessions_operate_concurrently(ext_ready, e2e_daemon):
@@ -307,7 +278,7 @@ def test_extension_backend_three_sessions_get_named_groups_and_scoped_tabs(
         "e2e-three-b": "e2e-bravo-group",
         "e2e-three-c": "e2e-charlie-group",
     }
-    seeded = _seed_sessions(sessions)
+    _seed_sessions(sessions)
     script = r'''
 import json
 import threading
@@ -474,4 +445,4 @@ if errors:
             assert after_targets == {entry["targetId"]}
     finally:
         _chrome_close_tabs(e2e_chrome, extension_id, tab_ids)
-        _cleanup_seeded_sessions(seeded, set(sessions))
+        _cleanup_seeded_sessions(set(sessions))
