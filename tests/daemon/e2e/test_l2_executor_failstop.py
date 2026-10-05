@@ -126,9 +126,10 @@ def test_action_timeout_survives_but_outer_deadline_recycles_executor_cdp(
         )
 
         assert terminal.terminal_reason == TERMINAL_DEADLINE_EXCEEDED
-        assert terminal.exit_code == 3
+        assert terminal.exit_code == 7
         assert terminal.error is not None
-        assert terminal.error["type"] == "TimeoutError"
+        assert terminal.error["type"] == "DeadlineExceeded"
+        assert terminal.error["scope"] == "call"
 
         # This is intentionally immediate, not a polling assertion: the
         # client contract says a terminal response is withheld until daemon

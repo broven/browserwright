@@ -130,7 +130,7 @@ def test_cmd_execute_dispatches_selected_env(monkeypatch):
     monkeypatch.setattr(
         inline,
         "run_code",
-        lambda code, *, session_id, env: calls.append(
+        lambda code, *, session_id, env, **_kw: calls.append(
             (session_id, code, env)
         ) or 0,
     )

@@ -135,6 +135,38 @@ call cannot see the values unless it selects them again. Values travel directly
 over the local executor socket and are not written to persistent `state`,
 discovery files, or Browserwright logs.
 
+## Call deadline: `--timeout`
+
+Every `-e` / `-f` / `--code-stdin` call has one **call deadline** for the whole
+call: `--timeout <seconds>`, default **90**. It is a ceiling, not a default for
+the Playwright calls inside your code — `click`, `wait_for` and friends keep
+Playwright's own `timeout=` (30s unless you pass one), and `page.goto` keeps
+its 60s.
+
+```bash
+browserwright -s "$sid" --timeout 300 -f long_crawl.py   # a known-slow job
+```
+
+When the deadline runs out the call is **fail-stopped**: the code is cut off
+wherever it was, its executor is terminated, and the command exits with code
+**7** and a `DeadlineExceeded` error (`"scope": "call"`). It cannot be caught
+from inside the code. Browser tabs survive; `state` does not, and `finally`
+blocks are not guaranteed. The next call starts a fresh executor on the same
+tab, so it works normally.
+
+What to do with exit 7: raise `--timeout` if the work is legitimately slow, or
+split it into several smaller calls (keep progress with `state` or
+`remember()`). Do not re-run the same call unchanged.
+
+| exit | meaning |
+|---|---|
+| 0 | the code finished |
+| 1 | usage error (bad flags, missing code) |
+| 2 | no session / daemon unavailable — read the `fix` line |
+| 3 | the code raised (a Playwright error, an `ElementNotFound`, …) |
+| 4 / 5 | auth wall / captcha — stop and ask the user |
+| 7 | `DeadlineExceeded`: the call deadline (`--timeout`) ran out |
+
 ## Driving The Browser: real Playwright
 
 Inside `browserwright -s <id> -e <code>` you write **synchronous Playwright**. Four names are injected for you, served by a **resident per-session executor** the daemon spawns on first browser use, plus two session primitives (`tabs`, `switch_tab`):
@@ -178,7 +210,7 @@ These are NOT re-created per call. A long-lived per-session **executor** holds t
 - `page` and `context` are the **same live objects** across separate calls — they do not reconnect or re-bind each time. Navigate `page` in place; the NEXT call sees the same tab on the same URL, with no re-navigation.
 - The first browser call cold-starts the executor (connect + bind the session's
   current tab). Steady state is "same objects." A terminal `reset()`,
-  `browserwright session reset <id>`, outer request deadline, or executor crash
+  `browserwright session reset <id>`, the call deadline (`--timeout`), or executor crash
   ends that executor; the next browser command cold-starts and rebinds the
   ledger target. A daemon replacement preserves the executor and `state`, then
   reconnects its Playwright objects on the next call.
@@ -204,7 +236,7 @@ Use `state` for cross-call working memory (a collected list, a cursor, a flag). 
 
 > **Executor recycle clears `state`** (so you are not surprised):
 > 1. You call `reset()` (below) — it clears `state` on purpose.
-> 2. The executor crashes, an outer executor request deadline expires, or you run `browserwright session reset <id>`: the next call cold-starts a fresh executor that re-binds the session's current tab via the ledger, but `state` starts empty. A normal daemon replacement adopts the executor, so `state` survives; persist important information with `remember(...)` regardless.
+> 2. The executor crashes, the call deadline (`--timeout`) expires, or you run `browserwright session reset <id>`: the next call cold-starts a fresh executor that re-binds the session's current tab via the ledger, but `state` starts empty. A normal daemon replacement adopts the executor, so `state` survives; persist important information with `remember(...)` regardless.
 
 ### `reset()` — terminal recycle / clean slate
 
@@ -221,7 +253,7 @@ page.goto("https://example.com")
 
 If the executor itself is wedged and cannot run `reset()`, use `browserwright session reset <id>`. Both reset paths recycle only the executor; the browser, tab group, and tabs stay open.
 
-An outer executor request deadline follows the same fail-stop rule: Browserwright terminates that executor and waits for daemon confirmation before the command returns. The next command starts fresh on the same browser tabs. An ordinary Playwright action timeout that is caught and returned normally does **not** recycle the executor. After fail-stop, Python `finally` blocks are not guaranteed to run and webpage side effects are not rolled back.
+The call deadline (`--timeout`, see above) follows the same fail-stop rule: Browserwright terminates that executor and waits for daemon confirmation before the command exits 7 with `DeadlineExceeded`. The next command starts fresh on the same browser tabs. An ordinary Playwright action timeout that is caught and returned normally does **not** recycle the executor. After fail-stop, Python `finally` blocks are not guaranteed to run and webpage side effects are not rolled back.
 
 ### Tabs are workstreams, not steps
 

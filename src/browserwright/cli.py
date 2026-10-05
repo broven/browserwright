@@ -25,9 +25,13 @@ from . import __version__
 HELP = """browserwright — Layer 2 of the browser stack.
 
 Usage:
-  browserwright -s <session-id> [--env NAME ...] -e 'page.goto("https://example.com"); print(page.title())'
-  browserwright -s <session-id> [--env NAME ...] -f script.py
-  browserwright -s <session-id> [--env NAME ...] --code-stdin < script.py
+  browserwright -s <session-id> [--env NAME ...] [--timeout SECONDS] -e 'page.goto("https://example.com"); print(page.title())'
+  browserwright -s <session-id> [--env NAME ...] [--timeout SECONDS] -f script.py
+  browserwright -s <session-id> [--env NAME ...] [--timeout SECONDS] --code-stdin < script.py
+
+      --timeout SECONDS  the call deadline (default 90). When it runs out the
+                         code is stopped, its executor is recycled, and the
+                         command exits 7 (DeadlineExceeded).
 
   browserwright session new --backend=<extension|cdp> --name=SESSION_LABEL [--reuse] [--create | --attach=PORT]
   browserwright recover --session=<id>          (the one recovery verb: exit 0 healthy, 4 needs-human)
@@ -41,7 +45,7 @@ Usage:
 
   browserwright markdown <url> [--mode=auto|article|full] [--backend=extension|cdp]
                                [--attach=<port|url>] [--out=PATH] [--max-chars=N]
-                               [--name=LABEL]
+                               [--name=LABEL] [--timeout=SECONDS]
       One page as Markdown. Creates and tears down its own session, so it takes
       no -s. Absolute links, shadow DOM flattened in, HTML only.
 
@@ -351,23 +355,71 @@ def _resolve_request_env(
     return values, None
 
 
+def _parse_timeout_value(raw: object) -> tuple[Optional[float], Optional[str]]:
+    """Validate one ``--timeout`` value: positive seconds, finite."""
+    import math
+
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None, f"--timeout must be a number of seconds, got {raw!r}"
+    if not math.isfinite(value) or value <= 0:
+        return None, f"--timeout must be a positive number of seconds, got {raw!r}"
+    return value, None
+
+
+def _extract_timeout_arg(
+    args: list[str],
+) -> tuple[Optional[float], list[str], Optional[str]]:
+    """Remove ``--timeout SECONDS`` / ``--timeout=SECONDS`` from ``args``.
+
+    The call deadline (ADR-0014). ``None`` means the caller did not set one,
+    and the default applies."""
+    timeout: Optional[float] = None
+    out: list[str] = []
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a == "--timeout":
+            if i + 1 >= n:
+                return None, [], "--timeout requires a value in seconds"
+            raw: object = args[i + 1]
+            i += 2
+        elif a.startswith("--timeout="):
+            raw = a.split("=", 1)[1]
+            i += 1
+        else:
+            out.append(a)
+            i += 1
+            continue
+        timeout, err = _parse_timeout_value(raw)
+        if err:
+            return None, [], err
+    return timeout, out, None
+
+
 def _cmd_execute(args: list[str]) -> int:
-    session_id, code, env_names, err = _parse_execute_args(args)
+    usage = ("usage: browserwright -s <session-id> [--env NAME ...] "
+             "[--timeout SECONDS] "
+             "(-e 'print(snapshot())' | -f script.py | --code-stdin)")
+    timeout_s, args, err = _extract_timeout_arg(args)
+    if not err:
+        session_id, code, env_names, err = _parse_execute_args(args)
     if err:
         print(f"usage error: {err}", file=sys.stderr)
-        print("usage: browserwright -s <session-id> [--env NAME ...] "
-              "(-e 'print(snapshot())' | -f script.py | --code-stdin)",
-              file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 1
     request_env, err = _resolve_request_env(env_names)
     if err:
         print(f"usage error: {err}", file=sys.stderr)
         return 1
+    from .errors import DEFAULT_CALL_TIMEOUT_S
     from .repl import inline
     return inline.run_code(
         code or "",
         session_id=session_id or "",
         env=request_env,
+        timeout_s=DEFAULT_CALL_TIMEOUT_S if timeout_s is None else timeout_s,
     )
 
 
@@ -520,6 +572,9 @@ Flags:
   --max-chars=N    cap what is printed (default 8000; 0 prints everything).
                    The FULL text is always written to the file either way.
   --name=LABEL     session label; shows as the Chrome tab group title
+  --timeout=SECONDS
+                   the call deadline for the navigate-and-convert step
+                   (default 90); running out exits 7 (DeadlineExceeded)
 """
 
 # Runs inside the session's executor, which is the only place a live `page`
@@ -594,6 +649,16 @@ def _cmd_markdown(args: list[str]) -> int:
               file=sys.stderr)
         return 1
 
+    from .errors import DEFAULT_CALL_TIMEOUT_S
+
+    timeout_s: float = DEFAULT_CALL_TIMEOUT_S
+    if "timeout" in kw:
+        parsed, err = _parse_timeout_value(kw["timeout"])
+        if err:
+            print(f"usage error: {err}", file=sys.stderr)
+            return 1
+        timeout_s = parsed  # type: ignore[assignment]
+
     out = kw.get("out")
     keep_file = out is not None
     out_path = str(out) if keep_file else spill_path(url)
@@ -627,6 +692,7 @@ def _cmd_markdown(args: list[str]) -> int:
             _MARKDOWN_CODE,
             session_id=sid,
             env={"BW_MD_URL": url, "BW_MD_OUT": out_path, "BW_MD_MODE": mode},
+            timeout_s=timeout_s,
         )
         if rc != 0:
             return rc
@@ -1267,6 +1333,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             or command_argv[0].startswith("--code-file=")
             or command_argv[0] == "--env"
             or command_argv[0].startswith("--env=")
+            or command_argv[0] == "--timeout"
+            or command_argv[0].startswith("--timeout=")
         ):
             sys.exit(_cmd_execute(argv))
         argv = command_argv

@@ -55,10 +55,13 @@ Expect to retry the first bind: on a fresh session the first browser call
 frequently returns `PageBindTimeout` (retryable) — retrying the same command
 succeeds.
 
-The executor request deadline is fail-stop. When it expires, Browserwright
+The executor request deadline — the caller's **call deadline**, `-e --timeout`
+(default 90s; ADR-0014) — is fail-stop. When it expires, Browserwright
 flushes a terminal response, terminates that exact executor instance (including
 its Playwright driver), and waits for daemon-confirmed process death before the
-CLI returns. Browser tabs survive, but executor `state` is lost, Python
+CLI returns. The caller sees `DeadlineExceeded` (`scope="call"`, exit code 7);
+`terminal_reason="deadline_exceeded"` stays an internal signal that tells the
+client to reap the executor. Browser tabs survive, but executor `state` is lost, Python
 `finally` blocks are not guaranteed, and webpage side effects are not rolled
 back. A Playwright action timeout that returns before the outer request
 deadline is an ordinary request error and does not recycle the executor.

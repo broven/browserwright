@@ -23,11 +23,18 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
+import threading
 import traceback
 from contextlib import redirect_stdout
 
-from ..errors import BrowserwrightError, serialize
+from ..errors import (
+    DEFAULT_CALL_TIMEOUT_S,
+    BrowserwrightError,
+    DeadlineExceeded,
+    serialize,
+)
 from . import _namespace
 
 # Names whose presence routes the heredoc to the persistent executor (Fork 7).
@@ -67,8 +74,14 @@ def _touches_executor_surface(code_obj) -> bool:
 
 
 def run_code(code: str, *, session_id: str,
-             env: dict[str, str] | None = None) -> int:
-    """Execute inline code for an explicit session id."""
+             env: dict[str, str] | None = None,
+             timeout_s: float = DEFAULT_CALL_TIMEOUT_S) -> int:
+    """Execute inline code for an explicit session id.
+
+    ``timeout_s`` is the **call deadline** (ADR-0014): the whole call gets that
+    long, on either path. Expiry is fail-stop and surfaces as
+    ``DeadlineExceeded`` with exit code 7 — the executor path terminates the
+    executor, the in-process path terminates this process."""
     if not code.strip():
         print("usage: browserwright -s <session-id> -e 'print(snapshot())'",
               file=sys.stderr)
@@ -97,11 +110,12 @@ def run_code(code: str, *, session_id: str,
         # (identical behaviour to before); never ship un-compilable code.
         code_obj = None
     if code_obj is not None and _touches_executor_surface(code_obj):
-        return _run_on_executor(sess, code, env=env)
+        return _run_on_executor(sess, code, env=env, timeout_s=timeout_s)
 
     # Run in-process. Capture stdout so we can replay it after the exec.
     globals_ = _namespace.build_globals()
     buf = io.StringIO()
+    watchdog = _arm_in_process_deadline(timeout_s, buf)
     try:
         with redirect_stdout(buf):
             exec(code_obj if code_obj is not None
@@ -124,6 +138,7 @@ def run_code(code: str, *, session_id: str,
             sys.stderr.write(f"[fix] {fix}\n")
         return 3
     finally:
+        watchdog.cancel()
         # Phase C: tear down the lazy Playwright connection at heredoc end. A
         # no-op when `page`/`context` were never accessed (nothing connected).
         # close() disconnects the CDP transport only — it never closes the
@@ -139,8 +154,45 @@ def run_code(code: str, *, session_id: str,
     return 0
 
 
+def _arm_in_process_deadline(timeout_s: float,
+                             buf: io.StringIO) -> threading.Timer:
+    """Enforce the call deadline on the in-process path, fail-stop.
+
+    Code that never touches the browser surface runs right here, in this
+    short-lived process, so there is no executor to recycle: the process itself
+    is what gets stopped. A watchdog thread is the only thing that can do that
+    to a main thread stuck in a ``time.sleep`` or a busy loop — an exception
+    raised into it could be swallowed by the agent's own ``except Exception``.
+    It replays what the code printed so far, reports ``DeadlineExceeded``, and
+    exits with its code without running any more of the agent's code.
+
+    It writes to ``sys.__stdout__``/``sys.__stderr__`` because the main thread
+    has ``sys.stdout`` redirected into ``buf`` while the code runs."""
+
+    def _expire() -> None:
+        try:
+            err = DeadlineExceeded(timeout=timeout_s)
+            out = sys.__stdout__
+            if out is not None:
+                out.write(buf.getvalue())
+                out.flush()
+            stderr = sys.__stderr__
+            if stderr is not None:
+                stderr.write(json.dumps(serialize(err)) + "\n")
+                stderr.write(f"[fix] {err.fix}\n")
+                stderr.flush()
+        finally:
+            os._exit(DeadlineExceeded.exit_code)
+
+    timer = threading.Timer(max(timeout_s, 0.001), _expire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def _run_on_executor(sess, code: str, *,
-                     env: dict[str, str] | None = None) -> int:
+                     env: dict[str, str] | None = None,
+                     timeout_s: float = DEFAULT_CALL_TIMEOUT_S) -> int:
     """Ship the whole code body to the session's persistent executor and replay
     its response locally (Phase B path).
 
@@ -154,7 +206,8 @@ def _run_on_executor(sess, code: str, *,
 
     try:
         # ExecutorUnavailable is a BrowserwrightError subclass — caught below.
-        resp = run_on_executor(sess, code, env=env)
+        resp = run_on_executor(
+            sess, code, env=env, timeout_ms=max(1, int(timeout_s * 1000)))
     except BrowserwrightError as e:
         sys.stderr.write(json.dumps(serialize(e)) + "\n")
         return e.exit_code
