@@ -238,6 +238,11 @@ tab group), so open one for work you will *return to*, not for each step.
 - **The failure mode is per-step tabs**, e.g. one new tab per search result
   you glance at — not the act of opening a tab itself.
 - **Never close the browser or context.** Do NOT call `browser.close()`, `context.close()`, or `page.close()` — those would close the user's real tabs. Browserwright tears down short-lived client transports for you; the tabs stay open.
+- **Session tabs are muted on extension.** Every tab in a session's tab group
+  is muted by default so it cannot make noise at the user. Only the speaker
+  output is silenced — page-level media (`play()`, events, `el.muted`) behaves
+  normally. If a task genuinely needs audible sound, ask the user to untick
+  "Mute agent tab groups" in the extension popup.
 - **observe → act → observe.** `snapshot()` to see what is actionable, act through a ref locator, then `snapshot()` again to confirm the result before the next action.
 
 ### Working across several tabs: `tabs()` + `switch_tab()`
