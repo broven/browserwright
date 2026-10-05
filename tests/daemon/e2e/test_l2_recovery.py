@@ -13,33 +13,25 @@ not by a numeric group id, which Chrome recycles on restart.
 from __future__ import annotations
 
 import json
-import time
-from pathlib import Path
 
-from .helpers import SkillResult, run_skill
+from .helpers import (
+    SkillResult,
+    bs_home,
+    drop_ledger_session,
+    locked_ledger,
+    run_skill,
+    seed_ledger_session,
+)
+
+# The BS_HOME helpers.run_skill pins for the extension backend.
+_HOME = bs_home("extension")
 
 
-def _bs_home() -> Path:
-    # Mirror the BS_HOME that helpers.run_skill pins for the extension backend.
-    return Path(__file__).resolve().parent / "_bs_home" / "extension"
-
-
-def _seed_session(sid: str, name: str) -> Path:
+def _seed_session(sid: str, name: str) -> None:
     """Pre-seed a STABLE ledger session (helpers only auto-creates ephemeral
     ones it then deletes; we want one that survives across two run_skill calls
     so the runtime cache persists)."""
-    sessions = _bs_home() / "sessions"
-    sessions.mkdir(parents=True, exist_ok=True)
-    ledger = sessions / "ledger.json"
-    now = time.time()
-    record = {
-        "id": sid, "backend": "extension",
-        "workspace": None, "owner": "attach", "name": name,
-        "created_at": now, "last_seen": now,
-    }
-    ledger.write_text(json.dumps({"next_id": 1, "sessions": {sid: record}}),
-                      encoding="utf-8")
-    return ledger
+    seed_ledger_session(_HOME, sid, backend="extension", name=name)
 
 
 def _payload(result: SkillResult) -> dict:
@@ -93,7 +85,7 @@ def test_recovery_fast_path_across_processes(ext_ready, e2e_daemon):
     transparently recover from the persisted ledger.runtime fast path."""
     rd = e2e_daemon.runtime_dir
     sid = "rec-fast"
-    ledger = _seed_session(sid, "cf-bots")
+    _seed_session(sid, "cf-bots")
     try:
         a = run_skill(script=_OPEN_SCRIPT.format(title="RecoverFast"),
                       backend="extension", runtime_dir=rd,
@@ -109,7 +101,7 @@ def test_recovery_fast_path_across_processes(ext_ready, e2e_daemon):
         # containment (not ==) correctly tolerates it.
         assert "RecoverFast" in _payload(b)["title"]
     finally:
-        ledger.unlink(missing_ok=True)
+        drop_ledger_session(_HOME, sid)
 
 
 def test_recovery_via_group_title_when_runtime_stale(ext_ready, e2e_daemon):
@@ -118,7 +110,7 @@ def test_recovery_via_group_title_when_runtime_stale(ext_ready, e2e_daemon):
     finds the session's group BY TITLE (`<name>-BW<sid>`, ADR-0009)."""
     rd = e2e_daemon.runtime_dir
     sid = "rec-group"
-    ledger = _seed_session(sid, "cf-bots2")
+    _seed_session(sid, "cf-bots2")
     try:
         a = run_skill(script=_OPEN_SCRIPT.format(title="RecoverGroup"),
                       backend="extension", runtime_dir=rd,
@@ -130,11 +122,10 @@ def test_recovery_via_group_title_when_runtime_stale(ext_ready, e2e_daemon):
         # cache holds only `current_target_id` / `updated_at` — no group id is
         # persisted, so nothing here simulates one: the fallback must recover
         # purely from the ledger name (`<name>-BW<sid>`) + live group title.
-        data = json.loads(ledger.read_text())
-        data["sessions"][sid]["runtime"] = {
-            "current_target_id": "ext-tab-999999", "updated_at": 0,
-        }
-        ledger.write_text(json.dumps(data), encoding="utf-8")
+        with locked_ledger(_HOME) as data:
+            data["sessions"][sid]["runtime"] = {
+                "current_target_id": "ext-tab-999999", "updated_at": 0,
+            }
 
         b = run_skill(script=_OPERATE_SCRIPT, backend="extension",
                       runtime_dir=rd, extra_env={"BD_SESSION": sid})
@@ -142,4 +133,4 @@ def test_recovery_via_group_title_when_runtime_stale(ext_ready, e2e_daemon):
             f"title recovery failed; stdout={b.stdout!r} stderr={b.stderr!r}")
         assert "RecoverGroup" in _payload(b)["title"]
     finally:
-        ledger.unlink(missing_ok=True)
+        drop_ledger_session(_HOME, sid)

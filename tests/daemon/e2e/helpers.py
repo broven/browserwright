@@ -5,9 +5,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from .conftest import (
     TEST_CDP_PORT,
@@ -15,6 +18,65 @@ from .conftest import (
     published_endpoint,
     scrubbed_env,
 )
+
+
+def bs_home(backend: str) -> Path:
+    """The isolated BS_HOME (ledger + memory) every e2e caller of `backend`
+    shares — and so does the long-lived test daemon for that backend."""
+    return Path(__file__).resolve().parent / "_bs_home" / backend
+
+
+@contextmanager
+def locked_ledger(home: str | Path) -> Iterator[dict]:
+    """Read-modify-write the ledger under BS_HOME `home` through the production
+    lock.
+
+    This is ``session_registry._locked`` pointed at the isolated BS_HOME, so a
+    harness edit serializes with the CLI subprocesses allocating sessions in
+    the same ledger, and it can only *edit* the ledger — never replace it.
+
+    That distinction is load-bearing. The ledger's ``next_id`` is monotonic and
+    never reused (CONTEXT.md, ``ledger``/``binding``), and the long-lived test
+    daemon relies on it: it remembers every session id it has ended for its
+    whole lifetime and refuses that id again. A harness that rewrote the file
+    from scratch (``{"next_id": 1, ...}``) or deleted it rewound the counter,
+    so the next numbered session a later test minted reused an id the daemon
+    had already ended — ``ensureExecutor failed: browserwright session has
+    ended``. Remove your row instead; leave the file and its counter alone.
+    """
+    from browserwright import session_registry
+
+    prev = os.environ.get("BS_HOME")
+    os.environ["BS_HOME"] = str(home)
+    try:
+        with session_registry._locked() as data:
+            data.setdefault("sessions", {})
+            yield data
+    finally:
+        if prev is None:
+            os.environ.pop("BS_HOME", None)
+        else:
+            os.environ["BS_HOME"] = prev
+
+
+def seed_ledger_session(home: str | Path, sid: str, *, backend: str,
+                        name: str, owner: str = "attach") -> dict:
+    """Add one session row (keyed by a caller-chosen, non-numeric id) to the
+    ledger under `home`, keeping every other row and ``next_id``."""
+    now = time.time()
+    record = {
+        "id": sid, "backend": backend, "workspace": None, "owner": owner,
+        "name": name, "created_at": now, "last_seen": now,
+    }
+    with locked_ledger(home) as data:
+        data["sessions"][sid] = record
+    return record
+
+
+def drop_ledger_session(home: str | Path, sid: str) -> None:
+    """Remove one session row; the ledger file and ``next_id`` stay."""
+    with locked_ledger(home) as data:
+        data["sessions"].pop(sid, None)
 
 
 @dataclass
@@ -74,7 +136,7 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
         if url is not None:
             env["BW_DAEMON_URL"] = url
     # Isolated BS_HOME per backend (ledger + memory).
-    env["BS_HOME"] = str(Path(__file__).resolve().parent / "_bs_home" / backend)
+    env["BS_HOME"] = str(bs_home(backend))
     # Bypass proxy for localhost
     env["no_proxy"] = "127.0.0.1,localhost"
     env["NO_PROXY"] = "127.0.0.1,localhost"
@@ -110,27 +172,9 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
     # backend — the single daemon routes per session (no daemon_endpoint).
     created_session_id = None
     if "BD_SESSION" not in env:
-        import json
-        import time
-
         created_session_id = f"e2e-{uuid.uuid4().hex}"
-        sessions_dir = Path(env["BS_HOME"]) / "sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-        ledger_path = sessions_dir / "ledger.json"
-        now = time.time()
-        record = {
-            "id": created_session_id,
-            "backend": backend,
-            "workspace": None,
-            "owner": "attach",
-            "name": "e2e-run-skill",
-            "created_at": now,
-            "last_seen": now,
-        }
-        ledger_path.write_text(
-            json.dumps({"next_id": 1, "sessions": {created_session_id: record}}),
-            encoding="utf-8",
-        )
+        seed_ledger_session(env["BS_HOME"], created_session_id,
+                            backend=backend, name="e2e-run-skill")
         env["BD_SESSION"] = created_session_id
 
     try:
@@ -144,10 +188,7 @@ def run_skill(script: str, *, backend: str, runtime_dir: str | None = None,
         )
     finally:
         if created_session_id is not None:
-            try:
-                ledger_path.unlink()
-            except OSError:
-                pass
+            drop_ledger_session(env["BS_HOME"], created_session_id)
     return SkillResult(
         returncode=proc.returncode,
         stdout=proc.stdout,

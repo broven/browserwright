@@ -38,7 +38,7 @@ from .conftest import (
     _isolated_runtime_dir,
     endpoint_url,
 )
-from .helpers import run_skill
+from .helpers import bs_home, drop_ledger_session, run_skill, seed_ledger_session
 from .test_l2_multisession import (
     _chrome_close_tabs,
     _extension_id_from_path,
@@ -169,35 +169,14 @@ def _seed_session(runtime_dir: str, backend: str,
     ``session end`` to actually drive the daemon's endSession verb — only a
     create-owned session contacts the daemon on teardown (an attach session
     deliberately leaves the browser untouched, ``session_create.end``)."""
-    bs_home = Path(__file__).resolve().parent / "_bs_home" / backend
-    sessions_dir = bs_home / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    ledger_path = sessions_dir / "ledger.json"
     sid = f"e2e-phasec-{uuid.uuid4().hex}"
-    now = time.time()
-    record = {
-        "id": sid, "backend": backend, "workspace": None, "owner": owner,
-        "name": "e2e-phasec", "created_at": now, "last_seen": now,
-    }
-    # Merge into any existing ledger so we don't clobber other sessions.
-    try:
-        existing = json.loads(ledger_path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        existing = {"next_id": 1, "sessions": {}}
-    existing.setdefault("sessions", {})[sid] = record
-    ledger_path.write_text(json.dumps(existing), encoding="utf-8")
+    seed_ledger_session(bs_home(backend), sid, backend=backend,
+                        name="e2e-phasec", owner=owner)
     return sid
 
 
 def _cleanup_session(backend: str, sid: str) -> None:
-    ledger_path = (Path(__file__).resolve().parent / "_bs_home" / backend
-                   / "sessions" / "ledger.json")
-    try:
-        data = json.loads(ledger_path.read_text())
-        data.get("sessions", {}).pop(sid, None)
-        ledger_path.write_text(json.dumps(data), encoding="utf-8")
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+    drop_ledger_session(bs_home(backend), sid)
 
 
 # The bound targetId is read from the LEDGER between heredocs (the handle
