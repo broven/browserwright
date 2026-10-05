@@ -197,9 +197,9 @@ _CLASSIFIERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "chrome.debugger command at 9s (DEBUGGER_COMMAND_TIMEOUT_MS in "
         "chrome-extension/background.js — a constant, not an env var), and "
         "this navigation took longer to commit. The navigation may still be "
-        "completing in Chrome. Heavy SPAs routinely exceed it; navigate from a "
-        "fresh tab (context.new_page()) instead of reusing one parked on a "
-        "heavy page, and retry",
+        "completing in Chrome: check page.url / snapshot() before retrying, "
+        "and only call page.goto(url) again if the page really did not land. "
+        "Heavy SPAs routinely exceed this one-command budget.",
         ("chrome.debugger.sendcommand timed out", "-32001",
          "chrome.debugger.attach timed out", "chrome.debugger.detach timed out"),
     ),

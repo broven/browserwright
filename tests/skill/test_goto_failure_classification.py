@@ -129,6 +129,22 @@ def test_non_network_causes_do_not_tell_the_user_to_check_the_network():
     assert "check the URL and network" not in err.fix
 
 
+def test_extension_budget_fix_does_not_advise_a_fresh_tab():
+    """GH#116: the old fix told agents to open a fresh tab
+    (``context.new_page()``). That is a real, user-visible tab in the user's
+    Chrome, no agent verb closes one tab, and following the advice piled up
+    tabs the agent could not see or clean up. The fix must instead tell the
+    agent to verify whether the navigation landed before retrying."""
+    err = _fail(_PWError(
+        "Protocol error (Page.navigate): chrome.debugger.sendCommand timed "
+        "out after 9000ms (Page.navigate tabId=7); the command may still "
+        "land in Chrome"))
+    assert err.reason == "extension-budget"
+    assert "new_page" not in err.fix
+    assert "fresh tab" not in err.fix
+    assert "page.url" in err.fix or "snapshot()" in err.fix
+
+
 def test_transport_timeouts_are_not_reported_as_the_site_timing_out():
     """A relay/extension budget expiring is not "the site did not respond"."""
     for msg in (

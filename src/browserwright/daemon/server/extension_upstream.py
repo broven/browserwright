@@ -185,10 +185,26 @@ def make_target_info(*, target_id: str, type: str = "page", url: str = "",
     }
 
 
-def _ghost_target_info(g: GhostTarget) -> dict:
-    """targetInfo for a relay ghost target, as enumerated by the agent path."""
+def _ghost_target_info(g: GhostTarget, live: dict | None = None) -> dict:
+    """targetInfo for a relay ghost target, as enumerated by the agent path.
+
+    ``live`` is an optional live Chrome tab record for the same tab (from the
+    extension's ``chrome.tabs`` group query). When given, its url/title win
+    unconditionally — they are read from Chrome at call time, while the ghost
+    only carries what it saw at create/attach. An empty string is a real live
+    value, not a cue to fall back to the stale cache (GH#116).
+    """
+    url = g.url
+    title = g.title
+    if live is not None:
+        live_url = live.get("url")
+        live_title = live.get("title")
+        if isinstance(live_url, str):
+            url = live_url
+        if isinstance(live_title, str):
+            title = live_title
     return make_target_info(
-        target_id=g.target_id, type=g.type, url=g.url, title=g.title)
+        target_id=g.target_id, type=g.type, url=url, title=title)
 
 
 def _filter_target_infos(infos: list[dict], params: dict) -> list[dict]:
@@ -422,12 +438,15 @@ class ExtensionUpstream:
                 f"{op} did not return a tab group id; the extension failed to "
                 "place the tab in the session tab group")
 
-    async def _group_member_tabs(
+    async def _group_member_infos(
         self, session_id: str | None, *,
         timeout: float | None = None,
-    ) -> tuple[int, list[int]]:
+    ) -> tuple[int, list[dict]]:
         """Resolve the session's live group membership = the source of truth.
-        Returns ``(group_id, [tab_id, ...])``. The group is found by TITLE
+        Returns ``(group_id, [live_tab_info, ...])`` where each entry is the
+        extension's live ``{tabId,url,title,active,lastAccessed}`` record —
+        URL and title are read from Chrome at call time, never from the
+        create/attach-time ghost cache. The group is found by TITLE
         (ADR-0009); the numeric id in the return value is Chrome's current
         handle for it, useful for the rest of this call and nothing longer.
         Empty list when the session has no live group — it never opened a tab,
@@ -472,9 +491,20 @@ class ExtensionUpstream:
                 "extension group membership is unknown: response has no tabs list")
         if session_id and live_gid >= 0:
             self._groups[session_id] = live_gid
+        return live_gid, [t for t in raw_tabs if isinstance(t, dict)]
+
+    async def _group_member_tabs(
+        self, session_id: str | None, *,
+        timeout: float | None = None,
+    ) -> tuple[int, list[int]]:
+        """The tab ids of the session's live group — ``_group_member_infos``
+        reduced to the identity callers that only need membership. Sorted and
+        de-duplicated so the result is stable across a Chrome re-query."""
+        live_gid, infos = await self._group_member_infos(
+            session_id, timeout=timeout)
         tabs = sorted({
-            t.get("tabId") for t in raw_tabs
-            if isinstance(t, dict) and isinstance(t.get("tabId"), int)
+            t.get("tabId") for t in infos
+            if isinstance(t.get("tabId"), int)
         })
         return (live_gid, list(tabs))
 
@@ -788,15 +818,31 @@ class ExtensionUpstream:
         groupId); we filter the global ghost list down to tabs that belong to
         this session's group so two sessions sharing one Chrome stay mutually
         invisible at enumeration. Shape matches the unscoped ``Target.getTargets``
-        interception."""
-        _gid, member_tabs = await self._group_member_tabs(session_id)
-        members = set(member_tabs)
+        interception.
+
+        URL and title come from the LIVE group query (GH#116): the relay's
+        GhostTarget cache only records them at create/attach time, so a tab
+        that attached on ``about:blank`` and later navigated would otherwise
+        enumerate as ``about:blank`` — and ``session_tabs(include_internal=
+        False)`` would drop it, hiding real tabs from ``tabs()``. Only the
+        ghost row decides visibility (so an unattached group member is not
+        announced as a Playwright target); the live query decides its url.
+        """
+        _gid, member_records = await self._group_member_infos(session_id)
+        live_by_tab: dict[int, dict] = {}
+        for record in member_records:
+            tab_id = record.get("tabId")
+            if isinstance(tab_id, int):
+                live_by_tab[tab_id] = record
         out: list[dict] = []
         for g in self._relay.list_ghost_targets():
             tab_id = _tab_id_from_target_id(g.target_id)
-            if tab_id is None or tab_id not in members:
+            if tab_id is None:
                 continue
-            out.append(_ghost_target_info(g))
+            live = live_by_tab.get(tab_id)
+            if live is None:
+                continue
+            out.append(_ghost_target_info(g, live))
         return out
 
     @property

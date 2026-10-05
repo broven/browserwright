@@ -251,3 +251,16 @@ def test_switch_tab_no_tabs_at_all(fake_session):
     fake.responses["Target.getTargets"] = {"targetInfos": []}
     with pytest.raises(TabMatchError, match="no open tabs"):
         switch_tab("anything")
+
+
+def test_runtime_guide_allows_closing_session_created_tabs():
+    """GH#116: the guide banned ``page.close()`` outright, so an agent that
+    opened a workstream tab had no supported way to close it again. The ban
+    must narrow to what is actually destructive — ``browser.close()`` /
+    ``context.close()`` and tabs the user owns."""
+    from browserwright.skill_doc import render
+
+    doc = render()
+    assert "page.close()" in doc
+    assert "context.new_page()" in doc
+    assert "Do NOT call `browser.close()`, `context.close()`, or `page.close()`" not in doc

@@ -64,9 +64,11 @@ browserwright session end --session=$sid
 `attach-active` asks the extension to move Chrome's currently-focused-window
 active tab into the session's tab group and bind it as the session's page.
 After that, the adopted tab behaves exactly like a tab the agent opened
-itself: `page` is live on it, new pages join the same group, and `session
-end` closes it with the group. There is no borrowed/owned distinction — the
-adopted tab is a regular member.
+itself: `page` is live on it, and new pages join the same group. There is no
+borrowed/owned distinction in the daemon — the adopted tab is a regular
+member, and `session end` closes it with the group. But it is still the
+user's tab: close it only through `session end`, never on its own with
+`page.close()`.
 
 Failure mode: the daemon REFUSES if the focused tab already sits in any tab
 group other than this session's own — the user's own manual tab groups count
@@ -237,7 +239,7 @@ tab group), so open one for work you will *return to*, not for each step.
   will not return to the page, don't leave a tab behind.
 - **The failure mode is per-step tabs**, e.g. one new tab per search result
   you glance at — not the act of opening a tab itself.
-- **Never close the browser or context.** Do NOT call `browser.close()`, `context.close()`, or `page.close()` — those would close the user's real tabs. Browserwright tears down short-lived client transports for you; the tabs stay open.
+- **Close only tabs this session opened.** `page.close()` is allowed on a page you created with `context.new_page()`: it closes that one session tab and leaves the rest — and the browser — alone. Never call `browser.close()` or `context.close()`, and never close a tab the user brought into the session with `attach-active`: that is their tab, not yours. Browserwright tears down short-lived client transports for you; any tab you leave open stays open.
 - **Session tabs are muted on extension.** Every tab in a session's tab group
   is muted by default so it cannot make noise at the user. Only the speaker
   output is silenced — page-level media (`play()`, events, `el.muted`) behaves
