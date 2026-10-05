@@ -63,6 +63,7 @@ from typing import Any
 from websockets.asyncio.server import ServerConnection
 
 from ... import session_registry
+from . import call_deadline
 from .extension_upstream import (
     ExtensionUpstream,
     _tab_id_from_target_id,
@@ -462,6 +463,14 @@ class ExtensionFacadeBridge:
         # it here because it talks raw flat-session CDP to Playwright. ---
         await self._forward_session_command(req_id, session_id, method, params)
 
+    def _command_wait_s(self) -> float | None:
+        """How long a forwarded command may wait in the relay: derived from
+        the deadline of the agent call currently running on this session
+        (ADR-0014; see `call_deadline.command_wait_s`), or ``None`` — the
+        relay's own default — when no call is bound (a raw Playwright client,
+        or Playwright traffic between calls)."""
+        return call_deadline.command_wait_s(self._session_id)
+
     async def _forward_session_command(self, req_id: int | None,
                                        session_id: str, method: str | None,
                                        params: dict) -> None:
@@ -477,7 +486,8 @@ class ExtensionFacadeBridge:
         # targetId we handed Playwright) must target the REAL Chrome frame id.
         self._rewrite_command_frame_id(tab_id, params)
         try:
-            result = await self._relay.send_cdp(tab_id, method or "", params)
+            result = await self._relay.send_cdp(
+                tab_id, method or "", params, timeout=self._command_wait_s())
             # PR3: real Chrome makes a page's TOP frame id === its targetId, and
             # CRPage keys its frame→session map on the targetId
             # (`_sessions.set(targetId, mainFrameSession)`) then resolves the
@@ -687,9 +697,13 @@ class ExtensionFacadeBridge:
             # Force re-emission of executionContextCreated for the existing
             # default context: disable → pause → enable.
             with contextlib.suppress(_CommandError, Exception):
-                await self._relay.send_cdp(tab_id, "Runtime.disable", {})
+                await self._relay.send_cdp(
+                    tab_id, "Runtime.disable", {},
+                    timeout=self._command_wait_s())
             await asyncio.sleep(_RUNTIME_REENABLE_PAUSE)
-            result = await self._relay.send_cdp(tab_id, "Runtime.enable", params)
+            result = await self._relay.send_cdp(
+                tab_id, "Runtime.enable", params,
+                timeout=self._command_wait_s())
         except _CommandError as e:
             self._disarm_context_waiter(tab_id, waiter)
             await self._error(req_id, e.code, e.message, session_id=session_id)

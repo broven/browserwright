@@ -168,16 +168,19 @@ def _bounded_timeout(total_ms: int, cap_ms: int) -> int:
 # used to collapse everything non-timeout into "network", which told users to
 # check their connection while the real failure was in the CDP/relay layer.
 #
-# The concrete accident this replaces: the extension caps every
-# `chrome.debugger.sendCommand` at 9000ms (`DEBUGGER_COMMAND_TIMEOUT_MS` in
-# chrome-extension/background.js) and reports the breach as "... timed out
-# after 9000ms ...". That string contains "timed out" but NOT "timeout", so it
-# missed the timeout check and fell into the second, identical branch —
-# `network`. A whole crawl's worth of "the extension's navigate budget expired
-# on a slow page" was reported to the operator as "check your network".
+# The concrete accident this replaced: the extension used to cap every
+# `chrome.debugger.sendCommand` at a fixed 9000ms and reported the breach as
+# "... timed out after 9000ms ...". That string contains "timed out" but NOT
+# "timeout", so it missed the timeout check and fell into a branch identical
+# to `network`: a whole crawl's worth of "the navigate budget expired on a
+# slow page" was reported to the operator as "check your network".
+#
+# Since ADR-0014 that budget no longer exists: the extension's bound is
+# derived from the caller's remaining call deadline. Its breach is therefore
+# the caller's own deadline running out, and lands in the ordinary `timeout`
+# bucket — see `_TIMEOUT_NEEDLES`.
 _REASON_TIMEOUT = "timeout"
 _REASON_NETWORK = "network"
-_REASON_EXT_BUDGET = "extension-budget"
 _REASON_NAV_INTERRUPTED = "navigation-interrupted"
 _REASON_TARGET_CLOSED = "target-closed"
 _REASON_FRAME_DETACHED = "frame-detached"
@@ -186,23 +189,21 @@ _REASON_UNKNOWN = "unknown"
 
 _DETAIL_MAX = 300
 
+# The extension's chrome.debugger timeout (code -32001). Its bound is the
+# caller's remaining call deadline (ADR-0014), so it is a timeout like any
+# other. Checked before `_CLASSIFIERS`, whose `cdp-transport` bucket would
+# otherwise claim it on the bare "chrome.debugger" needle.
+_TIMEOUT_NEEDLES = (
+    "chrome.debugger.sendcommand timed out", "-32001",
+    "chrome.debugger.attach timed out", "chrome.debugger.detach timed out",
+)
+
 # Ordered most-specific-first; the first entry whose needle appears in the
 # lowercased message wins. Transport buckets deliberately sit ABOVE the generic
-# timeout bucket: a relay/extension budget that expires is NOT the site failing
-# to respond, and saying so sends the operator to the wrong layer.
+# timeout bucket: a relay transport fault that happens to mention a timeout is
+# NOT the site failing to respond, and saying so sends the operator to the
+# wrong layer.
 _CLASSIFIERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    (
-        _REASON_EXT_BUDGET,
-        "NOT a network problem: the browserwright extension caps every "
-        "chrome.debugger command at 9s (DEBUGGER_COMMAND_TIMEOUT_MS in "
-        "chrome-extension/background.js — a constant, not an env var), and "
-        "this navigation took longer to commit. The navigation may still be "
-        "completing in Chrome: check page.url / snapshot() before retrying, "
-        "and only call page.goto(url) again if the page really did not land. "
-        "Heavy SPAs routinely exceed this one-command budget.",
-        ("chrome.debugger.sendcommand timed out", "-32001",
-         "chrome.debugger.attach timed out", "chrome.debugger.detach timed out"),
-    ),
     (
         # net::ERR_ABORTED is NOT a network condition: Chrome emits it when a
         # navigation is cancelled — superseded by another goto, turned into a
@@ -267,14 +268,19 @@ def _detail_for(exc: BaseException) -> str:
 def _classify(exc: BaseException) -> tuple[str, str]:
     """Map a navigation exception to (reason, fix)."""
     lower = str(exc).lower()
+    timeout = (
+        _REASON_TIMEOUT,
+        "site did not respond at commit in time; the navigation may still "
+        "land, so check page.url / snapshot() before retrying page.goto(url), "
+        "and verify the site with http_get(url)",
+    )
+    if any(needle in lower for needle in _TIMEOUT_NEEDLES):
+        return timeout
     for reason, fix, needles in _CLASSIFIERS:
         if any(needle in lower for needle in needles):
             return reason, fix
     if "timeout" in lower or "timed out" in lower or type(exc).__name__ == "TimeoutError":
-        return (
-            _REASON_TIMEOUT,
-            "site did not respond at commit; verify it with http_get(url) or retry",
-        )
+        return timeout
     return (
         _REASON_UNKNOWN,
         "unrecognised navigation failure — do NOT assume it is the network; "
