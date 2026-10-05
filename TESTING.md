@@ -59,7 +59,13 @@ The gate is walled off from the developer's real global daemon by an autouse
 fixture in `tests/conftest.py`. It redirects `XDG_RUNTIME_DIR` (so a
 `cleanup_endpoint()` cannot unlink the live daemon's control socket, which would
 make its watchdog self-exit) and neuters the two daemon cold-start entry points,
-with a raising backstop on the low-level detached spawn. `tests/daemon/e2e/` is
+with a raising backstop on the low-level detached spawn. It also redirects
+`TMPDIR`, `BS_HOME` and `XDG_CACHE_HOME`, which the daemon log, the sessions
+ledger and the Chrome-profile cache resolve from — unredirected, unit tests
+appended fake `LIFECYCLE` lines to the global daemon's log and rewrote
+`~/.browserwright/sessions/ledger.json`. An audit hook refuses, and fails the
+test for, any write that still lands on the global install's files or any
+connect to ports 19989/19990. `tests/daemon/e2e/` is
 exempt — it starts real daemons deliberately, behind its own port isolation.
 
 Before this existed, `mise run test` reliably evicted the machine-global daemon

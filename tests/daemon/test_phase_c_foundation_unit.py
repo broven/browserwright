@@ -205,6 +205,15 @@ def test_status_json_includes_endpoint_and_cdp_surface(monkeypatch, capsys):
     monkeypatch.setattr(
         _ipc, "ping_status_sync",
         lambda timeout=1.0: _ipc.PongInfo(pid=4242, version="0.15.1"))
+    # The pong is stubbed, so the session-row enrichment would otherwise GET
+    # `/__status__` from whatever really listens on 19990: the developer's
+    # global daemon.
+    from browserwright.daemon.probe import DaemonProbe
+
+    async def _no_rows(self, timeout=1.0):
+        return None
+
+    monkeypatch.setattr(DaemonProbe, "session_rows", _no_rows)
 
     class _Args:
         json = True

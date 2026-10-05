@@ -100,3 +100,46 @@ def test_the_wall_exempts_the_e2e_suite():
     assert root_conftest._is_e2e(root / "tests/daemon/e2e/test_x.py", root)
     assert not root_conftest._is_e2e(root / "tests/daemon/test_x.py", root)
     assert not root_conftest._is_e2e(root / "tests/skill/test_x.py", root)
+
+
+
+def _live_root_conftest():
+    """The `tests/conftest.py` module pytest actually loaded.
+
+    Not `_root_conftest()`: re-executing it now would snapshot the global
+    state paths from an environment the wall has already redirected.
+    """
+    import sys
+
+    want = Path(__file__).resolve().parents[1] / "conftest.py"
+    return next(m for m in list(sys.modules.values())
+                if getattr(m, "__file__", None)
+                and Path(m.__file__).resolve() == want)
+
+
+def test_global_state_paths_resolve_into_the_test_dirs():
+    """Vector C: the daemon log, sessions ledger and profile cache are
+    redirected. Before this, `cli stop` / `restart` unit tests appended fake
+    `LIFECYCLE` lines to the developer's real daemon log, and the issue-86
+    rebind tests rewrote the real sessions ledger."""
+    from browserwright import session_registry
+    from browserwright.daemon import _ipc, platforms
+
+    conftest = _live_root_conftest()
+    for resolved in (_ipc.log_path(), session_registry._ledger_path(),
+                     platforms.cache_dir()):
+        assert conftest._global_hit(resolved) is None, resolved
+
+
+def test_a_write_to_the_real_daemon_log_is_refused():
+    """Vector C backstop: a path that ignores the redirected env vars is still
+    stopped, and named. Opened for append with nothing written, so even a
+    disarmed guard leaves the real log byte-for-byte unchanged."""
+    conftest = _live_root_conftest()
+    real_log = next(p for p in conftest._GLOBAL_STATE
+                    if p.endswith("/browserwright-daemon.log"))
+    with pytest.raises(PermissionError):
+        open(real_log, "a").close()
+    # Consume the recorded hit so the wall's teardown does not fail this test.
+    assert conftest._guard["hits"] == [f"open {real_log}"]
+    conftest._guard["hits"].clear()
