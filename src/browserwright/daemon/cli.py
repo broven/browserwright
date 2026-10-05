@@ -603,7 +603,7 @@ async def _run_backend_info(args, cfg: Config) -> int:
 
 
 def _cmd_activity(args, cfg: Config) -> int:
-    """ADR-0012 rule 4: the one gate every "don't disturb live sessions"
+    """ADR-0012 rule 2: the one gate every "don't disturb live sessions"
     script consults. Exit 0 when nobody would be interrupted, 4 when someone
     would (reasons on stdout / in the JSON), 0 with ``determinate: false``
     when the daemon could not be asked (nothing to interrupt)."""

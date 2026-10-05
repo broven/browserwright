@@ -499,8 +499,7 @@ exit {daemon_rc}
         **os.environ,
         "HOME": str(home),
         "PATH": f"{fake_path}{os.pathsep}{os.environ['PATH']}",
-        # The gate promises to remove all of these before invoking the global
-        # command.  The fake records whether that actually happened.
+        # Dev-shaped environment; the fake daemon records any call it gets.
         "XDG_RUNTIME_DIR": "/must-not-leak/xdg",
         "TMPDIR": "/must-not-leak/tmp",
         "BS_HOME": "/must-not-leak/home",
@@ -509,7 +508,10 @@ exit {daemon_rc}
     return env, uv_log, daemon_log
 
 
-def test_e2e_activity_exit_four_refuses_before_pytest(tmp_path):
+def test_e2e_runs_even_when_the_global_daemon_is_busy(tmp_path):
+    # e2e is fully isolated from the global install (own ports, runtime dir,
+    # ledger and Chrome for Testing), so a busy global daemon must neither
+    # be consulted nor stop the run (ADR-0012 rule 4, amended 2026-10-05).
     env, uv_log, daemon_log = _e2e_fake_environment(tmp_path, daemon_rc=4)
 
     proc = subprocess.run(
@@ -517,28 +519,7 @@ def test_e2e_activity_exit_four_refuses_before_pytest(tmp_path):
         text=True, capture_output=True, env=env, cwd=REPO, timeout=20,
     )
 
-    assert proc.returncode == 4
-    assert "refusing to start e2e" in proc.stderr
-    assert "session-7" in proc.stderr
-    invocations = uv_log.read_text().splitlines()
-    assert len(invocations) == 1
-    assert "_e2e_ports.py" in invocations[0]
-    line = daemon_log.read_text().strip()
-    assert line.startswith("activity|")
-    assert "XDG=unset|TMP=unset|HOMEVAR=unset|URL=unset" in line
-
-
-def test_e2e_force_bypasses_activity_and_reaches_pytest(tmp_path):
-    env, uv_log, daemon_log = _e2e_fake_environment(tmp_path, daemon_rc=4)
-    env["E2E_FORCE"] = "1"
-
-    proc = subprocess.run(
-        ["bash", str(REPO / "tests/daemon/e2e/run.sh"), "chosen_test.py", "-q"],
-        text=True, capture_output=True, env=env, cwd=REPO, timeout=20,
-    )
-
-    # The fake uv's distinctive final code proves run.sh reached its pytest
-    # exec instead of silently treating force as success.
+    # The fake uv's distinctive final code proves run.sh reached pytest.
     assert proc.returncode == 23
     assert not daemon_log.exists()
     invocations = uv_log.read_text().splitlines()
