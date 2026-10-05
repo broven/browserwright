@@ -351,9 +351,23 @@ function buildScript(query: string, limit: number, outPath: string, searchUrl: s
 		'    elif "neterror" in html and "error-code" in html:',
 		'        payload = {"blocked": "the browser could not reach the search engine"}',
 		"    else:",
-		"        rows = data.get(\"results\") or []",
+		"        rows = (data.get(\"results\") or [])[:LIMIT]",
+		// A signed-out profile (e.g. a remote CloakBrowser) gets opaque
+		// `/goto?url=<token>` hrefs with the target nowhere in the DOM. The
+		// redirect answers with a 302 to the real URL inside this same browser
+		// context; on any failure keep the goto link rather than drop the row.
+		"        for row in rows:",
+		'            if "/goto?" not in (row.get("url") or ""):',
+		"                continue",
+		"            try:",
+		'                r = page.request.get(row["url"], max_redirects=0, timeout=10000)',
+		'                loc = r.headers.get("location")',
+		'                if r.status in (301, 302, 303, 307, 308) and loc and loc.startswith("http"):',
+		'                    row["url"] = loc',
+		"            except Exception:",
+		"                pass",
 		"        payload = {",
-		'            "results": rows[:LIMIT],',
+		'            "results": rows,',
 		'            "url": page.url,',
 		'            "answerBox": data.get("answerBox"),',
 		'            "knowledgeGraph": data.get("knowledgeGraph"),',
