@@ -86,6 +86,53 @@ def test_bad_max_chars_is_rejected():
     assert _run("https://e.com", "--max-chars=lots") == 1
 
 
+def _forbid_session(monkeypatch):
+    from browserwright import session_create
+
+    def _no_session(**_kw):
+        raise AssertionError("a session was minted during validation")
+
+    monkeypatch.setattr(session_create, "new", _no_session)
+
+
+def test_bad_attach_target_is_rejected_before_a_session_is_created(monkeypatch):
+    """`--attach` takes the same values as `session new --attach`, and a bad one
+    must be refused before the ledger or the daemon is touched — a bare
+    host:port, a bare flag (parses to True, which once pinned port 1), and a
+    non-CDP scheme."""
+    _forbid_session(monkeypatch)
+    assert _run("https://e.com", "--attach=cdp.example:9222") == 1
+    assert _run("https://e.com", "--attach") == 1
+    assert _run("https://e.com", "--attach=ftp://cdp.example") == 1
+    assert _run("https://e.com", "--attach=0") == 1
+
+
+def test_attach_conflicts_with_the_extension_backend(monkeypatch):
+    _forbid_session(monkeypatch)
+    assert _run("https://e.com", "--backend=extension",
+                "--attach=wss://cdp.example") == 1
+
+
+def test_attach_borrows_the_browser_instead_of_launching_one(monkeypatch):
+    """The session is minted as a cdp ATTACH (create=False): a remote browser
+    someone else owns must never be confused with one we launch and later
+    close. Stops at session creation, so no browser is involved."""
+    from browserwright import session_create
+
+    seen: dict = {}
+
+    def _record(**kw):
+        seen.update(kw)
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(session_create, "new", _record)
+    target = "https://cdp.example.ts.net"
+    assert _run("https://e.com", f"--attach={target}") == 1
+    assert seen["backend"] == "cdp"
+    assert seen["create"] is False
+    assert seen["attach"] == target
+
+
 def test_markdown_command_is_registered_in_the_help_banner():
     from browserwright.cli import HELP
 
