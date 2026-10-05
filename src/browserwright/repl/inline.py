@@ -127,13 +127,24 @@ def run_code(code: str, *, session_id: str,
     except SystemExit as e:
         sys.stdout.write(buf.getvalue())
         return int(e.code) if isinstance(e.code, int) else 0
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         sys.stdout.write(buf.getvalue())
         sys.stderr.write(traceback.format_exc())
+        # ADR-0014: an uncaught Playwright TimeoutError is reported as an
+        # operation timeout (exit 8), the same as on the executor path. Only
+        # look when Playwright is loaded: a Playwright error implies it is,
+        # and checking must not import its driver stack for every failure.
+        if "playwright.sync_api" in sys.modules:
+            from ..errors import operation_timeout_from
+            op = operation_timeout_from(e)
+            if op is not e:
+                sys.stderr.write(json.dumps(serialize(op)) + "\n")
+                sys.stderr.write(f"[fix] {op.fix}\n")
+                return op.exit_code
         # C: surface the recovery hint for raw Playwright failures (target
         # closed etc.) instead of dropping it with the traceback.
         from ..errors import playwright_error_fix
-        fix = playwright_error_fix(sys.exc_info()[1])
+        fix = playwright_error_fix(e)
         if fix:
             sys.stderr.write(f"[fix] {fix}\n")
         return 3

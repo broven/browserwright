@@ -26,6 +26,7 @@ and a generous client-owned wait.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import io
 import json
 import os
@@ -44,6 +45,7 @@ from .._text import spill_text, truncate_hard
 from ..errors import (
     BrowserwrightError,
     DeadlineExceeded,
+    OperationTimeout,
     TabRebindFailed,
     serialize,
 )
@@ -325,20 +327,41 @@ class _Worker:
         exits the whole executor process, which lets the OS tear down the
         Playwright transport without touching browser tabs."""
         box: "queue.Queue[ExecuteResponse]" = queue.Queue(maxsize=1)
+        budget_s = max(req.timeout_ms, 1) / 1000.0
+        deadline = time.monotonic() + budget_s
         self._q.put((req, box))
         try:
-            return box.get(timeout=max(req.timeout_ms, 1) / 1000.0)
+            response = box.get(timeout=budget_s)
         except queue.Empty:
-            # The one place the internal terminal reason becomes the
-            # caller-facing error (ADR-0014): `terminal_reason` stays the
-            # daemon/client's signal to reap this exact process, while the
-            # agent reads `DeadlineExceeded` (exit 7) and its `--timeout` fix.
-            exc = DeadlineExceeded(timeout=req.timeout_ms / 1000.0)
-            return ExecuteResponse(
-                error=serialize(exc),
-                exit_code=exc.exit_code,
-                terminal_reason=TERMINAL_DEADLINE_EXCEEDED,
-            )
+            return self._deadline_exceeded(req)
+        # ADR-0014, the 7-vs-8 race: a call that FAILED once its deadline had
+        # run out failed because of the deadline. Classify by the clock, not by
+        # which thread happened to win the hand-off: a Playwright timeout that
+        # fires at the deadline (its `timeout=` was >= what was left, so the
+        # deadline was the binding cap) and a relay command cut short by the
+        # propagated deadline (#120; it lands `INNER_GRACE_S` after it) can
+        # reach this box at or after the deadline. They are the call
+        # deadline's, never an `OperationTimeout`. A call that finished is
+        # left alone: its work is done, there is nothing to blame.
+        if response.error is not None and time.monotonic() >= deadline:
+            late = self._deadline_exceeded(req)
+            return dataclasses.replace(
+                response, error=late.error, exit_code=late.exit_code,
+                terminal_reason=late.terminal_reason)
+        return response
+
+    @staticmethod
+    def _deadline_exceeded(req: ExecuteRequest) -> ExecuteResponse:
+        """The one place the internal terminal reason becomes the
+        caller-facing error (ADR-0014): `terminal_reason` stays the
+        daemon/client's signal to reap this exact process, while the agent
+        reads `DeadlineExceeded` (exit 7) and its `--timeout` fix."""
+        exc = DeadlineExceeded(timeout=req.timeout_ms / 1000.0)
+        return ExecuteResponse(
+            error=serialize(exc),
+            exit_code=exc.exit_code,
+            terminal_reason=TERMINAL_DEADLINE_EXCEEDED,
+        )
 
     def shutdown(self) -> None:
         self._q.put(None)
@@ -908,8 +931,13 @@ class _Worker:
                     if _is_target_closed_family(e):
                         return self._target_closed_response(
                             buf, serialize(e), e.exit_code)
+                    error = serialize(e)
+                    if isinstance(e, OperationTimeout):
+                        # Smart goto's timeout: keep the traceback, which
+                        # says WHICH call ran out.
+                        error["traceback"] = traceback.format_exc()
                     return self._finish(
-                        buf, error=serialize(e), exit_code=e.exit_code)
+                        buf, error=error, exit_code=e.exit_code)
                 except SystemExit as e:
                     code = int(e.code) if isinstance(e.code, int) else 0
                     return self._finish(buf, exit_code=code)
@@ -917,8 +945,24 @@ class _Worker:
                     # Restore traceback fidelity: the in-process path writes
                     # `traceback.format_exc()` to stderr; a shipped heredoc must
                     # show the SAME traceback. We carry it on the serialized error.
-                    from ..errors import playwright_error_fix
+                    from ..errors import (
+                        operation_timeout_from,
+                        playwright_error_fix,
+                    )
 
+                    op = operation_timeout_from(e)
+                    if op is not e:
+                        # ADR-0014: inside the code a Playwright call raises
+                        # Playwright's own TimeoutError (we never patch it);
+                        # escaping the code, it is REPORTED as an operation
+                        # timeout — exit 8, executor kept. The traceback (the
+                        # original frames, ending in the reported type) says
+                        # which call ran out.
+                        error = serialize(op)
+                        error["traceback"] = "".join(
+                            traceback.format_exception(op))
+                        return self._finish(
+                            buf, error=error, exit_code=op.exit_code)
                     error = {
                         "type": type(e).__name__,
                         "msg": str(e),

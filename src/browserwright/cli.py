@@ -31,7 +31,9 @@ Usage:
 
       --timeout SECONDS  the call deadline (default 90). When it runs out the
                          code is stopped, its executor is recycled, and the
-                         command exits 7 (DeadlineExceeded).
+                         command exits 7 (DeadlineExceeded). One Playwright
+                         call running out of its own timeout= exits 8
+                         (OperationTimeout) when the code does not catch it.
 
   browserwright session new --backend=<extension|cdp> --name=SESSION_LABEL [--reuse] [--create | --attach=PORT]
   browserwright recover --session=<id>          (the one recovery verb: exit 0 healthy, 4 needs-human)
