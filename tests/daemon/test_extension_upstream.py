@@ -900,6 +900,49 @@ async def test_scoped_target_infos_filters_ghosts_to_session_group(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_scoped_target_infos_reports_live_url_not_stale_ghost(
+    monkeypatch,
+):
+    """GH#116: a tab navigated after attach must enumerate with its LIVE url.
+
+    The relay's per-tab record (GhostTarget) only captures url/title at
+    create/attach time, so a tab parked on ``about:blank`` and then navigated
+    is cached as ``about:blank`` forever. scoped_target_infos must take the
+    url/title from the live group query, not that cache — otherwise
+    ``session_tabs(include_internal=False)`` drops every navigated tab as
+    internal and ``tabs()`` returns [] while real tabs exist.
+    """
+    async with _ext_upstream() as (relay, upstream, captured, ext):
+        # Attached while still blank — the cache now says about:blank. It will
+        # never be updated by the navigation that follows.
+        await ext.announce_attached(tab_id=1, url="about:blank", title="")
+        await asyncio.sleep(0.05)
+
+        _ledger(monkeypatch, "A", "Agent")
+        upstream._bind_group("A", 100)
+
+        async def respond_query():
+            cmd = await ext.next_command()
+            assert cmd["type"] == "queryGroup"
+            assert cmd.get("groupName") == "Agent-BWA"
+            await ext.respond(cmd["id"], result={
+                "groupId": 100,
+                "tabs": [{"tabId": 1, "url": "https://landed.example/x",
+                          "title": "Landed", "active": True,
+                          "lastAccessed": 2}],
+            })
+
+        r = asyncio.create_task(respond_query())
+        infos = await upstream.scoped_target_infos(session_id="A")
+        await r
+
+        assert len(infos) == 1
+        assert infos[0]["targetId"] == "ext-tab-1"
+        assert infos[0]["url"] == "https://landed.example/x"
+        assert infos[0]["title"] == "Landed"
+
+
+@pytest.mark.asyncio
 async def test_end_session_refuses_to_treat_unknown_membership_as_empty():
     class _DisconnectedRelay:
         port = 19989
