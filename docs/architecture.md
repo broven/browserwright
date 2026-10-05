@@ -390,8 +390,9 @@ tests/
 chrome-extension/         ← MV3 unpacked extension; NOT in the wheel, ships as a
                             GitHub Release zip (see version.py:165)
 pi-extension/             ← `@browserwright/pi`, the pi agent's web_fetch +
-                            web_search; NOT in the wheel, ships to npm. A CLI
-                            consumer that lives in-repo — see ADR-0008.
+                            web_search; NOT in the wheel, ships to npm. One CLI
+                            call per tool (`markdown` / `search`) — see
+                            ADR-0008 and ADR-0015.
 ```
 
 Both of the last two are published from the same git tag as the wheel, by their

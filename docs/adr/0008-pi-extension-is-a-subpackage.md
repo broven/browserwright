@@ -27,6 +27,8 @@ new` 的 stdout 分流、错误 envelope 的形状和退出码，而这些没有
 
 ## 抓取逻辑留在 JS 侧
 
+> 已被 [ADR-0015](0015-search-is-a-cli-command.md) 推翻：搜索提取搬进了 `browserwright search`，链引擎与 fallback 一并删除。
+
 `web_search` 需要 DOM 提取——实测 `browserwright markdown` 的输出解析不出搜索结果：
 `--mode=auto` 会丢掉标题和链接，`--mode=full` 里标题和面包屑粘连、还混进 YouTube 章
 节时间戳。而 DOM 提取要管会话生命周期。
@@ -76,6 +78,8 @@ AI Overview 是流式后注入的,初始 HTML 里逐字符搜不到。解析文�
 东西,所以"用浏览器取"这一步省不掉。
 
 ## 只保留 browserwright 的 provider
+
+> 链引擎部分已被 [ADR-0015](0015-search-is-a-cli-command.md) 推翻。
 
 搬迁时砍掉了 jina / cloudflare / curl 三个 rung。这个包的定位是「browserwright 官方
 pi 扩展」，不是「一个通用的 web 工具包」。

@@ -218,7 +218,7 @@ jobs:
 
       - name: Run pi extension tests
         working-directory: pi-extension
-        run: node --test 'core/*.test.ts'
+        run: node --test '*.test.ts'
 
       - name: Publish to npm
         working-directory: pi-extension

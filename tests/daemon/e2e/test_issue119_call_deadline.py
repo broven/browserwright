@@ -359,25 +359,26 @@ def test_pi_fetch_rung_forwards_its_timeout(
 ):
     """AC3 (pi): the `bw_web_fetch` timeout parameter reaches the executor.
 
-    Runs the shipped `browserwright` fetch rung through the pi extension's own
-    command executor — the code path `bw_web_fetch` takes — against the
-    12s-commit page with a 3s call deadline. The rung must fail with exit 7
-    and the `--timeout` fix, well before the page would have committed."""
+    Runs the pi extension's own CLI call — `runBrowserwright` with the argv
+    `bw_web_fetch` builds — against the 12s-commit page with a 3s call
+    deadline. It must fail with DeadlineExceeded and the `--timeout` fix, well
+    before the page would have committed."""
     pytest.importorskip("playwright.sync_api")
     node = _node_with_type_stripping()
     if node is None:
         pytest.skip("needs node >= 23.6 (unflagged TS type stripping)")
     runtime_dir, _ = _ext_autofacade_ready
     script = (
-        "import { readFileSync } from 'node:fs';\n"
-        "import { execCommand } from './core/exec-command.ts';\n"
-        "const provider = JSON.parse(readFileSync('./providers/browserwright.json', 'utf8'));\n"
+        "import { runBrowserwright } from './browserwright.ts';\n"
         # `node -e` puts the first script argument at argv[1].
         "const [, url, deadline] = process.argv;\n"
         "const callTimeoutS = deadline ? Number(deadline) : undefined;\n"
         "const started = Date.now();\n"
-        "const outcome = await execCommand(provider, url, "
-        "{ dir: process.cwd(), role: 'fetch', timeoutMs: 30000, callTimeoutS });\n"
+        "let outcome;\n"
+        "try {\n"
+        "  const { stdout } = await runBrowserwright(['markdown', url, '--max-chars=50000', '--name=pi-webfetch'], { callTimeoutS });\n"
+        "  outcome = { ok: true, content: stdout };\n"
+        "} catch (e) { outcome = { ok: false, reason: e.message }; }\n"
         "console.log(JSON.stringify({ ...outcome, ms: Date.now() - started }));\n"
     )
 
@@ -389,7 +390,7 @@ def test_pi_fetch_rung_forwards_its_timeout(
         assert proc.returncode == 0, proc.stderr
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
-    # No timeout from the caller: the rung runs under the default deadline.
+    # No timeout from the caller: the call runs under the default deadline.
     # Retried once to absorb the fresh-Chrome cold-start race the other e2e
     # tests retry through.
     warm = fetch(local_site + "/fast")
@@ -402,8 +403,8 @@ def test_pi_fetch_rung_forwards_its_timeout(
     _record("pi-fetch-rung", deadline_s=3.0, elapsed_s=outcome["ms"] / 1000,
             reason=outcome.get("reason"))
     assert outcome["ok"] is False, outcome
-    assert outcome["reason"].startswith("exit 7"), outcome
+    assert outcome["reason"].startswith("DeadlineExceeded"), outcome
     assert "--timeout" in outcome["reason"], outcome
-    # Exit 7 already proves the 3s deadline cut the call: under the default
-    # 90s the page would have committed at 12s and the rung would succeed.
+    # DeadlineExceeded (exit 7) already proves the 3s deadline cut the call:
+    # under the default 90s the page would have committed at 12s and succeeded.
     assert outcome["ms"] >= 3000, outcome

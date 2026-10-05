@@ -1,153 +1,80 @@
 /**
- * @browserwright/pi — `bw_web_fetch` and `bw_web_search` for pi, backed by
- * declarative providers that drive browserwright.
+ * @browserwright/pi — `bw_web_fetch` and `bw_web_search` for pi.
+ *
+ * Each tool is one browserwright CLI call (`markdown` / `search`); this file
+ * only declares the tools and relays what the CLI says. The browser is the
+ * user's own Chrome, or the remote one named by `BW_REMOTE_CDP` — never both,
+ * and nothing falls back to anything else.
  *
  * Tool names are `bw_`-prefixed (not bare `web_fetch`/`web_search`) because
  * providers reserve generic tool names: grok rejects a custom function named
- * `web_search` with a 400. The prefix keeps every provider safe.
- *
- * A provider is a JSON file in providers/; adding one needs no code change.
- * This package ships only the browserwright rungs, which are the ones that
- * carry the user's login state. Drop your own JSON in to add a cheaper or
- * anonymous rung ahead of them. See README.md for the contract.
+ * `web_search` with a 400.
  */
 
 import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { makeExecutor, runChain } from "./core/chain.ts";
-import { EXTENSION_DIR, loadConfig, loadProviders } from "./core/config.ts";
-import { renderFailure, renderResults, renderSuccess } from "./core/format.ts";
-import { inspectSearch, inspectText, providersForRole } from "./core/predicates.ts";
-import { formatProbeReport, loadProbeCases, runProbe, saveProbeEvidence } from "./core/probe.ts";
-import type { PiConfig, Provider, Role, SearchPayload } from "./core/types.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { browserArgs, browserLabel, runBrowserwright } from "./browserwright.ts";
 
-/**
- * A chain failure is reported by THROWING, not by returning a flag.
- *
- * `AgentToolResult` has no `isError` field: pi's agent loop hardcodes
- * `isError: false` on the normal return path and only sets it in the catch
- * around `execute`. Returning `{isError: true}` therefore records a failed call
- * as a successful one — the TUI does not mark it, and observers of the
- * `tool_result` event see `isError: false`.
- */
-class ToolFailure extends Error {}
+/** What fetch prints before cutting; the full text stays in the file the CLI names. */
+const FETCH_MAX_CHARS = 50_000;
 
 /**
  * The call deadline for the browserwright call behind a tool (ADR-0014): the
- * same knob as `browserwright -e --timeout`. Forwarded as `--timeout`; when it
- * runs out browserwright fails the rung with DeadlineExceeded.
+ * same knob as `browserwright -e --timeout`.
  */
 const CALL_TIMEOUT_PARAM = Type.Optional(
 	Type.Number({
 		minimum: 1,
 		description:
 			"Call deadline in seconds for the browserwright call (default 90). Raise it for a page " +
-			"known to be slow; when it runs out the attempt fails with DeadlineExceeded.",
+			"known to be slow; when it runs out the call fails with DeadlineExceeded.",
 	}),
 );
 
+/**
+ * Failures are THROWN: `AgentToolResult` has no `isError`, and pi only marks a
+ * call failed when `execute` throws. A thrown `BrowserwrightFailure` carries
+ * the CLI's own sentence.
+ */
 export default function (pi: ExtensionAPI) {
-	const config = loadConfig();
-	const providers = loadProviders();
-
-	const namesFor = (role: Role): string[] => [...providersForRole(providers, role).keys()];
-	const fetchNames = namesFor("fetch");
-	const searchNames = namesFor("search");
-
-	if (fetchNames.length === 0 && searchNames.length === 0) {
-		console.error("[browserwright-pi] no provider declarations found in providers/ — both tools will always fail");
-	}
-
-	// setStatus is TUI/RPC only; print and json modes have no UI to update.
-	const statusReporter =
-		(ctx: ExtensionContext, onUpdate?: (partial: { content: Array<{ type: "text"; text: string }> }) => void) =>
-		(text: string) => {
-			if (ctx.hasUI) ctx.ui.setStatus("browserwright", text);
-			onUpdate?.({ content: [{ type: "text", text: `*${text}*` }] });
-		};
-
-	// ---- bw_web_fetch ------------------------------------------------------
-
 	pi.registerTool({
 		name: "bw_web_fetch",
 		label: "Fetch Web Page",
 		description:
-			"Fetch a URL and return its content as Markdown or text. " +
-			`Tries providers in order until one returns usable content: ${config.order.fetch.join(" → ")}. ` +
-			"The response header states which provider answered and what format the body is in. " +
-			"Output over 50KB is truncated and the full text written to a temp file whose path is given.",
-		promptSnippet: "Fetch a URL as Markdown or text, through the user's real browser",
+			"Fetch a URL in a real browser and return its main content as Markdown (absolute links, " +
+			`JavaScript rendered). Runs in ${browserLabel()}. HTML only: other content types are refused. ` +
+			`Output over ${FETCH_MAX_CHARS} characters is cut on a line boundary and the full text written to a file whose path is given.`,
+		promptSnippet: "Fetch a URL as Markdown through a real browser",
 		promptGuidelines: [
-			"Prefer `bw_web_fetch` over curl or a shell HTTP client for reading web pages — it renders JavaScript " +
-				"and carries the user's login state, while its text fallback also reads raw source endpoints.",
+			"Prefer `bw_web_fetch` over curl or a shell HTTP client for reading web pages — it renders JavaScript.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "HTTP(S) URL to fetch" }),
 			timeout: CALL_TIMEOUT_PARAM,
-			provider: Type.Optional(
-				Type.String({
-					description:
-						`Force one provider instead of the automatic chain (${fetchNames.join(", ") || "none declared"}). ` +
-						"Forcing disables fallback.",
-				}),
-			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal) {
 			const url = /^https?:\/\//i.test(params.url) ? params.url : `https://${params.url}`;
-			const setStatus = statusReporter(ctx, onUpdate);
-
-			const result = await runChain<string>({
-				providers,
-				config,
-				role: "fetch",
-				subject: url,
-				inspect: inspectText,
-				forced: params.provider,
-				executor: makeExecutor<string>(config, {
-					dir: EXTENSION_DIR,
-					role: "fetch",
-					signal,
-					callTimeoutS: params.timeout,
-				}),
-				onAttempt: (provider, index, total) =>
-					setStatus(`🌐 ${provider.label ?? provider.name} (${index + 1}/${total})`),
-			});
-
-			if (ctx.hasUI) ctx.ui.setStatus("browserwright", "");
-
-			if (!result.ok) {
-				throw new ToolFailure(renderFailure(result, url, { tool: "bw_web_fetch", alternatives: fetchNames }));
-			}
-
+			const { stdout, stderr } = await runBrowserwright(
+				["markdown", url, `--max-chars=${FETCH_MAX_CHARS}`, "--name=pi-webfetch", ...browserArgs()],
+				{ signal, callTimeoutS: params.timeout },
+			);
+			// The CLI announces a cut (and where the rest is) on stderr.
+			const cut = stderr.split("\n").find((line) => line.startsWith("[markdown] truncated"));
+			const header = [url, ...(cut ? [cut.replace(/^\[markdown\] /, "")] : [])].join("\n");
 			return {
-				content: [
-					{
-						type: "text" as const,
-						text: renderSuccess(result, { url, maxBytes: config.maxBytes, maxLines: config.maxLines }),
-					},
-				],
-				details: {
-					url,
-					provider: result.provider,
-					format: result.format,
-					chars: result.content?.length ?? 0,
-					attempts: result.attempts,
-				},
+				content: [{ type: "text" as const, text: `${header}\n\n${stdout}` }],
+				details: { url, chars: stdout.length, truncated: Boolean(cut) },
 			};
 		},
 	});
-
-	// ---- bw_web_search -----------------------------------------------------
 
 	pi.registerTool({
 		name: "bw_web_search",
 		label: "Search the Web",
 		description:
-			"Search the web and return ranked results as title, URL, snippet and date. " +
-			`Providers in order: ${config.order.search.join(" → ")}. ` +
-			"Also returns the engine's own AI Overview, knowledge panel, 'people also ask' and " +
-			"related searches when that query triggered them. Returns links, never page bodies — " +
-			"call bw_web_fetch on the ones worth reading.",
+			"Search the web (Google, in a real browser) and return ranked results as title, URL, date and snippet, " +
+			"plus the engine's AI Overview, knowledge panel, 'people also ask' and related searches when the query " +
+			`triggered them. Runs in ${browserLabel()}. Returns links, never page bodies — call bw_web_fetch on the ones worth reading.`,
 		promptSnippet: "Search the web and get back ranked links",
 		promptGuidelines: [
 			"`bw_web_search` returns links, not page contents. After searching, call `bw_web_fetch` on the one or two " +
@@ -156,152 +83,18 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			query: Type.String({ description: "What to search for" }),
 			timeout: CALL_TIMEOUT_PARAM,
-			provider: Type.Optional(
-				Type.String({
-					description:
-						`Force one provider instead of the automatic chain (${searchNames.join(", ") || "none declared"}). ` +
-						"Forcing disables fallback.",
-				}),
-			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal) {
 			const query = params.query.trim();
-			if (!query) throw new ToolFailure("bw_web_search needs a non-empty query");
-			const setStatus = statusReporter(ctx, onUpdate);
-
-			const result = await runChain<SearchPayload>({
-				providers,
-				config,
-				role: "search",
-				subject: query,
-				inspect: inspectSearch,
-				forced: params.provider,
-				executor: makeExecutor<SearchPayload>(config, {
-					dir: EXTENSION_DIR,
-					role: "search",
-					signal,
-					callTimeoutS: params.timeout,
-					// Only module providers stream, and the search rung is why
-					// that capability exists: it is slow enough that the user
-					// deserves to see which phase it is in.
-					onProgress: (text) => setStatus(`🔎 ${text}`),
-				}),
-				onAttempt: (provider, index, total) =>
-					setStatus(`🔎 ${provider.label ?? provider.name} (${index + 1}/${total})`),
+			if (!query) throw new Error("bw_web_search needs a non-empty query");
+			const { stdout } = await runBrowserwright(["search", query, "--name=pi-websearch", ...browserArgs()], {
+				signal,
+				callTimeoutS: params.timeout,
 			});
-
-			if (ctx.hasUI) ctx.ui.setStatus("browserwright", "");
-
-			if (!result.ok) {
-				throw new ToolFailure(renderFailure(result, query, { tool: "bw_web_search", alternatives: searchNames }));
-			}
-
 			return {
-				content: [{ type: "text" as const, text: renderResults(result, query) }],
-				details: {
-					query,
-					provider: result.provider,
-					count: result.content?.results.length ?? 0,
-					// Zero rows is a success now, so the trace has to record which
-					// kind of zero it was.
-					noMatch: result.content?.noMatch === true,
-					features: {
-						answerBox: Boolean(result.content?.answerBox),
-						knowledgeGraph: Boolean(result.content?.knowledgeGraph),
-						peopleAlsoAsk: result.content?.peopleAlsoAsk?.length ?? 0,
-						relatedSearches: result.content?.relatedSearches?.length ?? 0,
-					},
-					attempts: result.attempts,
-				},
+				content: [{ type: "text" as const, text: stdout }],
+				details: { query },
 			};
 		},
 	});
-
-	// ---- /bw ---------------------------------------------------------------
-	// Named `/bw` (not `/browserwright`) so it cannot be confused with the
-	// `browserwright` skill, which pi exposes as `/skill:browserwright`.
-
-	pi.registerCommand("bw", {
-		description:
-			"Inspect providers (/bw list) or probe one against real URLs (/bw probe <provider>)",
-		handler: async (args, ctx) => {
-			const [subcommand, target] = args.trim().split(/\s+/);
-
-			if (!subcommand || subcommand === "list") {
-				ctx.ui.notify(describeProviders(config, providers), "info");
-				return;
-			}
-
-			if (subcommand !== "probe") {
-				ctx.ui.notify(`Unknown subcommand "${subcommand}". Use "list" or "probe <provider>".`, "error");
-				return;
-			}
-
-			// Probing only makes sense for fetch providers — the cases are URLs.
-			const chosen = target ? [target] : fetchNames;
-			const unknown = chosen.filter((name) => !fetchNames.includes(name));
-			if (unknown.length > 0) {
-				ctx.ui.notify(`Not a probeable fetch provider: ${unknown.join(", ")}`, "error");
-				return;
-			}
-
-			// Probe hits real sites and opens tabs in the user's daily Chrome.
-			// It never runs without an explicit yes.
-			if (!ctx.hasUI) return;
-			const cases = loadProbeCases();
-			const ok = await ctx.ui.confirm(
-				"Run probe?",
-				`Hits ${cases.length} real URLs for: ${chosen.join(", ")}.\n\nThis opens tabs in your daily Chrome.`,
-			);
-			if (!ok) return;
-
-			for (const name of chosen) {
-				const provider = providers.get(name) as Provider;
-				ctx.ui.setStatus("browserwright", `🔬 probing ${name}…`);
-				const rows = await runProbe(provider, cases, {
-					config,
-					dir: EXTENSION_DIR,
-					onCase: (probeCase, index) =>
-						ctx.ui.setStatus("browserwright", `🔬 ${name} ${index + 1}/${cases.length}: ${probeCase.name}`),
-				});
-				const path = saveProbeEvidence(name, rows);
-				// deliverAs "steer" so the report renders as soon as the probe
-				// finishes. "nextTurn" would queue it invisibly until the user
-				// typed something else, which defeats the point of a report.
-				pi.sendMessage(
-					{
-						customType: "browserwright-probe",
-						content: `${formatProbeReport(name, rows)}\n\nEvidence written to ${path}`,
-						display: true,
-					},
-					{ deliverAs: "steer" },
-				);
-			}
-
-			ctx.ui.setStatus("browserwright", "");
-		},
-	});
-}
-
-function describeProviders(config: PiConfig, providers: Map<string, Provider>): string {
-	const lines: string[] = [];
-	for (const role of ["fetch", "search"] as Role[]) {
-		const scoped = providersForRole(providers, role);
-		lines.push(`${role}:`);
-		if (scoped.size === 0) {
-			lines.push("  (none declared)");
-			continue;
-		}
-		const order = config.order[role] ?? [];
-		const names = [...order.filter((n) => scoped.has(n)), ...[...scoped.keys()].filter((n) => !order.includes(n))];
-		for (const [index, name] of names.entries()) {
-			const provider = scoped.get(name);
-			if (!provider) continue;
-			const flags = [provider.kind, `returns=${provider.returns}`];
-			if (provider.enabled === false) flags.push("disabled");
-			if (provider.when) flags.push("conditional");
-			lines.push(`  ${index + 1}. ${name} (${flags.join(", ")})`);
-		}
-	}
-	return lines.join("\n");
 }
