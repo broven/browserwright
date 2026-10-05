@@ -162,7 +162,8 @@ export interface HttpProvider extends ProviderCommon {
 export interface CommandProvider extends ProviderCommon {
 	kind: "command";
 	/**
-	 * argv. Supports {url}/{query}, the {…Encoded} variants, and {dir}.
+	 * argv. Supports {url}/{query}, the {…Encoded} variants, {dir}, and
+	 * $ENV_VAR (an unset one skips the rung with `missing env NAME`).
 	 * Exit code contract: 0 = success, 2 = not applicable (drop a rung),
 	 * anything else = hard error (also drops a rung, but is reported as an error).
 	 */

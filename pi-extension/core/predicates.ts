@@ -147,6 +147,29 @@ export function interpolateEnv(
 }
 
 /**
+ * Fill one declaration string: $ENV_VAR first, then the {token} placeholders.
+ *
+ * The order is the point. Tokens carry the SUBJECT — a URL or query the model
+ * chose — so expanding $ENV after them would let a subject such as
+ * `https://x.test/?k=$API_TOKEN` pull a secret into a request or an argv, and
+ * would skip the rung as "missing env" for any URL that merely contains a `$`.
+ * Only what the provider author wrote is ever read for env references.
+ */
+export function fillTemplate(
+	template: string,
+	tokens: Record<string, string>,
+	env: Record<string, string | undefined>,
+): { value: string; missing: string[] } {
+	const resolved = interpolateEnv(template, env);
+	return { value: interpolate(resolved.value, tokens), missing: resolved.missing };
+}
+
+/** The reason a rung reports when its declaration names an unset env var. */
+export function missingEnvReason(missing: string[]): string {
+	return `missing env ${[...new Set(missing)].join(", ")}`;
+}
+
+/**
  * Fill {token} placeholders. Longer names are substituted first so that
  * {urlEncoded} wins over {url} — otherwise the shorter token would eat its
  * own prefix and leave a stray "Encoded" behind.

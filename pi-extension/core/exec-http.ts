@@ -4,18 +4,18 @@
  * hosted reader API happens to have.
  */
 
-import { interpolate, interpolateEnv, pickPath, subjectTokens } from "./predicates.ts";
+import { fillTemplate, missingEnvReason, pickPath, subjectTokens } from "./predicates.ts";
 import { normalizeSearchPayload } from "./results.ts";
 import type { HttpProvider, ProviderOutcome, Role } from "./types.ts";
 
-/** Interpolate the subject tokens then $ENV, collecting unset variable names. */
+/** Interpolate $ENV then the subject tokens, collecting unset variable names. */
 function fill(
 	template: string,
 	tokens: Record<string, string>,
 	env: Record<string, string | undefined>,
 	missing: string[],
 ): string {
-	const resolved = interpolateEnv(interpolate(template, tokens), env);
+	const resolved = fillTemplate(template, tokens, env);
 	missing.push(...resolved.missing);
 	return resolved.value;
 }
@@ -63,7 +63,7 @@ export async function execHttp(
 	// A provider that references an unset key is not a failure to report, it is
 	// a rung that does not exist on this machine. Say so plainly and move on.
 	if (missing.length > 0) {
-		return { ok: false, reason: `missing env ${[...new Set(missing)].join(", ")}` };
+		return { ok: false, reason: missingEnvReason(missing) };
 	}
 
 	const timeout = AbortSignal.timeout(provider.timeoutMs ?? options.timeoutMs);
