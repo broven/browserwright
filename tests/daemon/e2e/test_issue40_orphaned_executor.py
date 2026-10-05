@@ -8,6 +8,16 @@ same must hold for `session reset` (reap locally, keep the row).
 Auto-marked `real_chrome` by the e2e conftest (opt-in via path or `-m
 real_chrome`) — it spawns real daemon/executor processes, so it stays out of
 the default gate.
+
+Endpoint isolation: the CLI subprocesses must reach the private daemon, never
+the machine-global one on 19990 (ADR-0012). `BW_DAEMON_URL` would do that but
+also makes the endpoint *explicit*, which turns off the auto-start that
+`session reset`'s recovery path relies on (ADR-0011). So the fixture starts
+the private daemon itself and lets the CLI find it the non-explicit way: the
+endpoint state file the daemon publishes in this test's `XDG_RUNTIME_DIR`. A
+SIGKILL leaves that file behind, so after the kill the CLI still resolves the
+private (now dead) port, and any auto-start it does binds the private ports
+from `BD_*`. Every CLI call asserts this before it runs.
 """
 from __future__ import annotations
 
@@ -37,13 +47,16 @@ def _free_port() -> int:
 
 def _env(runtime: str, home: str) -> dict:
     env = os.environ.copy()
+    # An inherited explicit endpoint would point every CLI call elsewhere and
+    # disable the auto-start this test depends on (see module docstring).
+    env.pop("BW_DAEMON_URL", None)
     env.update({
         "XDG_RUNTIME_DIR": runtime,
         "TMPDIR": runtime,
         "BS_HOME": home,
         "BD_CONFIG": "",
-        # The isolated daemon auto-spawned by `session new` inherits these, so
-        # it never touches the machine-global 19989/19990 ports.
+        # The private daemon (started by the fixture, or re-spawned by a CLI
+        # auto-start) binds these, never the machine-global 19989/19990.
         "BD_EXTENSION_PORT": str(_free_port()),
         "BD_FACADE_PORT": str(_free_port()),
         "BD_RDP_PORT": str(_free_port()),
@@ -51,10 +64,50 @@ def _env(runtime: str, home: str) -> dict:
     return env
 
 
+def _published_url(runtime: str) -> str | None:
+    """The endpoint URL the private daemon published in ``runtime``."""
+    try:
+        data = json.loads((Path(runtime) / "browserwright-daemon.endpoint")
+                          .read_text())
+    except (OSError, ValueError):
+        return None
+    return data.get("url") if isinstance(data, dict) else None
+
+
+def _private_url(env: dict) -> str:
+    return f"http://127.0.0.1:{env['BD_FACADE_PORT']}"
+
+
 def _cli(args, env, timeout: float = 90) -> subprocess.CompletedProcess:
+    # Guard: the CLI resolves its endpoint from the state file in this test's
+    # runtime dir. If that ever stops naming the private port, the call would
+    # fall through to the default 19990 — the machine-global daemon.
+    published = _published_url(env["XDG_RUNTIME_DIR"])
+    assert published == _private_url(env), (
+        f"the CLI would not resolve the private daemon (state file names "
+        f"{published!r}, expected {_private_url(env)!r}); refusing to run it "
+        f"against the default endpoint")
     return subprocess.run(
         [sys.executable, "-m", "browserwright", *args],
         capture_output=True, text=True, env=env, timeout=timeout)
+
+
+def _start_private_daemon(env: dict, timeout: float = 15.0) -> int:
+    """Start the isolated daemon and return its pid once it serves the
+    private port and has published that port in the state file."""
+    subprocess.Popen(
+        [sys.executable, "-m", "browserwright.daemon.cli", "serve"],
+        env=env, start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    port = int(env["BD_FACADE_PORT"])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pr = _ipc.probe_endpoint_sync("127.0.0.1", port, timeout=0.3)
+        if (pr.kind == "ours" and pr.pid is not None
+                and _published_url(env["XDG_RUNTIME_DIR"]) == _private_url(env)):
+            return pr.pid
+        time.sleep(0.05)
+    raise AssertionError(f"the private daemon never came up on port {port}")
 
 
 def _spawn_executor(session_id: str, env: dict) -> int:
@@ -88,27 +141,11 @@ def _wait_discovery(session_id: str, timeout: float = 15.0) -> None:
         f"executor discovery record for session {session_id!r} never appeared")
 
 
-def _daemon_pid(runtime: str, timeout: float = 10.0) -> int:
-    """The daemon pid once it is fully serving. The spawn is detached + async
-    (`session new` returns before `serve` binds), and spawning an executor
-    before the daemon finishes its startup orphan sweep races the sweep — so
-    wait for the control socket to answer, then return the pid."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _ipc.ping_sync(timeout=0.3) is not None:
-            pid = _ipc_pid(runtime)
-            if pid is not None:
-                return pid
-        time.sleep(0.05)
-    raise AssertionError("daemon never came up on the isolated socket")
-
-
-def _ipc_pid(runtime: str) -> int | None:
-    p = Path(runtime) / "browserwright-daemon.pid"
-    try:
-        return int(p.read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return None
+def _private_daemon_pid(env: dict) -> int | None:
+    """The pid of whatever daemon answers on the private port, if any."""
+    pr = _ipc.probe_endpoint_sync("127.0.0.1", int(env["BD_FACADE_PORT"]),
+                                  timeout=0.3)
+    return pr.pid if pr.kind == "ours" else None
 
 
 def _kill_hard(pid: int) -> None:
@@ -155,9 +192,24 @@ def scenario(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
     monkeypatch.setenv("BS_HOME", home)
     env = _env(runtime, home)
+    scenario = _Scenario(runtime=runtime, home=home, env=env)
     try:
-        yield _Scenario(runtime=runtime, home=home, env=env)
+        scenario.daemon_pid = _start_private_daemon(env)
+        yield scenario
     finally:
+        # Reap only what this test owns: a daemon answering on the private
+        # port (e.g. the one `session reset` auto-started) and any executor
+        # this test spawned. Then the private runtime dir.
+        pid = _private_daemon_pid(env)
+        if pid is not None:
+            _kill_hard(pid)
+        # An executor the test expected reaped but that survived (a failed
+        # run) — signalled only if the pid still names the process we
+        # spawned, so a recycled pid is never hit.
+        from browserwright.daemon.platforms import proc_start_time
+        for exec_pid, started in scenario.executors:
+            if started is not None and proc_start_time(exec_pid) == started:
+                _kill_hard(exec_pid)
         import shutil
         shutil.rmtree(runtime, ignore_errors=True)
 
@@ -167,30 +219,39 @@ class _Scenario:
         self.runtime = runtime
         self.home = home
         self.env = env
+        self.daemon_pid: int | None = None
+        #: (pid, start time) of every executor the test spawned.
+        self.executors: list[tuple[int, object]] = []
+
+    def track_executor(self, pid: int) -> None:
+        from browserwright.daemon.platforms import proc_start_time
+        self.executors.append((pid, proc_start_time(pid)))
 
 
 def test_issue40_session_end_recovers_after_daemon_sigkill(scenario):
     """The issue's exact sequence: live session → daemon dies hard → `session
     end` must reap the executor locally and drop the ledger row."""
     env = scenario.env
-    # 1. Create a session (allocates the ledger row; auto-spawns the isolated
-    #    daemon via `daemon_lifecycle.ensure`).
+    # 1. Create a session against the live private daemon (allocates the
+    #    ledger row; `daemon_lifecycle.ensure` finds the daemon up).
     created = _cli(["session", "new", "--backend=cdp", "--name=issue40-e2e",
                     "--create"], env)
     assert created.returncode == 0, created.stderr
     sid = created.stdout.strip()
-    assert _daemon_pid(scenario.runtime) is not None
+    assert _private_daemon_pid(env) == scenario.daemon_pid
 
     # 2. A real executor is live for the session (what `ensureExecutor`
     #    spawns; no Chrome needed — cold-start is lazy). Its parent is a
     #    throwaway launcher, so a daemon death orphans it to init exactly as
     #    in production.
     exec_pid = _spawn_executor(sid, env)
+    scenario.track_executor(exec_pid)
     _wait_discovery(sid)
     assert not _pid_dead(exec_pid)
 
     # 3. The daemon dies hard — SIGKILL, no graceful teardown.
-    _kill_hard(_daemon_pid(scenario.runtime))
+    _kill_hard(scenario.daemon_pid)
+    assert _private_daemon_pid(env) is None
 
     # 4. `session end` must now recover WITHOUT the daemon: exit 0, executor
     #    reaped, ledger row dropped.
@@ -210,11 +271,15 @@ def test_issue40_session_reset_recovers_after_daemon_sigkill(scenario):
     assert created.returncode == 0, created.stderr
     sid = created.stdout.strip()
 
+    assert _private_daemon_pid(env) == scenario.daemon_pid
+
     exec_pid = _spawn_executor(sid, env)
+    scenario.track_executor(exec_pid)
     _wait_discovery(sid)
     assert not _pid_dead(exec_pid)
 
-    _kill_hard(_daemon_pid(scenario.runtime))
+    _kill_hard(scenario.daemon_pid)
+    assert _private_daemon_pid(env) is None
 
     reset = _cli(["session", "reset", sid], env)
     assert reset.returncode == 0, f"stderr: {reset.stderr}"
