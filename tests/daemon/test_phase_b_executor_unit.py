@@ -1101,12 +1101,14 @@ def test_submit_timeout_has_terminal_deadline_disposition():
     t = threading.Thread(target=worker_loop, daemon=True)
     t.start()
 
-    # First submit with a tiny timeout → returns a TimeoutError without wedging.
+    # First submit with a tiny timeout → returns DeadlineExceeded (ADR-0014)
+    # without wedging.
     t0 = _time.monotonic()
     r1 = w.submit(protocol.ExecuteRequest("slow()", timeout_ms=100))
     assert _time.monotonic() - t0 < 1.0
-    assert r1.error is not None and r1.error["type"] == "TimeoutError"
-    assert r1.exit_code == 3
+    assert r1.error is not None and r1.error["type"] == "DeadlineExceeded"
+    assert r1.error["scope"] == "call"
+    assert r1.exit_code == 7
     assert r1.terminal_reason == "deadline_exceeded"
 
     # The process-level serve loop flushes this terminal response and exits;

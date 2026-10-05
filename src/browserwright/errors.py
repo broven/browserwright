@@ -122,6 +122,44 @@ class TabRebindFailed(BrowserwrightError):
         super().__init__(message, fix=fix)
 
 
+#: The call deadline when the caller sets none: ``browserwright -e`` without
+#: ``--timeout``, and every other exec surface without a ``timeout`` field
+#: (ADR-0014). It is a ceiling for the whole call, not a per-operation default.
+DEFAULT_CALL_TIMEOUT_S = 90
+
+
+class DeadlineExceeded(BrowserwrightError):
+    """The caller's call deadline ran out before the code finished (ADR-0014).
+
+    Fail-stop, deliberately: the code is cut off wherever it was, the
+    executor that ran it is terminated, and the next call cold-starts a fresh
+    one on the same tabs. Its ``state`` is gone and ``finally`` blocks were not
+    guaranteed to run. That is why this is not catchable from inside the code
+    and why it has its own exit code (7): the agent's next move is to give the
+    call more time or less work, never to retry the same call unchanged.
+
+    ``scope`` names which timeout ran out. It is always ``"call"`` here; an
+    operation timeout (one Playwright call) is a different error.
+    """
+
+    exit_code = 7
+    default_fix = (
+        "raise the call deadline with `browserwright -s <id> --timeout "
+        "<seconds> -e ...` (default 90), or split the work into smaller calls. "
+        "Browser tabs survive, but the executor was recycled: `state` is empty "
+        "on the next call"
+    )
+
+    def __init__(self, timeout: float = 0.0, scope: str = "call",
+                 fix: str = ""):
+        self.timeout, self.scope = timeout, scope
+        super().__init__(
+            f"call deadline exceeded: the code did not finish within "
+            f"{timeout:g}s (--timeout) and was stopped (fail-stop)",
+            fix=fix,
+        )
+
+
 class ElementNotFound(BrowserwrightError):
     exit_code = 3
     default_fix = (
@@ -259,7 +297,7 @@ class NeedsUserConfirm(BrowserwrightError):
 def serialize(exc: BaseException) -> dict:
     """Compact JSON-friendly representation for stderr / repl socket."""
     out = {"type": type(exc).__name__, "msg": str(exc)}
-    for k in ("url", "selector", "target_id", "timeout", "reason", "signals", "kind",
+    for k in ("url", "selector", "target_id", "timeout", "scope", "reason", "signals", "kind",
               "status", "detail", "site", "task", "failed_check",
               "method", "cdp_message", "what", "proposal", "fix", "retryable"):
         v = getattr(exc, k, None)

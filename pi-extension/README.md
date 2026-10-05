@@ -4,9 +4,14 @@ Two tools for [pi](https://github.com/badlogic/pi-mono), backed by **declarative
 providers** that drive [browserwright](https://github.com/broven/browserwright):
 
 ```
-bw_web_fetch(url, provider?)   → the page as Markdown, or raw text for text endpoints
-bw_web_search(query, provider?) → ranked links + the SERP features Google showed
+bw_web_fetch(url, provider?, timeout?)   → the page as Markdown, or raw text for text endpoints
+bw_web_search(query, provider?, timeout?) → ranked links + the SERP features Google showed
 ```
+
+`timeout` is browserwright's **call deadline** in seconds (default 90), the same
+knob as `browserwright -e --timeout`. It is forwarded to the browserwright rung as
+`--timeout`; when it runs out that rung fails with `DeadlineExceeded` (exit 7)
+instead of being retried. The rung's own process budget is widened to outlast it.
 
 The browserwright paths run through the user's **own Chrome**, so they see what
 the user sees — including pages behind a login. Fetch also has a raw-text
@@ -183,7 +188,9 @@ rather than ignored.
 
 - `role` is `fetch` (the default) or `search`. It decides which tool can reach
   the provider, and which tokens it may use: `{url}`/`{urlEncoded}` for fetch,
-  `{query}`/`{queryEncoded}` for search. `{dir}` is available to both.
+  `{query}`/`{queryEncoded}` for search. `{dir}` is available to both, and so
+  is `{timeout}`: the caller's call deadline in seconds (90 when unset), for a
+  command that forwards it as browserwright's `--timeout`.
 - `$ENV_VAR` is substituted in the declaration first, then the tokens — so a
   `$NAME` inside the requested URL or query is never read as an env reference.
 - A referenced env var that is unset makes the rung **skip** with
@@ -236,8 +243,10 @@ process:
 ```
 
 The module default-exports `(subject, ctx) => Promise<ProviderOutcome<T>>`.
-`ctx` carries `dir`, `timeoutMs`, `signal`, `options` (verbatim from the
-declaration) and `onProgress`. Cancellation is cooperative: there is no process
+`ctx` carries `dir`, `timeoutMs`, `callTimeoutS` (the caller's call deadline
+in seconds, or undefined for browserwright's 90s default — forward it as
+`--timeout`), `signal`, `options` (verbatim from the declaration) and
+`onProgress`. Cancellation is cooperative: there is no process
 to kill, so the runner must unwind its own resources when `ctx.signal` fires.
 
 `providers/browserwright-search.ts` is the worked example. Its `options`:

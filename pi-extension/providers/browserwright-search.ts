@@ -35,6 +35,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { interpolateEnv, missingEnvReason } from "../core/predicates.ts";
 import { normalizeSearchPayload } from "../core/results.ts";
+import { DEFAULT_CALL_TIMEOUT_S } from "../core/config.ts";
 import type { ModuleContext, ProviderOutcome, SearchPayload } from "../core/types.ts";
 
 const BIN = "browserwright";
@@ -154,6 +155,9 @@ export function explain(stderr: string): { message: string; type?: string; retry
 }
 
 function isTransient(info: { type?: string; retryable?: boolean; message: string }): boolean {
+	// The call deadline ran out (exit 7). Retrying the same work under the same
+	// deadline only spends it a second time.
+	if (info.type === "DeadlineExceeded") return false;
 	if (info.retryable) return true;
 	if (info.type && TRANSIENT.has(info.type)) return true;
 	return /executor/i.test(info.message);
@@ -403,7 +407,9 @@ interface Attempted {
 }
 
 async function attempt(sid: string, script: string, outPath: string, ctx: ModuleContext): Promise<Attempted> {
-	const exec = await run(["-s", sid, "--code-stdin"], {
+	// The tool caller's call deadline rides as `--timeout` (ADR-0014).
+	const deadline = String(ctx.callTimeoutS ?? DEFAULT_CALL_TIMEOUT_S);
+	const exec = await run(["-s", sid, "--timeout", deadline, "--code-stdin"], {
 		input: script,
 		signal: ctx.signal,
 		timeoutMs: ctx.timeoutMs,

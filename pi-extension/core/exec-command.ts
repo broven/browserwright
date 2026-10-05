@@ -9,9 +9,13 @@
  *
  * The provider script is the thing that understands its own tool, so it owns
  * the "is this page actually empty" judgement and signals it with exit 2.
+ *
+ * `{timeout}` interpolates to the caller's call deadline in seconds (or
+ * browserwright's 90s default), for a command that forwards it as `--timeout`.
  */
 
 import { spawn } from "node:child_process";
+import { DEFAULT_CALL_TIMEOUT_S, withCallDeadline } from "./config.ts";
 import { fillTemplate, missingEnvReason, subjectTokens } from "./predicates.ts";
 import type { CommandProvider, ProviderOutcome, Role } from "./types.ts";
 
@@ -24,10 +28,14 @@ export async function execCommand(
 		timeoutMs: number;
 		signal?: AbortSignal;
 		env?: Record<string, string | undefined>;
+		callTimeoutS?: number;
 	},
 ): Promise<ProviderOutcome<string>> {
 	const env = options.env ?? process.env;
-	const tokens = subjectTokens(options.role, subject, options.dir);
+	const tokens = {
+		...subjectTokens(options.role, subject, options.dir),
+		timeout: String(options.callTimeoutS ?? DEFAULT_CALL_TIMEOUT_S),
+	};
 	const missing: string[] = [];
 	const fill = (template: string) => {
 		const resolved = fillTemplate(template, tokens, env);
@@ -42,7 +50,7 @@ export async function execCommand(
 	if (missing.length > 0) return { ok: false, reason: missingEnvReason(missing) };
 
 	const [bin, ...args] = argv;
-	const timeoutMs = provider.timeoutMs ?? options.timeoutMs;
+	const timeoutMs = withCallDeadline(provider.timeoutMs ?? options.timeoutMs, options.callTimeoutS);
 
 	return await new Promise<ProviderOutcome<string>>((resolve) => {
 		let settled = false;

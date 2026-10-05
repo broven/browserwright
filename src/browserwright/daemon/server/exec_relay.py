@@ -17,6 +17,14 @@ Framing, and why the two legs differ:
     disagree with the first. The daemon adds the prefix going out and strips it
     coming back.
 
+The call deadline rides in the request frame (ADR-0014): a client sets the
+frame's ``timeout_ms`` field (``browserwright -e --timeout`` does, default 90s)
+and the relay forwards it untouched, so the executor enforces exactly what the
+caller asked for. When it runs out the response carries a ``DeadlineExceeded``
+error (``scope="call"``, ``exit_code`` 7) plus the internal
+``terminal_reason="deadline_exceeded"``, which tells the client to reap that
+executor.
+
 Consequences the caller must know (ADR-0011 "What this does NOT change"):
 execute payloads and large outputs now cross the daemon's event loop, and a
 daemon restart severs a live data plane — previously it survived one. The client

@@ -22,13 +22,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .._text import MAX_TEXT_CHARS as _MAX_TEXT_CHARS
+from ..errors import DEFAULT_CALL_TIMEOUT_S
 
-# Default per-call timeout (ms). Playwriter defaults to 10000ms, but real page
-# ops (cold navigation + network settle) can legitimately take longer, so we
-# pick a more generous default. It is deliberately bounded WELL UNDER any
-# realistic idle-reap threshold (`Config.idle_close_after`, default None = never)
-# so a slow-but-legitimate call never trips idle reclamation mid-flight.
-DEFAULT_TIMEOUT_MS = 90000
+# Default call deadline (ms) — what `timeout_ms` is when the caller sets none
+# (`browserwright -e` without `--timeout`; ADR-0014). Playwriter defaults to
+# 10000ms, but real page ops (cold navigation + network settle) can
+# legitimately take longer, so we pick a more generous default. It is
+# deliberately bounded WELL UNDER any realistic idle-reap threshold
+# (`Config.idle_close_after`, default None = never) so a slow-but-legitimate
+# call never trips idle reclamation mid-flight. Expiry is fail-stop and reaches
+# the caller as `errors.DeadlineExceeded` (exit 7).
+DEFAULT_TIMEOUT_MS = DEFAULT_CALL_TIMEOUT_S * 1000
 
 # Cap on EVERY text channel of the response — console, return value, warnings
 # and the task result JSON — so a runaway print loop, or an equally ordinary

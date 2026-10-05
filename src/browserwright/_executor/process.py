@@ -41,7 +41,12 @@ from contextlib import contextmanager, redirect_stdout
 from typing import Any
 
 from .._text import spill_text, truncate_hard
-from ..errors import BrowserwrightError, TabRebindFailed, serialize
+from ..errors import (
+    BrowserwrightError,
+    DeadlineExceeded,
+    TabRebindFailed,
+    serialize,
+)
 from .protocol import (
     MAX_TEXT_CHARS,
     RECOVERY_BOUND,
@@ -324,19 +329,14 @@ class _Worker:
         try:
             return box.get(timeout=max(req.timeout_ms, 1) / 1000.0)
         except queue.Empty:
+            # The one place the internal terminal reason becomes the
+            # caller-facing error (ADR-0014): `terminal_reason` stays the
+            # daemon/client's signal to reap this exact process, while the
+            # agent reads `DeadlineExceeded` (exit 7) and its `--timeout` fix.
+            exc = DeadlineExceeded(timeout=req.timeout_ms / 1000.0)
             return ExecuteResponse(
-                error={
-                    "type": "TimeoutError",
-                    "msg": (
-                        f"executor request deadline exceeded "
-                        f"({req.timeout_ms}ms); the executor was recycled"
-                    ),
-                    "fix": (
-                        "retry the command; browser tabs were preserved, but "
-                        "executor state and Python finally blocks were not"
-                    ),
-                },
-                exit_code=3,
+                error=serialize(exc),
+                exit_code=exc.exit_code,
                 terminal_reason=TERMINAL_DEADLINE_EXCEEDED,
             )
 

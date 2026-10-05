@@ -187,6 +187,13 @@ export interface ModuleContext {
 	/** The package directory — the same value `{dir}` interpolates to. */
 	dir: string;
 	timeoutMs: number;
+	/**
+	 * The call deadline the tool caller asked for, in seconds, or undefined for
+	 * browserwright's default (90s). A runner that drives `browserwright -e`
+	 * forwards it as `--timeout` (ADR-0014). `timeoutMs` above is already
+	 * widened to outlast it.
+	 */
+	callTimeoutS?: number;
 	signal?: AbortSignal;
 	options: Record<string, unknown>;
 	/**

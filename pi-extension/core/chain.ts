@@ -119,13 +119,15 @@ export interface ExecutorOptions {
 	signal?: AbortSignal;
 	/** Forwarded to `kind: "module"` runners, which are the only ones that stream. */
 	onProgress?: (text: string) => void;
+	/** The tool caller's call deadline in seconds (ADR-0014); undefined = default. */
+	callTimeoutS?: number;
 }
 
 /** Wire the real executors. Kept separate so tests can skip it entirely. */
 export function makeExecutor<T>(config: PiConfig, options: ExecutorOptions): Executor<T> {
-	const { dir, role, signal, onProgress } = options;
+	const { dir, role, signal, onProgress, callTimeoutS } = options;
 	return async (provider, subject) => {
-		const shared = { dir, role, timeoutMs: config.timeoutMs, signal };
+		const shared = { dir, role, timeoutMs: config.timeoutMs, signal, callTimeoutS };
 		if (provider.kind === "http") {
 			return (await execHttp(provider, subject, shared)) as ProviderOutcome<T>;
 		}
