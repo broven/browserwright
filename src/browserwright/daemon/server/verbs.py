@@ -635,7 +635,8 @@ class SessionVerbsMixin:
             return
         machine = daemon.recovery
         registry = daemon.executors
-        upstream = daemon.context_for_required(session).upstream
+        ctx = daemon.context_for_required(session)
+        upstream = ctx.upstream
         steps: list[dict] = []
 
         def note(event: str, **kw) -> None:
@@ -658,6 +659,22 @@ class SessionVerbsMixin:
                 note(TAB_RECOVER_FAILED, reason=reason)
             note(RECOVERY_FAILED, reason=reason)
             await finish(NEEDS_HUMAN, reason)
+
+        # rung 0 — the session's tabs are attachable. The state machine cannot
+        # see an attacher that is not the session's executor (issue #131):
+        # every fresh attach is refused while it calls the session healthy,
+        # and `session reset` only reaps the executor. Release such attachers
+        # before trusting `healthy`.
+        handle = registry.get(session)
+        executor_pid = (handle.current_pid()
+                        if handle is not None and handle.is_alive() else None)
+        for target_id, owner in ctx.state.release_foreign_attachers(
+                session, executor_pid):
+            detail = (f"released {target_id}: its attacher was client "
+                      f"{owner.client_id} ({owner.label}, pid "
+                      f"{owner.pid or 'unknown'}), not this session's executor")
+            logger.warning("recover: session %s: %s", session, detail)
+            steps.append({"rung": "attach", "ok": True, "detail": detail})
 
         # State-directed ladder: a healthy session is already converged.  In
         # particular, do not force a tab re-attach merely because a user asked
@@ -915,3 +932,4 @@ VERBS: dict[str, Handler] = {
     "BrowserwrightDaemon.userscript.logs": partial(
         SessionVerbsMixin._handle_userscript, verb="logs"),
 }
+

@@ -34,14 +34,16 @@ def _rpc_error_fix(method: str, err: object) -> str:
         return ModeBClient.explain_rpc_error(method, err)
     if (isinstance(err, dict) and method == "Target.attachToTarget"
             and "already attached" in str(err.get("message", "")).lower()):
-        # Issue #40: the "another client" here is very likely the session's
-        # own executor orphaned by a daemon crash/restart — it still holds
-        # the target while the ledger row + discovery record leak. Reaping it
-        # breaks the deadlock; the generic -32601 hint does not apply.
+        # Issues #40/#131: another client is this target's attacher.
+        # `recover` releases an attacher outside the session's executor
+        # process (a stray script, an executor the daemon no longer tracks);
+        # when the executor process itself is the attacher, only reaping it
+        # frees the tab. The generic -32601 hint does not apply.
         return (
-            "an executor orphaned by a daemon crash may still hold this "
-            "target: run `browserwright recover --session <session-id>`; it "
-            "adopts or replaces that executor without changing other sessions"
+            "another client is attached to this tab: run `browserwright "
+            "recover --session <session-id>`, which releases an attacher "
+            "outside the session's executor; if the same error survives a "
+            "healthy recover, run `browserwright session reset <session-id>`"
         )
     return ""
 

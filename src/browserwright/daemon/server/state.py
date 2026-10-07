@@ -110,6 +110,11 @@ class ClientState:
     # the bare REPL client / single-context unit tests.
     session_id: str | None = None
     session_name: str | None = None
+    # The connecting process, from the ws ``?pid=<pid>`` query. Lets
+    # `recover` tell the session's executor process apart from any other
+    # attacher of the session's tab (issue #131). None when the client did
+    # not say (older clients, unit tests).
+    pid: int | None = None
     # Opaque daemon lease used to revoke this exact control transport when its
     # Browserwright session ends.  None for sessionless/unit-test clients.
     connection_token: object | None = None
@@ -170,14 +175,16 @@ class DaemonState:
 
     def allocate_client(self, label: str, *, client_id: int | None = None,
                         session_id: str | None = None,
-                        session_name: str | None = None) -> ClientState:
+                        session_name: str | None = None,
+                        pid: int | None = None) -> ClientState:
         # Phase 2: the Daemon passes a globally-unique client_id (unique across
         # all UpstreamContexts) so daemon logs never show two clients sharing a
         # number. When omitted (single-context callers / tests), fall back to
         # this state's own monotonic counter.
         cid = client_id if client_id is not None else next(self._next_client_id)
         c = ClientState(client_id=cid, label=label or "anonymous",
-                        session_id=session_id, session_name=session_name)
+                        session_id=session_id, session_name=session_name,
+                        pid=pid)
         self.clients[cid] = c
         return c
 
@@ -270,6 +277,35 @@ class DaemonState:
             primary_local_session=local_session_id,
             upstream_session_id=upstream_session_id,
         )
+
+    def release_foreign_attachers(
+        self, session_id: str, executor_pid: int | None,
+    ) -> list[tuple[str, ClientState]]:
+        """Drop attacher ownership on `session_id`'s targets unless it is held
+        from the session's executor process (`executor_pid`; None = no live
+        executor, so nothing is kept). Returns ``(target_id, former owner)``
+        per release.
+
+        The resident executor owning its own tab is by design. Any other owner
+        on the session (a stray script, an executor this daemon no longer
+        tracks, a client too old to report its pid) refuses every fresh
+        `Target.attachToTarget` with "already attached by another client"
+        (issue #131). Bookkeeping only, like `release_client`: the owner's
+        bindings on the target go and its connection stays open, but no
+        upstream detach is sent and the owner is not told."""
+        released: list[tuple[str, ClientState]] = []
+        for target_id, own in list(self.attachers.items()):
+            owner = self.clients.get(own.primary_client_id)
+            if owner is None or owner.session_id != session_id:
+                continue
+            if executor_pid is not None and owner.pid == executor_pid:
+                continue
+            for local_sid, binding in list(owner.sessions.items()):
+                if binding.target_id == target_id:
+                    self.unbind_session_by_local(owner.client_id, local_sid)
+            self.attachers.pop(target_id, None)
+            released.append((target_id, owner))
+        return released
 
     # ---- pending request map ---------------------------------------------
 

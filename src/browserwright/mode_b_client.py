@@ -19,7 +19,9 @@ Discovery:
     / ``$BW_DAEMON_URL`` / the toml ``daemon_url`` key / the running daemon's
     state file / ``http://127.0.0.1:19990``. No subprocess, no socket path.
   - On connect, the client opens
-    ``ws://<host>:<port>/control?client=skill-repl&session=<id>``.
+    ``ws://<host>:<port>/control?client=skill-repl&session=<id>&pid=<pid>``.
+    The pid lets the daemon tell the session's executor process apart from
+    any other connection on the session (issue #131).
 
 This client never starts, stops or replaces a daemon — that is
 :mod:`browserwright.daemon_lifecycle`, and only ``session new`` / ``recover``
@@ -30,6 +32,7 @@ call it.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 from .daemon_url import DaemonEndpoint, daemon_endpoint
@@ -73,7 +76,8 @@ class ModeBClient:
         # Session-bound clients carry ``?session=<id>`` — the daemon dispatcher
         # routes on this (not on the client label). Without it a cdp session
         # resolves to None → the shared (extension) context.
-        url = ep.ws("/control", client=client_label, session=self._session_id)
+        url = ep.ws("/control", client=client_label, session=self._session_id,
+                    pid=str(os.getpid()))
         self._cached_ws = url
         self._endpoint = ep.url
         self._transport = "tcp"
