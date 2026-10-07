@@ -277,6 +277,10 @@ function sendHello(sock, id) {
     type: "hello",
     installId: id || "",
     browser: "chrome",
+    // The worker's own UA (never read from a page). Playwright derives the
+    // platform from Browser.getVersion and needs it to pick Meta vs Control
+    // for editing shortcuts such as select-all.
+    userAgent: navigator.userAgent,
     version: manifest.version,
     browserwrightVersion: manifest.version,
     extensionProtocolVersion: BROWSERWRIGHT_EXTENSION_PROTOCOL_VERSION,
