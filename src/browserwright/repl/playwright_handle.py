@@ -546,6 +546,13 @@ def page_for_target(context: Any, sess: Any, target_id: str,
     attachments are independent of Playwright's primary session and never
     place state in the document. Lightweight test doubles without an agent
     CDP surface retain the strict unique-URL fallback.
+
+    Identity alone does not prove the Page is usable: the auxiliary probe is a
+    fresh attachment, so it answers even when the Page's PRIMARY session went
+    stale (e.g. the extension service worker was replaced and the tab was
+    re-attached without Playwright's domain subscriptions). The single
+    identity match must therefore also answer a round-trip on its own primary
+    session (``_page_responds``) before it is accepted.
     """
     pages = list(context.pages)
     if not pages:
@@ -560,7 +567,9 @@ def page_for_target(context: Any, sess: Any, target_id: str,
     else:
         matches = [page for page in pages
                    if _target_id_for_page(page) == target_id]
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1 and _page_responds(matches[0]):
+            return matches[0]
+        return None
 
     # Test-double compatibility only: without an agent CDP path, require a
     # unique URL match. Never use the old singleton/last-match heuristics.
@@ -573,6 +582,19 @@ def page_for_target(context: Any, sess: Any, target_id: str,
         return None
     matches = [p for p in pages if p.url == url]
     return matches[0] if len(matches) == 1 else None
+
+
+def _page_responds(page: Any) -> bool:
+    """Does the Page's own (primary) session still serve evaluation?
+
+    A constant expression: it reads and writes no page state. A stale primary
+    session has no live execution context and fails fast with a
+    TargetClosed-family error, which the caller treats as "no usable Page".
+    """
+    try:
+        return page.evaluate("() => true") is True
+    except Exception:
+        return False
 
 
 def _target_id_for_page(page: Any) -> str | None:
