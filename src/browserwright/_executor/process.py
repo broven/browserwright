@@ -1187,6 +1187,9 @@ class _Worker:
         helper modules are seeded from the live surface too.
         """
         from ..repl.markdown import make_read_markdown
+        from ..repl.screenshot_defaults import install_screenshot_defaults
+
+        install_screenshot_defaults(self._context)
 
         g.pop("__bw_playwright_handle__", None)
         g["page"] = self._page
