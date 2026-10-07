@@ -15,9 +15,9 @@ agent the rest of the surface:
     it (same call and across calls), so the agent can keep several pages open
     and move between them without ``page.goto`` ping-pong.
 
-Both go through the AGENT CDP path (``sess.cdp``) — never Playwright-created
-CDP sessions (the fatal-over-the-facade constraint, see
-``repl/playwright_handle``). ``switch_tab`` delegates to
+Tab lifecycle operations go through the AGENT CDP path (``sess.cdp``). Exact
+Playwright Page matching reads its top-frame identity over an independent CDP
+attachment (see ``repl/playwright_handle``). ``switch_tab`` delegates to
 ``session_runtime.bind_target`` — the existing internal switch_tab — which
 attaches, persists the ledger binding, and fires the target-changed hook; it
 does NOT steal the user's focus (its best-effort ``Target.activateTarget`` is
@@ -114,39 +114,15 @@ def _resolve_target_id(sess: Any, infos: list[dict], url_or_page: Any) -> str:
 
 
 def _match_page_object(sess: Any, infos: list[dict], page: Any) -> str:
-    """Find which session target a Playwright Page is, via the same short-lived
-    marker the binding glue uses (``repl/playwright_handle``). No guessing
-    from URL — duplicate URLs are legal."""
-    from .repl.playwright_handle import (
-        _clear_target_marker,
-        _install_target_marker,
-        _page_has_target_marker,
-    )
-
-    for t in infos:
-        marker_attempted, marker = _install_target_marker(sess, t["targetId"])
-        if not marker_attempted or marker is None:
-            continue
-        key, value, cdp, session_id = marker
-        try:
-            if _page_has_target_marker(page, key, value):
-                return t["targetId"]
-        finally:
-            _clear_target_marker(cdp, session_id, key)
-    # A Page can legitimately sit on an internal URL (a fresh about:blank
-    # tab) that the filtered display list hides — probe everything.
+    """Match a Playwright Page by exact CDP identity; duplicate URLs are legal."""
+    from .repl.playwright_handle import _target_id_for_page
     from .session_runtime import session_tabs
 
-    for t in session_tabs(sess, include_internal=True):
-        marker_attempted, marker = _install_target_marker(sess, t["targetId"])
-        if not marker_attempted or marker is None:
-            continue
-        key, value, cdp, session_id = marker
-        try:
-            if _page_has_target_marker(page, key, value):
-                return t["targetId"]
-        finally:
-            _clear_target_marker(cdp, session_id, key)
+    target_id = _target_id_for_page(page)
+    # Internal URLs are hidden from display, but may still be matched exactly.
+    targets = infos + session_tabs(sess, include_internal=True)
+    if target_id is not None and any(t["targetId"] == target_id for t in targets):
+        return target_id
     raise TabMatchError(
         "switch_tab: the given Page does not belong to this session's tabs",
         fix="pass a Page from context.pages() / context.new_page() "

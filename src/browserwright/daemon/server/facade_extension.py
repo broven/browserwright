@@ -201,6 +201,9 @@ class ExtensionFacadeBridge:
         # `targetDestroyed`/`detachedFromTarget` references the same session and
         # forwarded extension events can be tagged with the right sessionId.
         self._tab_sessions: dict[int, str] = {}
+        # Explicit CDP attachments are independent handles over the shared
+        # debugger. Reusing a primary session crashes Playwright's CDP router.
+        self._aux_sessions: dict[str, int] = {}
         self._closed = False
         # Guard concurrent synthesis (autoAttach replay vs fan-out attach) so we
         # never announce the same tab twice.
@@ -423,6 +426,9 @@ class ExtensionFacadeBridge:
 
         # --- A4: Runtime.enable barrier (session-scoped) ---
         if method == "Runtime.enable" and session_id is not None:
+            if session_id in self._aux_sessions:
+                await self._forward_session_command(req_id, session_id, method, params)
+                return
             await self._handle_runtime_enable(req_id, session_id, params)
             return
 
@@ -431,6 +437,15 @@ class ExtensionFacadeBridge:
         # Browser.getVersion). Its responses carry no sessionId, which is
         # correct for these browser-level methods. ---
         if session_id is None:
+            if method == "Target.detachFromTarget" and params.get("sessionId") in self._aux_sessions:
+                detached_sid = params["sessionId"]
+                self._aux_sessions.pop(detached_sid)
+                await self._respond(req_id, {})
+                await self._send_to_client(json.dumps({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": detached_sid},
+                }))
+                return
             if method == "Target.getTargets" and self._session_id is not None:
                 try:
                     envelope = await self._ext.get_targets(
@@ -533,24 +548,12 @@ class ExtensionFacadeBridge:
         if (isinstance(target_id, str)
                 and not await self._authorize_target(req_id, target_id)):
             return
-        # Reuse an already-announced session for this tab if we have one, so
-        # auto-attach replay + an explicit attachToTarget agree on one session.
+        # An explicit attachment to an announced Page is an auxiliary handle;
+        # never reuse or re-announce its primary auto-attachment session.
         if tab_id is not None and tab_id in self._tab_sessions:
-            sid = self._tab_sessions[tab_id]
-            try:
-                # Shared attach core: relay attach + (re-)registering the sid
-                # in the upstream's table (it may differ from ours if this is
-                # the first explicit attach) so session-scoped commands
-                # resolve the tab.
-                await self._ext.attach_target(tab_id, sid=sid, timeout=10.0)
-            except _CommandError as e:
-                await self._error(req_id, e.code, e.message)
-                return
-            except Exception as e:  # noqa: BLE001
-                await self._error(req_id, -32603, f"attach failed: {e!r}")
-                return
+            sid = f"ext-aux-{secrets.token_hex(12)}"
+            self._aux_sessions[sid] = tab_id
             await self._respond(req_id, {"sessionId": sid})
-            await self._announce_target(tab_id, sid=sid, send_created=False)
             return
         # Unknown tab → let ExtensionUpstream do the attach + sid fabrication,
         # then snoop its table to learn the sid it handed back.
@@ -643,6 +646,7 @@ class ExtensionFacadeBridge:
             await self._respond(req_id, {"success": False})
             return
         # Evict the facade-local per-tab state too.
+        await self._detach_aux_sessions(tab_id)
         self._evict_tab(tab_id)
         await self._respond(req_id, {"success": True})
         # Real Chrome ALWAYS emits detachedFromTarget + targetDestroyed after a
@@ -737,6 +741,8 @@ class ExtensionFacadeBridge:
         authorization boundary: a facade client could otherwise invent
         ``ext-sid-<foreign-tab>-anything`` and bypass attachToTarget entirely.
         """
+        if session_id in self._aux_sessions:
+            return self._aux_sessions[session_id]
         return next(
             (tab_id for tab_id, sid in self._tab_sessions.items()
              if sid == session_id),
@@ -981,6 +987,7 @@ class ExtensionFacadeBridge:
             sid = self._tab_sessions.get(tab_id)
             if self._session_id is not None and sid is None:
                 return
+            await self._detach_aux_sessions(tab_id)
             self._evict_tab(tab_id)
             await self._emit_target_detached(tab_id, sid)
             return
@@ -1021,9 +1028,24 @@ class ExtensionFacadeBridge:
             if sid is not None:
                 out["sessionId"] = sid
             await self._send_to_client(json.dumps(out))
+            for aux_sid, target_tab in list(self._aux_sessions.items()):
+                if target_tab == tab_id:
+                    await self._send_to_client(json.dumps({
+                        "method": method, "params": params, "sessionId": aux_sid,
+                    }))
             return
 
     # ---- helpers ---------------------------------------------------------
+
+    async def _detach_aux_sessions(self, tab_id: int) -> None:
+        for aux_sid, target_tab in list(self._aux_sessions.items()):
+            if target_tab == tab_id:
+                self._aux_sessions.pop(aux_sid, None)
+                await self._send_to_client(json.dumps({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": aux_sid,
+                               "targetId": f"ext-tab-{tab_id}"},
+                }))
 
     async def _emit_target_detached(self, tab_id: int,
                                     sid: str | None) -> None:
@@ -1087,6 +1109,8 @@ class ExtensionFacadeBridge:
         """Drop all per-tab state for a closed/detached tab and wake any
         outstanding Runtime.enable barrier so it doesn't hang on a dead tab."""
         self._tab_sessions.pop(tab_id, None)
+        for sid in [sid for sid, target in self._aux_sessions.items() if target == tab_id]:
+            self._aux_sessions.pop(sid, None)
         self._ext.evict_tab_sessions(tab_id)
         self._tab_url.pop(tab_id, None)
         self._fresh_blank_tabs.discard(tab_id)

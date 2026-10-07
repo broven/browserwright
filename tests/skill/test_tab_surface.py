@@ -181,40 +181,22 @@ class _FakePage:
         self.evaluate = lambda *a, **k: None  # callable — duck-type Page
 
 
-def test_switch_tab_page_object_match(fake_session):
+def test_switch_tab_page_object_match(fake_session, monkeypatch):
     from browserwright import switch_tab
 
     sess, fake = fake_session
     fake.responses["Runtime.evaluate"] = {"result": {"value": True}}
 
-    # A page that reads the marker installed on target-docs is resolved to it.
-    hits: list[str] = []
-
-    def marker_reads(marker_target):
-        # pretend the given Page is the docs tab
-        return marker_target == "target-docs"
-
+    # Exact CDP identity resolves the Page independently of URL similarity.
     import browserwright.repl.playwright_handle as ph
-
-    # Monkeypatch the marker helpers so the fake page "reads" the marker of
-    # exactly one target.
-    def fake_install(sess_, target_id):
-        hits.append(target_id)
-        return True, ("k", "v", None, "sid")
-
-    def fake_read(page, key, value):
-        return marker_reads(hits[-1])
-
-    ph._install_target_marker = fake_install
-    ph._page_has_target_marker = fake_read
-    ph._clear_target_marker = lambda *a: None
+    monkeypatch.setattr(ph, "_target_id_for_page", lambda page: "target-docs")
 
     result = switch_tab(_FakePage("https://docs.example.com/api-keys"))
     assert result["targetId"] == "target-docs"
     assert sess.current_target_id == "target-docs"
 
 
-def test_switch_tab_page_object_no_match(fake_session):
+def test_switch_tab_page_object_no_match(fake_session, monkeypatch):
     from browserwright import switch_tab
 
     sess, fake = fake_session
@@ -222,9 +204,7 @@ def test_switch_tab_page_object_no_match(fake_session):
 
     import browserwright.repl.playwright_handle as ph
 
-    ph._install_target_marker = lambda sess_, tid: (True, ("k", "v", None, "s"))
-    ph._page_has_target_marker = lambda page, k, v: False
-    ph._clear_target_marker = lambda *a: None
+    monkeypatch.setattr(ph, "_target_id_for_page", lambda page: None)
 
     with pytest.raises(TabMatchError, match="does not belong"):
         switch_tab(_FakePage("https://elsewhere.example.com/"))

@@ -103,7 +103,7 @@ tests/daemon/test_adr0011_*.py             the one TCP endpoint: surfaces, Origi
 tests/daemon/test_adr0012_isolation.py     dev/prod isolation: own-port stale-detect, stop guard, plist carry-forward, activity verb
 tests/daemon/test_adr0013_*.py             recovery state, bounded recover, executor adoption/handoff
 tests/skill/test_adr0013_diagnose_before_blame.py  diagnose-before-blame errors, banned words, --reuse, attributed log
-tests/daemon/test_extension_*.py           extension upstream, title marker, version reload
+tests/daemon/test_extension_*.py           extension upstream, debugger timeouts, version reload
 tests/daemon/test_launch_chrome.py         Chrome launch/discovery (fake binaries; no real Chrome)
 tests/daemon/test_doctor.py                doctor schema + backend recommendation
 tests/daemon/test_stale_daemon*.py         stale/half-alive daemon recovery

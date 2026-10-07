@@ -9,7 +9,7 @@ module-level functions that cannot have one — deliberately absent from
 The pipeline, and why it has the shape it has (all of it is ADR-0007):
 
     live DOM
-      │  page.evaluate(_md_normalize)      absolutize URLs, flatten open shadow
+      │  isolated_evaluate(_md_normalize) absolutize URLs, flatten open shadow
       │                                    roots, inline same-origin iframes
       ▼
     normalized HTML  ─── optional ───►  Readability (in the same pass, on a
@@ -42,6 +42,7 @@ from ..errors import UnsupportedContentType
 from .._text import PRODUCER_BUDGET, truncate_lines as _truncate_lines
 from . import _md_normalize
 from ._md_convert import convert_html
+from .isolated_world import isolated_evaluate
 
 MODES = ("auto", "article", "full")
 
@@ -99,7 +100,7 @@ def render_page_markdown(page: Any, *, mode: str = "auto") -> RenderedPage:
         raise ValueError(f"mode must be one of {MODES!r}, got {mode!r}")
 
     want_article = mode in ("auto", "article")
-    raw = page.evaluate(
+    raw = isolated_evaluate(page,
         _md_normalize.build_script(extract=want_article),
         {"extract": want_article},
     )

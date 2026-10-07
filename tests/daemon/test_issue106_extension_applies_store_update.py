@@ -37,7 +37,7 @@ let now = 1_000_000;
 Date.now = () => now;
 let reloads = 0, cleanups = 0;
 const chrome = {{ runtime: {{ reload: () => {{ reloads += 1; }} }} }};
-async function cleanupMarkersBeforeReload() {{ cleanups += 1; }}
+async function cleanupAttachmentIndicatorsBeforeReload() {{ cleanups += 1; }}
 const attachedTabs = new Set();
 let inflightCommands = 0;
 let pendingUpdate = null;

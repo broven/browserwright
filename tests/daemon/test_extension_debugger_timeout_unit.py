@@ -216,7 +216,7 @@ vm.runInContext(`
   const PROTOCOL_VERSION = "1.3";
   const attachedTabs = new Set();
   function stripMarker(t) { return t || ""; }
-  async function unmarkTabBeforeDetach() {}
+  async function updateTabAttachmentIndicator() {}
   async function postAttachCosmetics() {}
   async function announceAttached() {}
   ${wrapper}
@@ -297,7 +297,7 @@ const wrapper = input.wrapperRegion
 vm.runInContext(`
   const PROTOCOL_VERSION = "1.3";
   const attachedTabs = new Set([17]);
-  async function unmarkTabBeforeDetach() {}
+  async function updateTabAttachmentIndicator() {}
   ${wrapper}
   ${input.detachTab}
   ${input.doDetach}
@@ -433,7 +433,7 @@ const wrapper = input.wrapperRegion
 vm.runInContext(`
   const PROTOCOL_VERSION = "1.3";
   const attachedTabs = new Set();
-  async function unmarkTabBeforeDetach() {}
+  async function updateTabAttachmentIndicator() {}
   async function announceAttached(tabId) { announced.push(tabId); }
   ${wrapper}
   ${input.attachTab}

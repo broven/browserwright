@@ -367,7 +367,7 @@ async function applyPendingUpdateIfIdle() {
   const { version } = pendingUpdate;
   pendingUpdate = null;
   console.info("[bd-relay] reloading into store update", version);
-  await cleanupMarkersBeforeReload();
+  await cleanupAttachmentIndicatorsBeforeReload();
   chrome.runtime.reload();
 }
 
@@ -637,7 +637,7 @@ async function handleDaemonMessage(msg) {
         msg.reason || "manual",
         msg.expectedVersion || daemonVersion || "",
       );
-      await cleanupMarkersBeforeReload();
+      await cleanupAttachmentIndicatorsBeforeReload();
       chrome.runtime.reload();
       return;
     case "attach":
@@ -721,13 +721,7 @@ async function handleDaemonMessage(msg) {
 // "completes after detach" window, `tabEpochs` below guards the steps in
 // between.
 //
-// The title-marker path predates this and stays separate on purpose:
-// `markerCommandBefore` shares ONE deadline across the phases of a marker
-// install/remove (so hung calls cannot multiply the delay) and is guarded
-// by its own per-tab tokens. Do not merge the two without re-running the
-// marker unit tests.
-
-// The extension's OWN chrome.debugger commands (title marker, keep-rendered,
+// The extension's OWN chrome.debugger commands (keep-rendered,
 // reload cleanup), and a relayed command from a daemon too old to send
 // `timeoutMs` (whose send_cdp waits 10.0s).
 const DEBUGGER_INTERNAL_COMMAND_TIMEOUT_MS = 9000;
@@ -865,18 +859,17 @@ async function attachTab(tabId, { announce = true, skipIfAttached = false } = {}
 // Post-attach niceties, deliberately NOT awaited by callers. Called at each
 // site's original position (after/before the RPC response varies per site).
 function postAttachCosmetics(tabId) {
-  markTabAttached(tabId);  // fire-and-forget; cosmetic
+  updateTabAttachmentIndicator(tabId);  // fire-and-forget; extension UI only
   keepTabRendered(tabId);  // fire-and-forget; keep off-screen tab rendering
 }
 
-// Shared detach cleanup: strip title marker → chrome.debugger.detach →
+// Shared detach cleanup: chrome.debugger.detach →
 // attachedTabs.delete → [announce `detached`]. Options:
 //   announceReason — when set, emit {type:"detached", reason} to the daemon.
 //   ignoreDetachError (default false) — swallow chrome.debugger.detach errors
 //     (already detached / tab gone) instead of throwing.
 async function detachTab(tabId, { announceReason = null, ignoreDetachError = false } = {}) {
   const epoch = bumpTabEpoch(tabId);
-  await unmarkTabBeforeDetach(tabId);
   try {
     await debuggerDetach(tabId);
   } catch (e) {
@@ -887,6 +880,7 @@ async function detachTab(tabId, { announceReason = null, ignoreDetachError = fal
   // daemon would drop a ghost that just re-joined).
   if (!isTabEpochCurrent(tabId, epoch)) return;
   attachedTabs.delete(tabId);
+  updateTabAttachmentIndicator(tabId);
   if (announceReason) {
     safeSend({ type: "detached", tabId, reason: announceReason });
   }
@@ -904,7 +898,7 @@ async function doAttach(id, tabId) {
       result: {
         targetInfo: {
           url: tab.url || "",
-          title: stripMarker(tab.title),
+          title: String(tab.title ?? ""),
         },
       },
     });
@@ -970,7 +964,7 @@ async function doAttachActive(id, groupName) {
       result: {
         tabId: tab.id,
         url: tab.url || "",
-        title: stripMarker(tab.title),
+        title: String(tab.title ?? ""),
         groupId: finalGroupId,
       },
     });
@@ -1042,7 +1036,7 @@ async function doCreateTab(
     safeSend({
       type: "response",
       id,
-      result: { tabId: tab.id, url: actualUrl, title: stripMarker(title), groupId },
+      result: { tabId: tab.id, url: actualUrl, title: String(title ?? ""), groupId },
     });
     if (!skipPostAttachCommands && attached) {
       postAttachCosmetics(tab.id);
@@ -1096,11 +1090,8 @@ async function doCloseTab(id, tabId) {
     await chrome.tabs.remove(tabId);
     // Chrome removed the tab and tears down its debugger session as part of
     // that operation. Commit our bookkeeping only after that confirmation;
-    // otherwise a failed remove would leave a visible marker on a tab we had
-    // already forgotten and detached.
+    // otherwise a failed remove would forget a tab that Chrome still owns.
     bumpTabEpoch(tabId);
-    invalidateMarkerInstall(tabId);
-    markedTabs.delete(tabId);
     attachedTabs.delete(tabId);
     safeSend({ type: "response", id, result: { ok: true, tabId } });
   } catch (e) {
@@ -1108,10 +1099,8 @@ async function doCloseTab(id, tabId) {
     if (msg.includes("no tab with id")) {
       // Already gone — caller wanted it closed, success-equivalent.
       bumpTabEpoch(tabId);
-      invalidateMarkerInstall(tabId);
-      markedTabs.delete(tabId);
       attachedTabs.delete(tabId);
-        safeSend({ type: "response", id, result: { ok: true, tabId } });
+      safeSend({ type: "response", id, result: { ok: true, tabId } });
       return;
     }
     safeSend({
@@ -1249,7 +1238,7 @@ async function doQueryGroup(id, groupName) {
     const out = (Array.isArray(tabs) ? tabs : []).map((tab) => ({
       tabId: tab.id,
       url: tab.url || "",
-      title: stripMarker(tab.title),
+      title: String(tab.title ?? ""),
       active: !!tab.active,
       lastAccessed: tab.lastAccessed || 0,
     }));
@@ -1279,7 +1268,7 @@ async function announceAttached(tabId) {
     safeSend({
       type: "attached",
       tabId,
-      targetInfo: { url: tab.url || "", title: stripMarker(tab.title) },
+      targetInfo: { url: tab.url || "", title: String(tab.title ?? "") },
     });
   } catch (e) {
     // Tab was closed before we could read it — silently drop.
@@ -1292,373 +1281,37 @@ function errMessage(e) {
   return e.message || String(e);
 }
 
-// ---- title marker: 👀 prefix on AI-attached tabs --------------------------
+// ---- extension-owned attachment indicator --------------------------------
 //
-// Prepend 👀 to document.title on every attached tab so the user can see in
-// their browser tab strip which tab the agent is driving. Survives same-doc
-// title mutations (React/Next.js routes, jQuery, etc.) via MutationObserver
-// on document.head, and survives navigations via
-// Page.addScriptToEvaluateOnNewDocument. On graceful detach we strip the
-// prefix and disconnect the observer; on unexpected detach (DevTools steals
-// the session) the prefix persists until the user reloads — acceptable.
-
-// The marker written in front of a real title: eye + separating space.
-//
-// There are TWO marker forms on purpose, and the injected side (PREFIX /
-// PREFIX_BARE in MARKER_STRIP_PREFIX_SRC) is what decides between them. An
-// empty title gets the *bare* eye, because HTML's `document.title` getter
-// strips trailing ASCII whitespace: `"👀 "` can never be read back as `"👀 "`.
-// The injected observer re-asserts the marker on every <head> mutation, so a
-// value that never reads back as what was written is rewritten forever — a
-// microtask loop that pins the renderer's main thread. `chrome.debugger`
-// commands then never resolve and the daemon reports
-// `relay send failed: TimeoutError()`. Only empty-titled pages (about:blank,
-// data: URLs, pages caught before their title is set) could reach it, which is
-// what made the freeze look random.
-//
-// This constant is the read side: `stripMarker()` below must keep accepting
-// both forms. There is no bare twin here because the SW never writes titles.
-const TITLE_PREFIX = "\u{1F440} ";  // 👀 + space
-
-// ---- shared injected-source fragments --------------------------------------
-//
-// Both MARKER_INSTALL_SCRIPT and MARKER_REMOVE_SCRIPT are assembled from
-// these canonical fragments so the prefix-stripping / title-reading logic
-// can't drift between the two. The SW-side stripMarker() below mirrors
-// MARKER_STRIP_PREFIX_SRC but can't be generated from it (MV3 extension CSP
-// forbids eval/new Function) — keep them in sync by hand.
-//
-// Footgun: everything below lives inside template literals, so a backtick
-// anywhere in them — including in a // comment — ends the string early and
-// turns background.js into a syntax error. Quote identifiers in these comments
-// with plain words, not backticks.
-
-// Defines PREFIX / PREFIX_BARE + stripPrefix(value) + markedTitle(value) in the
-// injected scope. Mirrors TITLE_PREFIX / TITLE_PREFIX_BARE / stripMarker() on
-// the SW side.
-const MARKER_STRIP_PREFIX_SRC = `
-  const PREFIX = '\u{1F440} ';
-  const PREFIX_BARE = '\u{1F440}';
-
-  function stripPrefix(value) {
-    let title = String(value ?? '');
-    while (title.startsWith(PREFIX)) {
-      title = title.slice(PREFIX.length);
-    }
-    while (title.length > 0 && title.codePointAt(0) === 0x1F440) {
-      title = title.slice(2);
-      if (title.length > 0 && /\\s/.test(title[0])) {
-        title = title.slice(1);
-      }
-    }
-    return title;
-  }
-
-  // The one place that decides what a marked title looks like. Used by BOTH
-  // writers (the observer's re-assert and the document.title setter) so they
-  // cannot disagree about the empty case — the case that used to loop.
-  //
-  // Invariant: markedTitle(x) must survive a DOM round-trip unchanged, i.e.
-  // reading back what it wrote yields the same string. With a trailing space
-  // and an empty clean title it does not, and the observer never settles.
-  // stripPrefix() accepts both the spaced and the bare form, so titles marked
-  // by an older build are still cleaned up correctly on detach.
-  function markedTitle(value) {
-    const clean = stripPrefix(value);
-    return clean ? PREFIX + clean : PREFIX_BARE;
-  }
-`;
-
-// Defines rawTitle(doc) in the injected scope. Reads the real document title
-// via a `titleDescriptor` that must already be in scope (each script derives
-// its own), falling back to the <title> element. writeRawTitle is NOT shared:
-// the install and remove scripts intentionally differ in which descriptor
-// they trust for writing.
-const MARKER_RAW_TITLE_SRC = `
-  function rawTitle(doc) {
-    doc = doc || document;
-    if (titleDescriptor && titleDescriptor.get) {
-      return titleDescriptor.get.call(doc) || '';
-    }
-    const el = doc.querySelector && doc.querySelector('title');
-    return el ? (el.textContent || '') : '';
-  }
-`;
-
-// Playwright reads titles -- `page.title()`, `expect(page).to_have_title()` --
-// in its own isolated "utility" world, which has its own Document.prototype, so
-// the main-world accessor in MARKER_INSTALL_SCRIPT never reaches it and agents
-// read "👀 <title>". Give every utility world a read-side strip too. Only the
-// getter changes: the main-world observer re-marks whatever gets written.
-const PLAYWRIGHT_UTILITY_WORLD_PREFIX = "__playwright_utility_world_";
-const UTILITY_WORLD_TITLE_SCRIPT = `
-(function() {
-` + MARKER_STRIP_PREFIX_SRC + `
-  const native = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
-  if (!native || !native.get || !native.set) return;
-  Object.defineProperty(Document.prototype, 'title', {
-    configurable: true,
-    enumerable: true,
-    get: function() { return stripPrefix(native.get.call(this)); },
-    set: function(value) { native.set.call(this, value); },
-  });
-})();
-`;
-
-function stripMarkerInUtilityWorld(source, params) {
-  const ctx = params?.context;
-  const name = ctx?.name || ctx?.auxData?.name || "";
-  if (typeof ctx?.id !== "number"
-      || !name.startsWith(PLAYWRIGHT_UTILITY_WORLD_PREFIX)) {
-    return;
-  }
-  // Issued before the event is forwarded: Chrome runs one debuggee's commands
-  // in order, and Playwright cannot address this context until it has seen
-  // the event, so no title read in it can overtake the install.
-  debuggerCommand(source, "Runtime.evaluate", {
-    expression: UTILITY_WORLD_TITLE_SCRIPT,
-    contextId: ctx.id,
-  }).catch((e) =>
-    console.warn("[bd-relay] utility-world title strip failed:", e));
-}
-
-const MARKER_INSTALL_SCRIPT = `
-(function() {
-` + MARKER_STRIP_PREFIX_SRC + `
-  const previousMarker = window.__bdTitleMarker || null;
+// Attached state belongs to Chrome's extension UI, not the website's DOM.
+// Per-tab action badges and the existing session group / popup identify the
+// driven tab without changing document.title, DOM prototypes, or page globals.
+// No renderer script is needed on attachment, navigation, or detach.
+async function updateTabAttachmentIndicator(tabId, attached = attachedTabs.has(tabId)) {
   try {
-    previousMarker && previousMarker.obs && previousMarker.obs.disconnect();
-  } catch (e) {}
-  try {
-    previousMarker && previousMarker.restoreTitleAccessor &&
-      previousMarker.restoreTitleAccessor();
-  } catch (e) {}
-
-  function findTitleOwner() {
-    if (typeof Document !== 'undefined' &&
-        Object.getOwnPropertyDescriptor(Document.prototype, 'title')) {
-      return Document.prototype;
-    }
-    if (typeof HTMLDocument !== 'undefined' &&
-        Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title')) {
-      return HTMLDocument.prototype;
-    }
-    return typeof Document !== 'undefined' ? Document.prototype : null;
-  }
-
-  const titleOwner = findTitleOwner();
-  const titleDescriptor = titleOwner
-    ? Object.getOwnPropertyDescriptor(titleOwner, 'title')
-    : null;
-` + MARKER_RAW_TITLE_SRC + `
-  function writeRawTitle(doc, title) {
-    doc = doc || document;
-    if (titleDescriptor && titleDescriptor.set) {
-      titleDescriptor.set.call(doc, title);
-      return;
-    }
-    let el = doc.querySelector && doc.querySelector('title');
-    if (!el && doc.head && doc.createElement) {
-      el = doc.createElement('title');
-      doc.head.appendChild(el);
-    }
-    if (el) el.textContent = title;
-  }
-
-  let normalizing = false;
-  // The value we last asked the DOM to store, cleared once it sticks.
-  //
-  // The normalizing flag is not a guard against self-feeding writes:
-  // ensurePrefix runs from a MutationObserver, whose callbacks are delivered
-  // asynchronously, so the finally below has always released the flag before
-  // the next one arrives. markedTitle() is a fixpoint, so this latch never
-  // fires in practice — but if a write ever fails to round-trip again (a future
-  // DOM normalization rule, another script fighting us for the title) it caps
-  // the argument at one wasted write instead of an unbounded microtask loop
-  // that freezes the tab.
-  let lastWritten = null;
-  function ensurePrefix() {
-    if (normalizing) return;
-    normalizing = true;
-    try {
-      const current = rawTitle();
-      const marked = markedTitle(current);
-      if (current === marked) {
-        lastWritten = null;  // settled; a later title change may re-mark
-        return;
-      }
-      if (marked === lastWritten) return;  // already written, it didn't stick
-      lastWritten = marked;
-      writeRawTitle(document, marked);
-    } finally {
-      normalizing = false;
-    }
-  }
-
-  function installTitleAccessor(target) {
-    if (!target) return;
-    Object.defineProperty(target, 'title', {
-      configurable: true,
-      enumerable: true,
-      get: function() {
-        return stripPrefix(rawTitle(this));
-      },
-      set: function(value) {
-        // Same fixpoint rule as ensurePrefix — a page clearing its own title
-        // must not store a value the getter will normalize into a mismatch.
-        writeRawTitle(this, markedTitle(value));
-      },
-    });
-  }
-
-  function restoreTitleAccessor() {
-    try { delete document.title; } catch (e) {}
-    if (!titleOwner) return;
-    try {
-      if (titleDescriptor) {
-        Object.defineProperty(titleOwner, 'title', titleDescriptor);
-      } else {
-        delete titleOwner.title;
-      }
-    } catch (e) {}
-  }
-
-  try {
-    installTitleAccessor(titleOwner);
-    installTitleAccessor(document);
-  } catch (e) {}
-
-  const obs = new MutationObserver(ensurePrefix);
-  function attachObs() {
-    if (!document.head) return;
-    obs.observe(document.head, { childList: true, characterData: true, subtree: true });
-    ensurePrefix();
-  }
-  if (document.head) {
-    attachObs();
-  } else {
-    document.addEventListener('DOMContentLoaded', attachObs, { once: true });
-  }
-  window.__bdTitleMarker = {
-    obs,
-    ensurePrefix,
-    restoreTitleAccessor,
-    nativeTitleDescriptor: titleDescriptor,
-    nativeTitleOwner: titleOwner,
-  };
-})();
-`;
-
-const MARKER_REMOVE_SCRIPT = `
-(function() {
-` + MARKER_STRIP_PREFIX_SRC + `
-  const marker = window.__bdTitleMarker || null;
-  const nativeTitleDescriptor =
-    marker && marker.nativeTitleDescriptor;
-  const titleDescriptor =
-    nativeTitleDescriptor ||
-    Object.getOwnPropertyDescriptor(Document.prototype, 'title') ||
-    (typeof HTMLDocument !== 'undefined'
-      ? Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'title')
-      : null);
-` + MARKER_RAW_TITLE_SRC + `
-  function writeRawTitle(doc, title) {
-    doc = doc || document;
-    if (nativeTitleDescriptor && nativeTitleDescriptor.set) {
-      nativeTitleDescriptor.set.call(doc, title);
-      return;
-    }
-    if (titleDescriptor && titleDescriptor.set &&
-        !(marker && marker.restoreTitleAccessor)) {
-      titleDescriptor.set.call(doc, title);
-      return;
-    }
-    let el = doc.querySelector && doc.querySelector('title');
-    if (!el && doc.head && doc.createElement) {
-      el = doc.createElement('title');
-      doc.head.appendChild(el);
-    }
-    if (el) el.textContent = title;
-  }
-  try { window.__bdTitleMarker && window.__bdTitleMarker.obs.disconnect(); } catch (e) {}
-  const clean = stripPrefix(rawTitle());
-  try {
-    marker && marker.restoreTitleAccessor && marker.restoreTitleAccessor();
-  } catch (e) {
-    try { delete document.title; } catch (_e) {}
-  }
-  delete window.__bdTitleMarker;
-  writeRawTitle(document, clean);
-})();
-`;
-
-// tabId → scriptIdentifier returned by Page.addScriptToEvaluateOnNewDocument
-// (needed to remove the per-document hook on detach).
-const markedTabs = new Map();
-// tabId → {token, promise} for the in-flight installation. The unique token is
-// the cancellation/ABA guard: detach invalidates it, and a later re-attach gets
-// a different token that an old catch/finally cannot erase.
-const markingTabs = new Map();
-// tabId → current opaque generation token. Object identity (not a resettable
-// integer) stays safe if Chrome later recycles a numeric tab id.
-const markerTokens = new Map();
-const MARKER_RELOAD_CLEANUP_TIMEOUT_MS = 1500;
-// Marker CDP is cosmetic and must never hold debugger detach hostage. Each
-// phase gets one absolute budget shared by all of its sendCommand calls, so a
-// sequence of hung calls cannot multiply the delay.
-const MARKER_INSTALL_TIMEOUT_MS = 1500;
-const MARKER_REMOVE_TIMEOUT_MS = 1000;
-
-function invalidateMarkerInstall(tabId) {
-  const pending = markingTabs.get(tabId)?.promise;
-  markerTokens.set(tabId, {});
-  markingTabs.delete(tabId);
-  return pending;
-}
-
-async function markerCommandBefore(deadline, tabId, method, params) {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) {
-    throw new Error("marker " + method + " exceeded its deadline");
-  }
-  let timer = null;
-  try {
-    return await Promise.race([
-      chrome.debugger.sendCommand({ tabId }, method, params),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(
-          "marker " + method + " timed out")), remaining);
+    await Promise.all([
+      chrome.action.setBadgeText({ tabId, text: attached ? "AI" : "" }),
+      chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" }),
+      chrome.action.setTitle({
+        tabId,
+        title: attached ? "browserwright: agent attached" : "browserwright-daemon relay",
       }),
     ]);
-  } finally {
-    if (timer !== null) clearTimeout(timer);
+  } catch (e) {
+    // Tab closure and extension UI failures must never affect browser driving.
+    console.warn("[bd-relay] attachment indicator(" + tabId + ") failed:", e);
   }
 }
 
-// SW-side twin of the injected stripPrefix — see MARKER_STRIP_PREFIX_SRC
-// above. Can't be generated from that fragment (MV3 CSP bans eval); if you
-// change one, change both.
-//
-// Handles BOTH marker forms, and must keep doing so: the first loop eats
-// TITLE_PREFIX (`"👀 Foo"`), the second eats a bare TITLE_PREFIX_BARE plus one
-// optional following whitespace char (`"👀"`, `"👀Foo"`). That is not just
-// tidiness — tabs marked by an older build carry the spaced form, and a user's
-// long-lived Chrome still has those tabs open across an extension update, so a
-// stripper that only knew the new form would leave 👀 stuck in their tab strip.
-// There is deliberately no markedTitle() twin here: the SW only ever *reads*
-// titles (to report them upstream), it never writes one.
-function stripMarker(title) {
-  let clean = String(title ?? "");
-  while (clean.startsWith(TITLE_PREFIX)) {
-    clean = clean.slice(TITLE_PREFIX.length);
-  }
-  while (clean.length > 0 && clean.codePointAt(0) === 0x1F440) {
-    clean = clean.slice(2);
-    if (clean.length > 0 && /\s/.test(clean[0])) {
-      clean = clean.slice(1);
-    }
-  }
-  return clean;
+async function cleanupAttachmentIndicatorsBeforeReload() {
+  // Action state can outlive a service-worker realm. Clear it while we still
+  // know the attached tabs; debugger attachment itself is torn down by reload.
+  await Promise.race([
+    Promise.allSettled(
+      [...attachedTabs].map((tabId) => updateTabAttachmentIndicator(tabId, false)),
+    ),
+    sleep(1500),  // Cosmetic browser UI must never hold extension reload hostage.
+  ]);
 }
 
 async function keepTabRendered(tabId) {
@@ -1667,7 +1320,7 @@ async function keepTabRendered(tabId) {
   // unthrottles requestAnimationFrame, keeps document.hasFocus() true, and
   // stops Chrome from freezing/discarding the tab. fire-and-forget; each
   // command is independently guarded so an unsupported one doesn't sink the
-  // other, and a failure never fails the attach (cosmetic-ish, like markTab).
+  // other, and a failure never fails the attach (independent of the browser UI indicator).
   try {
     await debuggerCommand(
       { tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
@@ -1679,126 +1332,6 @@ async function keepTabRendered(tabId) {
       { tabId }, "Page.setWebLifecycleState", { state: "active" });
   } catch (e) {
     console.warn("[bd-relay] setWebLifecycleState(" + tabId + ") failed:", e);
-  }
-}
-
-async function markTabAttached(tabId) {
-  const pending = markingTabs.get(tabId);
-  if (pending && markerTokens.get(tabId) === pending.token) {
-    await pending.promise;
-    return;
-  }
-  if (markedTabs.has(tabId)) return;
-  const token = {};
-  markerTokens.set(tabId, token);
-  const isCurrent = () => markerTokens.get(tabId) === token;
-  const install = (async () => {
-    const deadline = Date.now() + MARKER_INSTALL_TIMEOUT_MS;
-    // Reserve the slot up-front so concurrent markTabAttached(tabId) calls
-    // (e.g. popup-attach racing daemon attach-active) coalesce.
-    markedTabs.set(tabId, "");
-    try {
-      // Page domain may not be enabled yet on a fresh chrome.debugger session;
-      // enabling is idempotent so this is safe to call repeatedly.
-      await markerCommandBefore(deadline, tabId, "Page.enable", {});
-      if (!isCurrent()) return;
-      const reg = await markerCommandBefore(
-        deadline,
-        tabId,
-        "Page.addScriptToEvaluateOnNewDocument",
-        { source: MARKER_INSTALL_SCRIPT },
-      );
-      if (!isCurrent()) {
-        // Best effort for a registration that completed as detach invalidated
-        // us. Detach itself clears debugger-session registrations; this covers
-        // implementations where the completion won that race. Bounded like
-        // every other chrome.debugger call here.
-        if (reg?.identifier) {
-          debuggerCommand(
-            { tabId },
-            "Page.removeScriptToEvaluateOnNewDocument",
-            { identifier: reg.identifier },
-          ).catch(() => {});
-        }
-        return;
-      }
-      markedTabs.set(tabId, reg?.identifier || "");
-      // The above fires only on new documents; inject into the current one too.
-      await markerCommandBefore(
-        deadline,
-        tabId,
-        "Runtime.evaluate",
-        { expression: MARKER_INSTALL_SCRIPT },
-      );
-      if (!isCurrent()) return;
-    } catch (e) {
-      // Tab might have closed mid-attach, or chrome.debugger session is gone —
-      // not worth failing the whole attach over a cosmetic marker.
-      console.warn("[bd-relay] markTabAttached(" + tabId + ") failed:", e);
-      if (isCurrent()) markedTabs.delete(tabId);
-    }
-  })();
-  const record = { token, promise: install };
-  markingTabs.set(tabId, record);
-  try {
-    await install;
-  } finally {
-    if (markingTabs.get(tabId) === record) markingTabs.delete(tabId);
-  }
-}
-
-async function unmarkTabBeforeDetach(tabId) {
-  const deadline = Date.now() + MARKER_REMOVE_TIMEOUT_MS;
-  const pending = invalidateMarkerInstall(tabId);
-  // Invalidate before any wait. Every continuation of the old installation
-  // checks its opaque token before issuing the next marker command.
-  const identifier = markedTabs.get(tabId);
-  markedTabs.delete(tabId);
-  // Dispatch both cleanup commands immediately. They queue behind any marker
-  // command Chrome is already processing; notably, current-page removal then
-  // runs after a late install Runtime.evaluate instead of detach racing ahead
-  // and leaving the visible marker behind. Awaiting one cleanup before sending
-  // the other would let it consume the whole shared deadline.
-  const removals = [];
-  if (identifier) {
-    removals.push(markerCommandBefore(
-        deadline,
-        tabId,
-        "Page.removeScriptToEvaluateOnNewDocument",
-        { identifier },
-      ).catch(() => {}));
-  }
-  removals.push(markerCommandBefore(
-      deadline,
-      tabId,
-      "Runtime.evaluate",
-      { expression: MARKER_REMOVE_SCRIPT },
-    ).catch(() => {}));
-  await Promise.allSettled(removals);
-  if (pending) {
-    // Still bounded: a wedged renderer must never hold debugger detach hostage.
-    await Promise.race([
-      pending.catch(() => {}),
-      sleep(Math.max(0, deadline - Date.now())),
-    ]);
-  }
-}
-
-async function cleanupMarkersBeforeReload() {
-  // A controlled extension reload destroys this service-worker realm and both
-  // in-memory sets. Strip markers while chrome.debugger is still usable. The
-  // union also covers a mark still in flight (attached, but no identifier yet)
-  // and any bookkeeping drift between the two collections.
-  const knownTabs = new Set([...attachedTabs, ...markedTabs.keys()]);
-  const cleanup = Promise.allSettled(
-    [...knownTabs].map((tabId) => unmarkTabBeforeDetach(tabId)),
-  );
-  const completed = await Promise.race([
-    cleanup.then(() => true),
-    sleep(MARKER_RELOAD_CLEANUP_TIMEOUT_MS).then(() => false),
-  ]);
-  if (!completed) {
-    console.warn("[bd-relay] marker cleanup timed out; reloading anyway");
   }
 }
 
@@ -1832,9 +1365,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (typeof source.sessionId === "string" && source.sessionId) {
     return;
   }
-  if (method === "Runtime.executionContextCreated") {
-    stripMarkerInUtilityWorld(source, params);
-  }
   safeSend({
     type: "event",
     tabId: source.tabId,
@@ -1848,13 +1378,8 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     // A detach invalidates every in-flight attach/arm continuation for this
     // tab: whatever Chrome settles from here on is stale by construction.
     bumpTabEpoch(source.tabId);
-    invalidateMarkerInstall(source.tabId);
     attachedTabs.delete(source.tabId);
-    // Unexpected detach (DevTools steals the session, tab crashes, etc.) —
-    // we can no longer run CDP commands, so the page-side observer keeps the
-    // 👀 prefix on the current document. It clears naturally on next
-    // navigation (addScriptToEvaluateOnNewDocument is no longer registered).
-    markedTabs.delete(source.tabId);
+    updateTabAttachmentIndicator(source.tabId);
     safeSend({ type: "detached", tabId: source.tabId, reason });
   }
 });
@@ -1996,9 +1521,7 @@ chrome.tabGroups.onUpdated.addListener((group) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (!attachedTabs.has(tabId)) return;
   bumpTabEpoch(tabId);
-  invalidateMarkerInstall(tabId);
   attachedTabs.delete(tabId);
-  markedTabs.delete(tabId);
   safeSend({ type: "detached", tabId, reason: "tab_closed" });
 });
 

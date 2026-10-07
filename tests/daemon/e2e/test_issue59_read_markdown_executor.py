@@ -17,13 +17,27 @@ with the patched unpacked extension — so it never touches the daily Chrome.
 from __future__ import annotations
 
 import http.server
+import json
 import threading
+from pathlib import Path
 
 import pytest
 
 from .helpers import run_skill
 
 _PAGE = b"""<!doctype html><html><head><title>Issue 59</title></head><body>
+<script>
+window.mainWorldDomReads = 0;
+for (const prototype of [Document.prototype, Element.prototype]) {
+  for (const name of ['querySelector', 'querySelectorAll', 'cloneNode']) {
+    const original = prototype[name];
+    if (original) prototype[name] = function(...args) {
+      window.mainWorldDomReads++;
+      return Reflect.apply(original, this, args);
+    };
+  }
+}
+</script>
 <nav><a href="/nav">NAVLINK</a></nav>
 <article><h1>Executor Content View</h1>
 <p>Body paragraph with <a href="rel/deep?q=1">RELLINK</a> inside it.</p>
@@ -108,3 +122,29 @@ def test_read_markdown_notes_ride_the_executor_warning_channel(
     assert "output truncated" in result.stderr
     # ...and never into the markdown itself.
     assert "output truncated" not in result.stdout
+
+
+def test_internal_views_use_an_isolated_world(
+    ext_ready, e2e_daemon, page_url, tmp_path,
+):
+    """Page hooks cannot intercept internal views, and auxiliary CDP detach
+    leaves the executor's primary Playwright page usable."""
+    result = run_skill(
+        f'page.goto({page_url!r})\n'
+        'print(read_markdown(mode="full"))\n'
+        'print(snapshot())\n'
+        'aux = context.new_cdp_session(page)\n'
+        'aux.detach()\n'
+        'print(snapshot())\n'
+        'import json\n'
+        'print("ISOLATION:" + json.dumps(page.evaluate("() => ({reads: window.mainWorldDomReads, globals: Object.keys(window).filter(k => k.startsWith(\\\"__bw\\\") || k.startsWith(\\\"__browserwright\\\"))})")))',
+        backend="extension", runtime_dir=e2e_daemon.runtime_dir, timeout=120.0,
+    )
+    artifact = Path(tmp_path) / "internal-views-isolation.json"
+    artifact.write_text(json.dumps({"stdout": result.stdout,
+                                    "stderr": result.stderr,
+                                    "returncode": result.returncode}, indent=2))
+    assert result.returncode == 0, f"{artifact}: {result.stderr}"
+    evidence = json.loads(result.stdout.split("ISOLATION:", 1)[1].splitlines()[0])
+    assert evidence == {"reads": 0, "globals": []}, f"{artifact}: {evidence}"
+    assert "Executor Content View" in result.stdout
