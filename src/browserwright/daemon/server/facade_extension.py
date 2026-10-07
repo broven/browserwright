@@ -57,6 +57,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import secrets
 from collections import deque
@@ -208,6 +209,14 @@ class ExtensionFacadeBridge:
         # debugger. Reusing a primary session crashes Playwright's CDP router.
         self._aux_sessions: dict[str, int] = {}
         self._closed = False
+        # In-flight pointer-move forwards (see `_queue_mouse_move`).
+        self._mouse_moves: set[asyncio.Task] = set()
+        # Device-pixel grid leases for the executor's generated clicks
+        # (`Browserwright.setPointerGrid`). Scale, owning CDP session and the
+        # last dispatched point live here, outside every page execution world.
+        self._pointer_grids: dict[int, float] = {}
+        self._pointer_grid_owners: dict[int, str] = {}
+        self._pointer_grid_points: dict[int, dict[str, float]] = {}
         # Guard concurrent synthesis (autoAttach replay vs fan-out attach) so we
         # never announce the same tab twice.
         self._lock = asyncio.Lock()
@@ -305,9 +314,53 @@ class ExtensionFacadeBridge:
                     continue
                 text = raw if isinstance(raw, str) else raw.decode(
                     "utf-8", errors="replace")
+                if self._queue_mouse_move(text):
+                    continue
+                # Pointer-move ACKs arrive only after renderer dispatch. Let a
+                # run of consecutive samples reach Chrome together (so it can
+                # coalesce them like a real device), then finish the run
+                # before a press or any other protocol operation.
+                await self._drain_mouse_moves()
                 await self._handle_client_frame(text)
         finally:
+            await self._drain_mouse_moves()
             await self.aclose()
+
+    def _queue_mouse_move(self, frame: str) -> bool:
+        """Forward a session-scoped `mouseMoved` without waiting for its ACK.
+
+        Only plain pointer motion is parallelized; presses, keys and every
+        stateful handshake stay strictly sequential through
+        `_handle_client_frame`. Each response keeps its own id/sessionId.
+        """
+        try:
+            msg = json.loads(frame)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(msg, dict) or msg.get("method") != "Input.dispatchMouseEvent":
+            return False
+        params = msg.get("params")
+        sid = msg.get("sessionId")
+        if (not isinstance(params, dict) or params.get("type") != "mouseMoved"
+                or not isinstance(sid, str) or self._tab_id_for_session(sid) is None):
+            return False
+        req_id = msg.get("id") if isinstance(msg.get("id"), int) else None
+        task = asyncio.create_task(self._forward_session_command(
+            req_id, sid, "Input.dispatchMouseEvent", params))
+        self._mouse_moves.add(task)
+        task.add_done_callback(self._mouse_moves.discard)
+        return True
+
+    async def _drain_mouse_moves(self) -> None:
+        if self._mouse_moves:
+            moves = self._mouse_moves.copy()
+            await asyncio.gather(*moves, return_exceptions=True)
+            self._mouse_moves.difference_update(moves)
+
+    def _drop_pointer_grid(self, tab_id: int) -> None:
+        self._pointer_grids.pop(tab_id, None)
+        self._pointer_grid_owners.pop(tab_id, None)
+        self._pointer_grid_points.pop(tab_id, None)
 
     async def aclose(self) -> None:
         if self._closed:
@@ -321,6 +374,9 @@ class ExtensionFacadeBridge:
         self._context_refresh_tasks.clear()
         self._context_refresh_pending.clear()
         self._frame_generations.clear()
+        self._pointer_grids.clear()
+        self._pointer_grid_owners.clear()
+        self._pointer_grid_points.clear()
         self._pending_console_text.clear()
         # NOTE: we deliberately do NOT call self._ext.close() — ExtensionUpstream
         # .close() calls relay.set_event_handler(None), which would clobber the
@@ -463,7 +519,9 @@ class ExtensionFacadeBridge:
         if session_id is None:
             if method == "Target.detachFromTarget" and params.get("sessionId") in self._aux_sessions:
                 detached_sid = params["sessionId"]
-                self._aux_sessions.pop(detached_sid)
+                detached_tab = self._aux_sessions.pop(detached_sid)
+                if self._pointer_grid_owners.get(detached_tab) == detached_sid:
+                    self._drop_pointer_grid(detached_tab)
                 await self._respond(req_id, {})
                 await self._send_to_client(json.dumps({
                     "method": "Target.detachedFromTarget",
@@ -502,6 +560,41 @@ class ExtensionFacadeBridge:
         # it here because it talks raw flat-session CDP to Playwright. ---
         await self._forward_session_command(req_id, session_id, method, params)
 
+    async def _set_pointer_grid(self, req_id: int | None, session_id: str,
+                                tab_id: int, params: dict) -> None:
+        """`Browserwright.setPointerGrid` — a facade-only method.
+
+        ``{"devicePixelRatio": r}`` leases dispatch-time rounding of this tab's
+        `Input.dispatchMouseEvent` coordinates to the physical pixel grid;
+        ``{"devicePixelRatio": null}`` releases the lease and returns the last
+        dispatched point. Only the executor's generated clicks use it (see
+        `repl/human_input.py`): Playwright's final actionability pass may move
+        the target after the pointer approach, so the snap happens here, at
+        native dispatch. The lease belongs to the CDP session that took it;
+        detaching that session or losing the tab drops it.
+        """
+        scale = params.get("devicePixelRatio")
+        if scale is None:
+            point = None
+            if self._pointer_grid_owners.get(tab_id) == session_id:
+                point = self._pointer_grid_points.get(tab_id)
+                self._drop_pointer_grid(tab_id)
+            await self._respond(req_id, {"point": point}, session_id=session_id)
+            return
+        value = 0.0
+        if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+            with contextlib.suppress(OverflowError, ValueError):
+                value = float(scale)
+        if not (math.isfinite(value) and value > 0):
+            await self._error(req_id, -32602,
+                              "devicePixelRatio must be positive and finite",
+                              session_id=session_id)
+            return
+        self._pointer_grids[tab_id] = value
+        self._pointer_grid_owners[tab_id] = session_id
+        self._pointer_grid_points.pop(tab_id, None)
+        await self._respond(req_id, {}, session_id=session_id)
+
     def _command_wait_s(self) -> float | None:
         """How long a forwarded command may wait in the relay: derived from
         the deadline of the agent call currently running on this session
@@ -521,6 +614,11 @@ class ExtensionFacadeBridge:
                               f"unknown sessionId {session_id!r}",
                               session_id=session_id)
             return
+        if method == "Browserwright.setPointerGrid":
+            await self._set_pointer_grid(req_id, session_id, tab_id, params)
+            return
+        if method == "Input.dispatchMouseEvent" and tab_id in self._pointer_grids:
+            params = _snap_to_grid(params, self._pointer_grids[tab_id])
         # PR3: a command scoped to the synthetic main-frame id (which equals the
         # targetId we handed Playwright) must target the REAL Chrome frame id.
         self._rewrite_command_frame_id(tab_id, params)
@@ -531,6 +629,9 @@ class ExtensionFacadeBridge:
         try:
             result = await self._relay.send_cdp(
                 tab_id, method or "", params, timeout=self._command_wait_s())
+            if method == "Input.dispatchMouseEvent" and tab_id in self._pointer_grids:
+                self._pointer_grid_points[tab_id] = {
+                    axis: params[axis] for axis in ("x", "y") if axis in params}
             if method == "Runtime.enable":
                 self._native_runtime_tabs.add(tab_id)
             elif method == "Runtime.disable":
@@ -1431,6 +1532,7 @@ class ExtensionFacadeBridge:
         """Drop all per-tab state for a closed/detached tab and wake any
         outstanding Runtime.enable barrier so it doesn't hang on a dead tab."""
         self._tab_sessions.pop(tab_id, None)
+        self._drop_pointer_grid(tab_id)
         self._quiet_runtime_tabs.discard(tab_id)
         self._native_runtime_tabs.discard(tab_id)
         self._execution_contexts.pop(tab_id, None)
@@ -1473,3 +1575,20 @@ class ExtensionFacadeBridge:
 
     async def _noop_close(self, reason: str) -> None:
         return
+
+
+def _snap_to_grid(params: dict, scale: float) -> dict:
+    """Round a mouse event's x/y to the device-pixel grid of ``scale``.
+
+    Malformed coordinates pass through untouched so Chrome reports its normal
+    invalid-parameter error.
+    """
+    try:
+        if all(isinstance(params.get(axis), (int, float))
+               and not isinstance(params[axis], bool)
+               and math.isfinite(params[axis] * scale) for axis in ("x", "y")):
+            return {**params, **{axis: round(params[axis] * scale) / scale
+                                 for axis in ("x", "y")}}
+    except (OverflowError, ValueError):
+        pass
+    return params
