@@ -1186,10 +1186,12 @@ class _Worker:
         Called by ``build_globals`` BEFORE ``_load_agent_helpers``, so the
         helper modules are seeded from the live surface too.
         """
+        from ..repl.human_input import install_human_input
         from ..repl.markdown import make_read_markdown
         from ..repl.screenshot_defaults import install_screenshot_defaults
 
         install_screenshot_defaults(self._context)
+        install_human_input(self._context)
 
         g.pop("__bw_playwright_handle__", None)
         g["page"] = self._page
