@@ -93,6 +93,15 @@ wait for the extension to reconnect (bounded by the relay's reconnect
 window) → rebind the session's tab → cold-start the session's executor →
 self-check the daemon. It affects one session only.
 
+Amendment (issue #131): before trusting the recovery state's `healthy`, the
+daemon-side ladder releases attacher ownership of the session's tabs held by any
+client outside the session's live executor process (clients report their pid on
+connect). The state machine cannot see such an attacher, yet the single-attacher
+rule refuses every fresh attach to the tab, and `session reset` only reaps the
+executor — so without this check `recover` said `healthy` on a session that
+could not attach its own tab. Each release is reported as an `attach` step. An
+attacher inside the executor process is kept; `session reset` frees that one.
+
 The last rung may replace the daemon **automatically** when, and only when, the
 daemon's self-check finds that its process is gone or that its running version
 differs from the installed version. Both verdicts require two consecutive

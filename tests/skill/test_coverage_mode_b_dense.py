@@ -44,20 +44,22 @@ def test_diagnose_reads_pid_and_version_off_the_pong(monkeypatch):
 def test_ws_url_caches_until_invalidated_and_carries_session_query(monkeypatch):
     from browserwright.mode_b_client import ModeBClient
 
+    monkeypatch.setattr("os.getpid", lambda: 4242)
+
     monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:19990")
     client = ModeBClient()
     client._session_id = "s-42"
 
     assert client.ws_url(client_label="first") == (
-        "ws://127.0.0.1:19990/control?client=first&session=s-42")
+        "ws://127.0.0.1:19990/control?client=first&session=s-42&pid=4242")
     # Cached: the label of the second call is ignored until invalidate().
     assert client.ws_url(client_label="second") == (
-        "ws://127.0.0.1:19990/control?client=first&session=s-42")
+        "ws://127.0.0.1:19990/control?client=first&session=s-42&pid=4242")
 
     client.invalidate()
     monkeypatch.setenv("BW_DAEMON_URL", "http://127.0.0.1:29990")
     assert client.ws_url(client_label="second") == (
-        "ws://127.0.0.1:29990/control?client=second&session=s-42")
+        "ws://127.0.0.1:29990/control?client=second&session=s-42&pid=4242")
     assert client._endpoint == "http://127.0.0.1:29990"
     assert client._transport == "tcp"
 
@@ -279,8 +281,9 @@ def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():
     assert "stale" in exc.value.fix
     assert "BrowserwrightDaemon.newerMethod" in exc.value.fix
 
-    # Issue #40: an attach conflict against the session's own orphaned
-    # executor must point at the reap recovery, not at the generic -32601
+    # Issues #40/#131: an attach conflict must point at the recoveries that
+    # can free the tab -- `recover` (releases a stray claim), then `session
+    # reset` (reaps the session's own executor) -- not at the generic -32601
     # stale-daemon hint (which does not apply).
     cdp._ws = _FakeWS(
         lambda frame: {
@@ -294,8 +297,8 @@ def test_cdp_send_serializes_session_returns_result_and_rewrites_stale_errors():
     )
     with pytest.raises(CDPError) as exc:
         CDPSession.send(cdp, "Target.attachToTarget", targetId="ext-tab-1")
-    assert "orphaned" in exc.value.fix
     assert "browserwright recover --session" in exc.value.fix
+    assert "browserwright session reset" in exc.value.fix
 
     cdp._closed = True
     cdp._closed_reason = "bye"

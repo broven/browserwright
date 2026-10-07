@@ -496,6 +496,10 @@ class _ClientHandler:
         query = _parse_query(conn.request.path or "/")
         label = query.get("client", "anonymous")
         session_id = query.get("session") or None
+        try:
+            client_pid: int | None = int(query["pid"])
+        except (KeyError, ValueError):
+            client_pid = None
 
         lease_token: object | None = None
         handler_task = asyncio.current_task()
@@ -541,7 +545,7 @@ class _ClientHandler:
                 session_name = rec.get("name")
         client = state.allocate_client(
             label, client_id=next(self.daemon._next_client_id),
-            session_id=session_id, session_name=session_name)
+            session_id=session_id, session_name=session_name, pid=client_pid)
         client.connection_token = lease_token
 
         async def send_to_client(text: str) -> None:
