@@ -163,9 +163,10 @@ def remove(session_id: str) -> Optional[dict]:
 def redacted(record: Optional[dict]) -> Optional[dict]:
     """A record safe to print, with any endpoint credential stripped.
 
-    `workspace["url"]` is the one field here that can carry a secret: a cloud
-    or anti-detect browser's CDP URL routinely embeds a reusable token in its
-    userinfo or query string. Before #38 that value lived in a daemon's
+    `workspace["url"]` and `workspace["proxy"]` are the fields here that can
+    carry a secret: a cloud or anti-detect browser's CDP URL routinely embeds a
+    reusable token in its userinfo or query string, and a proxy URL may carry
+    `user:pass@`. Before #38 that value lived in a daemon's
     environment and never in this file, so dumping a record wholesale was safe;
     it isn't any more.
 
@@ -176,12 +177,14 @@ def redacted(record: Optional[dict]) -> Optional[dict]:
     if not isinstance(record, dict):
         return record
     workspace = record.get("workspace")
-    if not isinstance(workspace, dict) or "url" not in workspace:
+    secret_keys = [k for k in ("url", "proxy")
+                   if isinstance(workspace, dict) and k in workspace]
+    if not secret_keys:
         return record
     from .daemon._net import redact_url
 
-    return {**record,
-            "workspace": {**workspace, "url": redact_url(workspace["url"])}}
+    return {**record, "workspace": {
+        **workspace, **{k: redact_url(workspace[k]) for k in secret_keys}}}
 
 
 def _numeric_sort_key(key: object) -> int:

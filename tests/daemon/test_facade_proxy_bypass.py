@@ -1,25 +1,19 @@
 """Regression: the facade bridge must not route the upstream CDP connection
-through the user's ambient web proxy (issue #20).
+through the *daemon's* ambient web proxy (issues #20, #136).
 
 `websockets` 15.x honors ``http_proxy`` / ``https_proxy`` / ``all_proxy`` by
-default. But the daemon→browser CDP control channel is a direct connection to a
-browser the user controls (loopback, LAN, or a Tailscale host), and must bypass
-that proxy — otherwise any non-loopback upstream (e.g. a CloakBrowser profile
-reached over Tailscale) fails the ws handshake with ``InvalidProxyMessage``.
+default. The bridge's only proxy is the one the session pinned (resolved by
+the CLI that opened it); the daemon's own environment must never apply —
+otherwise a non-loopback upstream (e.g. a CloakBrowser profile reached over
+Tailscale) fails the ws handshake with ``InvalidProxyMessage``.
 
-The loopback-only ``_localhost_bypass_proxy`` shortcut can't cover a
-non-loopback upstream, so ``_bridge`` passes ``proxy=None`` to disable proxying
-outright (per-page proxying is applied downstream by Chrome itself).
-
-This test simulates a non-loopback upstream by no-op'ing the loopback shortcut,
-points a bogus proxy at a dead port, and asserts a client driven through the
-facade still reaches the (mock) upstream — which only holds if the facade
-disabled the proxy on its bridge connection.
+This test points every daemon-side proxy var at a dead port and asserts a
+client driven through the facade still reaches the (mock) upstream — which
+only holds if the bridge connection ignored that environment.
 """
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from types import SimpleNamespace
 
@@ -58,14 +52,6 @@ def bogus_proxy(monkeypatch):
 
 async def test_bridge_bypasses_ambient_proxy(monkeypatch, bogus_proxy):
     srv, upstream_url = await _mock_browser_cdp()
-
-    # Simulate a non-loopback upstream: the loopback bypass shortcut can't help,
-    # so only the facade's proxy=None keeps the bridge connection direct.
-    @contextlib.contextmanager
-    def _no_bypass(_ws_url):
-        yield
-    monkeypatch.setattr(
-        "browserwright.daemon.server.facade._localhost_bypass_proxy", _no_bypass)
 
     async def _fake_resolve(_cfg):
         return SimpleNamespace(ws_url=upstream_url)

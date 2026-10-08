@@ -34,7 +34,7 @@ print(page.title())
 browserwright session end --session=$sid
 ```
 
-Use `--backend=extension` for the user's daily Chrome. Use `--backend=cdp --create` for an isolated Chrome that the daemon owns. Use `--backend=cdp --attach=<port|url>` to bind to a browser someone else owns — a local port, or a `ws://`/`wss://`/`http://` endpoint for an anti-detect, fingerprint or cloud profile; ending the session never closes it. Each attached session carries its own endpoint, so one daemon can drive many external browsers at once.
+Use `--backend=extension` for the user's daily Chrome. Use `--backend=cdp --create` for an isolated Chrome that the daemon owns. Use `--backend=cdp --attach=<port|url>` to bind to a browser someone else owns — a local port, or a `ws://`/`wss://`/`http://` endpoint for an anti-detect, fingerprint or cloud profile; ending the session never closes it. Each attached session carries its own endpoint, so one daemon can drive many external browsers at once. A remote endpoint is reached through the proxy in *your* environment when you run `session new` (`http_proxy`/`https_proxy`/`all_proxy`); it is fixed for the session's life. To go direct, open the session with `NO_PROXY=<host>` set (CIDR such as `100.64.0.0/10` works).
 
 ## When A Call Fails
 

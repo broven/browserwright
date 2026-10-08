@@ -22,7 +22,13 @@ license = "AGPL-3.0-only"
 dependencies = [
     "websockets==15.0.1",
     "pillow==12.2.0",
-    "httpx>=0.27",
+    # SOCKS support is default, not an extra (#136): an `--attach` session's
+    # proxy comes from the caller's environment, and macOS proxy apps (Surge,
+    # Clash) routinely export `all_proxy=socks5://...`. `socks` gives httpx
+    # socksio for CDP discovery; python-socks is what websockets 15 needs for
+    # the CDP websocket itself.
+    "httpx[socks]>=0.27",
+    "python-socks>=2.7",
     # Phase C: the skill heredoc injects a real Playwright `page`/`context`
     # bound to the daemon facade, so playwright is a runtime dependency now (it
     # was previously dev-only). `playwright install chromium` is still needed

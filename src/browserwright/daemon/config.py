@@ -197,6 +197,10 @@ class CdpConfig:
     """
     port: int = 9222
     endpoint: str | None = None
+    #: The proxy that reaches `endpoint`, or None for direct. Per-session only,
+    #: like `endpoint`: resolved by the CLI from the environment of whoever
+    #: opened the session (#136). The daemon never reads its own proxy env.
+    proxy: str | None = None
 
 
 @dataclass

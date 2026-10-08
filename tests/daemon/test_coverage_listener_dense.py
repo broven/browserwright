@@ -289,21 +289,6 @@ async def test_upstream_close_cancels_tasks_rejects_pending_and_resets_ws_url():
     assert conn._heartbeat_task.cancelled()
 
 
-def test_localhost_bypass_proxy_augments_and_restores(monkeypatch):
-    monkeypatch.setenv("NO_PROXY", "example.com")
-    with upstream_mod._localhost_bypass_proxy("ws://localhost:9222/devtools/browser/x"):
-        no_proxy = upstream_mod.os.environ["NO_PROXY"]
-        assert "example.com" in no_proxy
-        assert "127.0.0.1" in no_proxy
-        assert "localhost" in no_proxy
-        assert "::1" in no_proxy
-    assert upstream_mod.os.environ["NO_PROXY"] == "example.com"
-
-    monkeypatch.delenv("NO_PROXY", raising=False)
-    with upstream_mod._localhost_bypass_proxy("wss://remote.example/ws"):
-        assert "NO_PROXY" not in upstream_mod.os.environ
-
-
 def test_relay_process_request_status_and_origin_filter():
     relay = RelayServer()
     relay._extensions["ready"] = SimpleNamespace(

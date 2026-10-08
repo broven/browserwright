@@ -17,6 +17,15 @@ from browserwright import cli, session_create
 from browserwright import session_registry as reg
 
 
+@pytest.fixture(autouse=True)
+def _no_caller_proxy(monkeypatch):
+    """`session new` pins the caller's proxy into the workspace (#136); keep
+    the developer's shell proxy out of the ledger shapes asserted here."""
+    for var in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var.upper(), raising=False)
+
+
 def _new(*args) -> int:
     return cli._cmd_session(["new", "--backend=cdp", "--name=t", *args])
 

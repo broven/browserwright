@@ -1,7 +1,7 @@
 """`daemon/_net.py` — the loopback predicate and the URL redactor.
 
 Both rules used to live inline at their single call site. They moved here
-because each is now asked from several places (proxy bypass, `trust_env`, the
+because each is now asked from several places (the proxy decision, the
 DevToolsActivePort fallback; daemon logs, `daemon ps --json`, `session list
 --json`, resolver errors), and a rule answered twice is a rule that drifts.
 """
