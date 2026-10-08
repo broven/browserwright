@@ -14,7 +14,7 @@ CDP commands intercepted here (not forwarded as `chrome.debugger.sendCommand`):
   - `Target.setDiscoverTargets` / `Target.setAutoAttach` → silent ack
     (we don't need Chrome's discover stream — ghost targets come from the
     extension via "attached"/"detached" event types instead)
-  - `Browser.getVersion` → daemon-stamped result, used for heartbeat
+  - `Browser.getVersion` → extension-reported browser identity (heartbeat shape)
   - `Browser.crash`, `Browser.close` and other unsupported browser-level
     methods → -32601 ("method not implemented in extension backend")
 
@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
@@ -1070,16 +1071,9 @@ class ExtensionUpstream:
             return
 
         if method == "Browser.getVersion":
-            # Heartbeat — daemon-internal. Return a stable shape so the
-            # proxy doesn't choke on the heartbeat loop in UpstreamConnection
-            # land (not used in extension backend, but symmetric).
-            await self._respond(req_id, {
-                "product": f"browserwright-daemon-extension/{__version__}",
-                "userAgent": "extension-relay",
-                "protocolVersion": "1.3",
-                "revision": "0",
-                "jsVersion": "0",
-            })
+            # Same stable CDP shape heartbeat callers rely on, carrying the
+            # extension-reported browser identity when there is one.
+            await self._respond(req_id, self._browser_version())
             return
 
         if isinstance(method, str) and method in _UNSUPPORTED_BROWSER_METHODS:
@@ -1444,14 +1438,29 @@ class ExtensionUpstream:
         if method == "Target.setDiscoverTargets":
             return {}
         if method == "Browser.getVersion":
-            return {
-                "product": f"browserwright-daemon-extension/{__version__}",
-                "userAgent": "extension-relay",
-                "protocolVersion": "1.3",
-                "revision": "0",
-                "jsVersion": "0",
-            }
+            return self._browser_version()
         return {}
+
+    def _browser_version(self) -> dict:
+        """`Browser.getVersion`, which chrome.debugger cannot answer itself.
+
+        Playwright derives the browser platform from ``userAgent``
+        (``Macintosh`` → mac) and uses it to resolve ``ControlOrMeta`` and to
+        attach macOS editing commands to shortcuts such as Meta+A. The
+        extension's service worker reports its own user agent in the relay
+        hello; no page is read. Older extensions that don't report one keep
+        the legacy identity.
+        """
+        user_agent = self._relay.browser_user_agent()
+        version = re.search(r"\b(?:Headless)?Chrome/[\d.]+", user_agent)
+        return {
+            "product": version.group(0) if version else
+                f"browserwright-daemon-extension/{__version__}",
+            "userAgent": user_agent or "extension-relay",
+            "protocolVersion": "1.3",
+            "revision": "0",
+            "jsVersion": "0",
+        }
 
     # ---- helpers ---------------------------------------------------------
 

@@ -230,6 +230,7 @@ class _ExtensionConn:
     version: str = ""
     browserwright_version: str = ""
     extension_protocol_version: str = ""
+    user_agent: str = ""
     version_drift: str = VersionDrift.UNKNOWN.value
     # Where this extension came from, classified at ws handshake from the
     # Origin header: "store" (Chrome Web Store item id), "development"
@@ -846,6 +847,11 @@ class RelayServer:
             "tab_count": sum(len(e.tabs) for e in self._extensions.values()),
         }
 
+    def browser_user_agent(self) -> str:
+        """Browser user agent reported by the active extension's service worker."""
+        ext = self._pick_active_extension()
+        return ext.user_agent if ext is not None else ""
+
     async def reload_extensions(
         self,
         *,
@@ -1345,6 +1351,7 @@ class RelayServer:
             ext.connection_generation = self._connection_generation
             ext.install_id = str(msg.get("installId") or "")
             ext.browser = str(msg.get("browser") or "")
+            ext.user_agent = str(msg.get("userAgent") or "")
             ext.version = str(msg.get("version") or "")
             ext.browserwright_version = str(msg.get("browserwrightVersion") or ext.version)
             ext.extension_protocol_version = str(
