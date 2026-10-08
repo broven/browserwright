@@ -2,7 +2,7 @@
 
 The env half of this had **no unit test at all** before the merge: neither the
 verbatim ws pass-through nor the http `/json/version` discovery was covered
-anywhere. That is also why the `trust_env` and 404-fallback differences between
+anywhere. That is also why the proxy and 404-fallback differences between
 the two old backends could sit encoded in their *names* unchallenged.
 """
 from __future__ import annotations
@@ -15,9 +15,10 @@ from browserwright.daemon.config import CdpConfig, BackendsConfig, Config
 from browserwright.daemon.errors import Unavailable
 
 
-def _cfg(*, port: int = 9222, endpoint: str | None = None) -> Config:
+def _cfg(*, port: int = 9222, endpoint: str | None = None,
+         proxy: str | None = None) -> Config:
     return Config(backend="cdp", backends=BackendsConfig(
-        cdp=CdpConfig(port=port, endpoint=endpoint)))
+        cdp=CdpConfig(port=port, endpoint=endpoint, proxy=proxy)))
 
 
 def _no_http(monkeypatch):
@@ -172,10 +173,10 @@ async def test_fallback_uses_the_endpoint_port_not_the_config_default(monkeypatc
     assert seen == [9444]
 
 
-# ---- trust_env is derived from the endpoint, not from a name ---------------
+# ---- the proxy is the session's, never the daemon's env (#136) ------------
 
 
-@pytest.mark.parametrize(("endpoint", "trusts_proxy"), [
+@pytest.mark.parametrize(("endpoint", "uses_proxy"), [
     (None, False),                                   # port mode: always local
     ("ws://127.0.0.1:9222/devtools/browser/x", False),
     ("ws://[::1]:9222/devtools/browser/x", False),
@@ -184,14 +185,17 @@ async def test_fallback_uses_the_endpoint_port_not_the_config_default(monkeypatc
     ("wss://cloud.example.com/cdp", True),
     ("http://192.168.1.10:9222", True),
 ])
-def test_proxy_trust_follows_the_endpoint(endpoint, trusts_proxy):
+def test_session_proxy_applies_only_to_a_remote_endpoint(endpoint, uses_proxy):
     """One predicate replaced two name checks.
 
     `rdp` hard-coded `trust_env=False` and `env` hard-coded `True`. Both were
-    answering the same question — is this browser on my machine? — so the merged
-    backend asks it directly.
+    answering the same question — is this browser on my machine? — so the
+    merged backend asks it directly, and now applies the session's own pinned
+    proxy instead of the daemon's environment.
     """
-    assert CdpBackend(_cfg(endpoint=endpoint))._trust_env is trusts_proxy
+    proxy = "socks5://127.0.0.1:6153"
+    backend = CdpBackend(_cfg(endpoint=endpoint, proxy=proxy))
+    assert backend._proxy == (proxy if uses_proxy else None)
 
 
 # ---- the deleted env vars are inert ----------------------------------------

@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .._net import is_loopback_host, redact_url
+from .._net import is_loopback_host, proxy_hint, redact_url
 from ..config import Config
 from ..errors import Unavailable
 from ..platforms import profile_paths
@@ -62,12 +62,10 @@ class RealCdpBackend:
     kind = "UPSTREAM_WS"
     recommended_mode: str = "A"
     ux_cost = "none"
-    # cdp overrides to False: the user's HTTP(S)_PROXY / ALL_PROXY must not be
-    # applied to localhost probes — proxying to your own loopback is never what
-    # anyone wants and triggers httpx[socks] import errors when
-    # ALL_PROXY=socks5://... env keeps the default: its target may be a remote
-    # host where the proxy is intentional.
-    _trust_env: bool = True
+    # The proxy discovery goes through, or None for direct. Never read from
+    # the daemon's environment (#136): `CdpBackend` takes it from the
+    # session's Config, where the CLI that opened the session pinned it.
+    _proxy: str | None = None
 
     def __init__(self, cfg: Config):
         self._cfg = cfg
@@ -97,7 +95,12 @@ class RealCdpBackend:
     # ---- shared plumbing ----------------------------------------------------
 
     async def _get(self, url: str, timeout: float) -> httpx.Response:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=self._trust_env) as client:
+        # `trust_env=False`: httpx would otherwise build a transport for every
+        # proxy env var at construction — before `NO_PROXY` is consulted — so
+        # a stray daemon-side `all_proxy` could crash a request it never
+        # applied to (#136).
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False,
+                                     proxy=self._proxy) as client:
             return await client.get(url)
 
     async def _discover_ws_url(self, base_url: str, timeout: float) -> str:
@@ -118,7 +121,8 @@ class RealCdpBackend:
             resp = await self._get(url, timeout)
         except (httpx.HTTPError, OSError) as e:
             raise Unavailable(
-                f"{self.name}: cannot reach {shown}: {e}",
+                f"{self.name}: cannot reach {shown}: {e}"
+                f"{proxy_hint(self._proxy, base_url)}",
                 attempts={self.name: f"GET {shown} -> {type(e).__name__}: {e}"},
             ) from e
         if resp.status_code == 404:
@@ -166,7 +170,7 @@ class CdpBackend(RealCdpBackend):
 
     | | old | new |
     |---|---|---|
-    | apply the user's `ALL_PROXY` | `cdp` no, `env` yes | `not _loopback` |
+    | apply a proxy | `cdp` no, `env` yes | `not _loopback` |
     | DevToolsActivePort 404 fallback | `cdp` yes, `env` never | `_loopback` |
 
     That is strictly more correct than the names were: `--attach=http://127.0.0.1:9222`
@@ -179,6 +183,7 @@ class CdpBackend(RealCdpBackend):
         super().__init__(cfg)
         self.port = cfg.backends.cdp.port
         self.endpoint = cfg.backends.cdp.endpoint
+        self.proxy = cfg.backends.cdp.proxy
 
     # ---- the one predicate the two old backends disagreed about -------------
 
@@ -190,15 +195,9 @@ class CdpBackend(RealCdpBackend):
         return is_loopback_host(self.endpoint)
 
     @property
-    def _trust_env(self) -> bool:  # overrides RealCdpBackend's class attribute
-        """Apply the user's HTTP(S)_PROXY / ALL_PROXY?
-
-        Never for a local browser: proxying to your own loopback is never what
-        anyone wants, and it trips httpx[socks] import errors under
-        `ALL_PROXY=socks5://...`. Always for a remote endpoint, where reaching
-        it through the proxy is usually the whole point.
-        """
-        return not self._loopback
+    def _proxy(self) -> str | None:  # overrides RealCdpBackend's class attribute
+        """The proxy the session pinned (#136); never one for a local browser."""
+        return None if self._loopback else self.proxy
 
     # ---- URL sources --------------------------------------------------------
 

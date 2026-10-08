@@ -16,7 +16,6 @@ drops, we mark CLOSING and signal up; the caller decides what comes next.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -26,7 +25,7 @@ from typing import Any, Awaitable, Callable, Protocol, TYPE_CHECKING, runtime_ch
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from .._net import is_loopback_host
+from .._net import proxy_hint, proxy_toward, redact_url
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +250,17 @@ class CdpUpstream:
         return self._cfg
 
     @property
+    def session_proxy(self) -> str | None:
+        """The proxy this session's endpoint is reached through, or None.
+
+        Pinned from the ledger by the context factory and read from the same
+        Config as the endpoint, so discovery, this adapter's websocket, and
+        the facade bridge can never disagree about it (#136)."""
+        cdp = getattr(getattr(self._cfg, "backends", None), "cdp", None)
+        proxy = getattr(cdp, "proxy", None)
+        return proxy if isinstance(proxy, str) else None
+
+    @property
     def browser_pid(self) -> int | None:
         """Pid of the Chrome this adapter launched, or None (attach-owned, or
         not launched yet)."""
@@ -334,37 +344,40 @@ class CdpUpstream:
         if timeout is None:
             timeout = 30.0
         assert ws_url is not None
-        with _localhost_bypass_proxy(ws_url):
-            connect_kwargs: dict[str, Any] = {
-                # Big max_size: CDP `Page.captureScreenshot` returns base64
-                # blobs that comfortably exceed the websockets default 1MiB.
-                "max_size": 100 * 1024 * 1024,
-                # Disable per-message-deflate — Chrome's browser-level CDP
-                # doesn't speak it, and websockets v15 sometimes negotiates
-                # extensions that break the handshake.
-                "compression": None,
-                # Never route the daemon→browser CDP control channel through the
-                # user's ambient web proxy. websockets v15 honors
-                # http_proxy/all_proxy by default, which breaks any non-loopback
-                # upstream (LAN / Tailscale / an env-backed CloakBrowser profile)
-                # that the loopback-only NO_PROXY bypass above can't cover. Same
-                # fix as the Playwright facade bridge. (issue #20)
-                "proxy": None,
-                # Keep the upstream alive with ws-level pings; CDP-level
-                # Browser.getVersion heartbeat is layered on top for protocol
-                # liveness.
-                "ping_interval": 20,
-                "ping_timeout": 20,
-            }
-            try:
-                self._ws = await asyncio.wait_for(
-                    websockets.connect(ws_url, **connect_kwargs),
-                    timeout=timeout,
-                )
-            except Exception as e:
-                if lifecycle:
-                    logger.warning("upstream open failed: %r", e)
-                raise
+        proxy = proxy_toward(ws_url, self.session_proxy)
+        connect_kwargs: dict[str, Any] = {
+            # Big max_size: CDP `Page.captureScreenshot` returns base64
+            # blobs that comfortably exceed the websockets default 1MiB.
+            "max_size": 100 * 1024 * 1024,
+            # Disable per-message-deflate — Chrome's browser-level CDP
+            # doesn't speak it, and websockets v15 sometimes negotiates
+            # extensions that break the handshake.
+            "compression": None,
+            # Exactly the session's proxy, or None for direct — never
+            # websockets' default of reading the daemon's http_proxy/all_proxy.
+            # The CLI that opened the session resolved it from its own
+            # environment; the facade bridge uses the same value. (#20, #136)
+            "proxy": proxy,
+            # Keep the upstream alive with ws-level pings; CDP-level
+            # Browser.getVersion heartbeat is layered on top for protocol
+            # liveness.
+            "ping_interval": 20,
+            "ping_timeout": 20,
+        }
+        try:
+            self._ws = await asyncio.wait_for(
+                websockets.connect(ws_url, **connect_kwargs),
+                timeout=timeout,
+            )
+        except Exception as e:
+            if lifecycle:
+                logger.warning("upstream open failed: %r%s", e,
+                               proxy_hint(proxy, ws_url))
+            if proxy is not None:
+                raise ConnectionError(
+                    f"cannot open {redact_url(ws_url)}: {e!r}"
+                    f"{proxy_hint(proxy, ws_url)}") from e
+            raise
         self._ws_url = ws_url
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -1064,37 +1077,6 @@ class CdpUpstream:
                     return
         except asyncio.CancelledError:
             return
-
-
-# ---- localhost proxy bypass (same trick as active_tab) --------------------
-
-
-@contextlib.contextmanager
-def _localhost_bypass_proxy(ws_url: str):
-    """When the upstream URL is loopback, ensure NO_PROXY covers it.
-
-    Spec doesn't mention this — but a browser we launched runs on the user's
-    machine, and the user often has HTTPS_PROXY / ALL_PROXY set. An external
-    endpoint is the opposite case: there the proxy is usually intentional, so
-    we leave it alone. `is_loopback_host` is what decides which one this is,
-    and it is the same predicate the cdp backend uses to pick `trust_env`.
-    """
-    if not is_loopback_host(ws_url):
-        yield
-        return
-    prev = os.environ.get("NO_PROXY", "")
-    augmented = prev
-    for h in ("127.0.0.1", "localhost", "::1"):
-        if h not in augmented:
-            augmented = f"{augmented},{h}" if augmented else h
-    os.environ["NO_PROXY"] = augmented
-    try:
-        yield
-    finally:
-        if prev:
-            os.environ["NO_PROXY"] = prev
-        else:
-            os.environ.pop("NO_PROXY", None)
 
 
 # Compatibility name for callers/tests that still import the old transport-

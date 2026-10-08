@@ -68,6 +68,7 @@ from .. import _ipc
 from ..config import (DEFAULT_FACADE_PORT, LOOPBACK_HOST, Config,
                       needs_loopback_cobind)
 from .. import __version__
+from .._net import proxy_toward
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
 from ..._executor.protocol import _MAX_FRAME
@@ -75,7 +76,6 @@ from .daemon import Daemon, UnknownSessionError, UpstreamContext
 from .exec_relay import serve_exec_relay
 from .facade_extension import ExtensionFacadeBridge
 from .relay import RelayServer
-from .upstream import _localhost_bypass_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -636,7 +636,7 @@ class PlaywrightFacade:
             return
 
         try:
-            await self._bridge(conn, ws_url)
+            await self._bridge(conn, ws_url, proxy=self._cdp_proxy(ctx))
         except websockets.exceptions.ConnectionClosed:
             pass
         except Exception as e:  # noqa: BLE001
@@ -656,29 +656,33 @@ class PlaywrightFacade:
         rr = await resolve_upstream(cfg)
         return rr.ws_url
 
-    async def _bridge(self, client: ServerConnection, upstream_url: str) -> None:
+    def _cdp_proxy(self, ctx: UpstreamContext | None = None) -> str | None:
+        """The proxy the session pinned for its endpoint — the same value its
+        own upstream connection uses, so the two always agree on the route
+        (#136). The daemon-wide Config never carries one."""
+        return getattr(ctx.upstream, "session_proxy", None) if ctx is not None else None
+
+    async def _bridge(self, client: ServerConnection, upstream_url: str,
+                      proxy: str | None = None) -> None:
         """Open a raw ws to the upstream Chrome and shuttle frames both ways.
 
         Transparent: no id/sessionId rewriting (unlike the agent Router) — a
         Playwright client owns the whole browser-level CDP namespace on its own
         dedicated upstream connection, so Target.*/Browser.* responses and
         events flow back unmodified."""
-        with _localhost_bypass_proxy(upstream_url):
-            upstream = await websockets.connect(
-                upstream_url,
-                max_size=100 * 1024 * 1024,
-                compression=None,
-                ping_interval=20,
-                ping_timeout=20,
-                # The daemon→browser CDP control channel must never traverse the
-                # user's ambient web proxy (http_proxy/all_proxy). `websockets`
-                # 15.x honors those env vars by default, which breaks any
-                # non-loopback upstream (LAN / Tailscale / CloakBrowser) — the
-                # loopback-only NO_PROXY augmentation above can't cover it.
-                # proxy=None disables proxying entirely; per-page proxying is
-                # applied downstream by Chrome/CloakBrowser itself. (issue #20)
-                proxy=None,
-            )
+        upstream = await websockets.connect(
+            upstream_url,
+            max_size=100 * 1024 * 1024,
+            compression=None,
+            ping_interval=20,
+            ping_timeout=20,
+            # Exactly the session's proxy, or None for direct — never
+            # websockets' default of reading the daemon's http_proxy/all_proxy,
+            # which broke LAN / Tailscale / CloakBrowser upstreams (#20). The
+            # CLI that opened the session resolved it from its own environment
+            # (#136); per-page proxying is still Chrome's own business.
+            proxy=proxy_toward(upstream_url, proxy),
+        )
         c2u = asyncio.create_task(self._pump(client, upstream, "c->u"))
         u2c = asyncio.create_task(self._pump(upstream, client, "u->c"))
         try:

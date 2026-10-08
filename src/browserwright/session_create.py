@@ -24,6 +24,7 @@ Ownership rule: who ``create``s, closes; ``attach`` only reminds.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from dataclasses import dataclass
@@ -345,6 +346,16 @@ def new(*, backend: str, create: bool = False, attach: Optional[object] = None,
         else:
             port, endpoint = _checked_attach(attach)
             workspace = {"port": port} if port is not None else {"url": endpoint}
+            if endpoint is not None:
+                # #136: the proxy is decided here, once, from the environment
+                # of whoever opens the session, and travels with the session.
+                # The daemon never reads proxy env vars of its own, so the
+                # same command behaves the same against any daemon.
+                from .daemon._net import proxy_for
+
+                proxy = proxy_for(endpoint, os.environ)
+                if proxy is not None:
+                    workspace["proxy"] = proxy
         sid = reg.allocate(backend="cdp", owner=owner,
                            name=name, workspace=workspace)
         return NewSession(sid, False, lifecycle.ensure("session new"))

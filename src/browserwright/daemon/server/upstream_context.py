@@ -361,6 +361,23 @@ def endpoint_from_workspace(workspace: object) -> tuple[int | None, str | None]:
     return None, None
 
 
+def proxy_from_workspace(workspace: object) -> str | None:
+    """The proxy a session's `workspace` pinned for its endpoint, or None.
+
+    Only a `{"url": ...}` workspace can carry one: the CLI resolved it from
+    its own environment when the session was opened (#136). A port endpoint
+    is on this machine and always direct, so a `proxy` beside a `port` is
+    ignored, as is anything that is not a URL.
+    """
+    if not isinstance(workspace, dict):
+        return None
+    _, url = endpoint_from_workspace(workspace)
+    proxy = workspace.get("proxy")
+    if url is None or not isinstance(proxy, str) or "://" not in proxy:
+        return None
+    return proxy
+
+
 def cdp_cfg_for(record: dict, base: Config) -> Config:
     """Derive a per-session cdp Config from the ledger record.
 
@@ -375,7 +392,8 @@ def cdp_cfg_for(record: dict, base: Config) -> Config:
         # `replace` shares the nested BackendsConfig instance; copy the cdp
         # sub-config so per-session pinning never mutates the shared cfg (or
         # another session's context).
-        fields: dict = {"endpoint": endpoint}
+        fields: dict = {"endpoint": endpoint,
+                        "proxy": proxy_from_workspace(record.get("workspace"))}
         if port is not None:
             fields["port"] = port
         cfg.backends = dataclasses.replace(
@@ -406,9 +424,11 @@ def context_for_record(session_id: str, record: dict,
         cfg = cdp_cfg_for(record, base)
         # Redacted: a per-session endpoint can carry a bearer token, and daemon
         # logs get pasted into bug reports.
-        logger.info("cdp context for session %s: port=%s endpoint=%s owner=%s",
+        logger.info("cdp context for session %s: port=%s endpoint=%s "
+                    "proxy=%s owner=%s",
                     session_id, cfg.backends.cdp.port,
-                    redact_url(cfg.backends.cdp.endpoint), record.get("owner"))
+                    redact_url(cfg.backends.cdp.endpoint),
+                    redact_url(cfg.backends.cdp.proxy), record.get("owner"))
         return build_context(
             backend="cdp", cfg=cfg, session_id=session_id,
             owns_browser=record.get("owner") == "create")
