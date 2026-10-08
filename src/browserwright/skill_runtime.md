@@ -533,8 +533,12 @@ browserwright userscript remove <id>
 ```
 
 Before writing one, read `userscripts.md` in this skill directory — in
-particular "Reacting to dynamic pages": prefer a `MutationObserver` over
-polling for elements.
+particular "Reacting to change: observers first". Prefer an observer
+(`MutationObserver`, `ResizeObserver`, `IntersectionObserver`,
+`PerformanceObserver`, `ReportingObserver`) over polling; when none fits, use the
+event that fires on the change, and only then a one-shot `setTimeout` or a
+**bounded** `requestAnimationFrame` — never `setInterval` or an unbounded rAF
+loop.
 
 ## Reporting browserwright bugs
 
