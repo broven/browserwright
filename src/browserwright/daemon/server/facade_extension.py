@@ -37,9 +37,9 @@ lives HERE, not inside `extension_upstream.py`):
       * A3 — `Target.createTarget` → `RelayServer.create_background_tab`
         (the extension can't open browser-level targets), then synthesizes the
         created/attached events for the new tab.
-      * A4 — `Runtime.enable` execution-context barrier: forward, then wait
-        (bounded) for `Runtime.executionContextCreated` so Playwright doesn't
-        race ahead of the main-frame default context.
+      * A4 — `Runtime.enable` execution-context barrier: discover real contexts
+        from native document handles without subscribing to console previews;
+        native Runtime events remain available via `BW_CAPTURE_CONSOLE=1`.
 
 Page-session `Target.setAutoAttach` is forwarded because Playwright expects the
 page-session auto-attach command to reach Chrome. The extension service worker
@@ -57,13 +57,16 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import secrets
+from collections import deque
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection
 
 from ... import session_registry
 from . import call_deadline
+from .extension_contexts import UnsupportedContextHandleError, discover_default_context
 from .extension_upstream import (
     ExtensionUpstream,
     _tab_id_from_target_id,
@@ -201,6 +204,9 @@ class ExtensionFacadeBridge:
         # `targetDestroyed`/`detachedFromTarget` references the same session and
         # forwarded extension events can be tagged with the right sessionId.
         self._tab_sessions: dict[int, str] = {}
+        # Explicit CDP attachments are independent handles over the shared
+        # debugger. Reusing a primary session crashes Playwright's CDP router.
+        self._aux_sessions: dict[str, int] = {}
         self._closed = False
         # Guard concurrent synthesis (autoAttach replay vs fan-out attach) so we
         # never announce the same tab twice.
@@ -242,6 +248,19 @@ class ExtensionFacadeBridge:
         # so `_handle_runtime_enable` can gate its response on the real event
         # rather than a blind sleep.
         self._ctx_waiters: dict[int, list[asyncio.Future]] = {}
+        # Runtime.enable subscribes Chrome to console previews, including
+        # synchronous table serialization. Native Document handles expose real
+        # context IDs without enabling either Runtime events or Debugger.
+        self._capture_console = os.environ.get("BW_CAPTURE_CONSOLE", "0") == "1"
+        self._quiet_runtime_tabs: set[int] = set()
+        self._native_runtime_tabs: set[int] = set()
+        self._execution_contexts: dict[int, dict[int, dict]] = {}
+        self._pending_console_text: dict[int, deque[dict]] = {}
+        self._world_names: dict[int, set[str]] = {}
+        self._frame_generations: dict[tuple[int, str], int] = {}
+        self._frame_discovery_serial = 0
+        self._context_refresh_tasks: dict[tuple[int, str], asyncio.Task] = {}
+        self._context_refresh_pending: set[asyncio.Task] = set()
 
     @property
     def auto_title(self) -> str | None:
@@ -295,6 +314,14 @@ class ExtensionFacadeBridge:
             return
         self._closed = True
         self._relay.remove_event_listener(self._on_relay_event)
+        # Native commands already on the shared relay must finish; subsequent
+        # refresh steps observe _closed and stop without issuing more work.
+        if self._context_refresh_pending:
+            await asyncio.gather(*self._context_refresh_pending, return_exceptions=True)
+        self._context_refresh_tasks.clear()
+        self._context_refresh_pending.clear()
+        self._frame_generations.clear()
+        self._pending_console_text.clear()
         # NOTE: we deliberately do NOT call self._ext.close() — ExtensionUpstream
         # .close() calls relay.set_event_handler(None), which would clobber the
         # AGENT path's primary event handler. Our dedicated ExtensionUpstream
@@ -423,6 +450,9 @@ class ExtensionFacadeBridge:
 
         # --- A4: Runtime.enable barrier (session-scoped) ---
         if method == "Runtime.enable" and session_id is not None:
+            if session_id in self._aux_sessions:
+                await self._forward_session_command(req_id, session_id, method, params)
+                return
             await self._handle_runtime_enable(req_id, session_id, params)
             return
 
@@ -431,6 +461,15 @@ class ExtensionFacadeBridge:
         # Browser.getVersion). Its responses carry no sessionId, which is
         # correct for these browser-level methods. ---
         if session_id is None:
+            if method == "Target.detachFromTarget" and params.get("sessionId") in self._aux_sessions:
+                detached_sid = params["sessionId"]
+                self._aux_sessions.pop(detached_sid)
+                await self._respond(req_id, {})
+                await self._send_to_client(json.dumps({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": detached_sid},
+                }))
+                return
             if method == "Target.getTargets" and self._session_id is not None:
                 try:
                     envelope = await self._ext.get_targets(
@@ -485,9 +524,27 @@ class ExtensionFacadeBridge:
         # PR3: a command scoped to the synthetic main-frame id (which equals the
         # targetId we handed Playwright) must target the REAL Chrome frame id.
         self._rewrite_command_frame_id(tab_id, params)
+        if method in ("Page.createIsolatedWorld", "Page.addScriptToEvaluateOnNewDocument"):
+            name = params.get("worldName")
+            if isinstance(name, str) and name:
+                self._world_names.setdefault(tab_id, set()).add(name)
         try:
             result = await self._relay.send_cdp(
                 tab_id, method or "", params, timeout=self._command_wait_s())
+            if method == "Runtime.enable":
+                self._native_runtime_tabs.add(tab_id)
+            elif method == "Runtime.disable":
+                self._native_runtime_tabs.discard(tab_id)
+            if (method == "Page.createIsolatedWorld"
+                    and tab_id in self._quiet_runtime_tabs
+                    and isinstance(result, dict)
+                    and isinstance(result.get("executionContextId"), int)):
+                await self._publish_execution_context(tab_id, {
+                    "id": result["executionContextId"], "origin": "",
+                    "name": params.get("worldName", ""),
+                    "auxData": {"isDefault": False, "type": "isolated",
+                                "frameId": params.get("frameId")},
+                })
             # PR3: real Chrome makes a page's TOP frame id === its targetId, and
             # CRPage keys its frame→session map on the targetId
             # (`_sessions.set(targetId, mainFrameSession)`) then resolves the
@@ -515,6 +572,16 @@ class ExtensionFacadeBridge:
                     if isinstance(real_id, str) and real_id:
                         self._tab_main_frame[tab_id] = real_id
                         frame["id"] = f"ext-tab-{tab_id}"
+                        # Existing child frames are replayed at cold bind too.
+                        # Their own ids stay native; only the root parent id
+                        # must agree with Playwright's synthetic main frame.
+                        pending = list((result.get("frameTree") or {}).get("childFrames") or [])
+                        while pending:
+                            child = pending.pop()
+                            child_frame = child.get("frame") or {}
+                            if child_frame.get("parentId") == real_id:
+                                child_frame["parentId"] = f"ext-tab-{tab_id}"
+                            pending.extend(child.get("childFrames") or [])
             await self._respond(req_id, result, session_id=session_id)
         except _CommandError as e:
             await self._error(req_id, e.code, e.message, session_id=session_id)
@@ -533,24 +600,12 @@ class ExtensionFacadeBridge:
         if (isinstance(target_id, str)
                 and not await self._authorize_target(req_id, target_id)):
             return
-        # Reuse an already-announced session for this tab if we have one, so
-        # auto-attach replay + an explicit attachToTarget agree on one session.
+        # An explicit attachment to an announced Page is an auxiliary handle;
+        # never reuse or re-announce its primary auto-attachment session.
         if tab_id is not None and tab_id in self._tab_sessions:
-            sid = self._tab_sessions[tab_id]
-            try:
-                # Shared attach core: relay attach + (re-)registering the sid
-                # in the upstream's table (it may differ from ours if this is
-                # the first explicit attach) so session-scoped commands
-                # resolve the tab.
-                await self._ext.attach_target(tab_id, sid=sid, timeout=10.0)
-            except _CommandError as e:
-                await self._error(req_id, e.code, e.message)
-                return
-            except Exception as e:  # noqa: BLE001
-                await self._error(req_id, -32603, f"attach failed: {e!r}")
-                return
+            sid = f"ext-aux-{secrets.token_hex(12)}"
+            self._aux_sessions[sid] = tab_id
             await self._respond(req_id, {"sessionId": sid})
-            await self._announce_target(tab_id, sid=sid, send_created=False)
             return
         # Unknown tab → let ExtensionUpstream do the attach + sid fabrication,
         # then snoop its table to learn the sid it handed back.
@@ -643,6 +698,7 @@ class ExtensionFacadeBridge:
             await self._respond(req_id, {"success": False})
             return
         # Evict the facade-local per-tab state too.
+        await self._detach_aux_sessions(tab_id)
         self._evict_tab(tab_id)
         await self._respond(req_id, {"success": True})
         # Real Chrome ALWAYS emits detachedFromTarget + targetDestroyed after a
@@ -690,6 +746,9 @@ class ExtensionFacadeBridge:
                               f"unknown sessionId {session_id!r}",
                               session_id=session_id)
             return
+        if not self._capture_console:
+            await self._enable_quiet_runtime(req_id, session_id, tab_id)
+            return
         # Arm the waiter BEFORE issuing enable so we can't miss the event
         # between the enable round-trip and registering the future.
         waiter = self._arm_context_waiter(tab_id)
@@ -722,6 +781,229 @@ class ExtensionFacadeBridge:
             self._disarm_context_waiter(tab_id, waiter)
         await self._respond(req_id, result, session_id=session_id)
 
+    async def _enable_quiet_runtime(self, req_id: int | None,
+                                    session_id: str, tab_id: int) -> None:
+        """Supply real context IDs without previews or debugger machinery."""
+        self._quiet_runtime_tabs.add(tab_id)
+        self._native_runtime_tabs.discard(tab_id)
+        self._forget_tab_discoveries(tab_id)
+        self._execution_contexts.pop(tab_id, None)
+        waiter = self._arm_context_waiter(tab_id)
+        try:
+            await self._relay.send_cdp(tab_id, "Runtime.disable", {},
+                                       timeout=self._command_wait_s())
+            await self._relay.send_cdp(tab_id, "Console.enable", {},
+                                       timeout=self._command_wait_s())
+            await self._relay.send_cdp(tab_id, "Debugger.disable", {},
+                                       timeout=self._command_wait_s())
+            tree = await self._relay.send_cdp(tab_id, "Page.getFrameTree", {},
+                                              timeout=self._command_wait_s())
+            root = tree.get("frameTree") or {}
+            main_id = (root.get("frame") or {}).get("id")
+            if not isinstance(main_id, str):
+                raise ValueError("Chrome returned no main frame for context discovery")
+            self._tab_main_frame[tab_id] = main_id
+            # A rebind discovers every existing local frame; it does not rely
+            # on an event subscription replay or a page-script preload.
+            pending = [root]
+            while pending:
+                node = pending.pop()
+                frame_id = (node.get("frame") or {}).get("id")
+                if isinstance(frame_id, str):
+                    generation = self._invalidate_frame_discovery(tab_id, frame_id)
+                    await self._refresh_frame_worlds(tab_id, frame_id, generation)
+                pending.extend(node.get("childFrames") or [])
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(waiter, _RUNTIME_ENABLE_BARRIER_TIMEOUT)
+            await self._respond(req_id, {}, session_id=session_id)
+        except _CommandError as exc:
+            await self._error(req_id, exc.code, exc.message, session_id=session_id)
+        except Exception as exc:  # noqa: BLE001
+            await self._error(req_id, -32603, f"context discovery failed: {exc!r}",
+                              session_id=session_id)
+        finally:
+            self._disarm_context_waiter(tab_id, waiter)
+
+    def _invalidate_frame_discovery(self, tab_id: int, frame_id: str) -> int:
+        key = (tab_id, frame_id)
+        self._frame_discovery_serial += 1
+        generation = self._frame_discovery_serial
+        self._frame_generations[key] = generation
+        # Let in-flight native commands finish. Cancelling a relay command can
+        # invalidate the shared extension transport; generation checks discard
+        # the result after it completes instead.
+        self._context_refresh_tasks.pop(key, None)
+        return generation
+
+    def _schedule_frame_refresh(self, tab_id: int, frame_id: str,
+                                *, rediscover: bool = False) -> None:
+        key = (tab_id, frame_id)
+        aliases = {frame_id}
+        if frame_id == self._tab_main_frame.get(tab_id):
+            aliases.add(f"ext-tab-{tab_id}")
+        if not rediscover and any(
+                (ctx.get("auxData") or {}).get("isDefault")
+                and (ctx.get("auxData") or {}).get("frameId") in aliases
+                for ctx in self._execution_contexts.get(tab_id, {}).values()):
+            return
+        pending = self._context_refresh_tasks.get(key)
+        if pending is not None and not pending.done():
+            return
+        generation = self._frame_generations.get(key)
+        if generation is None:
+            generation = self._invalidate_frame_discovery(tab_id, frame_id)
+        task = asyncio.create_task(self._refresh_frame_worlds(tab_id, frame_id, generation))
+        self._context_refresh_tasks[key] = task
+        self._context_refresh_pending.add(task)
+        task.add_done_callback(self._frame_refresh_done)
+
+    def _frame_refresh_done(self, task: asyncio.Task) -> None:
+        self._context_refresh_pending.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("facade(ext): context discovery failed: %r", task.exception())
+
+    def _frame_discovery_current(self, tab_id: int, frame_id: str,
+                                 generation: int) -> bool:
+        return (not self._closed and tab_id in self._quiet_runtime_tabs
+                and self._frame_generations.get((tab_id, frame_id)) == generation)
+
+    async def _publish_execution_context(self, tab_id: int, ctx: dict) -> None:
+        context_id = ctx.get("id")
+        if not isinstance(context_id, int):
+            return
+        contexts = self._execution_contexts.setdefault(tab_id, {})
+        previous = contexts.get(context_id)
+        if previous is not None:
+            old_aux = previous.get("auxData") or {}
+            new_aux = ctx.get("auxData") or {}
+            if (old_aux.get("frameId") == new_aux.get("frameId")
+                    and old_aux.get("isDefault") == new_aux.get("isDefault")
+                    and previous.get("name") == ctx.get("name")
+                    and previous.get("_native_identity") == ctx.get("_native_identity")):
+                return
+            contexts.pop(context_id)
+            await self._on_relay_event({
+                "type": "event", "tabId": tab_id,
+                "method": "Runtime.executionContextDestroyed",
+                "params": {"executionContextId": context_id},
+            })
+        ctx['_console_ready'] = False
+        contexts[context_id] = ctx
+        payload = {key: value for key, value in ctx.items() if not key.startswith('_')}
+        if isinstance(payload.get("auxData"), dict):
+            payload["auxData"] = dict(payload["auxData"])
+        await self._on_relay_event({
+            "type": "event", "tabId": tab_id,
+            "method": "Runtime.executionContextCreated", "params": {"context": payload},
+        })
+        main_ids = {self._tab_main_frame.get(tab_id), f"ext-tab-{tab_id}"}
+        aux = ctx.get('auxData') or {}
+        if aux.get('isDefault') and aux.get('frameId') in main_ids:
+            # Publish the realm before text events, and preserve their order
+            # while more native messages arrive during the flush.
+            while (self._execution_contexts.get(tab_id, {}).get(context_id) is ctx
+                   and self._pending_console_text.get(tab_id)):
+                message = self._pending_console_text[tab_id].popleft()
+                if tab_id not in self._native_runtime_tabs:
+                    await self._emit_console_text(tab_id, context_id, message)
+            if not self._pending_console_text.get(tab_id):
+                self._pending_console_text.pop(tab_id, None)
+        ctx['_console_ready'] = True
+
+    def _console_context_id(self, tab_id: int) -> int | None:
+        main_ids = {self._tab_main_frame.get(tab_id), f"ext-tab-{tab_id}"}
+        return next((context_id for context_id, context in
+                     self._execution_contexts.get(tab_id, {}).items()
+                     if (context.get("auxData") or {}).get("isDefault")
+                     and context.get('_console_ready')
+                     and (context.get("auxData") or {}).get("frameId") in main_ids), None)
+
+    async def _emit_console_text(self, tab_id: int, context_id: int, message: dict) -> None:
+        await self._on_relay_event({
+            "type": "event", "tabId": tab_id,
+            "method": "Runtime.consoleAPICalled", "params": {
+                "type": message.get("level", "log"),
+                "args": [{"type": "string", "value": message.get("text", "")}],
+                "executionContextId": context_id, "timestamp": 0,
+            },
+        })
+
+    async def _refresh_frame_worlds(self, tab_id: int, frame_id: str,
+                                    generation: int) -> None:
+        async def send(method: str, params: dict) -> dict:
+            return await self._relay.send_cdp(
+                tab_id, method, params, timeout=self._command_wait_s())
+
+        # frameNavigated arrives at WillCommitLoad, before the new Document
+        # necessarily exists. Retry only while this exact document generation
+        # remains current, and let later lifecycle events retry an early miss.
+        for attempt in range(6):
+            if not self._frame_discovery_current(tab_id, frame_id, generation):
+                return
+            try:
+                context = await discover_default_context(
+                    send, frame_id, main=frame_id == self._tab_main_frame.get(tab_id))
+                if not self._frame_discovery_current(tab_id, frame_id, generation):
+                    return
+                aliases = {frame_id}
+                if frame_id == self._tab_main_frame.get(tab_id):
+                    aliases.add(f"ext-tab-{tab_id}")
+                if any((ctx.get("auxData") or {}).get("isDefault")
+                       and (ctx.get("auxData") or {}).get("frameId") in aliases
+                       and ctx.get("_native_identity") != context["_native_identity"]
+                       for ctx in self._execution_contexts.get(tab_id, {}).values()):
+                    await self._retire_frame_contexts(tab_id, frame_id)
+                await self._publish_execution_context(tab_id, context)
+                break
+            except UnsupportedContextHandleError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a document may be provisional
+                if attempt == 5:
+                    logger.debug("facade(ext): context discovery for frame %s: %r",
+                                 frame_id, exc)
+                    return
+                await asyncio.sleep(0.025 * 2 ** attempt)
+        for name in self._world_names.get(tab_id, set()).copy():
+            if not self._frame_discovery_current(tab_id, frame_id, generation):
+                return
+            with contextlib.suppress(_CommandError, Exception):
+                result = await send("Page.createIsolatedWorld", {
+                    "frameId": frame_id, "worldName": name,
+                    "grantUniveralAccess": True,
+                })
+                if not self._frame_discovery_current(tab_id, frame_id, generation):
+                    return
+                await self._publish_execution_context(tab_id, {
+                    "id": result.get("executionContextId"), "origin": "", "name": name,
+                    "auxData": {"isDefault": False, "type": "isolated", "frameId": frame_id},
+                })
+
+    async def _retire_frame_contexts(self, tab_id: int, frame_id: str) -> None:
+        contexts = self._execution_contexts.get(tab_id, {})
+        for context_id, ctx in list(contexts.items()):
+            frame = (ctx.get("auxData") or {}).get("frameId")
+            if frame in (frame_id, f"ext-tab-{tab_id}" if frame_id == self._tab_main_frame.get(tab_id) else frame_id):
+                contexts.pop(context_id, None)
+                await self._on_relay_event({
+                    "type": "event", "tabId": tab_id,
+                    "method": "Runtime.executionContextDestroyed",
+                    "params": {"executionContextId": context_id},
+                })
+
+    def _forget_tab_discoveries(self, tab_id: int) -> None:
+        for key in [key for key in self._frame_generations if key[0] == tab_id]:
+            self._frame_generations.pop(key, None)
+            self._context_refresh_tasks.pop(key, None)
+
+    async def _retire_tab_contexts(self, tab_id: int) -> None:
+        contexts = self._execution_contexts.pop(tab_id, {})
+        for context_id in contexts:
+            await self._on_relay_event({
+                "type": "event", "tabId": tab_id,
+                "method": "Runtime.executionContextDestroyed",
+                "params": {"executionContextId": context_id},
+            })
+
     def _arm_context_waiter(self, tab_id: int) -> asyncio.Future:
         """Register a future resolved when the next default
         `Runtime.executionContextCreated` for `tab_id` is observed."""
@@ -737,6 +1019,8 @@ class ExtensionFacadeBridge:
         authorization boundary: a facade client could otherwise invent
         ``ext-sid-<foreign-tab>-anything`` and bypass attachToTarget entirely.
         """
+        if session_id in self._aux_sessions:
+            return self._aux_sessions[session_id]
         return next(
             (tab_id for tab_id, sid in self._tab_sessions.items()
              if sid == session_id),
@@ -981,6 +1265,7 @@ class ExtensionFacadeBridge:
             sid = self._tab_sessions.get(tab_id)
             if self._session_id is not None and sid is None:
                 return
+            await self._detach_aux_sessions(tab_id)
             self._evict_tab(tab_id)
             await self._emit_target_detached(tab_id, sid)
             return
@@ -992,17 +1277,59 @@ class ExtensionFacadeBridge:
                 return
             if method in ("Target.attachedToTarget", "Target.detachedFromTarget"):
                 return
+            if method == "Console.messageAdded" and tab_id in self._quiet_runtime_tabs:
+                if tab_id in self._native_runtime_tabs:
+                    return
+                message = params.get("message") or {}
+                if message.get("source") == "console-api":
+                    context_id = self._console_context_id(tab_id)
+                    if context_id is None:
+                        # Keep native text from early page scripts while a new
+                        # default realm is being discovered. No object preview
+                        # subscription or page-side console hook is involved.
+                        self._pending_console_text.setdefault(tab_id, deque(maxlen=1000)).append(message)
+                    else:
+                        await self._emit_console_text(tab_id, context_id, message)
+                return
             # PR3: keep the live top-frame url fresh and release the fresh-blank
             # normalization once the page actually navigates, so getTargetInfo
             # stops reporting ":" after the first real navigation.
             if method == "Page.frameNavigated":
                 frame = params.get("frame") or {}
+                if tab_id in self._quiet_runtime_tabs and isinstance(frame.get("id"), str):
+                    if not frame.get("parentId"):
+                        # A replacement root document destroys all child realms,
+                        # even if Chrome omits child frameDetached events during
+                        # a renderer swap and reuses numeric context IDs.
+                        self._forget_tab_discoveries(tab_id)
+                        await self._retire_tab_contexts(tab_id)
+                        self._tab_main_frame[tab_id] = frame["id"]
+                    else:
+                        await self._retire_frame_contexts(tab_id, frame["id"])
+                    self._invalidate_frame_discovery(tab_id, frame["id"])
+                    self._schedule_frame_refresh(tab_id, frame["id"])
                 # Top frame only: no parentId.
                 if isinstance(frame, dict) and not frame.get("parentId"):
                     new_url = frame.get("url")
                     if isinstance(new_url, str) and new_url and new_url != ":":
                         self._tab_url[tab_id] = new_url
                         self._fresh_blank_tabs.discard(tab_id)
+            elif method == "Page.frameDetached" and tab_id in self._quiet_runtime_tabs:
+                frame_id = params.get("frameId")
+                if isinstance(frame_id, str):
+                    key = (tab_id, frame_id)
+                    self._frame_generations.pop(key, None)
+                    self._context_refresh_tasks.pop(key, None)
+                    await self._retire_frame_contexts(tab_id, frame_id)
+            elif (method == "Page.lifecycleEvent" and tab_id in self._quiet_runtime_tabs
+                  and params.get("name") in ("init", "DOMContentLoaded")):
+                frame_id = params.get("frameId")
+                if isinstance(frame_id, str):
+                    self._schedule_frame_refresh(tab_id, frame_id, rediscover=True)
+            elif method == "DOM.documentUpdated" and tab_id in self._quiet_runtime_tabs:
+                frame_id = self._tab_main_frame.get(tab_id)
+                if frame_id is not None:
+                    self._schedule_frame_refresh(tab_id, frame_id, rediscover=True)
             # PR3: a default-context creation releases the Runtime.enable barrier.
             elif method == "Runtime.executionContextCreated":
                 ctx = params.get("context") or {}
@@ -1021,9 +1348,24 @@ class ExtensionFacadeBridge:
             if sid is not None:
                 out["sessionId"] = sid
             await self._send_to_client(json.dumps(out))
+            for aux_sid, target_tab in list(self._aux_sessions.items()):
+                if target_tab == tab_id:
+                    await self._send_to_client(json.dumps({
+                        "method": method, "params": params, "sessionId": aux_sid,
+                    }))
             return
 
     # ---- helpers ---------------------------------------------------------
+
+    async def _detach_aux_sessions(self, tab_id: int) -> None:
+        for aux_sid, target_tab in list(self._aux_sessions.items()):
+            if target_tab == tab_id:
+                self._aux_sessions.pop(aux_sid, None)
+                await self._send_to_client(json.dumps({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": aux_sid,
+                               "targetId": f"ext-tab-{tab_id}"},
+                }))
 
     async def _emit_target_detached(self, tab_id: int,
                                     sid: str | None) -> None:
@@ -1059,6 +1401,8 @@ class ExtensionFacadeBridge:
         # (executionContextCreated) are the carriers of the top-frame id.
         if params.get("frameId") == real:
             params["frameId"] = synthetic
+        if params.get("parentFrameId") == real:
+            params["parentFrameId"] = synthetic
         frame = params.get("frame")
         if isinstance(frame, dict):
             if frame.get("id") == real:
@@ -1087,6 +1431,14 @@ class ExtensionFacadeBridge:
         """Drop all per-tab state for a closed/detached tab and wake any
         outstanding Runtime.enable barrier so it doesn't hang on a dead tab."""
         self._tab_sessions.pop(tab_id, None)
+        self._quiet_runtime_tabs.discard(tab_id)
+        self._native_runtime_tabs.discard(tab_id)
+        self._execution_contexts.pop(tab_id, None)
+        self._pending_console_text.pop(tab_id, None)
+        self._world_names.pop(tab_id, None)
+        self._forget_tab_discoveries(tab_id)
+        for sid in [sid for sid, target in self._aux_sessions.items() if target == tab_id]:
+            self._aux_sessions.pop(sid, None)
         self._ext.evict_tab_sessions(tab_id)
         self._tab_url.pop(tab_id, None)
         self._fresh_blank_tabs.discard(tab_id)

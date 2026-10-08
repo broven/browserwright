@@ -13,7 +13,7 @@ and neither can be recovered on the Python side (ADR-0007):
 So this script runs where the DOM is, rebuilds a detached copy with those two
 problems fixed, and hands back plain HTML strings.
 
-Why ``page.evaluate`` and not ``add_script_tag``
+Why isolated protocol evaluation and not ``add_script_tag``
 ------------------------------------------------
 Verified in this repo against ``default-src 'none'; script-src 'none'`` with
 ``bypass_csp=False``: the page's own inline ``<script>`` does NOT run (CSP is
@@ -28,8 +28,9 @@ Three consequences the script below obeys:
   the protocol call; a continuation scheduled from inside it (``setTimeout``,
   ``await``) loses it. Everything here is one synchronous pass.
 - **Never assign ``innerHTML``, never use ``DOMParser``.** Those are gated by
-  Trusted Types, which ``page.evaluate`` does NOT bypass — it runs in the main
-  world. *Reading* ``innerHTML``/``outerHTML`` and calling ``cloneNode`` /
+  Trusted Types when the script is reused through ``page.evaluate``. The
+  production view runs in an isolated world through ``isolated_evaluate``.
+  *Reading* ``innerHTML``/``outerHTML`` and calling ``cloneNode`` /
   ``importNode`` are unaffected, which is why the copy is built with node APIs
   and HTML is only ever read out.
 - **Never mutate the live page.** Everything is built detached, and Readability

@@ -35,7 +35,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from uuid import uuid4
 
 from ..errors import BrowserwrightError, PageBindTimeout, TabRebindFailed
 
@@ -160,15 +159,10 @@ def _agent_page_targets(sess: Any) -> list[dict]:
     (``tab_surface``) use, so the ids always line up with the ledger's
     ``current_target_id``.
 
-    Why the agent path and not a Playwright CDP session? Two Playwright CDP
-    sessions for target enumeration are FATAL over the extension facade:
-    `context.new_cdp_session(page)` collides with the page's primary session,
-    and even `browser.new_browser_cdp_session()` reuses the facade's single
-    synthetic browser sessionId — both trip a Playwright-driver assert that
-    kills the connection. The agent path is the daemon's own, fully-tested
-    channel; its targetIds are exactly the daemon/ledger ids (extension
-    `ext-tab-N`, cdp real ids), so they line up with the ledger's
-    `current_target_id` and with `connect_over_cdp`'s synthesized targetIds."""
+    Enumeration stays on the agent connection, whose target ids match the
+    daemon/ledger ids. Page identity probes use independent auxiliary CDP
+    attachments; their detach never affects Playwright's primary attachment.
+    """
     try:
         res = sess.cdp.send("Target.getTargets")
     except Exception:
@@ -192,8 +186,8 @@ def _agent_page_targets(sess: Any) -> list[dict]:
 # Phase B: the persistent per-session executor (``browserwright._executor``)
 # runs the SAME connect+bind dance, just ONCE at cold-start instead of per
 # heredoc. These free functions are the single source of truth so the executor
-# never re-implements (and never drifts from) the FATAL "no Playwright CDP
-# session over the extension facade" constraint. ``PlaywrightHandle`` below is
+# never re-implements (and never drifts from) exact CDP identity mapping.
+# ``PlaywrightHandle`` below is
 # the per-heredoc Phase C consumer; the executor is the Phase B consumer.
 
 
@@ -264,15 +258,10 @@ def bind_current_page(context: Any, sess: Any) -> Any:
         tab. ``context.new_page()`` over the facade would open an un-grouped
         tab the agent path can't track → ledger drift → tab explosion.
 
-    We then attach Playwright to that exact tab by writing a short-lived random
-    marker through the already-attached AGENT target session and accepting only
-    the ``context.pages`` entry that reads it. The facade replays ``attached``
-    events for every open tab, so a session-group tab is enumerable once
-    materialized. Mapping creates NO Playwright CDP session — a per-page
-    (``context.new_cdp_session``) or even a second browser-level
-    (``new_browser_cdp_session``) session is fatal over the extension facade
-    because it reuses one synthetic sessionId and trips a Playwright-driver
-    assertion.
+    We match the resolved target with a Page's exact top-frame CDP identity.
+    The facade replays attachment events for open tabs, and each identity
+    probe uses an independent auxiliary CDP handle. Closing that handle leaves
+    Playwright's primary attachment intact and does not mutate the document.
     """
     from ..session_runtime import resolve_current_target
     from ._smart_goto import patch_context_pages, patch_page_goto
@@ -553,33 +542,34 @@ def page_for_target(context: Any, sess: Any, target_id: str,
                      hint_url: str | None = None) -> Any | None:
     """Find the live Playwright Page for the session's ``target_id``.
 
-    Mapping uses NO *Playwright-created* CDP session (fatal over the extension
-    facade — see ``_agent_page_targets``). Instead, the already-attached agent
-    path writes a short-lived random marker into the exact target's main world;
-    only the Playwright Page that can read that marker is accepted. This avoids
-    guessing from page count or URL, both of which are ambiguous for launcher
-    tabs, duplicate URLs, and several ``about:blank`` pages.
+    Mapping reads each Page's exact top-frame CDP identity. Auxiliary CDP
+    attachments are independent of Playwright's primary session and never
+    place state in the document. Lightweight test doubles without an agent
+    CDP surface retain the strict unique-URL fallback.
 
-    Lightweight unit-test doubles without an agent CDP surface retain a strict
-    unique-URL fallback. A real Session whose marker command fails returns no
-    match and lets the outer wait retry; it never degrades to a guess."""
+    Identity alone does not prove the Page is usable: the auxiliary probe is a
+    fresh attachment, so it answers even when the Page's PRIMARY session went
+    stale (e.g. the extension service worker was replaced and the tab was
+    re-attached without Playwright's domain subscriptions). The single
+    identity match must therefore also answer a round-trip on its own primary
+    session (``_page_responds``) before it is accepted.
+    """
     pages = list(context.pages)
     if not pages:
         return None
 
-    marker_attempted, marker = _install_target_marker(sess, target_id)
-    if marker_attempted:
-        if marker is None:
-            return None
-        key, value, cdp, session_id = marker
-        try:
-            matches = [
-                page for page in pages
-                if _page_has_target_marker(page, key, value)
-            ]
-            return matches[0] if len(matches) == 1 else None
-        finally:
-            _clear_target_marker(cdp, session_id, key)
+    try:
+        sess.cdp
+    except AttributeError:
+        pass
+    except Exception:
+        return None
+    else:
+        matches = [page for page in pages
+                   if _target_id_for_page(page) == target_id]
+        if len(matches) == 1 and _page_responds(matches[0]):
+            return matches[0]
+        return None
 
     # Test-double compatibility only: without an agent CDP path, require a
     # unique URL match. Never use the old singleton/last-match heuristics.
@@ -594,77 +584,27 @@ def page_for_target(context: Any, sess: Any, target_id: str,
     return matches[0] if len(matches) == 1 else None
 
 
-def _install_target_marker(
-    sess: Any,
-    target_id: str,
-) -> tuple[bool, tuple[str, str, Any, str] | None]:
-    """Mark ``target_id`` through the existing agent CDP attachment.
+def _page_responds(page: Any) -> bool:
+    """Does the Page's own (primary) session still serve evaluation?
 
-    Returns ``(False, None)`` only for lightweight objects with no ``cdp``
-    attribute (unit-test doubles). For a real Session, ``True`` means exact
-    matching was attempted; a failed attach/evaluate returns ``(True, None)``
-    so callers retry rather than fall back to an inexact URL guess.
+    A constant expression: it reads and writes no page state. A stale primary
+    session has no live execution context and fails fast with a
+    TargetClosed-family error, which the caller treats as "no usable Page".
     """
     try:
-        cdp = sess.cdp
-    except AttributeError:
-        return False, None
-    except Exception:
-        return True, None
-
-    key = f"__browserwright_bind_{uuid4().hex}"
-    value = uuid4().hex
-    try:
-        session_id = cdp.attach(target_id)
-        import json
-
-        expression = (
-            "(() => {"
-            f"Object.defineProperty(globalThis, {json.dumps(key)}, "
-            f"{{value: {json.dumps(value)}, configurable: true}});"
-            "return true;"
-            "})()"
-        )
-        result = cdp.send(
-            "Runtime.evaluate",
-            session=session_id,
-            expression=expression,
-            returnByValue=True,
-        )
-        if result.get("exceptionDetails"):
-            return True, None
-    except Exception:
-        return True, None
-    return True, (key, value, cdp, session_id)
-
-
-def _page_has_target_marker(page: Any, key: str, value: str) -> bool:
-    try:
-        return bool(page.evaluate(
-            "([key, value]) => globalThis[key] === value",
-            [key, value],
-        ))
+        return page.evaluate("() => true") is True
     except Exception:
         return False
 
 
-def _clear_target_marker(
-    cdp: Any,
-    session_id: str,
-    key: str,
-) -> None:
-    """Best-effort cleanup of the temporary page-global marker."""
-    try:
-        import json
+def _target_id_for_page(page: Any) -> str | None:
+    """Read exact CDP target identity without document state or URL guesses."""
+    from .isolated_world import target_id_for_page
 
-        cdp.send(
-            "Runtime.evaluate",
-            session=session_id,
-            expression=f"delete globalThis[{json.dumps(key)}]",
-            returnByValue=True,
-        )
+    try:
+        return target_id_for_page(page)
     except Exception:
-        pass
+        return None
 
 
 class PlaywrightHandle:
@@ -701,8 +641,7 @@ class PlaywrightHandle:
         # Enter sync_playwright() and connect_over_cdp. Keep the context manager
         # so close() can __exit__ it (stops the bundled driver process). The
         # connect + bind logic is the shared free functions (also used by the
-        # Phase B executor), so the FATAL "no Playwright CDP session over the
-        # extension facade" constraint lives in exactly one place.
+        # Phase B executor), so exact CDP identity mapping lives in one place.
         from ..session import current_session
 
         self._pw_cm = sync_playwright()

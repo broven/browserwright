@@ -608,6 +608,25 @@ def e2e_chrome(cft_binary, patched_ext_dir):
     shutil.rmtree(handle.profile_path, ignore_errors=True)
 
 
+@pytest.fixture
+def extension_only_chrome(cft_binary, patched_ext_dir, request):
+    """Chrome with extension automation and no remote debugging port.
+
+    Headful by default; input telemetry can request headless isolation from
+    unrelated desktop cursor movement through indirect parametrization.
+    """
+    from ._real_browser import kill_chrome, launch_cft_with_extension
+
+    handle = launch_cft_with_extension(cft_binary, patched_ext_dir,
+                                       remote_debugging=False,
+                                       headless=getattr(request, "param", None) == "headless")
+    try:
+        yield handle
+    finally:
+        kill_chrome(handle.pid)
+        shutil.rmtree(handle.profile_path, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 #   Artifact dump on failure
 # ---------------------------------------------------------------------------

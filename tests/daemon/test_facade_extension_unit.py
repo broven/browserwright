@@ -671,7 +671,8 @@ async def test_session_bound_create_target_refreshes_agent_bound_group(tmp_home)
         await relay.stop()
 
 
-async def test_runtime_enable_forwarded_and_acked():
+async def test_runtime_enable_forwarded_and_acked(monkeypatch):
+    monkeypatch.setenv("BW_CAPTURE_CONSOLE", "1")
     async with _wired() as (relay, ext, client, bridge):
         # First attach a tab so we have a session.
         await ext.announce_attached(tab_id=8, group_title=bridge.auto_title)
@@ -837,9 +838,10 @@ async def test_child_target_lifecycle_events_are_not_forwarded_to_playwright():
         ), new_frames
 
 
-async def test_runtime_enable_does_disable_enable_dance_and_gates_on_event():
+async def test_runtime_enable_does_disable_enable_dance_and_gates_on_event(monkeypatch):
     """PR3 fix #2: Runtime.enable issues Runtime.disable→enable to force a
     re-emit, and gates its response on the default executionContextCreated."""
+    monkeypatch.setenv("BW_CAPTURE_CONSOLE", "1")
     async with _wired() as (relay, ext, client, bridge):
         sid = await _attach_one(ext, client, tab_id=8,
                                 group_title=bridge.auto_title)

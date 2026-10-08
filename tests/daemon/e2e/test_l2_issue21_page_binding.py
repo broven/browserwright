@@ -128,9 +128,8 @@ def test_page_binding_follows_switch_tab_across_close_of_old_tab(
 
         # ...and `page` must have followed the switch: it is C's page, NOT the
         # stale about:blank the old binding left behind.
-        # `page.title` may or may not carry the extension's "👀 " attach
-        # prefix depending on injection timing (pre-existing race, unrelated
-        # to the switch binding under test) — containment tolerates both.
+        # Containment keeps this independent of title formatting, which is
+        # unrelated to the switch binding under test.
         page_title = _grep(r.stdout, "PAGE_TITLE")
         assert "C-target" in page_title, (
             f"page did not follow switch_tab: page.title={page_title!r} "

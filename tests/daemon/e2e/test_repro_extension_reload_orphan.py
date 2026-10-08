@@ -64,7 +64,6 @@ _SIMULATE_FRESH_SW_JS = (
     "(async () => {"
     "  const tabs = [...attachedTabs];"
     "  attachedTabs.clear();"
-    "  markedTabs.clear();"
     "  await Promise.allSettled(tabs.map(t => chrome.debugger.detach({tabId: t})));"
     "  forceReconnect('simulating fresh SW after reload');"
     "  return {detached: tabs};"

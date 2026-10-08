@@ -117,8 +117,8 @@ def test_tabs_reports_live_urls_for_session_tabs(
         assert any(r["current"] for r in rows), (
             "tabs() must still mark the session's current tab")
 
-        # The live title comes from the same group query as the url. The
-        # extension strips its 👀 marker, so the server's <title> is intact.
+        # The live title comes from the same group query as the url; the
+        # extension never rewrites document.title, so the server's <title> is intact.
         titles = sorted(r["title"] for r in rows)
         assert titles == sorted(
             f"bw116 {name}" for name in ("one", "two", "three", "four")

@@ -97,11 +97,14 @@ def launch_cft_with_extension(
     ext_dir: Path,
     *,
     cdp_port: int = 0,
+    remote_debugging: bool = True,
+    headless: bool = False,
 ) -> ChromeHandle:
-    """Launch Chrome for Testing with --load-extension, wait for CDP ready.
+    """Launch Chrome for Testing with --load-extension.
 
-    Detects the CDP websocket URL from either the DevToolsActivePort file
-    (port=0) or stderr (Chrome 148+ with explicit port skips the file).
+    By default, wait for the CDP websocket URL from DevToolsActivePort or
+    stderr. With remote_debugging=False there is no browser CDP socket; callers
+    wait for the extension relay instead.
     """
     profile_dir = Path(tempfile.mkdtemp(prefix="bd-e2e-chrome-"))
     stderr_path = profile_dir / "_cft_stderr.log"
@@ -109,10 +112,8 @@ def launch_cft_with_extension(
     args = [
         str(cft_binary),
         f"--user-data-dir={profile_dir}",
-        f"--remote-debugging-port={cdp_port}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--remote-allow-origins=*",
         "--no-proxy-server",
         "--enable-features=UserScriptUserExtensionToggle",
         # See the same pair in `launch_chrome.py` / e2e conftest: without them
@@ -123,6 +124,11 @@ def launch_cft_with_extension(
         f"--load-extension={ext_dir}",
         "about:blank",
     ]
+    if remote_debugging:
+        args[2:2] = [f"--remote-debugging-port={cdp_port}",
+                     "--remote-allow-origins=*"]
+    if headless:
+        args.insert(2, "--headless=new")
     proc = subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
@@ -130,6 +136,10 @@ def launch_cft_with_extension(
         start_new_session=True,
     )
     try:
+        if not remote_debugging:
+            stderr_fh.close()
+            return ChromeHandle(ws_url="", profile_path=profile_dir,
+                                pid=proc.pid, port=0)
         active_file = profile_dir / "DevToolsActivePort"
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:

@@ -221,15 +221,17 @@ def _looks_loaded(page: Any, before_url: str | None = None) -> bool:
             return False
         if before_url is not None and url == before_url:
             return False
-        ready_state = page.evaluate("() => document.readyState")
+        from .isolated_world import isolated_evaluate
+        ready_state = isolated_evaluate(page, "() => document.readyState")
         return ready_state != "loading"
     except Exception:
         return False
 
 
 def _smart_wait_settled(page: Any, deadline: float | None, network: "_NetworkMonitor") -> None:
+    from .isolated_world import isolated_evaluate
     try:
-        page.evaluate(_INSTALL_MONITOR_JS)
+        isolated_evaluate(page, _INSTALL_MONITOR_JS)
     except Exception:
         return
 
@@ -237,7 +239,7 @@ def _smart_wait_settled(page: Any, deadline: float | None, network: "_NetworkMon
         remaining_ms = None if deadline is None else max(1, int((deadline - time.monotonic()) * 1000))
         poll_ms = 250 if remaining_ms is None else min(250, remaining_ms)
         try:
-            settled = page.evaluate(_SETTLED_JS, _STABLE_WINDOW_MS)
+            settled = isolated_evaluate(page, _SETTLED_JS, _STABLE_WINDOW_MS)
         except Exception:
             return
         if settled or network.is_idle(_STABLE_WINDOW_MS):

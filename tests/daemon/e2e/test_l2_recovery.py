@@ -97,8 +97,7 @@ def test_recovery_fast_path_across_processes(ext_ready, e2e_daemon):
                       runtime_dir=rd, extra_env={"BD_SESSION": sid})
         assert b.returncode == 0, (
             f"transparent recovery failed; stdout={b.stdout!r} stderr={b.stderr!r}")
-        # The extension prepends a "👀 " attach-marker to the live DOM title;
-        # containment (not ==) correctly tolerates it.
+        # Containment (not ==) keeps this independent of title formatting.
         assert "RecoverFast" in _payload(b)["title"]
     finally:
         drop_ledger_session(_HOME, sid)
