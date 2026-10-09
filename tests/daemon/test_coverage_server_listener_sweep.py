@@ -506,7 +506,7 @@ async def test_upstream_open_and_heartbeat_failure(monkeypatch):
 
     assert conn.is_open is True
     assert conn.ws_url == "ws://localhost:9222/devtools/browser/x"
-    assert len(created) == 2
+    assert len(created) == 3  # reader, CDP heartbeat, ws keepalive
     assert connect_calls[0][0] == "ws://localhost:9222/devtools/browser/x"
     kwargs = connect_calls[0][1]
     assert kwargs["compression"] is None
