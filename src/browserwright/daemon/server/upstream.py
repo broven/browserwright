@@ -26,6 +26,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from .._net import proxy_hint, proxy_toward, redact_url
+from .ws_liveness import connect_kwargs as liveness_kwargs, keep_alive
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,7 @@ class CdpUpstream:
         self._ws: websockets.ClientConnection | None = None  # type: ignore[name-defined]
         self._reader_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
         self._next_internal_id = _DAEMON_ID_BASE
         self._pending_internal: dict[int, asyncio.Future] = {}
         self._ws_url: str | None = None
@@ -358,11 +360,12 @@ class CdpUpstream:
             # The CLI that opened the session resolved it from its own
             # environment; the facade bridge uses the same value. (#20, #136)
             "proxy": proxy,
-            # Keep the upstream alive with ws-level pings; CDP-level
+            # ws-level liveness is `ws_liveness.keep_alive` (started below):
+            # websockets' own keepalive closes a working connection when a
+            # pong is stuck behind a big reply on a slow link. CDP-level
             # Browser.getVersion heartbeat is layered on top for protocol
             # liveness.
-            "ping_interval": 20,
-            "ping_timeout": 20,
+            **liveness_kwargs(),
         }
         try:
             self._ws = await asyncio.wait_for(
@@ -381,6 +384,8 @@ class CdpUpstream:
         self._ws_url = ws_url
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._keepalive_task = asyncio.create_task(keep_alive(
+            self._ws, label=f"{self.backend_name} upstream"))
         if lifecycle:
             # Tell Chrome to gossip about all targets so the router can keep
             # its target table without the client having to enable it.
@@ -985,6 +990,8 @@ class CdpUpstream:
             self._reader_task.cancel()
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
         ws = self._ws
         self._ws = None
         for fut in self._pending_internal.values():

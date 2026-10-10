@@ -809,7 +809,8 @@ class _Worker:
             return
         sys.stderr.write(
             f"executor {self._session_id}: facade transport dropped "
-            "(daemon restart?); will reconnect on the next call\n")
+            "(daemon restart, or the link to the browser); will reconnect on "
+            "the next call\n")
         self._connected = False
         self._facade_death_handler = None
         self._facade_daemon_pid = None
@@ -1003,6 +1004,20 @@ class _Worker:
         outcomes, no loop.
         """
         sid = self._session_id or "<id>"
+        if self._transport_lost():
+            # Not the tab: the executor's connection to the browser is gone,
+            # and with it every Page and the context. Rebinding here would run
+            # on no context, and forgetting the binding would abandon a tab
+            # that is still alive. The next call reconnects and re-binds the
+            # SAME tab (`_ensure_connected`), with `state` intact.
+            error["fix"] = (
+                "the executor's connection to the browser dropped mid-call "
+                "(the tab itself was not closed). It reconnects to the same "
+                "tab on the next call and `state` is kept — RETRY the call. "
+                "Do not create a new session; if this repeats, check the link "
+                "to the browser (`browserwright-daemon` log names why the "
+                "connection ended).")
+            return self._finish(buf, error=error, exit_code=exit_code)
         failure: str | None = None
         try:
             if not self._rebind_dead_page():
@@ -1033,6 +1048,25 @@ class _Worker:
             "happening on the same URL, that page is closing its own tab."
         )
         return self._finish(buf, error=error, exit_code=exit_code)
+
+    def _transport_lost(self) -> bool:
+        """Is the Playwright Browser disconnected from the cdp surface?
+
+        A dropped connection closes every Page at once, so the call fails with
+        the same TargetClosedError a dead tab produces. Playwright usually
+        dispatched ``disconnected`` while the failing call pumped events; if it
+        has not yet, its ``is_connected()`` already reads False and the armed
+        handler is run here."""
+        if not self._connected:
+            return True
+        is_connected = getattr(self._browser, "is_connected", None)
+        try:
+            alive = bool(is_connected()) if callable(is_connected) else True
+        except Exception:  # noqa: BLE001 - a failed probe is disconnected
+            alive = False
+        if not alive:
+            self._on_facade_dead(self._browser)
+        return not alive
 
     @staticmethod
     def _exec_with_return(code: str, globals_: dict[str, Any]) -> str | None:

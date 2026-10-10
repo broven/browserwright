@@ -68,7 +68,7 @@ from .. import _ipc
 from ..config import (DEFAULT_FACADE_PORT, LOOPBACK_HOST, Config,
                       needs_loopback_cobind)
 from .. import __version__
-from .._net import proxy_toward
+from .._net import proxy_toward, redact_url
 from ..errors import Unavailable
 from ..resolver import resolve as resolve_upstream
 from ..._executor.protocol import _MAX_FRAME
@@ -76,6 +76,7 @@ from .daemon import Daemon, UnknownSessionError, UpstreamContext
 from .exec_relay import serve_exec_relay
 from .facade_extension import ExtensionFacadeBridge
 from .relay import RelayServer
+from .ws_liveness import connect_kwargs as liveness_kwargs, keep_alive
 
 logger = logging.getLogger(__name__)
 
@@ -669,31 +670,37 @@ class PlaywrightFacade:
         Transparent: no id/sessionId rewriting (unlike the agent Router) — a
         Playwright client owns the whole browser-level CDP namespace on its own
         dedicated upstream connection, so Target.*/Browser.* responses and
-        events flow back unmodified."""
+        events flow back unmodified.
+
+        The upstream leg's keepalive is `ws_liveness`, not websockets' own:
+        on a slow remote link a pong stuck behind one big reply used to close
+        this bridge mid-transfer, which the Playwright client can only read as
+        its whole browser closing."""
         upstream = await websockets.connect(
             upstream_url,
             max_size=100 * 1024 * 1024,
             compression=None,
-            ping_interval=20,
-            ping_timeout=20,
             # Exactly the session's proxy, or None for direct — never
             # websockets' default of reading the daemon's http_proxy/all_proxy,
             # which broke LAN / Tailscale / CloakBrowser upstreams (#20). The
             # CLI that opened the session resolved it from its own environment
             # (#136); per-page proxying is still Chrome's own business.
             proxy=proxy_toward(upstream_url, proxy),
+            **liveness_kwargs(),
         )
         c2u = asyncio.create_task(self._pump(client, upstream, "c->u"))
         u2c = asyncio.create_task(self._pump(upstream, client, "u->c"))
+        alive = asyncio.create_task(
+            keep_alive(upstream, label="facade bridge upstream"))
         try:
             await asyncio.wait(
                 {c2u, u2c}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            # Cancel + await BOTH pumps unconditionally. This runs on the normal
+            # Cancel + await every task unconditionally. This runs on the normal
             # FIRST_COMPLETED path AND when stop() cancels the handler task while
             # it's suspended in asyncio.wait above (where the `for pending`
             # cleanup would otherwise be skipped, orphaning the pump tasks).
-            for t in (c2u, u2c):
+            for t in (c2u, u2c, alive):
                 t.cancel()
                 # CancelledError is a BaseException; suppress it explicitly so a
                 # cancelled pump doesn't escape this cleanup.
@@ -703,6 +710,12 @@ class PlaywrightFacade:
                 await upstream.close()
             with contextlib.suppress(Exception):
                 await client.close()
+            # The client sees this as its browser disconnecting, so say which
+            # side ended it: nothing else in the daemon log would.
+            logger.info(
+                "facade: bridge to %s ended (upstream %s, client %s)",
+                redact_url(upstream_url), _close_summary(upstream),
+                _close_summary(client))
 
     @staticmethod
     async def _pump(src, dst, label: str) -> None:
@@ -715,6 +728,18 @@ class PlaywrightFacade:
         except Exception as e:  # noqa: BLE001
             logger.debug("facade pump %s ended: %r", label, e)
             return
+
+
+def _close_summary(conn: Any) -> str:
+    """`sent 1011 'keepalive timeout', received none` for one ws side."""
+    def frame(close: Any) -> str:
+        if close is None:
+            return "none"
+        return f"{int(close.code)} {close.reason!r}"
+
+    protocol = getattr(conn, "protocol", None)
+    return (f"sent {frame(getattr(protocol, 'close_sent', None))}, "
+            f"received {frame(getattr(protocol, 'close_rcvd', None))}")
 
 
 #: ADR-0011 name for what this class now is. `PlaywrightFacade` stays as the
