@@ -110,10 +110,13 @@ _SCROLL_SOURCE = r'''({
         }
       }
     }
+    const style=getComputedStyle(root);
     const active=root.getRootNode().activeElement || root.ownerDocument.activeElement;
     out.textContent=JSON.stringify({rect:r,jobs,focused:active === root || root.contains(active),
       viewport:{width:innerWidth,height:innerHeight,
       dpr:devicePixelRatio || 1},clientLeft:root.clientLeft,clientTop:root.clientTop,
+      // Playwright offsets padding-relative positions by parseInt(border).
+      border:{x:parseInt(style.borderLeftWidth,10) || 0,y:parseInt(style.borderTopWidth,10) || 0},
       offsetWidth:root.offsetWidth,offsetHeight:root.offsetHeight,caret});
     // A detached transport node never changes the document or its styles.
     return [out];
@@ -238,24 +241,20 @@ def _approach(page: Any, x: float, y: float, budget: _Budget, metrics: dict[str,
         budget.pause(_RNG.uniform(0.008, 0.015))
 
 
-def _border_width(locator: Any, property_name: str, budget: _Budget) -> float:
-    # Read computed CSS via Playwright's utility-world expectation transport.
-    # Locator.evaluate runs in the main world and would expose internal reads.
-    result = locator._sync(locator._impl_obj._expect('to.have.css', {
-        'expressionArg': property_name, 'expectedText': [{'regexSource': '.*', 'regexFlags': ''}],
-        'isNot': False, 'timeout': budget.remaining(),
-    }))
-    received = result['received']
-    if isinstance(received, dict) and 'value' in received:
-        received = received['value']
-    if isinstance(received, dict):
-        # Older Playwright releases return the wire-format value here.
-        from playwright._impl._js_handle import parse_value
-        received = parse_value(received)
-    if not isinstance(received, str):
-        raise ValueError(f'Unexpected computed CSS result for {property_name}')
-    # Match Playwright's parseInt border offset, including scaled screens.
-    return int(float(received.removesuffix('px')))
+def _borders(locator: Any, budget: _Budget) -> tuple[int, int]:
+    """Computed left/top border widths, read in Playwright's utility world.
+
+    Locator.evaluate runs in the main world and would expose internal reads,
+    so this uses the same isolated selector-engine transport as scrolling.
+    (Playwright's private ``_expect('to.have.css')`` result shape is not
+    stable: from 1.63 a passing expectation omits ``received`` entirely.)
+    """
+    handle = locator.element_handle(timeout=budget.remaining())
+    try:
+        border = _scroll_plan(handle, budget)['border']
+    finally:
+        handle.dispose()
+    return border['x'], border['y']
 
 
 def _scroll_plan(handle: Any, budget: _Budget, position: Any = None) -> dict[str, Any]:
@@ -380,8 +379,7 @@ def _click(native: Any, locator: Any, kwargs: dict[str, Any], *, generated_posit
             return native(locator, **{**kwargs, "timeout": budget.remaining()})
         # A comfortable interior point, deliberately away from dead center.
         fraction_x = _RNG.uniform(0.23, 0.40) if _RNG.random() < .5 else _RNG.uniform(.60, .77)
-        border_x = _border_width(locator, 'border-left-width', budget)
-        border_y = _border_width(locator, 'border-top-width', budget)
+        border_x, border_y = _borders(locator, budget)
         ratio = metrics['dpr']
         # Native click truncates to hundredths of a CSS pixel. Choose points
         # representable on both that grid and the physical pixel grid (e.g.
@@ -399,10 +397,9 @@ def _click(native: Any, locator: Any, kwargs: dict[str, Any], *, generated_posit
         position = {'x': x - box['x'] - border_x + .00001,
                     'y': y - box['y'] - border_y + .00001}
     else:
-        x = math.trunc((box['x'] + _border_width(locator, 'border-left-width', budget)
-                        + position['x']) * 100) / 100
-        y = math.trunc((box['y'] + _border_width(locator, 'border-top-width', budget)
-                        + position['y']) * 100) / 100
+        border_x, border_y = _borders(locator, budget)
+        x = math.trunc((box['x'] + border_x + position['x']) * 100) / 100
+        y = math.trunc((box['y'] + border_y + position['y']) * 100) / 100
     _approach(page, x, y, budget, metrics)
     # Native actionability can observe a newer target box than the approach.
     # Correct its final absolute coordinates at the dispatch boundary instead
