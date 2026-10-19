@@ -21,7 +21,7 @@ from typing import Optional
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
 
-from .errors import CDPError
+from .errors import CDPError, CDPTransportClosed
 
 
 def _rpc_error_fix(method: str, err: object) -> str:
@@ -98,8 +98,8 @@ class CDPSession:
 
     def send(self, method: str, *, session: Optional[str] = None, **params) -> dict:
         if self._closed:
-            raise CDPError(method=method, params=params,
-                           cdp_message=f"ws closed: {self._closed_reason}")
+            raise CDPTransportClosed(method=method, params=params,
+                                     cdp_message=f"ws closed: {self._closed_reason}")
         with self._lock:
             mid = self._next_id
             self._next_id += 1
@@ -113,7 +113,8 @@ class CDPSession:
             self._ws.send(payload)
         except ConnectionClosed as e:
             self._closed, self._closed_reason = True, str(e)
-            raise CDPError(method=method, params=params, cdp_message=str(e)) from e
+            raise CDPTransportClosed(method=method, params=params,
+                                     cdp_message=str(e)) from e
         # Wait for the reply.
         deadline = time.monotonic() + 30.0
         with self._inflight_cv:
@@ -128,8 +129,8 @@ class CDPSession:
             entry = self._inflight.pop(mid, None)
             self._inflight_meta.pop(mid, None)
         if self._closed and not entry:
-            raise CDPError(method=method, params=params,
-                           cdp_message=f"ws closed: {self._closed_reason}")
+            raise CDPTransportClosed(method=method, params=params,
+                                     cdp_message=f"ws closed: {self._closed_reason}")
         if "error" in entry:
             err = entry["error"]
             raise CDPError(method=method, params=params,

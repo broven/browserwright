@@ -145,15 +145,22 @@ def test_run_on_executor_round_trips_through_the_relay(harness):
 
 def test_a_severed_relay_surfaces_as_executor_unavailable(harness):
     """A daemon restart now takes live data planes with it. The client must say
-    so in words an agent can act on, not leak a websockets error."""
+    so in words an agent can act on, not leak a websockets error.
+
+    The connect retries a departed daemon inside the caller's deadline
+    (ADR-0014), so the call budget below is deliberately small: it is the
+    retry budget here, and the assertions are about the message."""
     sess = _Sess()
     harness.stop_endpoint()
 
     with pytest.raises(exec_client.ExecutorUnavailable) as ei:
-        exec_client.run_on_executor(sess, "print('hi')", timeout_ms=5000)
+        exec_client.run_on_executor(sess, "print('hi')", timeout_ms=600)
     msg = str(ei.value)
     assert "/exec" in msg
     assert f"127.0.0.1:{harness.port}" in msg
+    # Names the daemon, and ends with the one instruction that applies.
+    assert "was replaced or is shutting down" in msg
+    assert ei.value.fix == "retry the command"
 
 
 def test_ensure_executor_without_readiness_is_refused(harness):

@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable
 
 from ... import session_registry
 from ..config import Config
+from ..errors import DaemonShuttingDown
 from .upstream_context import (
     UnroutableRecord,
     UpstreamContext,
@@ -92,6 +93,13 @@ class Daemon:
         self._session_phases: dict[str, str] = {}
         self._session_results: dict[str, dict] = {}
         self._termination_locks: dict[str, asyncio.Lock] = {}
+        #: Set the instant SIGTERM's graceful shutdown starts, and never
+        #: cleared. SIGTERM pulls the relay away a few lines later, after which
+        #: every readiness wait fails — so without this flag the drivable path
+        #: blames the extension for a browser that is still connected and
+        #: healthy. The daemon owns it because only the daemon knows why its
+        #: own relay went quiet (ADR-0013 rule 3).
+        self.shutting_down = False
         self._register(shared_context)
 
     def _register(self, ctx: UpstreamContext) -> None:
@@ -163,6 +171,17 @@ class Daemon:
         """Resolve an explicitly session-bound context, failing closed."""
         return self.context_for(session_id, require_known=True)
 
+    def _refuse_if_shutting_down(self, session_id: str) -> None:
+        """Refuse new browser work once this process has been told to stop.
+
+        SIGTERM sets ``shutting_down`` before it pulls the relay away, so a
+        request landing in the shutdown window is answered with the daemon's
+        own departure instead of the extension diagnosis the readiness wait
+        would invent afterwards (ADR-0013 rule 3).
+        """
+        if self.shutting_down:
+            raise DaemonShuttingDown(session_id)
+
     # ---- the drivable path (ADR-0013 rule 1) ------------------------------
 
     async def ensure_session_drivable(self, session_id: str, *,
@@ -180,9 +199,14 @@ class Daemon:
         runs this inside the executor registry's per-session lifecycle lock.
         """
         ctx = self.context_for_required(session_id)
+        self._refuse_if_shutting_down(session_id)
         try:
             await ctx.upstream.await_browser(session_id)
         except Exception as e:  # noqa: BLE001
+            # The readiness wait can straddle the start of shutdown: report
+            # the daemon's departure rather than the browser its relay can no
+            # longer reach.
+            self._refuse_if_shutting_down(session_id)
             raise RuntimeError(f"upstream readiness: {e}") from e
         try:
             await ctx.holder.ensure_open()

@@ -226,7 +226,11 @@ def _agent_visible_sources() -> list[Path]:
             root / "session.py", root / "mode_b_client.py",
             root / "daemon_lifecycle.py",
             root / "_executor" / "client.py",
-            root / "_executor" / "process.py"]
+            root / "_executor" / "process.py",
+            # Daemon-raised text crosses the JSON-RPC envelope and reaches the
+            # agent (a shutdown, a recovery refusal), so its words are bound by
+            # the same list as the client's.
+            root / "daemon" / "errors.py"]
 
 
 def test_agent_visible_remediation_text_has_no_banned_words():

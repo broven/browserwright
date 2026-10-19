@@ -93,7 +93,7 @@ def test_task_client_uses_shared_executor_lease_and_request(monkeypatch):
     monkeypatch.setattr(
         client,
         "_ensure_executor_lease",
-        lambda _sess: client.ExecutorLease("sess-task", "executor-task"),
+        lambda _sess, **_kw: client.ExecutorLease("sess-task", "executor-task"),
     )
     monkeypatch.setattr(client, "_connect", lambda *_args, **_kwargs: _Connection())
     monkeypatch.setattr(

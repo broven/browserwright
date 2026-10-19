@@ -867,6 +867,10 @@ _SHUTDOWN_TEARDOWN_DRAIN_S = 65.0
 async def _graceful_shutdown(daemon: "Daemon") -> None:
     """Called on SIGTERM. Drain in-flight teardowns, run close etiquette on
     every context, then close the listener."""
+    # First line on purpose: from here the relay (and every readiness wait that
+    # depends on it) is living on borrowed time, and a request arriving in the
+    # window must be told the daemon is going, not that the extension is gone.
+    daemon.shutting_down = True
     # Consume replacement intent immediately. Draining a teardown may take
     # longer than the marker's anti-staleness window; validation is about when
     # SIGTERM arrived, not how long graceful shutdown etiquette takes.
