@@ -227,6 +227,28 @@ def _local_probe_host(facade_host: str) -> str:
     return facade_host
 
 
+def _on_stop_signal(stop: asyncio.Event, signum: int) -> None:
+    """SIGTERM / SIGINT: attribute the stop, then ask the loop to finish.
+
+    Attribution happens here, before the shutdown sequence begins (ADR-0012
+    rule 5): a daemon killed by something other than its own `stop` verb used
+    to leave no record of it, and reconstructing "who signalled the global
+    daemon" on 2026-10-19 is what cost hours. `record_signal_shutdown` skips
+    the line when the `stop` verb already recorded that stop.
+    """
+    _ipc.record_signal_shutdown(signum)
+    stop.set()
+
+
+def _install_stop_signals(loop, stop: asyncio.Event) -> None:
+    """Arm SIGTERM and SIGINT on *loop*, both carrying their own signum."""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_stop_signal, stop, sig)
+        except NotImplementedError:
+            pass  # e.g. inside pytest event loop
+
+
 async def run_serve(cfg: Config) -> int:
     """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code.
 
@@ -364,15 +386,7 @@ async def run_serve(cfg: Config) -> int:
     # we still need to run the graceful shutdown sequence (close clients with
     # 1011 + emit upstreamClosed + close upstream).
     stop = asyncio.Event()
-
-    def _on_signal():
-        stop.set()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _on_signal)
-        except NotImplementedError:
-            pass  # e.g. inside pytest event loop
+    _install_stop_signals(asyncio.get_running_loop(), stop)
 
     # PID file (best-effort).
     _ipc.write_pid(os.getpid())

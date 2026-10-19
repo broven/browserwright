@@ -8,6 +8,13 @@ flat — pydantic / dynaconf are explicitly rejected (附录 B).
 
 The toml file is *optional*. If it doesn't parse, we report a UserError up-stream
 so the CLI can show a clean message instead of a stack trace.
+
+The toml is the file `--config` names, else `$BD_CONFIG`, else the default
+:func:`default_config_path` — `$BS_HOME/config.toml` (default
+`~/.browserwright/config.toml`). The default exists so a bind setting has a
+durable, per-user home that is neither the LaunchAgent plist nor an environment
+variable (ADR-0012 amendment, 2026-10-19); "toml" in the precedence line above
+means whichever of the three names it. A missing file is an empty config.
 """
 from __future__ import annotations
 
@@ -302,6 +309,36 @@ class Config:
         return self.facade_port
 
 
+#: Filename of the default config, inside the browserwright home.
+DEFAULT_CONFIG_FILENAME = "config.toml"
+
+
+def default_config_path() -> Path:
+    """The config file read when neither `--config` nor `$BD_CONFIG` names one.
+
+    ``$BS_HOME/config.toml`` — beside ``global.md``, ``sessions/`` and
+    ``site-skills/``, and resolved through
+    :func:`browserwright.memory.global_mem.home_dir` so this file lands in the
+    same home as everything else the product persists.
+
+    It exists because a bind setting had nowhere durable to live otherwise:
+    `facade_host` (the tailnet address a remote consumer dials, with loopback
+    co-bound) could only be made durable by installing a LaunchAgent, and
+    `upgrade-global` scrubs `BD_CONFIG`/`BD_FACADE_HOST` before it touches the
+    global install (ADR-0012 rule 2), so an env var cannot be the home either.
+    Reading the path from ``$BS_HOME`` is also what keeps the test suite off a
+    developer's real config (``tests/conftest.py`` redirects `BS_HOME`).
+
+    ``daemon_url`` is deliberately NOT one of the keys this file can set for a
+    client: endpoint resolution keeps its own sources (`daemon_url._from_toml`
+    still requires a *named* file), so an auto-discovered file can never
+    silently re-point every client at another daemon.
+    """
+    from ..memory.global_mem import home_dir
+
+    return home_dir() / DEFAULT_CONFIG_FILENAME
+
+
 def _read_toml(path: Path) -> dict:
     from .errors import UserError
 
@@ -330,8 +367,10 @@ def load(
     """
     e = os.environ if env is None else env
 
-    # 1) Optional toml
-    cfg_path = cli_config_path or e.get("BD_CONFIG")
+    # 1) Optional toml: a named file wins, else the default one. `$BS_HOME` is
+    # read from the process environment (`home_dir()`), not from `e` — the same
+    # way every other consumer of the browserwright home resolves it.
+    cfg_path = cli_config_path or e.get("BD_CONFIG") or str(default_config_path())
     toml: dict = {}
     if cfg_path:
         toml = _read_toml(Path(cfg_path).expanduser())

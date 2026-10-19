@@ -962,6 +962,105 @@ def log_lifecycle(event: str, **fields: object) -> None:
         pass
 
 
+# ---- attributed shutdown (ADR-0012 rule 5) --------------------------------
+
+#: How recently the ``stop`` verb must have recorded its own ``LIFECYCLE stop``
+#: for a SIGTERM to count as that verb's doing. The verb writes the line and
+#: then signals, so the real gap is milliseconds; the window only has to
+#: survive a loaded machine.
+VERB_STOP_ATTRIBUTION_S = 10.0
+
+#: Bytes read back from the daemon log when looking for that line. Read from
+#: the end: this file is multi-megabyte on a machine that has been up a while,
+#: and only the last few seconds can matter.
+_LOG_SCAN_BYTES = 65536
+
+
+def _log_tail_text(limit: int = _LOG_SCAN_BYTES) -> str:
+    """The last *limit* bytes of the daemon log, decoded (empty when absent)."""
+    start = 0
+    try:
+        with log_path().open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - limit)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", "replace")
+    # Drop the partial first line of a windowed read.
+    return text.split("\n", 1)[-1] if start else text
+
+
+def log_tail(lines: int = 12) -> str:
+    """The last few non-empty lines of the daemon log.
+
+    The CLI-owned daemon's channel: unlike a launchd-owned one it is spawned
+    with ``stderr=DEVNULL`` (``daemon_lifecycle._spawn_detached``), so this file
+    is the only place its startup says anything.
+    """
+    tail = [ln for ln in _log_tail_text().splitlines() if ln.strip()][-lines:]
+    return "\n".join(tail)
+
+
+def stop_recorded_by_a_verb(pid: int, *, now: float | None = None) -> bool:
+    """Whether a verb's own ``LIFECYCLE stop pid=<pid>`` line is still fresh.
+
+    ``stop`` records the stop *before* it signals, so the daemon on the
+    receiving end can tell "a verb asked for this" from "someone signalled
+    me" by reading the trail that already exists, instead of inventing a
+    second mechanism beside it.
+    """
+    import datetime as _dt
+    import re as _re
+
+    now = time.time() if now is None else now
+    # `pid=<pid>` must end the field: `pid=1234` is not evidence about 12345.
+    stop_line = _re.compile(rf" LIFECYCLE stop pid={pid}(?=\s|$)")
+    for line in _log_tail_text().splitlines():
+        if not stop_line.search(line):
+            continue
+        stamp = line[:24]  # _iso_now(): "%Y-%m-%dT%H:%M:%S%z"
+        try:
+            at = _dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+        except ValueError:
+            continue
+        if 0.0 <= now - at <= VERB_STOP_ATTRIBUTION_S:
+            return True
+    return False
+
+
+def record_signal_shutdown(signum: int) -> None:
+    """ADR-0012 rule 5 for the one stop no verb can record: a signal.
+
+    A stop a verb asked for is already attributed by that verb's own
+    ``LIFECYCLE stop`` line. A SIGTERM from anywhere else — a script, a shell,
+    ``kill`` — used to leave nothing behind but ``shutdown requested``: on
+    2026-10-19 a dev-checkout script took the machine-global daemon down
+    mid-call and reconstructing who did it cost hours. So the daemon writes its
+    own line, naming the signal, its pid and the initiator from its
+    environment, and skips it when a fresh ``LIFECYCLE stop`` for this pid is
+    already on disk — a verb's record is never duplicated.
+
+    A ``restart``/``replace`` SIGTERM still gets this line: those verbs record
+    the *request* before they signal, so the daemon observing the signal is the
+    only proof it arrived — a different fact from who asked for it.
+
+    Called from the signal handler, before the shutdown sequence starts.
+    """
+    import signal as _signal
+
+    pid = os.getpid()
+    if stop_recorded_by_a_verb(pid):
+        return
+    try:
+        name = _signal.Signals(signum).name
+    except ValueError:
+        name = str(signum)
+    log_lifecycle("signal", sig=name, pid=pid, initiator=initiator_from_env())
+
+
 #: Collapse window for the "already running" line. launchd's KeepAlive
 #: respawns a daemon that exits 1 every few seconds forever, and each spawn is
 #: a fresh process, so the collapse state has to live on disk.

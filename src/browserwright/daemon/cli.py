@@ -152,7 +152,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_restart = sub.add_parser(
         "restart",
-        help="restart the installed LaunchAgent daemon after an upgrade")
+        help=("restart the daemon after an upgrade: the LaunchAgent if one is "
+              "installed, else the CLI-owned `serve`"))
     p_restart.add_argument("--timeout", type=float, default=5.0,
                            help="seconds to wait for the replacement daemon to "
                                 "come up and report its version")

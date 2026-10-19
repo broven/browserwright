@@ -12,9 +12,10 @@ from __future__ import annotations
 import pytest
 
 from browserwright.daemon import __version__ as INSTALLED
-from browserwright.daemon import launchagent
+from browserwright.daemon import _ipc, launchagent
 from browserwright.daemon.launchagent import LaunchAgentError
 from browserwright.daemon.restart_guard import Activity
+from browserwright import daemon_lifecycle
 
 
 #: A version that is definitely not the installed one. Derived rather than
@@ -262,10 +263,172 @@ def test_expected_version_falls_back_when_the_binary_fails(tmp_path):
     assert launchagent.expected_version(plist, "fallback") == "fallback"
 
 
-def test_restart_without_a_plist_is_a_distinct_error(harness, tmp_path,
-                                                     monkeypatch):
-    missing = tmp_path / "gone.plist"
-    monkeypatch.setattr(launchagent, "plist_path", lambda: missing)
+def test_restart_with_a_plist_still_goes_through_launchd(harness, monkeypatch):
+    """ADR-0012 amendment: the plist-less mode is new, the launchd path is not.
+
+    With a plist installed, `restart` must keep unloading/loading the job and
+    must never start a `serve` of its own.
+    """
+    def _must_not_spawn(*args, **kwargs):
+        raise AssertionError("restart with a plist must not spawn a serve")
+
+    monkeypatch.setattr(daemon_lifecycle, "_spawn_detached", _must_not_spawn)
+    harness["job_pids"] = [222]
+
+    report = launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert report["ok"] is True
+    assert report["owner"] == "launchd"
+    assert report["restarted"] == str(launchagent.plist_path())
+    assert [c[0] for c in harness["calls"]] == ["unload", "load"]
+
+
+# ---- CLI-owned mode: no LaunchAgent is a supported owner -------------------
+#
+# ADR-0012 amendment (2026-10-19): the endpoint has exactly one owner, and a
+# CLI-owned daemon (no plist anywhere) is a supported one. `restart` used to
+# refuse with "no LaunchAgent installed" (exit 2) — the step `mise run
+# upgrade-global` and `mise run restart-daemon` end on.
+
+
+class _SpawnedServe:
+    """What `daemon_lifecycle._spawn_detached` hands back."""
+
+    def __init__(self, exit_status=None):
+        self._exit = exit_status
+
+    def poll(self):
+        return self._exit
+
+
+@pytest.fixture
+def cli_owned(harness, monkeypatch, tmp_path):
+    """The plist-less shape: scriptable spawn, pings and stop."""
+    monkeypatch.setattr(launchagent, "plist_path",
+                        lambda: tmp_path / "absent.plist")
+    monkeypatch.setattr(launchagent, "_daemon_log_tail", lambda lines=12: "")
+    monkeypatch.setattr(launchagent, "_stop_incumbent",
+                        lambda timeout: harness.__setitem__("stops", 1)
+                        or {"stopped": 111})
+    harness.update({"spawned": [], "stops": 0, "pings": [111],
+                    "child": _SpawnedServe()})
+
+    def fake_ping(timeout=1.0):
+        pings = harness["pings"]
+        return pings.pop(0) if len(pings) > 1 else pings[0]
+
+    def fake_spawn(args, *, initiator):
+        harness["spawned"].append((args, initiator))
+        return harness["child"]
+
+    monkeypatch.setattr(_ipc, "ping_sync", fake_ping)
+    monkeypatch.setattr(_ipc, "request_executor_handoff",
+                        lambda pid, **kw: harness.__setitem__("handoff", pid))
+    monkeypatch.setattr(daemon_lifecycle, "_spawn_detached", fake_spawn)
+    return harness
+
+
+def test_restart_without_a_plist_bounces_a_cli_owned_daemon(cli_owned):
+    """No plist, and the same three-part post-condition as the launchd path:
+    the incumbent stopped, a different pid answers, `/__status__` reports the
+    version this CLI is."""
+    cli_owned["pings"] = [111, 222]
+
+    report = launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert report["ok"] is True
+    assert report["owner"] == "cli"
+    assert report["restarted"] == "serve (cli-owned)"
+    assert report["pid_before"] == 111
+    assert report["pid_after"] == 222
+    assert report["daemon_version"] == INSTALLED
+    assert report["stopped_incumbent"] == 111
+    # The incumbent was stopped, its executors were left for adoption, and the
+    # replacement is a `serve` that names restart as its initiator.
+    assert cli_owned["stops"] == 1
+    assert cli_owned["handoff"] == 111
+    assert len(cli_owned["spawned"]) == 1
+    args, initiator = cli_owned["spawned"][0]
+    assert args == ["serve"]
+    assert initiator.startswith("cli:restart")
+    # launchd is not involved on a machine that has no job.
+    assert cli_owned["calls"] == []
+
+
+def test_cli_owned_restart_still_refuses_a_healthy_daemon(cli_owned, monkeypatch,
+                                                          make_verdict):
+    """ADR-0013's diagnosis gate is not a launchd gate."""
+    monkeypatch.setattr(daemon_lifecycle, "diagnose", lambda **kw: make_verdict(
+        detail="the daemon answered twice"))
+
     with pytest.raises(LaunchAgentError) as e:
-        launchagent.restart(_Cfg())
-    assert e.value.exit_code == 2
+        launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert e.value.exit_code == 4
+    assert "refusing to restart" in str(e.value)
+    assert cli_owned["stops"] == 0
+    assert cli_owned["spawned"] == []
+
+
+def test_cli_owned_restart_still_refuses_while_someone_is_working(cli_owned):
+    cli_owned["activity"] = Activity(
+        blocked=True, determinate=True,
+        reasons=["executor(s) running: 7"])
+
+    with pytest.raises(LaunchAgentError) as e:
+        launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert e.value.exit_code == 4
+    assert "nothing was replaced" not in str(e.value)
+    assert cli_owned["stops"] == 0
+    assert cli_owned["spawned"] == []
+
+
+def test_cli_owned_restart_fails_loudly_when_the_serve_cannot_bind(cli_owned):
+    """`run_serve` returns 2 when it cannot bind, and the incumbent is already
+    gone — reporting anything but a failure here would leave the machine with
+    no daemon and no message."""
+    cli_owned["child"] = _SpawnedServe(exit_status=2)
+    cli_owned["pings"] = [111]
+
+    with pytest.raises(LaunchAgentError) as e:
+        launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert e.value.exit_code == 3
+    assert "exited with status 2" in str(e.value)
+    assert "bind failure" in str(e.value)
+
+
+def test_cli_owned_restart_fails_when_nothing_answers_after_the_spawn(cli_owned):
+    cli_owned["pings"] = [None]
+
+    with pytest.raises(LaunchAgentError) as e:
+        launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert e.value.exit_code == 3
+    assert "nothing answered the endpoint" in str(e.value)
+
+
+def test_cli_owned_restart_fails_when_the_serve_binary_is_missing(cli_owned):
+    cli_owned["child"] = None  # `_spawn_detached` returns None when not on PATH
+
+    with pytest.raises(LaunchAgentError) as e:
+        launchagent.restart(_Cfg(), timeout=2.0)
+
+    assert e.value.exit_code == 3
+    assert "not on PATH" in str(e.value)
+
+
+def test_cli_owned_restart_fails_when_the_new_daemon_reports_another_version(
+        cli_owned):
+    """A new pid is not new code, plist or no plist."""
+    cli_owned["pings"] = [111, 222]
+    cli_owned["live_version"] = STALE
+
+    with pytest.raises(LaunchAgentError) as e:
+        launchagent.restart(_Cfg(), timeout=2.0)
+
+    msg = str(e.value)
+    assert e.value.exit_code == 3
+    assert STALE in msg and INSTALLED in msg
+    assert "#44 B" in msg

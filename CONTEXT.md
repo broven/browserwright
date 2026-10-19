@@ -152,6 +152,20 @@ that, `EADDRINUSE` stops it. The control socket file that used to carry both
 jobs is gone, and with it the watchdog that self-exited a daemon whose socket
 was replaced — there is nothing left to replace.
 
+### daemon ownership
+Which process owns the single **endpoint**: `launchd` (an installed LaunchAgent
+plist runs `serve`, ADR-0012 rules 1–3) or `cli` (the CLI started the same
+`serve` detached — `browserwright-daemon restart` / `serve`, or
+`daemon_lifecycle.ensure`'s on-demand spawn — with no plist anywhere). Both are
+supported modes; `restart` works in both, takes the plist case through launchd
+unchanged, and reports which one it bounced (`owner`).
+
+**Trap:** this is not the **owner** above, which is about *browsers*. This one
+is about the *daemon process*, and it is what decides where durable bind config
+lives: in the plist's `ProgramArguments` (launchd-owned) or in the config file
+(`--config`, else `$BD_CONFIG`, else `$BS_HOME/config.toml`) — where a flag the
+plist passes still tops the file.
+
 ### downstream
 Everything that connects **into** the daemon: the CLI, the skill client, a
 Playwright client on the cdp surface. Downstream must never branch on backend —
@@ -380,11 +394,17 @@ and the e2e runner all consult it and refuse while it says busy;
 `restart --force` is the only override, for humans. ADR-0012 rules 2 and 4.
 
 ### lifecycle event
-A daemon start / stop / restart / spawn, written as one `LIFECYCLE <event>`
-line into the daemon log (`_ipc.log_lifecycle`) by whichever process caused
-it, so the record exists even when the daemon being replaced never logs its
-exit. Distinct from the extension's `hello` / relay reconnects, which are
-connection events, not process events.
+A daemon start / stop / restart / spawn / signal, written as one
+`LIFECYCLE <event>` line into the daemon log (`_ipc.log_lifecycle`) by
+whichever process caused it, so the record exists even when the daemon being
+replaced never logs its exit. Distinct from the extension's `hello` / relay
+reconnects, which are connection events, not process events.
+
+**Trap:** a *signal-driven* stop is the one event only the daemon can record
+(`LIFECYCLE signal sig=… pid=… initiator=…`): whoever ran `kill` writes no
+log line. It is skipped when the `stop` verb already recorded that stop, so
+one stop is one line. A stop with neither line is a stop the daemon never got
+to write — SIGKILL, or a crash — not an ordinary shutdown.
 
 ### Router
 The frame-routing engine (`daemon/server/proxy.py`). Owns request-id rewriting,

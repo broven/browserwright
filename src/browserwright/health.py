@@ -140,9 +140,10 @@ def _daemon_fix(info: dict) -> str:
             "exited before assuming it is stuck"
         )
     return (
-        "no LaunchAgent is installed, so nothing keeps the daemon up; "
-        "`browserwright install` sets one up, and `browserwright session "
-        "new` starts one on demand on the default endpoint"
+        "no LaunchAgent is installed, so nothing supervises the daemon — it "
+        "is CLI-owned, which is a supported mode: `browserwright session new` "
+        "starts one on demand on the default endpoint, and `browserwright "
+        "install` makes launchd own it instead (ADR-0012 rule 7)"
     )
 
 
