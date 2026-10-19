@@ -27,7 +27,7 @@ import socket
 import stat
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -693,10 +693,42 @@ class EndpointProbe:
     status_line: str = ""
     server: str = ""
     detail: str = ""
+    #: How long the probe took, in milliseconds — set by
+    #: :func:`probe_endpoint_sync`, ``None`` for a probe a caller built by hand
+    #: (tests, or a subclassed observation). Carried so a record of a decision
+    #: made on a probe can say what the probes actually cost, which is the
+    #: difference between "it timed out" and "it timed out in 1501ms".
+    latency_ms: float | None = None
 
     @property
     def answered(self) -> bool:
         return self.kind == "ours"
+
+    @property
+    def silent(self) -> bool:
+        """The socket opened and nothing usable came back.
+
+        ``timeout`` (nothing came back in time) and ``garbage`` (bytes that are
+        not HTTP at all) both mean the port never gave an answer we could read.
+        Distinct from ``foreign`` (something answered HTTP, just not our pong)
+        and from ``refused`` (nothing is listening).
+        """
+        return self.kind in SILENT_PROBE_KINDS
+
+    @property
+    def timed_out(self) -> bool:
+        """Nothing came back within the budget — the one kind escalation re-asks.
+
+        ``garbage`` is not slowness: something spoke, it just did not speak
+        HTTP. Asking again would burn the window for an answer we already have.
+        """
+        return self.kind == "timeout"
+
+    def evidence(self) -> str:
+        """``timeout@1501ms`` — the kind plus its measured cost, for a record."""
+        if self.latency_ms is None:
+            return self.kind
+        return f"{self.kind}@{self.latency_ms:.0f}ms"
 
     def describe(self) -> str:
         """One clause, suitable for inlining into an error message."""
@@ -715,12 +747,90 @@ class EndpointProbe:
         return f"{where} answered with something that is not HTTP"
 
 
+#: The escalated-probe window: how long the port may stay silent before
+#: "unresponsive" is a conclusion rather than a guess.
+#:
+#: A single short ``/__ping__`` cannot tell a dead daemon from a busy one: on
+#: 2026-10-19 two consecutive 1.5s probes timed out on a machine-global daemon
+#: that was still accepting ws clients, and a fresh ``serve`` SIGTERMed it two
+#: seconds later — it was never wedged, just slow. Silence is therefore measured
+#: across this window, which every escalated attempt may spend in full: anything
+#: that answers inside it is alive, and only a holder silent for the WHOLE
+#: window is called unresponsive. Bounded on purpose — the probe sits on the
+#: CLI's hot path, so the worst case for a port that accepts and then says
+#: nothing is ``2 x 1.5s`` (``confirm=True``) plus this window. Nothing else pays
+#: it: a responsive daemon answers the short probes, a dead one is ``refused``,
+#: and neither escalates.
+ESCALATED_PROBE_WINDOW_S = 6.0
+
+#: Upper bound on escalated attempts. An attempt may spend what is left of the
+#: window, so a real timeout normally runs once; the bound exists so an
+#: observation that returns *early* can never turn the escalation into a spin.
+ESCALATED_PROBE_ATTEMPTS = 3
+
+#: Probe kinds that mean "nothing usable came back": a socket that opened and
+#: then said nothing, or bytes that were not HTTP. These are exactly the kinds
+#: that must never be read as ``foreign`` — "something else is on the port" is
+#: an observation, not an inference from silence.
+SILENT_PROBE_KINDS = ("timeout", "garbage")
+
+
+def probes_until_answered(
+    host: str,
+    port: int,
+    *,
+    window: float | None = None,
+    probe=None,
+) -> list[EndpointProbe]:
+    """Re-probe ``host:port`` inside a bounded window until something answers.
+
+    The one escalation both liveness callers use: ``daemon_lifecycle.diagnose``
+    before it calls a silent endpoint unresponsive, and ``serve``'s port reclaim
+    before it SIGTERMs whoever holds the port. One short probe is not evidence —
+    a daemon that is merely busy misses it (see
+    :data:`ESCALATED_PROBE_WINDOW_S`) — so the question is asked again, with a
+    much larger budget, until either something comes back or the window runs
+    out. Only a ``timeout`` is re-asked (see :attr:`EndpointProbe.timed_out`):
+    bytes that were not HTTP are an answer, and asking again would spend the
+    window for information we already have.
+
+    Returns every probe taken, in order: the last one carries the observation,
+    and the whole list is the evidence a caller records (kind plus measured
+    latency) before it acts on it. Never raises.
+    """
+    window = ESCALATED_PROBE_WINDOW_S if window is None else window
+    probe = probe_endpoint_sync if probe is None else probe
+    observed: list[EndpointProbe] = []
+    deadline = time.monotonic() + window
+    while len(observed) < ESCALATED_PROBE_ATTEMPTS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # The whole remainder, deliberately not a divided slice: a daemon that
+        # answers 5s into a 6s window must be caught by the attempt that is
+        # waiting when it answers, and a divided budget would have given up on
+        # it three times over.
+        observed.append(probe(host, port, timeout=remaining))
+        if not observed[-1].timed_out:
+            break
+    return observed
+
+
 def probe_endpoint_sync(host: str, port: int, timeout: float = 1.5) -> EndpointProbe:
     """Classify whatever is on ``host:port``. Never raises.
 
     Same request as :func:`ping_status_sync`, but keeps the response instead
-    of collapsing every non-pong into "no daemon".
+    of collapsing every non-pong into "no daemon", and stamps how long the
+    probe took (``latency_ms``).
     """
+    started = time.monotonic()
+    observed = _probe_endpoint_once(host, port, timeout)
+    return replace(observed,
+                   latency_ms=round((time.monotonic() - started) * 1000.0, 1))
+
+
+def _probe_endpoint_once(host: str, port: int, timeout: float) -> EndpointProbe:
+    """One classification attempt inside ``timeout``. No latency stamping."""
     deadline = time.monotonic() + timeout
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -850,6 +960,105 @@ def log_lifecycle(event: str, **fields: object) -> None:
             fh.write(line + "\n")
     except OSError:
         pass
+
+
+# ---- attributed shutdown (ADR-0012 rule 5) --------------------------------
+
+#: How recently the ``stop`` verb must have recorded its own ``LIFECYCLE stop``
+#: for a SIGTERM to count as that verb's doing. The verb writes the line and
+#: then signals, so the real gap is milliseconds; the window only has to
+#: survive a loaded machine.
+VERB_STOP_ATTRIBUTION_S = 10.0
+
+#: Bytes read back from the daemon log when looking for that line. Read from
+#: the end: this file is multi-megabyte on a machine that has been up a while,
+#: and only the last few seconds can matter.
+_LOG_SCAN_BYTES = 65536
+
+
+def _log_tail_text(limit: int = _LOG_SCAN_BYTES) -> str:
+    """The last *limit* bytes of the daemon log, decoded (empty when absent)."""
+    start = 0
+    try:
+        with log_path().open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - limit)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", "replace")
+    # Drop the partial first line of a windowed read.
+    return text.split("\n", 1)[-1] if start else text
+
+
+def log_tail(lines: int = 12) -> str:
+    """The last few non-empty lines of the daemon log.
+
+    The CLI-owned daemon's channel: unlike a launchd-owned one it is spawned
+    with ``stderr=DEVNULL`` (``daemon_lifecycle._spawn_detached``), so this file
+    is the only place its startup says anything.
+    """
+    tail = [ln for ln in _log_tail_text().splitlines() if ln.strip()][-lines:]
+    return "\n".join(tail)
+
+
+def stop_recorded_by_a_verb(pid: int, *, now: float | None = None) -> bool:
+    """Whether a verb's own ``LIFECYCLE stop pid=<pid>`` line is still fresh.
+
+    ``stop`` records the stop *before* it signals, so the daemon on the
+    receiving end can tell "a verb asked for this" from "someone signalled
+    me" by reading the trail that already exists, instead of inventing a
+    second mechanism beside it.
+    """
+    import datetime as _dt
+    import re as _re
+
+    now = time.time() if now is None else now
+    # `pid=<pid>` must end the field: `pid=1234` is not evidence about 12345.
+    stop_line = _re.compile(rf" LIFECYCLE stop pid={pid}(?=\s|$)")
+    for line in _log_tail_text().splitlines():
+        if not stop_line.search(line):
+            continue
+        stamp = line[:24]  # _iso_now(): "%Y-%m-%dT%H:%M:%S%z"
+        try:
+            at = _dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+        except ValueError:
+            continue
+        if 0.0 <= now - at <= VERB_STOP_ATTRIBUTION_S:
+            return True
+    return False
+
+
+def record_signal_shutdown(signum: int) -> None:
+    """ADR-0012 rule 5 for the one stop no verb can record: a signal.
+
+    A stop a verb asked for is already attributed by that verb's own
+    ``LIFECYCLE stop`` line. A SIGTERM from anywhere else — a script, a shell,
+    ``kill`` — used to leave nothing behind but ``shutdown requested``: on
+    2026-10-19 a dev-checkout script took the machine-global daemon down
+    mid-call and reconstructing who did it cost hours. So the daemon writes its
+    own line, naming the signal, its pid and the initiator from its
+    environment, and skips it when a fresh ``LIFECYCLE stop`` for this pid is
+    already on disk — a verb's record is never duplicated.
+
+    A ``restart``/``replace`` SIGTERM still gets this line: those verbs record
+    the *request* before they signal, so the daemon observing the signal is the
+    only proof it arrived — a different fact from who asked for it.
+
+    Called from the signal handler, before the shutdown sequence starts.
+    """
+    import signal as _signal
+
+    pid = os.getpid()
+    if stop_recorded_by_a_verb(pid):
+        return
+    try:
+        name = _signal.Signals(signum).name
+    except ValueError:
+        name = str(signum)
+    log_lifecycle("signal", sig=name, pid=pid, initiator=initiator_from_env())
 
 
 #: Collapse window for the "already running" line. launchd's KeepAlive

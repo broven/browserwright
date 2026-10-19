@@ -375,6 +375,17 @@ class CDPError(BrowserwrightError):
         super().__init__(f"CDP {method} failed: {cdp_message}", fix=fix)
 
 
+class CDPTransportClosed(CDPError):
+    """The daemon's socket died under a request: no reply ever came.
+
+    Distinct from `CDPError` proper, which carries an error object the daemon
+    *sent* and therefore proves it is alive and said no. That difference is
+    what a client may base a retry on: a transport death means the daemon went
+    away (a replacement daemon adopts the session's executor), while a protocol
+    error would be reproduced by the next attempt against the same daemon.
+    """
+
+
 class NeedsUserConfirm(BrowserwrightError):
     """Raised by remember_preference (and similar) when the agent must surface
     a confirm prompt to the user before re-calling with confirm=False."""

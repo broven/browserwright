@@ -55,9 +55,9 @@ semantics, tab creation, facade behavior, or teardown:
      --port <X> --profile /tmp/...` or the e2e harness. Never short-connect to
      the user's daily Chrome.
   2. *Filesystem*: any code path that writes outside the temp dir
-     (e.g. `~/.config/browserwright-daemon/config.toml`) must accept a
-     `*_PATH` env override so tests can redirect to `tmp_path`. The wizard's
-     `BS_DAEMON_CONFIG_PATH` is the canonical example.
+     (e.g. `$BS_HOME/config.toml`) must accept a
+     `*_PATH` env override so tests can redirect to `tmp_path`. The daemon's
+     config resolves through `BS_HOME` for exactly this reason.
 - **Develop without touching global state.** The host machine very likely
   already runs a global `browserwright`/`browserwright-daemon` plus a loaded
   Chrome extension; this checkout must coexist with that, not fight it. The
@@ -87,7 +87,7 @@ touching any of the above.
 | Daemon endpoint | `127.0.0.1:19990` | two daemons cannot share the port — the second refuses to start |
 | Extension relay port | `127.0.0.1:19989` | starting a second relay there steals connections from the global extension |
 | CDP port | `9222` (Chrome's default) | a stray `--remote-debugging-port=9222` collides with your daily Chrome and pops Allow dialogs |
-| Daemon TOML config | `~/.config/browserwright-daemon/config.toml` (override with `BD_CONFIG`) | inherited backend / port settings leak into your dev daemon |
+| Daemon TOML config | `~/.browserwright/config.toml` (`$BS_HOME`; override with `BD_CONFIG`) | inherited backend / port settings — including a durable `facade_host` — leak into your dev daemon |
 | Skill home | `~/.browserwright/` (override with `BS_HOME`) | site-skill writes and memory leak across instances |
 | Chrome profile | the user's daily profile | `--load-extension` / `--remote-debugging-port` ruin it on Chrome 144+ |
 
@@ -129,7 +129,7 @@ which port is which:
 | daemon endpoint host | `127.0.0.1` (loopback) | tailnet/LAN IP or `0.0.0.0` to reach off-box | `--facade-host` / `BD_FACADE_HOST` |
 | which daemon a client talks to | `http://127.0.0.1:19990` | the test daemon's endpoint URL | `BW_DAEMON_URL` / `--daemon-url` |
 | runtime dir (pid, executor sockets, log) | `${XDG_RUNTIME_DIR:-/tmp}` | `$(mktemp -d)` | `XDG_RUNTIME_DIR` |
-| daemon TOML config | `~/.config/browserwright-daemon/config.toml` | none | `BD_CONFIG=""` |
+| daemon TOML config | `$BS_HOME/config.toml` | nothing (redirected `BS_HOME` has no file) | redirect `BS_HOME`; `BD_CONFIG` for a file of your own |
 | skill home | `~/.browserwright/` | tmpdir | `BS_HOME` |
 
 Isolation is **port-based** (ADR-0011): give the test daemon its own
@@ -236,7 +236,7 @@ End-to-end isolation matrix (kept in sync with `tests/daemon/e2e/README.md`):
 | Chrome `user-data-dir` | the user's daily profile | per-test tmpdir |
 | Chrome binary | Google Chrome | Chrome for Testing |
 | extension `RELAY_URL` | `ws://127.0.0.1:19989/` | `ws://127.0.0.1:29989/` (patched copy) |
-| `BD_CONFIG` | `~/.config/browserwright-daemon/config.toml` | `""` (no file) |
+| daemon TOML config | `$BS_HOME/config.toml` (when `BD_CONFIG` is unset) | `tests/daemon/e2e/_bs_home/…/config.toml` (via `BS_HOME`) |
 | `BS_HOME` | `~/.browserwright/` | `tests/daemon/e2e/_bs_home/...` |
 
 Nothing escapes the boundary. You can have your daily Chrome + global
@@ -306,7 +306,7 @@ lsof -iTCP:29989 -sTCP:LISTEN
 ls -la ~/.browserwright/
 
 # Daemon config untouched?
-stat -f '%m' ~/.config/browserwright-daemon/config.toml 2>/dev/null
+stat -f '%m' ~/.browserwright/config.toml 2>/dev/null
 ```
 
 If `lsof :19989` and `lsof :29989` print **different** PIDs (or

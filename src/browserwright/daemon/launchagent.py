@@ -421,16 +421,24 @@ def _stop_incumbent(timeout: float) -> dict:
     This used to be safe by construction: the control socket lived under *our*
     runtime dir, so anything answering it was our daemon by definition. ADR-0011
     replaced that socket with a URL, and a URL can name another machine — where
-    the pid on the pong is a pid over there. The caller (:func:`restart`) is a
-    LaunchAgent operation on this machine anyway, so an endpoint that is not
-    locally signalable (see `DaemonEndpoint.is_locally_signalable`) is refused
-    outright rather than signalled. A LOCAL daemon bound to a tailnet IP stays
-    stoppable — it publishes its endpoint into our runtime dir, which is what
-    makes it ours.
+    the pid on the pong is a pid over there. The caller (:func:`restart`)
+    replaces the daemon on *this* machine in both ownership modes (ADR-0012
+    rule 7), so an endpoint that is not locally signalable (see
+    `DaemonEndpoint.is_locally_signalable`) is refused outright rather than
+    signalled. A LOCAL daemon bound to a tailnet IP stays stoppable — it
+    publishes its endpoint into our runtime dir, which is what makes it ours.
 
     (Issue #44 B is a different case — the relay *ports*, where a stranger's
     daemon can hold 19989 without being ours. That one is caught by the version
     check in :func:`restart`'s verification, where refusing is right.)
+
+    **A daemon that stopped answering is still stoppable**, on proven identity:
+    when the ping fails, the pid comes from `_stale.unresponsive_daemon` — the
+    process holding the endpoint's own TCP port, whose cmdline is a browserwright
+    daemon, sharing our runtime dir. That is the same class of proof the implicit
+    reclaim demands, so the "never signal a process we cannot prove is
+    browserwright" rule is not weakened by an inch; what changes is that
+    `restart` no longer has to *fail* on the daemon `restart` exists to fix.
     """
     from . import _ipc, platforms, supervise
     from ..daemon_url import daemon_endpoint, not_ours_to_signal_message
@@ -441,8 +449,14 @@ def _stop_incumbent(timeout: float) -> dict:
             not_ours_to_signal_message(endpoint, "restart"), exit_code=3)
 
     pid = _ipc.ping_sync(timeout=1.0)
+    wedged = False
     if pid is None:
-        return {"stopped": None}
+        from . import _stale
+
+        pid = _stale.unresponsive_daemon(endpoint.port)
+        if pid is None:
+            return {"stopped": None}
+        wedged = True
     start0 = platforms.proc_start_time(pid)
 
     def _same_process() -> bool:
@@ -452,9 +466,17 @@ def _stop_incumbent(timeout: float) -> dict:
             return True
         return platforms.proc_start_time(pid) == start0
 
+    # Death is normally "the ping stopped answering". For a daemon that was
+    # already not answering when we found it, that observable is constant, so
+    # fall back to the process table: the pid is gone. This pid is not one we
+    # own (launchd does), which is why the start-time `guard` stays armed for
+    # the escalation either way.
+    is_dead = ((lambda: _ipc.ping_sync(timeout=0.3) is None) if not wedged
+               else (lambda: not _stale.pid_alive(pid)))
+
     supervise.terminate(
         pid,
-        is_dead=lambda: _ipc.ping_sync(timeout=0.3) is None,
+        is_dead=is_dead,
         grace=timeout,
         kill_grace=0,
         interval=0.1,
@@ -495,20 +517,30 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
     So the post-condition is all three: the job has a pid, it is a different pid,
     and `/__status__` reports our version. Anything else raises.
 
+    **No LaunchAgent is not a failure.** The endpoint has exactly one owner
+    (ADR-0012 amendment, 2026-10-19), and a *CLI-owned* daemon — the same
+    `serve`, started detached by this verb or by `daemon_lifecycle.ensure`,
+    with no plist anywhere — is a supported owner. So the plist is asked for,
+    not required: with one, the launchd path below runs unchanged; without one,
+    :func:`_restart_cli_owned` stops the incumbent and starts a `serve`, and
+    then proves the same three-part post-condition. Requiring `install` here is
+    what made `mise run upgrade-global` and `mise run restart-daemon` die on
+    the restart step of a plist-less machine.
+
     ``force`` overrides the "someone is working" gate (:mod:`restart_guard`) and
     nothing else — it never makes us signal a daemon that is not ours.
     """
     require_darwin("restart")
     path = plist_path()
-    if not path.exists():
-        raise LaunchAgentError(
-            "no LaunchAgent installed; run `browserwright-daemon install` "
-            "or restart your foreground `serve` process manually", 2)
+    launchd_owned = path.exists()
 
     from . import restart_guard
     from .. import __version__
     # The LaunchAgent's binary, not the checkout invoking this command, defines
-    # the version a healthy incumbent must report (issue #57).
+    # the version a healthy incumbent must report (issue #57). With no plist
+    # there is no third-party binary in the picture: the daemon this command
+    # starts is the `browserwright-daemon` this process is, so the caller's
+    # version is the expected one.
     want = expected_version(path, __version__)
 
     # ADR-0013 rule 5: restart is gated on DIAGNOSIS, not on session count.
@@ -544,6 +576,10 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
     # Resolve what "up to date" means BEFORE tearing anything down, so a plist
     # we cannot interrogate fails fast instead of after the daemon is already
     # stopped.
+    if not launchd_owned:
+        return _restart_cli_owned(cfg, want=want, force=force,
+                                  timeout=timeout, activity=activity)
+
     before = job_state()
     from . import _ipc
     _ipc.log_lifecycle(
@@ -571,6 +607,7 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
                 return {
                     "ok": True,
                     "restarted": str(path),
+                    "owner": "launchd",
                     "pid_before": before.get("pid"),
                     "pid_after": pid,
                     "daemon_version": live_version,
@@ -583,6 +620,122 @@ def restart(cfg, *, force: bool = False, timeout: float = 5.0) -> dict:
     raise LaunchAgentError(_restart_failure_message(
         before=before, after=last, live_version=live_version,
         expected=want, timeout=timeout), 3)
+
+
+def _restart_cli_owned(cfg, *, want: str, force: bool, timeout: float,
+                       activity) -> dict:
+    """Bounce a CLI-owned daemon: stop the incumbent, start `serve`, prove it.
+
+    The plist-less half of :func:`restart`. Only the *start mechanism* differs:
+    the launchd path unloads and loads a job, this one spawns `serve` detached
+    through :func:`browserwright.daemon_lifecycle._spawn_detached` — the one
+    entry point that starts a daemon without a supervisor — so the new process
+    inherits this CLI's resolved endpoint and carries an initiator into its own
+    ``LIFECYCLE start`` line (ADR-0012 rule 5).
+
+    The post-condition is deliberately the launchd path's: an incumbent was
+    stopped, the pid answering now is a different one, and `/__status__`
+    reports *want*. A `serve` that cannot bind exits at once (`run_serve`
+    returns 2) and the incumbent is already gone, so every way of failing here
+    raises a ``LaunchAgentError`` naming the way — never a silent ok.
+    """
+    from . import _ipc
+    from .. import daemon_lifecycle
+
+    initiator = _ipc.describe_initiator("restart (cli-owned daemon)")
+    before_pid = _ipc.ping_sync(timeout=1.0)
+    _ipc.log_lifecycle("restart", owner="cli", pid_before=before_pid,
+                       forced=bool(force), initiator=initiator)
+    if before_pid is not None:
+        # A replacement, not an operator stop: leave resident executors for the
+        # new daemon to adopt (ADR-0013).
+        _ipc.request_executor_handoff(before_pid)
+    stopped = _stop_incumbent(timeout)
+    child = daemon_lifecycle._spawn_detached(  # noqa: SLF001
+        ["serve"], initiator=initiator)
+
+    live_pid: int | None = None
+    live_version: str | None = None
+    deadline = time.monotonic() + max(timeout, 1.0)
+    # An exited child is proof enough: `serve` exits 2 when it cannot bind, so
+    # there is nothing left to wait for.
+    while child is not None and child.poll() is None:
+        live_pid = _ipc.ping_sync(timeout=0.3)
+        if live_pid is not None and live_pid != before_pid:
+            live_version = _live_daemon_version(cfg)
+            if live_version == want:
+                return {
+                    "ok": True,
+                    "restarted": "serve (cli-owned)",
+                    "owner": "cli",
+                    "pid_before": before_pid,
+                    "pid_after": live_pid,
+                    "daemon_version": live_version,
+                    "stopped_incumbent": stopped.get("stopped"),
+                    "forced": bool(force),
+                    "interrupted": list(activity.reasons) if force else [],
+                }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+
+    raise LaunchAgentError(_cli_owned_failure_message(
+        before_pid=before_pid, live_pid=live_pid, live_version=live_version,
+        expected=want, timeout=timeout,
+        spawn_missing=child is None,
+        spawn_exit=None if child is None else child.poll()), 3)
+
+
+def _cli_owned_failure_message(*, before_pid: int | None,
+                               live_pid: int | None,
+                               live_version: str | None, expected: str,
+                               timeout: float, spawn_missing: bool,
+                               spawn_exit: int | None) -> str:
+    """Name the specific way a CLI-owned restart failed.
+
+    The same reasoning as :func:`_restart_failure_message` — each branch is a
+    different fix — minus launchd, because there is no job state here to read.
+    """
+    if spawn_missing:
+        return (
+            "restart failed: `browserwright-daemon` is not on PATH, so the "
+            "CLI-owned daemon could not be started (the incumbent is already "
+            "stopped). Install it, or run `browserwright-daemon serve` "
+            "yourself."
+        )
+    if live_pid is None:
+        tail = _daemon_log_tail()
+        hint = f"\nLast daemon log lines:\n{tail}" if tail else ""
+        if spawn_exit is not None:
+            return (
+                f"restart failed: the CLI-owned `serve` exited with status "
+                f"{spawn_exit} without answering the endpoint — that is what a "
+                f"bind failure looks like (the port may be held by something "
+                f"this command may not signal), and the incumbent is already "
+                f"stopped.{hint}"
+            )
+        return (
+            f"restart failed: nothing answered the endpoint within "
+            f"{timeout:g}s of starting the CLI-owned `serve`.{hint}"
+        )
+    if live_pid == before_pid:
+        return (f"restart failed: pid {live_pid} is unchanged after "
+                f"{timeout:g}s — nothing was replaced.")
+    if live_version is None:
+        return (f"restart failed: a new process started (pid {live_pid}) but "
+                f"nothing answered `/__status__` within {timeout:g}s.")
+    return (f"restart failed: a new process started (pid {live_pid}) but the "
+            f"daemon answering `/__status__` reports {live_version}, not "
+            f"{expected}. Either it is still loading old code, or the relay "
+            f"port is held by a daemon that is not ours (issue #44 B) — this "
+            f"command will not signal that one.")
+
+
+def _daemon_log_tail(lines: int = 12) -> str:
+    """Last lines of the daemon's own log file — the CLI-owned daemon's channel."""
+    from . import _ipc
+
+    return _ipc.log_tail(lines)
 
 
 def restart_endpoint(cfg):

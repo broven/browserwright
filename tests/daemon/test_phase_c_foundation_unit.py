@@ -20,6 +20,7 @@ from browserwright.daemon.config import (
     DEFAULT_FACADE_HOST,
     DEFAULT_FACADE_PORT,
     Config,
+    default_config_path,
     load,
 )
 
@@ -87,6 +88,61 @@ def test_facade_host_precedence_cli_over_env_over_toml(tmp_path):
         env={"BD_FACADE_HOST": "10.0.0.2"},
     )
     assert cfg_cli.facade_host == "100.72.20.32"
+
+
+# ---- the default config file (ADR-0012 amendment: durable bind config) ----
+#
+# `facade_host` (the tailnet address a remote consumer dials, with loopback
+# co-bound) had no durable home that was neither the LaunchAgent plist nor an
+# environment variable: `upgrade-global` scrubs BD_CONFIG / BD_FACADE_HOST
+# before it touches the global install. `$BS_HOME/config.toml` is that home,
+# and it must follow `BS_HOME` or the suite reads the developer's real config.
+
+
+def test_default_config_file_follows_BS_HOME(monkeypatch, tmp_path):
+    """The suite's isolation depends on this: `tests/conftest.py` redirects
+    `BS_HOME`, so a default that ignored it would make `mise run test` read
+    `~/.browserwright/config.toml`."""
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    assert default_config_path() == (tmp_path / "config.toml").resolve()
+
+
+def test_default_config_file_is_honoured_when_nothing_names_one(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text('facade_host = "100.72.20.32"\n')
+
+    cfg = load(env={})
+    assert cfg.facade_host == "100.72.20.32"
+
+
+def test_default_config_file_is_ignored_when_BD_CONFIG_names_another(
+        monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text('facade_host = "10.0.0.1"\n')
+    named = tmp_path / "named.toml"
+    named.write_text('facade_host = "10.0.0.9"\n')
+    monkeypatch.setenv("BS_HOME", str(home))
+
+    assert load(env={"BD_CONFIG": str(named)}).facade_host == "10.0.0.9"
+    assert load(cli_config_path=str(named), env={}).facade_host == "10.0.0.9"
+
+
+def test_a_missing_default_config_file_is_an_empty_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("BS_HOME", str(tmp_path / "nothing-here"))
+
+    cfg = load(env={})
+    assert cfg.facade_host == DEFAULT_FACADE_HOST
+    assert cfg.facade_port is None
+
+
+def test_env_and_cli_still_top_the_default_config_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("BS_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text('facade_host = "10.0.0.1"\n')
+
+    assert load(env={"BD_FACADE_HOST": "10.0.0.2"}).facade_host == "10.0.0.2"
+    assert load(env={}, cli_facade_host="10.0.0.3").facade_host == "10.0.0.3"
 
 
 def test_session_idle_prune_loads_from_toml_and_env(tmp_path):

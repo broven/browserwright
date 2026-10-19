@@ -55,6 +55,26 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
     runtime dir (issue #44 B — that is someone else's live daemon, e.g. the
     machine-global one; we never SIGTERM a stranger).
 
+    Two gates stand between "the ports are held" and a SIGTERM, and they answer
+    different questions:
+
+    - **which process** (``confirmed_stale_holder`` + ``same_runtime_dir_as_us``):
+      the pid must be a proven browserwright daemon holding our port on our
+      runtime dir. Unchanged, and deliberately never loosened.
+    - **is it actually stale** (``_reclaim_decision``): a negative short ping is
+      not evidence — on 2026-10-19 one 1.0s ping was negative on a daemon that
+      was still accepting ws clients, and this function SIGTERMed it two
+      seconds into the next CLI call. The incumbent is therefore re-probed
+      across the escalated window (``_ipc.probes_until_answered``, the same
+      helper and budget ``daemon_lifecycle`` escalates with) and is reclaimed
+      only when it stays unanswered for all of it, or when nothing is listening
+      on the endpoint port at all.
+
+    Every decision is written as a ``LIFECYCLE reclaim`` line through
+    ``_ipc.log_lifecycle`` — a direct file append, so it survives a serve
+    spawned with ``stdout=DEVNULL, stderr=DEVNULL`` (``daemon_lifecycle.ensure``)
+    and a daemon whose logging is not wired yet.
+
     The write-side twin of `cli status`: both read the world through the same
     `probe.DaemonProbe` so they can never disagree about which ports matter or
     who counts as a confirmed holder. Only the reclaim itself is local, because
@@ -70,6 +90,7 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
         return
     pid = p.confirmed_stale_holder(held)
     if pid is None:
+        _record_reclaim_decision("no-holder", cfg, ports=held)
         logger.warning(
             "ports %s are in use but no confirmed browserwright daemon holds "
             "them; leaving them alone (bind will surface a clear error)", held)
@@ -82,6 +103,9 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
     # daemon — never do that; refuse loudly and let the bind (if we actually
     # need the port) fail with an actionable message instead.
     if not _stale.same_runtime_dir_as_us(pid):
+        _record_reclaim_decision(
+            "refused", cfg, pid=pid, ports=held,
+            reason="different-runtime-dir")
         logger.warning(
             "ports %s are held by browserwright daemon pid %d from a DIFFERENT "
             "runtime dir (%s) — not a stale daemon of ours, so refusing to "
@@ -90,14 +114,106 @@ def _reclaim_stale_daemon_ports(cfg: Config, *, probe=None) -> None:
             "that daemon yourself.",
             held, pid, _stale.pid_runtime_dir(pid))
         return
+    observed = _rechallenge_incumbent(p, cfg)
+    decision, reason, detail = _reclaim_decision(observed)
+    _record_reclaim_decision(decision, cfg, pid=pid, ports=held,
+                            probes=observed, reason=reason)
+    if decision != "reclaimed":
+        logger.warning(
+            "refusing to reclaim ports %s from browserwright daemon pid %d: %s "
+            "(%s); leaving it alone, so the bind may fail",
+            held, pid, detail, _probe_evidence(observed))
+        return
     logger.warning(
-        "reclaiming ports %s from stale browserwright daemon pid %d (issue #15)",
-        held, pid)
+        "reclaiming ports %s from stale browserwright daemon pid %d (issue #15): "
+        "%s (%s)", held, pid, detail, _probe_evidence(observed))
     if _stale.reclaim_ports(pid, held):
         logger.info("reclaimed ports %s from pid %d", held, pid)
     else:
         logger.warning("could not free ports %s from pid %d; bind may fail",
                        held, pid)
+
+
+def _rechallenge_incumbent(p, cfg: Config) -> list:
+    """Re-probe the endpoint we are about to bind, with the escalated budget.
+
+    Targets the port THIS daemon will bind, on the address local clients use for
+    it (ADR-0012 rule 6) — the port the holder must answer on if it is alive.
+    A config that binds an ephemeral port has no address to re-probe, so it
+    returns nothing and :func:`_reclaim_decision` refuses: nothing can prove
+    that holder stale.
+    """
+    port = cfg.resolved_facade_port()
+    if not port:
+        return []
+    return p.escalated_probes(_local_probe_host(cfg.facade_host), port)
+
+
+def _probe_evidence(observed) -> str:
+    """``timeout@2000ms,timeout@1999ms`` — kinds plus what they cost."""
+    return ", ".join(pr.evidence() for pr in observed) or "no probe taken"
+
+
+def _reclaim_decision(observed) -> tuple[str, str, str]:
+    """``(decision, reason-slug, english)`` from the escalated probes.
+
+    Two shapes authorize a SIGTERM, and nothing else does:
+
+    - the endpoint port stays unanswered for the whole escalated window — a
+      holder that owns the port but will not serve on it;
+    - nothing is listening on the endpoint port at all. That is not "slow": a
+      live process that owns its listening socket cannot refuse a connection, so
+      this is the half-alive shape (endpoint listener gone, relay port still
+      bound). It is also what the reclaim did before, and it is what keeps a
+      genuinely dead daemon's ports reclaimable.
+
+    Anything that *answered* — our pong, someone else's HTTP, non-HTTP bytes — is
+    never a reclaim target. That is the correction: the short-probe timeout that
+    used to land here is not an answer of any kind.
+    """
+    kinds = [pr.kind for pr in observed]
+    if not kinds:
+        return ("refused", "no-endpoint-port",
+                "no endpoint port was available to re-probe")
+    if "ours" in kinds:
+        return ("refused", "holder-answered",
+                "the holder answered its ping and is alive")
+    if "foreign" in kinds:
+        return ("refused", "non-pong-answer",
+                "something other than a browserwright pong answered")
+    if "garbage" in kinds:
+        return ("refused", "non-http-answer",
+                "the port answered with bytes that are not HTTP")
+    if "refused" in kinds:
+        return ("reclaimed", "nothing-listening",
+                "nothing is listening on the endpoint port, so it serves "
+                "nobody")
+    return ("reclaimed", "silent-window",
+            "it stayed unanswered for the whole escalated probe window")
+
+
+def _record_reclaim_decision(decision: str, cfg: Config, *, pid: int | None = None,
+                             ports=(), probes=(), reason: str = "") -> None:
+    """Append the reclaim decision to the daemon log, cost what it may.
+
+    ``_ipc.log_lifecycle`` writes the file directly instead of going through
+    ``logging``, which is the only reason this record exists when the serve was
+    spawned with ``stdout=DEVNULL, stderr=DEVNULL``: before it, an
+    ensure-spawned ``serve`` could SIGTERM a live daemon and leave no trace
+    anywhere (the warnings went to ``logging.lastResort`` on a devnull stderr,
+    and the INFO lines had no handler yet).
+    """
+    port = cfg.resolved_facade_port()
+    _ipc.log_lifecycle(
+        "reclaim",
+        decision=decision,
+        pid=pid if pid is not None else "-",
+        endpoint=f"{_local_probe_host(cfg.facade_host)}:{port or '-'}",
+        ports=",".join(str(p) for p in ports) or "-",
+        probes=",".join(pr.evidence() for pr in probes) or "-",
+        reason=reason or "-",
+        initiator=_ipc.initiator_from_env(),
+    )
 
 
 def _local_probe_host(facade_host: str) -> str:
@@ -111,11 +227,44 @@ def _local_probe_host(facade_host: str) -> str:
     return facade_host
 
 
+def _on_stop_signal(stop: asyncio.Event, signum: int) -> None:
+    """SIGTERM / SIGINT: attribute the stop, then ask the loop to finish.
+
+    Attribution happens here, before the shutdown sequence begins (ADR-0012
+    rule 5): a daemon killed by something other than its own `stop` verb used
+    to leave no record of it, and reconstructing "who signalled the global
+    daemon" on 2026-10-19 is what cost hours. `record_signal_shutdown` skips
+    the line when the `stop` verb already recorded that stop.
+    """
+    _ipc.record_signal_shutdown(signum)
+    stop.set()
+
+
+def _install_stop_signals(loop, stop: asyncio.Event) -> None:
+    """Arm SIGTERM and SIGINT on *loop*, both carrying their own signum."""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_stop_signal, stop, sig)
+        except NotImplementedError:
+            pass  # e.g. inside pytest event loop
+
+
 async def run_serve(cfg: Config) -> int:
     """Run a Mode B daemon until SIGTERM / Ctrl-C / shutdown. Returns exit code.
 
     There is exactly one global daemon on a fixed socket — no instance name.
     """
+    # Logging first, before anything that can take a decision worth recording.
+    # This used to run a few hundred lines in, which left the startup path
+    # (orphan sweeps, the ledger sweep, the port reclaim and every warning they
+    # emit) with only `logging.lastResort` — undated, unlabelled, and on an
+    # ensure-spawned daemon's devnull stderr (ADR-0012 rule 5). The daemon that
+    # was SIGTERMed mid-call on 2026-10-19 left nothing behind but its own
+    # stderr startup line.
+    _wire_logging()
+    # v0.5: opt-in JSON log formatter. After _wire_logging adds the
+    # file/console handlers, swap formatters in place if BD_LOG_JSON=1.
+    install_json_logging_if_requested()
     # Stale-detect: ping the endpoint before binding. If something answers,
     # refuse to start a second copy of ourselves (enforces the "at most one
     # global daemon" invariant). ADR-0011 re-keyed this from the control socket
@@ -194,12 +343,6 @@ async def run_serve(cfg: Config) -> int:
     # swap no longer severs every session's executor.
     adoptable_executors = cleanup_orphan_executors()
 
-    # Log file is best-effort — we route Python logging to it but never crash
-    # the daemon over a write failure.
-    _wire_logging()
-    # v0.5: opt-in JSON log formatter. After _wire_logging adds the
-    # file/console handlers, swap formatters in place if BD_LOG_JSON=1.
-    install_json_logging_if_requested()
     # `kill -USR1 <daemon pid>` dumps every thread's stack into the daemon log.
     # `ps` answers "who is waiting"; this answers "on what line". Armed before
     # anything can hang, and a no-op until someone signals.
@@ -243,15 +386,7 @@ async def run_serve(cfg: Config) -> int:
     # we still need to run the graceful shutdown sequence (close clients with
     # 1011 + emit upstreamClosed + close upstream).
     stop = asyncio.Event()
-
-    def _on_signal():
-        stop.set()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _on_signal)
-        except NotImplementedError:
-            pass  # e.g. inside pytest event loop
+    _install_stop_signals(asyncio.get_running_loop(), stop)
 
     # PID file (best-effort).
     _ipc.write_pid(os.getpid())
@@ -436,20 +571,29 @@ _LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 
 def _wire_logging() -> None:
-    """Route the daemon's logger to a file under TMPDIR. Best-effort."""
+    """Route the daemon's logger to a file under TMPDIR. Best-effort.
+
+    Idempotent: a process that calls it twice (a long test run, a serve retried
+    in-process) keeps one handler per sink instead of doubling every line.
+    """
     try:
         log_p = _ipc.log_path()
         log_p.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(str(log_p), encoding="utf-8")
-        handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
         root = logging.getLogger()
         root.setLevel(logging.INFO)
+        if any(getattr(h, "_bw_log_path", None) == str(log_p)
+               for h in root.handlers):
+            return
+        handler = logging.FileHandler(str(log_p), encoding="utf-8")
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
+        handler._bw_log_path = str(log_p)
         # Also echo to stderr. Under launchd that is the captured
         # StandardErrorPath file; without a handler here, warnings fell
         # through to logging's lastResort handler — undated, unlabelled,
         # which is what the launchd log looked like (ADR-0012 rule 5).
         echo = logging.StreamHandler(sys.stderr)
         echo.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
+        echo._bw_log_path = str(log_p)
         root.addHandler(echo)
         root.addHandler(handler)
     except OSError:
@@ -737,6 +881,10 @@ _SHUTDOWN_TEARDOWN_DRAIN_S = 65.0
 async def _graceful_shutdown(daemon: "Daemon") -> None:
     """Called on SIGTERM. Drain in-flight teardowns, run close etiquette on
     every context, then close the listener."""
+    # First line on purpose: from here the relay (and every readiness wait that
+    # depends on it) is living on borrowed time, and a request arriving in the
+    # window must be told the daemon is going, not that the extension is gone.
+    daemon.shutting_down = True
     # Consume replacement intent immediately. Draining a teardown may take
     # longer than the marker's anti-staleness window; validation is about when
     # SIGTERM arrived, not how long graceful shutdown etiquette takes.

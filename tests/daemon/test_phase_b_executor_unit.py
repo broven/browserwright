@@ -87,7 +87,7 @@ def test_run_on_executor_touches_session_before_ensure(monkeypatch):
     monkeypatch.setattr(
         executor_client,
         "_ensure_executor_lease",
-        lambda sess: order.append("ensure") or (_ for _ in ()).throw(
+        lambda sess, **_kw: order.append("ensure") or (_ for _ in ()).throw(
             ExecutorUnavailable("stop after ensure")
         ),
     )
@@ -112,12 +112,12 @@ def test_run_on_executor_forwards_explicit_request_env(monkeypatch):
     monkeypatch.setattr(
         executor_client,
         "_ensure_executor_lease",
-        lambda _sess: executor_client.ExecutorLease("sess-env", "executor-env"),
+        lambda _sess, **_kw: executor_client.ExecutorLease("sess-env", "executor-env"),
     )
     monkeypatch.setattr(
         executor_client,
         "_connect",
-        lambda _sid, *, timeout: _Connection(),
+        lambda _sid, **_kw: _Connection(),
     )
     monkeypatch.setattr(
         executor_client,
@@ -168,7 +168,7 @@ def _stub_client_transport(monkeypatch, response_or_error, connection_state=None
     monkeypatch.setattr(
         executor_client,
         "_ensure_executor_lease",
-        lambda _sess: executor_client.ExecutorLease("sess-client", "executor-client"),
+        lambda _sess, **_kw: executor_client.ExecutorLease("sess-client", "executor-client"),
     )
     monkeypatch.setattr(executor_client, "_connect", lambda *_a, **_kw: _Connection())
     monkeypatch.setattr(executor_client, "_send_frame", lambda *_a: None)

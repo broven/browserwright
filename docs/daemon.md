@@ -171,7 +171,10 @@ daemon 会让已连接的扩展调用 `chrome.runtime.reload()` 从磁盘重新�
 
 ## 配置（可选）
 
-`~/.config/browserwright-daemon/config.toml`：
+`$BS_HOME/config.toml`（默认 `~/.browserwright/config.toml`，与 `global.md`、`sessions/`、
+`site-skills/` 同一个 home；`--config` / `BD_CONFIG` 可指定别的文件，文件不存在等于空配置）。
+装 LaunchAgent 的机器上也可以把同样的条目写进 plist 的 `ProgramArguments`——那是另一种
+endpoint 归属模式（ADR-0012 规则 7），两种模式只需要选一种：
 
 ```toml
 # 覆盖 daemon shared upstream（与 `BD_BACKEND` 等价；

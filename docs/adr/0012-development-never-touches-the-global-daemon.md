@@ -1,6 +1,6 @@
 # Development never touches the global daemon, the global binary, or the daily Chrome
 
-Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 and 6 implemented (#91). Amended the same day: remote use over the tailnet is a real requirement (a VPS drives this Mac's Chrome), so rule 3 keeps the non-loopback bind and makes it durable instead of removing it; rule 4 became an activity gate rather than a concurrency cap (rule 4 was later withdrawn, 2026-10-05); rule 6 was added after the maintainer's own verification run stopped the global daemon. Supersedes the partial
+Status: accepted (2026-09-02). Rule 5 implemented (#89, via #92); rules 1–4 and 6 implemented (#91). Amended the same day: remote use over the tailnet is a real requirement (a VPS drives this Mac's Chrome), so rule 3 keeps the non-loopback bind and makes it durable instead of removing it; rule 4 became an activity gate rather than a concurrency cap (rule 4 was later withdrawn, 2026-10-05); rule 6 was added after the maintainer's own verification run stopped the global daemon. Amended 2026-10-19: rule 7 — the endpoint has exactly one owner, and a CLI-owned daemon with no LaunchAgent is a supported owner. Supersedes the partial
 isolation in `tests/conftest.py` (kept) by extending the same rule to every
 developer-facing verb.
 
@@ -155,6 +155,62 @@ Rules, one per leak found:
    global daemon and `stop` kill it.
    `stop` skips the guard when the override is port 0 (the per-test
    "bind anywhere" scheme), where the state file is the only truth.
+
+### Amendment (2026-10-19, ownership): a CLI-owned daemon is the other supported owner
+
+Rules 1–6 above are all written against an *installed* LaunchAgent, and read
+together they made the plist look mandatory: rule 3 gave durable bind config no
+home but the plist, and `install` was "the" way to run the daemon as a service.
+Three gaps followed, each found by hitting it:
+
+- **`restart` required a plist.** It refused with "no LaunchAgent installed"
+  (exit 2) before doing anything, and `mise run upgrade-global` and `mise run
+  restart-daemon` both end on `browserwright-daemon restart` — so on a machine
+  that runs a CLI-owned daemon, a release upgrade died at the restart step with
+  the new package already installed.
+- **Durable bind config lived only in the plist.** `facade_host` (the tailnet
+  address a remote consumer connects to, with loopback co-bound) could only be
+  made durable by installing a LaunchAgent. `upgrade-global` scrubs
+  `BD_CONFIG`/`BD_FACADE_HOST` before it touches the global install (rule 2),
+  so an environment variable cannot be the durable home either.
+- **A signal-driven stop was unattributable.** Rule 5's `LIFECYCLE stop` line is
+  written by the `stop` verb, never by the daemon, so a daemon that something
+  else SIGTERMed left nothing behind but `shutdown requested` — the exact
+  evidence gap rule 5 exists to close, and the reason the 2026-10-19 incident
+  (a dev-checkout script killing the machine-global daemon mid-call) was
+  expensive to reconstruct.
+
+7. **The endpoint has exactly one owner, and "no LaunchAgent" is a supported
+   mode.** The owner is either launchd (an installed plist, rules 1–3) or the
+   CLI that started `serve` (a *CLI-owned* daemon: `browserwright-daemon
+   restart`/`serve`, or `daemon_lifecycle.ensure`'s on-demand spawn). Both are
+   supported; neither is a degraded form of the other. Concretely:
+   - **Durable bind config lives in the config file.** The toml is `--config`,
+     else `$BD_CONFIG`, else `$BS_HOME/config.toml` (default
+     `~/.browserwright/config.toml`, beside `global.md` / `sessions/` /
+     `site-skills/`). A missing file is an empty config, never an error, and
+     the precedence is unchanged: a flag the plist passes still tops the file
+     (rule 3), so the two homes cannot silently fight over one setting.
+   - **`restart` never requires a LaunchAgent.** With a plist it does what it
+     always did. Without one it stops the incumbent and starts the same
+     `serve` detached, then proves the *same* post-condition: a pid exists, it
+     differs from the incumbent's, and `/__status__` reports the expected
+     version. A `serve` that cannot bind exits at once (status 2) and the
+     incumbent is already stopped, so every failure is reported with its exit
+     status — never a silent ok. `install`/`uninstall` are untouched: a plist
+     is still how you ask launchd to own the daemon.
+   - **Both owners write the same lifecycle trail.** A signal-driven shutdown
+     records its own `LIFECYCLE signal` line (signal, pid, initiator from the
+     daemon's environment) before the shutdown sequence starts, and skips it
+     when the `stop` verb already recorded that stop — one event, one line.
+   - **The mode is visible, not merely tolerated.** `browserwright-daemon
+     list` reports `service: manual` when no plist is installed, and
+     `restart`'s report carries `owner: cli | launchd`.
+
+   What this does NOT change: the isolation rules themselves (a development
+   daemon still owns its own ports, runtime dir and ledger), the diagnosis and
+   activity gates on `restart`, or who may signal what — a CLI-owned restart
+   still stops only a locally signalable endpoint.
 
 ## What this does NOT change
 

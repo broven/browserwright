@@ -152,7 +152,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_restart = sub.add_parser(
         "restart",
-        help="restart the installed LaunchAgent daemon after an upgrade")
+        help=("restart the daemon after an upgrade: the LaunchAgent if one is "
+              "installed, else the CLI-owned `serve`"))
     p_restart.add_argument("--timeout", type=float, default=5.0,
                            help="seconds to wait for the replacement daemon to "
                                 "come up and report its version")
@@ -480,6 +481,17 @@ def _cmd_stop(args, cfg: Config) -> int:
     Death is measured by the *ping*, not by the process table: a daemon that has
     stopped answering has stopped serving, which is all `stop` promises.
 
+    **A daemon that stopped answering is still stoppable.** The ping is how this
+    verb finds the pid; when it fails, the pid is looked up the other way — the
+    process holding the endpoint's own TCP port, confirmed to be a browserwright
+    daemon on our runtime dir (`_stale.unresponsive_daemon`). That is the
+    explicit path acting on proven identity, which is exactly the asymmetry this
+    closes: it used to SIGTERM nothing at all, so a genuinely wedged daemon could
+    not be stopped by any verb. `stop`'s identity rule is unchanged and absolute:
+    a pid is signalled only when it is either the one our endpoint's pong named,
+    or one lsof names as holding our port with a browserwright cmdline on our
+    runtime dir.
+
     **Refused for a remote endpoint (ADR-0011).** The whole mechanism rests on
     "the pid the endpoint reports is a pid on this machine", which was
     guaranteed while the endpoint was a unix socket in our own runtime dir and
@@ -519,15 +531,26 @@ def _cmd_stop(args, cfg: Config) -> int:
         return 3
 
     pid = _ipc.ping_sync(timeout=1.0)
+    wedged = False
     if pid is None:
-        # No live daemon. Still clean up stale files so the next `serve` can
-        # bind freshly without manual intervention.
-        _ipc.cleanup_endpoint()
-        print("no live daemon; cleaned up stale files", file=sys.stderr)
-        return 0
+        # Nothing answered. Either no daemon, or one holding our port that will
+        # not serve. The second still has to be stoppable — a wedged daemon is
+        # the single most likely reason to want `stop` — but only on proof of
+        # identity, which is what this lookup is (never a stranger).
+        from . import _stale
+
+        pid = _stale.unresponsive_daemon(endpoint.port)
+        if pid is None:
+            # No live daemon. Still clean up stale files so the next `serve` can
+            # bind freshly without manual intervention.
+            _ipc.cleanup_endpoint()
+            print("no live daemon; cleaned up stale files", file=sys.stderr)
+            return 0
+        wedged = True
 
     start0 = platforms.proc_start_time(pid)
     _ipc.log_lifecycle("stop", pid=pid,
+                       probes="ping" if not wedged else "unresponsive",
                        initiator=_ipc.describe_initiator("stop"))
 
     def _same_process() -> bool:
@@ -537,7 +560,7 @@ def _cmd_stop(args, cfg: Config) -> int:
 
     outcome = supervise.terminate(
         pid,
-        is_dead=lambda: _ipc.ping_sync(timeout=0.3) is None,
+        is_dead=_dead_when_not_serving(wedged, pid),
         grace=args.timeout,
         # Nothing left to do after the SIGKILL but clean up and exit, so don't
         # spend another ping confirming it.
@@ -560,6 +583,21 @@ def _cmd_stop(args, cfg: Config) -> int:
               f"it", file=sys.stderr)
     _ipc.cleanup_endpoint()
     return 0
+
+
+def _dead_when_not_serving(wedged: bool, pid: int):
+    """`stop`'s death observable: the daemon no longer serves its endpoint.
+
+    Normally one 0.3s ping. For a daemon that was already not serving when we
+    found it — the wedged case, whose pid came from the port lookup — that ping
+    would answer "not serving" both before and after the SIGTERM, so death is
+    measured against the process table instead: the pid is gone.
+    """
+    from . import _ipc, _stale
+
+    if not wedged:
+        return lambda: _ipc.ping_sync(timeout=0.3) is None
+    return lambda: not _stale.pid_alive(pid)
 
 
 def _cmd_backend_info(args, cfg: Config) -> int:

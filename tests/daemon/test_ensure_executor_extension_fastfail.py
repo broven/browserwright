@@ -20,6 +20,7 @@ from browserwright import session_registry
 from browserwright.daemon.config import Config
 from browserwright.daemon.errors import Unavailable
 from browserwright.daemon.server import executor_registry as registry_mod
+from browserwright.daemon.server import listener
 from browserwright.daemon.server import extension_upstream as ext_mod
 from browserwright.daemon.server.daemon import Daemon
 from browserwright.daemon.server.extension_upstream import ExtensionUpstream
@@ -185,3 +186,65 @@ async def test_cdp_skips_extension_fastfail(monkeypatch, tmp_path):
     assert reply["result"]["ready"] is True
     assert opens == ["cdp"]
     assert spawned == [client.session_id]
+
+
+# ---- a shutting-down daemon is not a missing extension ---------------------
+#
+# 2026-10-19: three agent calls were told "no browserwright extension is
+# connected ... chrome://extensions" while the extension was connected and
+# healthy — the daemon was being replaced under the call and had pulled its own
+# relay away. The daemon now owns that reason explicitly, and these two tests
+# hold the two ways a call can meet it: before the readiness wait, and during.
+
+
+@pytest.mark.asyncio
+async def test_shutdown_names_the_daemon_never_the_extension(monkeypatch, tmp_path):
+    """Same session, same unready relay, before and after SIGTERM: only the
+    reason changed, and the earlier text is the unchanged extension wording."""
+    relay = _FakeRelay(ready=False)
+    ctx, client, sent, spawned, _ = _build(
+        monkeypatch, tmp_path, "extension", relay=relay)
+    daemon = ctx.router.daemon
+
+    await _ensure_executor(ctx, client)
+    before = sent[-1]["error"]["message"]
+    assert "no browserwright extension is connected" in before
+    assert "chrome://extensions" in before
+    assert relay.wait_calls == 1
+
+    await listener._graceful_shutdown(daemon)
+    assert daemon.shutting_down is True
+
+    await _ensure_executor(ctx, client)
+    after = sent[-1]["error"]["message"]
+    assert "the daemon is shutting down" in after
+    assert "no browserwright extension is connected" not in after
+    assert "chrome://extensions" not in after
+    # The refusal happens before the readiness grace: no second wait_ready.
+    assert relay.wait_calls == 1
+    assert spawned == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_the_readiness_wait_still_names_the_daemon(
+        monkeypatch, tmp_path):
+    """A request can straddle the start of shutdown: the wait has already
+    begun when SIGTERM lands, so the failure it produces must still be
+    attributed to the daemon that is leaving."""
+    relay = _FakeRelay(ready=False)
+    ctx, client, sent, spawned, _ = _build(
+        monkeypatch, tmp_path, "extension", relay=relay)
+    daemon = ctx.router.daemon
+
+    async def _shutdown_mid_wait(timeout: float = 30.0) -> None:
+        daemon.shutting_down = True
+        raise asyncio.TimeoutError
+
+    relay.wait_ready = _shutdown_mid_wait
+
+    await _ensure_executor(ctx, client)
+
+    msg = sent[-1]["error"]["message"]
+    assert "the daemon is shutting down" in msg
+    assert "no browserwright extension is connected" not in msg
+    assert spawned == []
