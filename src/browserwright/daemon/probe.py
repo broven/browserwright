@@ -172,6 +172,19 @@ class DaemonProbe:
         from . import _stale
         return _stale.confirmed_stale_holder(ports)
 
+    def escalated_probes(self, host: str, port: int) -> list:
+        """Re-probe ``host:port`` until something answers, or the window runs out.
+
+        The escalated evidence `serve`'s reclaim decides on: a single short ping
+        cannot tell a dead daemon from a busy one (issue #15's reclaim SIGTERMed
+        a live daemon on exactly that basis on 2026-10-19), so the question is
+        asked again with a much larger budget. Returns every
+        :class:`_ipc.EndpointProbe` taken, in order, each carrying its measured
+        latency; an empty list means there was no address to ask.
+        """
+        from . import _ipc
+        return _ipc.probes_until_answered(host, port)
+
     def live_pid_file_pid(self) -> int | None:
         """Best-effort fallback holder hint: the pid file's pid, if still alive.
 

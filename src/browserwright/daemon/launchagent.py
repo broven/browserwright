@@ -431,6 +431,14 @@ def _stop_incumbent(timeout: float) -> dict:
     (Issue #44 B is a different case — the relay *ports*, where a stranger's
     daemon can hold 19989 without being ours. That one is caught by the version
     check in :func:`restart`'s verification, where refusing is right.)
+
+    **A daemon that stopped answering is still stoppable**, on proven identity:
+    when the ping fails, the pid comes from `_stale.unresponsive_daemon` — the
+    process holding the endpoint's own TCP port, whose cmdline is a browserwright
+    daemon, sharing our runtime dir. That is the same class of proof the implicit
+    reclaim demands, so the "never signal a process we cannot prove is
+    browserwright" rule is not weakened by an inch; what changes is that
+    `restart` no longer has to *fail* on the daemon `restart` exists to fix.
     """
     from . import _ipc, platforms, supervise
     from ..daemon_url import daemon_endpoint, not_ours_to_signal_message
@@ -441,8 +449,14 @@ def _stop_incumbent(timeout: float) -> dict:
             not_ours_to_signal_message(endpoint, "restart"), exit_code=3)
 
     pid = _ipc.ping_sync(timeout=1.0)
+    wedged = False
     if pid is None:
-        return {"stopped": None}
+        from . import _stale
+
+        pid = _stale.unresponsive_daemon(endpoint.port)
+        if pid is None:
+            return {"stopped": None}
+        wedged = True
     start0 = platforms.proc_start_time(pid)
 
     def _same_process() -> bool:
@@ -452,9 +466,17 @@ def _stop_incumbent(timeout: float) -> dict:
             return True
         return platforms.proc_start_time(pid) == start0
 
+    # Death is normally "the ping stopped answering". For a daemon that was
+    # already not answering when we found it, that observable is constant, so
+    # fall back to the process table: the pid is gone. This pid is not one we
+    # own (launchd does), which is why the start-time `guard` stays armed for
+    # the escalation either way.
+    is_dead = ((lambda: _ipc.ping_sync(timeout=0.3) is None) if not wedged
+               else (lambda: not _stale.pid_alive(pid)))
+
     supervise.terminate(
         pid,
-        is_dead=lambda: _ipc.ping_sync(timeout=0.3) is None,
+        is_dead=is_dead,
         grace=timeout,
         kill_grace=0,
         interval=0.1,

@@ -348,11 +348,11 @@ just before it is the attribution.
 ### daemon lifecycle
 The client side's one owner of "is the daemon up, and make it so"
 (`src/browserwright/daemon_lifecycle.py`). Three calls: `diagnose()` returns
-one `DaemonVerdict` (`up` · `stale` · `down` · `foreign` · `unreachable` ·
-`undecided`), `ensure(reason)` is the **only** Layer 2 code that starts or
-replaces the daemon (executor handoff, initiator, `LIFECYCLE` line, child env),
-and `unreachable_fix()` builds the agent-facing diagnosis text. Every
-`browserwright-daemon <verb>` a Layer 2 module runs goes through its
+one `DaemonVerdict` (`up` · `stale` · `down` · `foreign` · `unresponsive` ·
+`unreachable` · `undecided`), `ensure(reason)` is the **only** Layer 2 code
+that starts or replaces the daemon (executor handoff, initiator, `LIFECYCLE`
+line, child env), and `unreachable_fix()` builds the agent-facing diagnosis
+text. Every `browserwright-daemon <verb>` a Layer 2 module runs goes through its
 `run_verb` adapter, which carries the resolved endpoint into the child.
 
 **Trap:** constructing a `Session` (or its `ModeBClient`) has no lifecycle side
@@ -363,8 +363,13 @@ configured endpoint (see `endpoint`) is diagnosed, never started or replaced.
 
 **Trap:** `diagnose(confirm=True)` takes two probes and concludes nothing when
 they disagree (`undecided`); only `down` and `stale` on the default endpoint
-are `replaceable`. `foreign` (something that is not browserwright holds the
-port) is never replaced by `recover` — ADR-0013 rule 2.
+are `replaceable`. `foreign` (something *answered* HTTP that is not our pong)
+and `unresponsive` (the socket opened and nothing came back, for the whole
+escalated probe window) are never replaced by `recover` — ADR-0013 rule 2.
+Folding silence into `foreign` is exactly the bug that replaced a live daemon
+mid-call on 2026-10-19: two agreeing timeouts are not evidence of anything.
+A probe that times out is therefore re-asked with a much larger budget
+(`_ipc.probes_until_answered`), so a merely slow daemon comes back `up`/`stale`.
 
 ### activity gate
 The daemon's own answer to "would interrupting me hurt someone right now":

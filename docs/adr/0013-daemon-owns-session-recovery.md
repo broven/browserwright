@@ -112,6 +112,18 @@ is logged with its reason and both probe results (ADR-0012 rule 5). If the ladde
 ends in `needs-human`, `recover` says so with the diagnosis and stops; it never
 loops.
 
+Amendment (2026-10-19, incident): a **probe timeout is not evidence about a
+process**. The first implementation classified an unanswered `GET /__ping__` as
+`foreign` ("something else holds the port"), so two agreeing 1.5s timeouts
+authorized a replacement — and, through `serve`'s port reclaim, a SIGTERM —
+against a machine-global daemon that was alive but momentarily slow (still
+accepting ws clients, graceful on the signal). Silence now has its own verdict,
+`unresponsive`: a timeout (or non-HTTP bytes) is escalated for a bounded window
+before anything is concluded, `ensure` never spawns or stops on it, and the
+implicit reclaim that SIGTERMs a port holder requires the holder to have stayed
+unanswered for that whole window. `foreign` keeps its original meaning —
+something *answered*, just not with our pong.
+
 ### 3. Agent-visible error text follows a banned-word list
 
 Text an agent can see (exceptions, `doctor`, skill documents' runtime-error

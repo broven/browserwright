@@ -199,6 +199,42 @@ def confirmed_stale_holder(ports: list[int]) -> int | None:
     return None
 
 
+def unresponsive_daemon(port: int) -> int | None:
+    """The pid of a *confirmed browserwright* daemon holding TCP ``port`` on OUR
+    runtime dir (excluding ourselves), or None.
+
+    The identity proof for a daemon that cannot prove itself by answering. Both
+    of this module's signal rules apply, unchanged and in full:
+
+    - lsof names the pid as holding the port AND its command line is a
+      browserwright daemon (:func:`pid_is_browserwright_daemon`);
+    - it shares our runtime dir (:func:`same_runtime_dir_as_us`) — a daemon from
+      another runtime dir is someone else's live one (the machine-global daemon,
+      a sibling worktree's e2e daemon), never a target.
+
+    ``port`` must be the endpoint's own port — the socket that should have
+    answered — never a configured guess, so a stop aimed at one daemon can never
+    nominate the holder of another's port.
+
+    For the **explicit** verbs only (``stop``, and ``restart``'s incumbent stop):
+    they were asked for directly, so "this daemon holds the port that should be
+    answering, is provably browserwright, sits on our runtime dir, and does not
+    answer" is what their caller needs. The **implicit** path (`serve`'s reclaim)
+    additionally has to prove the holder *stale* — a single negative ping is not
+    evidence — so it does not use this.
+    """
+    me = os.getpid()
+    for pid in port_holder_pids(port):
+        if pid == me:
+            continue
+        if not pid_is_browserwright_daemon(pid):
+            continue
+        if not same_runtime_dir_as_us(pid):
+            continue
+        return pid
+    return None
+
+
 def reclaim_ports(pid: int, ports: list[int], *, timeout: float = 5.0) -> bool:
     """SIGTERM ``pid`` and wait until every port in ``ports`` frees; escalate to
     SIGKILL as a last resort. Returns True once the ports are free.

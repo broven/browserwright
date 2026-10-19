@@ -6,7 +6,9 @@ answered here and nowhere else. The interface is three calls:
 
 - :func:`diagnose` → one :class:`DaemonVerdict`. Probes the resolved endpoint
   (once, or twice with ``confirm=True`` — ADR-0013's two agreeing probes) and
-  classifies what it found. Side-effect free.
+  classifies what it found. A probe that ends in silence is escalated before it
+  is concluded, so a daemon that is merely slow is diagnosed ``up`` / ``stale``
+  rather than ``unresponsive``. Side-effect free.
 - :func:`ensure` → the **only** code that starts or replaces the daemon. It owns
   the executor handoff, the initiator attribution (ADR-0012 rule 5), the
   ``LIFECYCLE`` log line, and the child environment. An explicitly configured
@@ -33,6 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .daemon._ipc import SILENT_PROBE_KINDS
 from .daemon_url import (
     DEFAULT_DAEMON_URL,
     ENV_VAR,
@@ -57,10 +60,20 @@ STALE = "stale"
 DOWN = "down"
 #: Something answers on the port, but it cannot be proven to be browserwright.
 FOREIGN = "foreign"
+#: The port opened a socket and then never answered HTTP at all. NOT
+#: :data:`FOREIGN` (which means something *did* answer, and it was not our
+#: pong): a silent holder is evidence of nothing yet, so it is never an
+#: automatic kill or replacement target. The probes escalate before this is
+#: concluded — a daemon that is merely slow answers inside the window and is
+#: diagnosed ``up`` / ``stale`` — and it never authorizes a spawn or a stop.
+UNRESPONSIVE = "unresponsive"
 #: Nothing listens on an explicitly configured endpoint (never auto-started).
 UNREACHABLE = "unreachable"
 #: ``confirm=True`` and the two probes disagreed; nothing is concluded.
 UNDECIDED = "undecided"
+#: The states :func:`ensure` never acts on: neither one is evidence about a
+#: process it would be allowed to start or signal.
+NO_ACTION_STATES = (UNRESPONSIVE, UNDECIDED)
 
 
 @dataclass(frozen=True)
@@ -110,9 +123,61 @@ def _classify(pr, ep: DaemonEndpoint, installed: str) -> tuple[str, str]:
                            f"is {installed}")
         return UP, (f"the daemon answers at {ep.authority} (pid {pr.pid}, "
                     f"version {pr.version})")
+    if pr.kind in SILENT_PROBE_KINDS:
+        # "Nothing came back" is not "something else is there". Folding the
+        # two together is what turned one 1.5s timeout into a replacement —
+        # and a SIGTERM — on a daemon that was alive but slow.
+        return UNRESPONSIVE, pr.describe()
     if pr.kind == "refused":
         return (UNREACHABLE if ep.explicit else DOWN), pr.describe()
     return FOREIGN, pr.describe()
+
+
+def _escalate(ep: DaemonEndpoint) -> list:
+    """Re-probe ``ep`` with the escalated budget, through the ``probe`` seam.
+
+    A short-probe timeout is escalated, never concluded (see
+    ``_ipc.probes_until_answered``, the helper `serve`'s reclaim uses too).
+    """
+    from .daemon._ipc import probes_until_answered
+
+    return probes_until_answered(ep.host, ep.port, probe=probe)
+
+
+def _diagnose_silent(ep: DaemonEndpoint, installed: str,
+                     silent: list) -> DaemonVerdict:
+    """The endpoint said nothing: ask again with the escalating budget.
+
+    A daemon that answers inside the window was merely slow, and the verdict is
+    whatever it says (``up`` / ``stale``). Only silence for the whole window is
+    concluded — as :data:`UNRESPONSIVE`, whose detail carries the endpoint and
+    every probe taken (kind and measured latency). A negative found later
+    (``refused`` in a window that was already silent) does not turn into a
+    spawn either: a ``serve`` started against a port that answered nothing while
+    something held it would have refused or lost the race anyway, and the
+    caller's next probe settles a genuine death.
+    """
+    from .daemon._ipc import ESCALATED_PROBE_WINDOW_S
+
+    escalated = _escalate(ep)
+    answer = next((p for p in escalated if p.kind == "ours"), None)
+    if answer is not None:
+        state, detail = _classify(answer, ep, installed)
+        return DaemonVerdict(
+            state=state, endpoint=ep, installed=installed,
+            detail=(f"{detail}; the first {len(silent)} probe(s) timed out "
+                    "before it answered"),
+            probes=tuple(p.kind for p in [*silent, *escalated]),
+            pid=answer.pid, version=answer.version)
+    observed = [*silent, *escalated]
+    evidence = ", ".join(p.evidence() for p in observed) or "no probe taken"
+    return DaemonVerdict(
+        state=UNRESPONSIVE, endpoint=ep, installed=installed,
+        detail=(f"no HTTP answer at {ep.authority} over the "
+                f"{ESCALATED_PROBE_WINDOW_S:.1f}s escalated window "
+                f"({evidence}); a holder that says nothing is not proven to be "
+                "browserwright, so nothing is started or signalled on it"),
+        probes=tuple(p.kind for p in observed))
 
 
 def diagnose(*, confirm: bool = False, endpoint: DaemonEndpoint | None = None,
@@ -121,7 +186,11 @@ def diagnose(*, confirm: bool = False, endpoint: DaemonEndpoint | None = None,
     """Classify the daemon at ``endpoint`` (default: the resolved one).
 
     ``confirm`` takes two probes and only concludes when they agree — the
-    ADR-0013 rule for anything that may lead to a replacement. The installed
+    ADR-0013 rule for anything that may lead to a replacement. A probe that
+    comes back silent (``timeout`` / ``garbage``) is escalated before anything
+    is concluded from it: :func:`_diagnose_silent` re-asks with a much larger
+    budget, so a daemon that is merely slow answers and is classified
+    ``up`` / ``stale`` instead of being called unresponsive. The installed
     version is this package's (``expected_version`` overrides it for the
     LaunchAgent, whose binary may differ from the checkout asking).
     """
@@ -131,6 +200,8 @@ def diagnose(*, confirm: bool = False, endpoint: DaemonEndpoint | None = None,
     installed = expected_version or package_version()
     observed = [probe(ep.host, ep.port, timeout=timeout)
                 for _ in range(2 if confirm else 1)]
+    if observed and all(p.kind in SILENT_PROBE_KINDS for p in observed):
+        return _diagnose_silent(ep, installed, observed)
     kinds = tuple(p.kind for p in observed)
     conclusions = [_classify(p, ep, installed) for p in observed]
     if len({c[0] for c in conclusions}) > 1:
@@ -163,10 +234,16 @@ def ensure(reason: str, *, wait: float = 10.0) -> DaemonVerdict:
       repaired: that daemon belongs to whoever configured the URL.
     - **default endpoint** — ours. ``DOWN`` / ``FOREIGN`` spawn ``serve``
       (which refuses beside a live daemon and reclaims ports only from a
-      process it proves is browserwright, issue #15); ``STALE`` hands the
-      resident executors over, stops the old daemon and spawns the installed
-      one; ``UNDECIDED`` does nothing — a daemon mid-transition is not piled
-      on. After a spawn, waits up to ``wait`` seconds for ``UP``.
+      process it proves is browserwright and that stayed silent for the whole
+      escalated probe window, issue #15); ``STALE`` hands the resident
+      executors over, stops the old daemon and spawns the installed one;
+      ``UNDECIDED`` and ``UNRESPONSIVE`` do nothing — a daemon
+      mid-transition, and a port that accepts connections and then says
+      nothing, are both things no replacement may be started against. (The
+      unresponsive case used to spawn: the port holder that refused to answer
+      was mistaken for a foreign one, and on 2026-10-19 that killed a live
+      machine-global daemon mid-call.) After a spawn, waits up to ``wait``
+      seconds for ``UP``.
 
     Never raises for the default endpoint: the returned verdict says whether
     it worked, and each caller decides what a failure means for it.
@@ -186,7 +263,7 @@ def ensure(reason: str, *, wait: float = 10.0) -> DaemonVerdict:
                   "configured explicitly, browserwright will not replace it — "
                   "update the daemon on that machine.", file=sys.stderr)
         return verdict
-    if verdict.state == UNDECIDED:
+    if verdict.state in NO_ACTION_STATES:
         return verdict
 
     initiator = _ipc.describe_initiator(f"auto-start ({reason})")
@@ -336,7 +413,7 @@ def unreachable_fix(ep: DaemonEndpoint) -> str:
     """The ``fix`` for "nothing answered" on a NON-explicitly-configured
     endpoint, built from what the probes observed.
 
-    Four observed shapes, each with its own next step; none of them is
+    Five observed shapes, each with its own next step; none of them is
     "restart the daemon" — a client that could not connect has no evidence
     the daemon is at fault, and on 2026-09-01 that advice restarted a healthy
     daemon out from under another agent (ADR-0012, ADR-0013 rule 3).
@@ -365,6 +442,21 @@ def unreachable_fix(ep: DaemonEndpoint) -> str:
             f"Find it with `lsof -nP -iTCP:{first.port} -sTCP:LISTEN` and stop "
             "it, or move the daemon to another port. `browserwright-daemon "
             "status` reports what browserwright itself believes is running."
+        )
+    # 2b. The port accepted the connection and then said nothing at all — a
+    #     holder that is unresponsive rather than absent, or a listener that is
+    #     not speaking HTTP. Neither is a daemon this client may start over:
+    #     a silent holder can be a live daemon that is merely slow, and this
+    #     message is built on one probe, so it describes rather than concludes.
+    if first.silent:
+        return (
+            f"{findings}. A process holds {first.host}:{first.port} without "
+            "serving on it — busy, stuck, or not browserwright at all. That is "
+            "not a daemon this client will start over; retry the command (a "
+            "slow daemon answers on its own), and if it keeps happening "
+            f"`lsof -nP -iTCP:{first.port} -sTCP:LISTEN` names the holder while "
+            "`browserwright-daemon status` and `browserwright doctor` report "
+            "what browserwright sees there."
         )
     # 3. A daemon answers at the resolved address after all (a transient
     #    failure between the caller's attempt and this probe), possibly on
