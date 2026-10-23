@@ -21,7 +21,7 @@ requires-python = ">=3.11"
 license = "AGPL-3.0-only"
 dependencies = [
     "websockets==15.0.1",
-    "pillow==12.2.0",
+    "pillow==13.0.0",
     # SOCKS support is default, not an extra (#136): an `--attach` session's
     # proxy comes from the caller's environment, and macOS proxy apps (Surge,
     # Clash) routinely export `all_proxy=socks5://...`. `socks` gives httpx
