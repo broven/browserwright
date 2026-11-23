@@ -160,6 +160,21 @@ class _Budget:
         self.remaining()
 
 
+def _impl_mouse_move(mouse_impl: Any, x: float, y: float) -> Any:
+    """Queue one impl-level mouse move on the installed Playwright's signature.
+
+    ``_mouse_samples`` batches these directly through Playwright's impl (the
+    public sync ``mouse.move`` waits for every dispatched event, which is too
+    slow for a sampled approach path). Playwright 1.65 made the third parameter
+    mandatory — ``move(x, y, steps: Optional[int])`` — while <= 1.64 spelled it
+    ``steps: int = None``. Passing the public API's default explicitly is
+    accepted by both, so one spelling covers the range; on 1.65 the old
+    two-argument call raised ``TypeError: Mouse.move() missing 1 required
+    positional argument: 'steps'`` from every human click/fill.
+    """
+    return mouse_impl.move(x, y, steps=1)
+
+
 def _mouse_samples(page: Any, points: list[tuple[float, float]], budget: _Budget) -> None:
     """Queue one small group of native samples before waiting for their ACKs.
 
@@ -179,7 +194,8 @@ def _mouse_samples(page: Any, points: list[tuple[float, float]], budget: _Budget
         return
 
     async def send() -> None:
-        tasks = [asyncio.create_task(page.mouse._impl_obj.move(px, py))
+        tasks = [asyncio.create_task(
+                     _impl_mouse_move(page.mouse._impl_obj, px, py))
                  for px, py in points]
         try:
             batch = asyncio.gather(*tasks)

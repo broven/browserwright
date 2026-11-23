@@ -372,7 +372,16 @@ class _Worker:
         """Worker loop. Cold-start is NOT done here — it is deferred to the
         first execute (see :meth:`_execute` → :meth:`_ensure_cold_started`), so
         the process can start serving its socket immediately while the slow
-        facade connect happens off the control-plane RPC's critical path."""
+        facade connect happens off the control-plane RPC's critical path.
+
+        Every exception the agent's code can raise is answered inside
+        :meth:`_execute`; anything that escapes is an EXECUTOR bug
+        (``_build_globals``, the pre-call reconcile, a view factory). It is
+        caught here and answered, because letting it kill this thread leaves
+        the main thread blocked in ``submit`` until the call deadline and
+        reports a ``DeadlineExceeded`` that blames the agent's timeout — which
+        is exactly how the 2026-11 Playwright-channel crash burned hours of
+        misdirected diagnosis."""
         while True:
             item = self._q.get()
             if item is None:
@@ -380,7 +389,10 @@ class _Worker:
             req, box = item
             self._begin_inflight(req)
             try:
-                response = self._execute(req)
+                try:
+                    response = self._execute(req)
+                except BaseException as exc:  # noqa: BLE001 - answer, never wedge
+                    response = self._internal_error_response(exc)
             finally:
                 self._end_inflight()
                 # Values are restored out of os.environ by
@@ -391,6 +403,36 @@ class _Worker:
                 req.env.clear()
             box.put(response)
         self._teardown()
+
+    def _internal_error_response(self, exc: BaseException) -> ExecuteResponse:
+        """Answer a call whose failure escaped :meth:`_execute`.
+
+        The executor stays alive: an exception this far out is a browserwright
+        bug, not a statement about the call, and a retry re-enters the same
+        path (a transient failure can recover, a deterministic one fails fast
+        instead of hanging). The real type/message/traceback reach the agent,
+        so the next occurrence names its own cause instead of masquerading as
+        the caller's timeout."""
+        traceback_text = traceback.format_exc()
+        try:
+            sys.stderr.write(
+                f"executor {self._session_id}: internal error while running a "
+                f"call: {type(exc).__name__}: {exc}\n{traceback_text}\n")
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001 - logging must not replace the error
+            pass
+        return self._finish(
+            io.StringIO(),
+            error={
+                "type": type(exc).__name__,
+                "msg": (f"executor internal error: {type(exc).__name__}: {exc}"),
+                "fix": ("this is a browserwright bug, not a problem with the "
+                        "call: report it with the traceback; retry once in case "
+                        "it was transient, or `reset()` to recycle the executor"),
+                "traceback": traceback_text,
+            },
+            exit_code=3,
+        )
 
     # ---- in-flight introspection (C1b) ----------------------------------
 
