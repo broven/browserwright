@@ -585,6 +585,39 @@ def _fill(native: Any, locator: Any, value: str, kwargs: dict[str, Any]) -> Any:
     return None
 
 
+def _register_scroll_engine(context: Any) -> None:
+    """Register the scroll selector engine through whichever channel shape the
+    installed Playwright exposes.
+
+    ``registerSelectorEngine`` is an internal Playwright protocol command with
+    no public Python wrapper, and its client-side spelling moved inside the
+    ``playwright>=1.60.0`` range this package supports:
+
+      - **<= 1.64**: every channel is the generic ``Channel``, and the command
+        is ``channel.send('registerSelectorEngine', timeout, params)``;
+      - **>= 1.65**: the generic channel was replaced by per-object generated
+        channels. ``send`` is gone and the command is a generated
+        ``channel.registerSelectorEngine(selectorEngine)`` returning an
+        awaitable.
+
+    Calling only the old shape raised ``AttributeError`` on >= 1.65. That
+    happened inside the executor worker (``_build_globals`` → here), which has
+    no crash-to-response path, so the worker thread died silently and the CLI
+    call hung until its deadline instead of surfacing the error. Register via
+    the generated method when it exists, and keep the generic call for the
+    older versions the dependency floor still allows.
+    """
+    engine = {'name': _SCROLL_ENGINE, 'source': _SCROLL_SOURCE,
+              'contentScript': True}
+    channel = context._impl_obj._channel
+    register = getattr(channel, 'registerSelectorEngine', None)
+    if callable(register):
+        context._sync(register(engine))
+        return
+    context._sync(channel.send('registerSelectorEngine', None,
+                               {'selectorEngine': engine}))
+
+
 def install_human_input(context: Any) -> None:
     """Register the executor context and patch its sync API input methods."""
     global _INSTALLED
@@ -592,10 +625,7 @@ def install_human_input(context: Any) -> None:
     if not isinstance(context, BrowserContext):
         return
     if context not in _SCROLL_CONTEXTS:
-        context._sync(context._impl_obj._channel.send('registerSelectorEngine', None, {
-            'selectorEngine': {'name': _SCROLL_ENGINE, 'source': _SCROLL_SOURCE,
-                               'contentScript': True},
-        }))
+        _register_scroll_engine(context)
         _SCROLL_CONTEXTS.add(context)
     _CONTEXTS.add(context)
     if _INSTALLED:
