@@ -1283,6 +1283,51 @@ def test_generic_cold_start_failure_carries_traceback(monkeypatch):
     assert r.exit_code == 3
 
 
+def test_worker_internal_crash_answers_error_instead_of_deadline(monkeypatch):
+    """An exception escaping `_execute` must ANSWER the waiting call.
+
+    Regression for the 2026-11 Playwright-1.65 selector-engine crash: the
+    exception was raised from `_build_globals` on the worker thread, the thread
+    died silently (a thread target that raises only prints to the executor's
+    stderr), `submit` sat in `box.get` for the whole call deadline and the CLI
+    reported `DeadlineExceeded` — blaming the caller's `--timeout` for a
+    browserwright bug and hiding the real traceback.
+
+    The worker must answer with the real error and stay alive, so a retry
+    re-enters the same path instead of waiting out another deadline.
+    """
+    import time
+
+    w = _Worker("sess-worker-crash")
+
+    def fake_execute(self, req):
+        raise RuntimeError("view factory blew up")
+
+    monkeypatch.setattr(_Worker, "_execute", fake_execute)
+    w.start()
+    try:
+        started = time.monotonic()
+        response = w.submit(protocol.ExecuteRequest("print('never runs')", 3000))
+        elapsed = time.monotonic() - started
+        # The pre-fix behaviour was a DeadlineExceeded after the full 3s budget.
+        assert response.error is not None
+        assert response.error["type"] == "RuntimeError"
+        # The worker survived the crash: it is back in the loop for the next
+        # call instead of having died with the request unanswered.
+        assert w._thread.is_alive()
+    finally:
+        w.shutdown()
+
+    assert "view factory blew up" in response.error["msg"]
+    assert "fix" in response.error and response.error["fix"]
+    assert "traceback" in response.error
+    assert response.exit_code == 3
+    assert response.terminal_reason is None
+    # Pre-fix this was the deadline (3s) with DeadlineExceeded. The error must
+    # arrive on its own, not by the clock.
+    assert elapsed < 2.0
+
+
 def test_ensure_cold_started_enters_driver_once_and_reuses_on_retry(monkeypatch):
     """Cold-start enters `sync_playwright()` exactly ONCE; a connect failure
     leaves the live driver in place (NOT torn down) so a retry REUSES it. The
